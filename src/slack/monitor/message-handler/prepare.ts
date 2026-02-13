@@ -439,7 +439,11 @@ export async function prepareSlackMessage(params: {
     });
   }
 
-  const slackTo = isDirectMessage ? `user:${message.user}` : `channel:${message.channel}`;
+  // Use actual channel id for both DM and channel. For DM, message.channel is the IM channel id (D...).
+  // This ensures replyTarget, OriginatingTo and toolContext.currentChannelId all point to the same
+  // destination, so replies and tool-sent messages (e.g. slack.chat_postMessage) stay in the DM
+  // instead of being sent to a default channel like #kairos-oraculo.
+  const slackTo = `channel:${message.channel}`;
 
   const untrustedChannelMetadata = isRoomish
     ? buildUntrustedChannelMetadata({

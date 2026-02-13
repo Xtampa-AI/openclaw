@@ -38,20 +38,20 @@ export type SlackActionContext = {
 
 /**
  * Resolve threadTs for a Slack message based on context and replyToMode.
+ * When the session is in a thread (currentThreadTs set), we always reply in that thread
+ * when sending to the same channel, so replies never land in the channel and duplicate topics.
  * - "all": always inject threadTs
- * - "first": inject only for first message (updates hasRepliedRef)
- * - "off": never auto-inject
+ * - "first": inject only for first message (updates hasRepliedRef), then channel
+ * - "off": still inject when in a thread (same channel) to avoid replying in channel
  */
 function resolveThreadTsFromContext(
   explicitThreadTs: string | undefined,
   targetChannel: string,
   context: SlackActionContext | undefined,
 ): string | undefined {
-  // Agent explicitly provided threadTs - use it
   if (explicitThreadTs) {
     return explicitThreadTs;
   }
-  // No context or missing required fields
   if (!context?.currentThreadTs || !context?.currentChannelId) {
     return undefined;
   }
@@ -62,20 +62,17 @@ function resolveThreadTsFromContext(
   }
   const normalizedTarget = parsedTarget.id;
 
-  // Different channel - don't inject
   if (normalizedTarget !== context.currentChannelId) {
     return undefined;
   }
 
-  // Check replyToMode
-  if (context.replyToMode === "all") {
-    return context.currentThreadTs;
+  if (context.replyToMode === "first" && context.hasRepliedRef?.value) {
+    return undefined;
   }
-  if (context.replyToMode === "first" && context.hasRepliedRef && !context.hasRepliedRef.value) {
+  if (context.replyToMode === "first" && context.hasRepliedRef) {
     context.hasRepliedRef.value = true;
-    return context.currentThreadTs;
   }
-  return undefined;
+  return context.currentThreadTs;
 }
 
 export async function handleSlackAction(

@@ -220,16 +220,18 @@ function readBooleanParam(params: Record<string, unknown>, key: string): boolean
   return undefined;
 }
 
+/**
+ * When the session is in a Slack thread (currentThreadTs set), any send to the same channel
+ * must use that thread_ts so the reply stays in the thread. Otherwise replies can land in the
+ * channel and duplicate topics. We always inject thread_ts when target matches the thread's
+ * channel; for replyToMode "first" we only skip after the first reply (hasRepliedRef).
+ */
 function resolveSlackAutoThreadId(params: {
   to: string;
   toolContext?: ChannelThreadingToolContext;
 }): string | undefined {
   const context = params.toolContext;
   if (!context?.currentThreadTs || !context.currentChannelId) {
-    return undefined;
-  }
-  // Only mirror auto-threading when Slack would reply in the active thread for this channel.
-  if (context.replyToMode !== "all" && context.replyToMode !== "first") {
     return undefined;
   }
   const parsedTarget = parseSlackTarget(params.to, { defaultKind: "channel" });
@@ -239,9 +241,11 @@ function resolveSlackAutoThreadId(params: {
   if (parsedTarget.id.toLowerCase() !== context.currentChannelId.toLowerCase()) {
     return undefined;
   }
+  // replyToMode "first": only first reply goes to thread; subsequent go to channel.
   if (context.replyToMode === "first" && context.hasRepliedRef?.value) {
     return undefined;
   }
+  // When we're in a thread, always reply in that thread (avoid posting to channel).
   return context.currentThreadTs;
 }
 

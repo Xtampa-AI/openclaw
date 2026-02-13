@@ -205,6 +205,9 @@ export function getChromeExtensionRelayAuthHeaders(url: string): Record<string, 
   return { [RELAY_AUTH_HEADER]: token };
 }
 
+/** When set to "0.0.0.0", relay binds on all interfaces (e.g. for Docker port-forward). */
+const RELAY_BIND_HOST = (process.env.OPENCLAW_RELAY_BIND_HOST ?? "").trim();
+
 export async function ensureChromeExtensionRelayServer(opts: {
   cdpUrl: string;
 }): Promise<ChromeExtensionRelayServer> {
@@ -217,6 +220,8 @@ export async function ensureChromeExtensionRelayServer(opts: {
   if (existing) {
     return existing;
   }
+
+  const bindHost = RELAY_BIND_HOST === "0.0.0.0" ? "0.0.0.0" : info.host;
 
   let extensionWs: WebSocket | null = null;
   const cdpClients = new Set<WebSocket>();
@@ -487,7 +492,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
     const pathname = url.pathname;
     const remote = req.socket.remoteAddress;
 
-    if (!isLoopbackAddress(remote)) {
+    if (bindHost !== "0.0.0.0" && !isLoopbackAddress(remote)) {
       rejectUpgrade(socket, 403, "Forbidden");
       return;
     }
@@ -735,7 +740,7 @@ export async function ensureChromeExtensionRelayServer(opts: {
   });
 
   await new Promise<void>((resolve, reject) => {
-    server.listen(info.port, info.host, () => resolve());
+    server.listen(info.port, bindHost, () => resolve());
     server.once("error", reject);
   });
 

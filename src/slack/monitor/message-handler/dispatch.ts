@@ -28,7 +28,7 @@ export async function dispatchPreparedSlackMessage(prepared: PreparedSlackMessag
       sessionKey: route.mainSessionKey,
       deliveryContext: {
         channel: "slack",
-        to: `user:${message.user}`,
+        to: prepared.ctxPayload.To ?? `channel:${message.channel}`,
         accountId: route.accountId,
       },
       ctx: prepared.ctxPayload,

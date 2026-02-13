@@ -235,7 +235,7 @@ describe("handleSlackAction", () => {
     });
   });
 
-  it("replyToMode=first without hasRepliedRef does not thread", async () => {
+  it("replyToMode=first without hasRepliedRef still threads when in a thread (avoid channel reply)", async () => {
     const cfg = { channels: { slack: { botToken: "tok" } } } as OpenClawConfig;
     sendSlackMessage.mockClear();
     await handleSlackAction({ action: "sendMessage", to: "channel:C123", content: "No ref" }, cfg, {
@@ -246,18 +246,18 @@ describe("handleSlackAction", () => {
     });
     expect(sendSlackMessage).toHaveBeenCalledWith("channel:C123", "No ref", {
       mediaUrl: undefined,
-      threadTs: undefined,
+      threadTs: "1111111111.111111",
     });
   });
 
-  it("does not auto-inject threadTs when replyToMode=off", async () => {
+  it("auto-injects threadTs when in a thread even with replyToMode=off (avoid reply in channel)", async () => {
     const cfg = { channels: { slack: { botToken: "tok" } } } as OpenClawConfig;
     sendSlackMessage.mockClear();
     await handleSlackAction(
       {
         action: "sendMessage",
         to: "channel:C123",
-        content: "Off mode",
+        content: "In thread",
       },
       cfg,
       {
@@ -266,9 +266,9 @@ describe("handleSlackAction", () => {
         replyToMode: "off",
       },
     );
-    expect(sendSlackMessage).toHaveBeenCalledWith("channel:C123", "Off mode", {
+    expect(sendSlackMessage).toHaveBeenCalledWith("channel:C123", "In thread", {
       mediaUrl: undefined,
-      threadTs: undefined,
+      threadTs: "1111111111.111111",
     });
   });
 
