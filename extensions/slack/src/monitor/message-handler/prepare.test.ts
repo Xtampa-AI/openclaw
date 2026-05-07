@@ -21,7 +21,7 @@ import { clearSlackAllowFromCacheForTest } from "../auth.js";
 import type { SlackMonitorContext } from "../context.js";
 import { resetSlackThreadStarterCacheForTest } from "../thread.js";
 import { resolveSlackMessageContent } from "./prepare-content.js";
-import { prepareSlackMessage } from "./prepare.js";
+import { prepareSlackMessage, resetSlackBotLoopGuardForTest } from "./prepare.js";
 import {
   createInboundSlackTestContext,
   createSlackSessionStoreFixture,
@@ -51,6 +51,7 @@ describe("slack prepareSlackMessage inbound contract", () => {
     clearSlackThreadParticipationCache();
     clearSlackAllowFromCacheForTest();
     clearSlackSubteamMentionCacheForTest();
+    resetSlackBotLoopGuardForTest();
     enqueueSystemEventMock.mockClear();
   });
 
@@ -579,6 +580,57 @@ describe("slack prepareSlackMessage inbound contract", () => {
     expect(prepared).toBeTruthy();
     expect(prepared!.ctxPayload.RawBody).toContain("Readiness probe failed");
     expect(members).toHaveBeenCalledTimes(1);
+  });
+
+  it("throttles repeated unmentioned bot-authored room messages", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-07T08:00:00Z"));
+    try {
+      const { slackCtx } = createOwnerScopedBotRoomCtx({ members: ["UOWNER"] });
+      const account = createSlackAccount({ allowBots: true });
+
+      const first = await prepareMessageWith(
+        slackCtx,
+        account,
+        createBotRoomMessage({ ts: "1.000", text: "first bot message" }),
+      );
+      const second = await prepareMessageWith(
+        slackCtx,
+        account,
+        createBotRoomMessage({ ts: "2.000", text: "second bot message" }),
+      );
+
+      expect(first).toBeTruthy();
+      expect(second).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not throttle explicitly mentioned bot-authored room messages", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-07T08:00:00Z"));
+    try {
+      const { slackCtx } = createOwnerScopedBotRoomCtx({ members: ["UOWNER"] });
+      slackCtx.botUserId = "UOPENCLAW";
+      const account = createSlackAccount({ allowBots: true });
+
+      const first = await prepareMessageWith(
+        slackCtx,
+        account,
+        createBotRoomMessage({ ts: "1.000", text: "first bot message" }),
+      );
+      const second = await prepareMessageWith(
+        slackCtx,
+        account,
+        createBotRoomMessage({ ts: "2.000", text: "<@UOPENCLAW> second bot message" }),
+      );
+
+      expect(first).toBeTruthy();
+      expect(second).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("allows bot-authored room messages when the bot is explicitly channel-allowlisted (#59284)", async () => {
