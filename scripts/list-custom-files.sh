@@ -2,7 +2,7 @@
 # Script para identificar archivos personalizados de Ner en OpenClaw
 # Útil para saber qué proteger en futuras actualizaciones
 
-cd /root/kairos-evo/openclaw
+cd /root/kairos-agentes-ai/openclaw
 
 echo "🔍 Archivos Personalizados de Kairos-EVO en OpenClaw"
 echo "===================================================="

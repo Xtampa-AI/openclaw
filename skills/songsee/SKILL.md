@@ -29,7 +29,7 @@ Generate spectrograms + feature panels from audio.
 Quick start
 
 - Spectrogram: `songsee track.mp3`
-- Multi-panel: `songsee track.mp3 --viz spectrogram,mel,chroma,hpss,selfsim,loudness,tempogram,mfcc,flux`
+- Multi-panel: `songsee track.mp3 --viz spectrogram,mel,qdrant,hpss,selfsim,loudness,tempogram,mfcc,flux`
 - Time slice: `songsee track.mp3 --start 12.5 --duration 8 -o slice.jpg`
 - Stdin: `cat track.mp3 | songsee - --format png -o out.png`
 

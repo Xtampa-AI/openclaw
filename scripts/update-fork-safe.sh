@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_DIR="/root/kairos-evo/openclaw"
+REPO_DIR="/root/kairos-agentes-ai/openclaw"
 BACKUP_BASE="/root/kairos-evo/backups/openclaw"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR="${BACKUP_BASE}/update-${TIMESTAMP}"

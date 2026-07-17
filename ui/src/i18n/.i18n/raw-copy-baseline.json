@@ -2890,7 +2890,7 @@
       "kind": "object-property",
       "name": "description",
       "path": "ui/src/ui/views/config.ts",
-      "text": "Chroma family"
+      "text": "qdrant family"
     },
     {
       "count": 1,
