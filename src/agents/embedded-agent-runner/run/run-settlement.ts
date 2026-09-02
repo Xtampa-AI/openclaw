@@ -39,19 +39,19 @@ export async function settleEmbeddedRun(input: {
   // Publish committed bookkeeping before cleanup can throw or cancellation closes the caller.
   // A returned model/session id is never a substitute for the accepted host target.
   const committed = compaction.session.committedCompactionSuccessor;
-  const originalCompactionWriter = compaction.session.sessionWriterFence;
+  const originalWriter = compaction.session.sessionWriterFence;
   const target = committed?.sessionTarget ?? compaction.originalTarget;
   const counts = {
     count: compaction.state.autoCompactionCount,
-    ...(compaction.state.currentContextSnapshot
-      ? { currentContextSnapshot: { ...compaction.state.currentContextSnapshot } }
-      : {}),
+    currentContextSnapshot:
+      compaction.state.currentContextSnapshot ??
+      (compaction.state.autoCompactionCount > 0 ? { tokens: undefined } : undefined),
   };
-  // Plugin harnesses can return usage without subscription events; their claimed writer
-  // still owns final persistence, while absent context leaves terminal usage eligible.
+  // Native runtimes can return usage without ordered context events. Carry their
+  // claimed writer without inventing a context observation that would override it.
   const fact: CompactionAccountingFact | undefined =
     compaction.durable &&
-    (committed || originalCompactionWriter) &&
+    (committed || originalWriter) &&
     target.agentId &&
     target.sessionId &&
     target.sessionKey &&
@@ -66,10 +66,10 @@ export async function settleEmbeddedRun(input: {
             storePath: target.storePath,
             lifecycleRevision: committed
               ? committed.entry.lifecycleRevision
-              : originalCompactionWriter?.expectedLifecycleRevision,
+              : originalWriter?.expectedLifecycleRevision,
             activeWriterRunId: committed
               ? committed.entry.activeWriterRunId
-              : originalCompactionWriter?.expectedWriterRunId,
+              : originalWriter?.expectedWriterRunId,
           },
         }
       : counts.count > 0 || counts.currentContextSnapshot

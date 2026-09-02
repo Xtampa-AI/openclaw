@@ -205,12 +205,27 @@ describe("agentCommand embedded maintenance", () => {
   });
 
   it.each([
-    { replaceWriter: false, observed: true },
-    { replaceWriter: true, observed: true },
-    { replaceWriter: false, observed: false },
+    {
+      retry: "model context",
+      replaceWriter: false,
+      initialTokens: 42,
+      currentContextSnapshot: { tokens: 95_000 },
+    },
+    {
+      retry: "model context",
+      replaceWriter: true,
+      initialTokens: 42,
+      currentContextSnapshot: { tokens: 95_000 },
+    },
+    {
+      retry: "custody only after unknown compaction",
+      replaceWriter: false,
+      initialTokens: undefined,
+      currentContextSnapshot: undefined,
+    },
   ])(
-    "refreshes count-zero retry context only for its retained writer (replacement=$replaceWriter, observed=$observed)",
-    async ({ replaceWriter, observed }) => {
+    "keeps count-zero retry $retry on its retained writer (replacement=$replaceWriter)",
+    async ({ replaceWriter, initialTokens, currentContextSnapshot }) => {
       const sessionId = "retry-context-owner";
       const sessionKey = `agent:main:explicit:${sessionId}`;
       const storePath = requireStorePath();
@@ -225,7 +240,7 @@ describe("agentCommand embedded maintenance", () => {
         params.onCompactionAccounting?.({
           kind: "durable",
           count: 1,
-          currentContextSnapshot: { tokens: 42 },
+          currentContextSnapshot: { tokens: initialTokens },
           target: {
             ...target,
             lifecycleRevision: entry.lifecycleRevision,
@@ -260,7 +275,7 @@ describe("agentCommand embedded maintenance", () => {
         params.onCompactionAccounting?.({
           kind: "durable",
           count: 0,
-          ...(observed ? { currentContextSnapshot: { tokens: 95_000 } } : {}),
+          ...(currentContextSnapshot ? { currentContextSnapshot } : {}),
           target: {
             ...target,
             lifecycleRevision: entry.lifecycleRevision,
@@ -268,25 +283,31 @@ describe("agentCommand embedded maintenance", () => {
           },
         });
         const result = makeResult({ sessionId, text: "retry answer", runner: "embedded" });
-        result.meta.agentMeta = {
-          ...result.meta.agentMeta!,
-          usage: { input: 777, output: 8 },
-          lastCallUsage: { input: 777, output: 8 },
-        };
+        if (!currentContextSnapshot) {
+          const usage = { input: 95_000, output: 10 };
+          result.meta.agentMeta = {
+            ...result.meta.agentMeta!,
+            promptTokens: 95_000,
+            usage,
+            lastCallUsage: usage,
+          };
+        }
         return result;
       });
 
       await agentCommand({ message: "continue", sessionId, sessionKey });
 
       expect(state.runAgentAttemptMock).toHaveBeenCalledTimes(2);
-      expect(findStoredSessionEntry(sessionKey)).toMatchObject({
+      const stored = findStoredSessionEntry(sessionKey);
+      expect(stored).toMatchObject({
         sessionId,
         compactionCount: replaceWriter ? 7 : 1,
-        totalTokensFresh: replaceWriter || observed,
+        totalTokensFresh: replaceWriter || currentContextSnapshot !== undefined,
       });
-      expect(findStoredSessionEntry(sessionKey)?.totalTokens).toBe(
-        replaceWriter ? 777 : observed ? 95_000 : undefined,
-      );
+      expect(stored?.totalTokens).toBe(replaceWriter ? 777 : currentContextSnapshot?.tokens);
+      if (!currentContextSnapshot) {
+        expect(stored).toMatchObject({ inputTokens: 95_000, outputTokens: 10 });
+      }
       expect(loadSessionEntry({ sessionKey, storePath })?.activeWriterRunId).toBe(
         replaceWriter ? "replacement-writer" : retainedWriter,
       );

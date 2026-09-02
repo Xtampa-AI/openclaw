@@ -196,9 +196,6 @@ if [[ "$1" == "scripts/package-openclaw-for-docker.mjs" ]]; then
   rm -rf "$fixture"
   exit 0
 fi
-if [[ "$1" == "scripts/check-openclaw-package-tarball.mjs" ]]; then
-  exit 0
-fi
 exit 64
 `,
     { mode: 0o755 },
@@ -307,6 +304,7 @@ function runReleaseInputCapture(params: {
         RELEASE_RUN_MATURITY_SCORECARD_INPUT: "false",
         RELEASE_RUN_RELEASE_SOAK_INPUT: "false",
         RELEASE_SKIP_PACKAGE_TELEGRAM_E2E_INPUT: "false",
+        TELEGRAM_WAIVER: "",
       },
     });
     expect(result.status, result.stderr).toBe(0);
@@ -652,7 +650,6 @@ describe("package source preflight", () => {
     expect(result.validationResult.status, result.validationResult.stderr).toBe(0);
     expect(result.calls).toEqual([
       expect.stringContaining("scripts/package-openclaw-for-docker.mjs"),
-      expect.stringContaining("scripts/check-openclaw-package-tarball.mjs"),
     ]);
     expect(result.output).toMatchObject({
       file_name: "openclaw-current.tgz",

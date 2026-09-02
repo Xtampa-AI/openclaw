@@ -18,6 +18,7 @@ import {
   getAgentEventLifecycleGeneration,
   rotateAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
+import { isAgentRunStaleLifecycleError } from "../../infra/agent-lifecycle-error.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type {
   UserTurnTranscriptRecorder,
@@ -146,6 +147,8 @@ describe("createReplyRestartRecoveryClaimController", () => {
     "restart-abort",
     "successor-generation",
     "missing-generation",
+    "commit-rotation",
+    "commit-abort",
   ] as const)(
     "preserves the delivery claim when queued cleanup loses ownership through %s",
     async (interruption) => {
@@ -154,6 +157,7 @@ describe("createReplyRestartRecoveryClaimController", () => {
       const lifecycleGeneration = getAgentEventLifecycleGeneration();
       const deliveryContext = { channel: "telegram", to: "chat", accountId: "default" };
       let restartAborted = false;
+      let interruptBeforeCommit = false;
       let entry: InternalSessionEntry = {
         sessionId: "session",
         updatedAt: 1,
@@ -170,7 +174,20 @@ describe("createReplyRestartRecoveryClaimController", () => {
           interruption === "missing-generation" ? undefined : lifecycleGeneration,
         admissionRunId: "recovery-run",
         getEntry: () => entry,
-        getSessionId: () => "session",
+        getSessionId: () => {
+          if (interruptBeforeCommit) {
+            interruptBeforeCommit = false;
+            // The store awaits the prepared patch before entering its write transaction.
+            queueMicrotask(() => {
+              if (interruption === "commit-rotation") {
+                rotateAgentEventLifecycleGeneration();
+              } else {
+                restartAborted = true;
+              }
+            });
+          }
+          return "session";
+        },
         isRestartAbort: () => restartAborted,
         resolveDeliveryContext: () => deliveryContext,
         setEntry: (next) => {
@@ -220,8 +237,11 @@ describe("createReplyRestartRecoveryClaimController", () => {
         return current;
       });
       await writerEntered.promise;
+      interruptBeforeCommit = interruption === "commit-rotation" || interruption === "commit-abort";
       // The old cleanup enters before shutdown; its actual write waits behind the handoff.
-      const clearing = controller.clear();
+      const clearing = controller.clear().catch((error: unknown) => {
+        expect(isAgentRunStaleLifecycleError(error)).toBe(true);
+      });
       try {
         if (interruption === "restart-abort") {
           restartAborted = true;

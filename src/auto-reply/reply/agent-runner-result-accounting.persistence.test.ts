@@ -404,11 +404,19 @@ describe.each(["ordinary", "followup"] as const)("%s context-pressure accounting
       sessionId: "unverified-successor",
       compactionCount: 2,
       compactionTokensAfter: 40,
+      usage: { input: 120, output: 8 },
+      lastCallUsage: { input: 120, output: 8 },
+      promptTokens: 120,
     });
 
     expect(fixture.read()?.sessionId).toBe("session");
     expect(fixture.read()?.compactionCount).toBeUndefined();
-    expect(fixture.read()?.totalTokens).not.toBe(40);
+    expect(fixture.read()?.totalTokens).toBeUndefined();
+    expect(fixture.read()).toMatchObject({
+      totalTokensFresh: false,
+      inputTokens: 120,
+      outputTokens: 8,
+    });
   });
 
   it.each([

@@ -526,7 +526,7 @@ async function resolveModelOverride(params: {
           env: process.env,
         });
   const modelManifestContext = {
-    manifestPlugins: manifestMetadataSnapshot?.plugins,
+    manifestPlugins: manifestMetadataSnapshot,
   };
   const policy = createModelVisibilityPolicy({
     cfg: params.cfg,
@@ -1137,6 +1137,7 @@ export function createSessionStatusTool(opts?: {
           const { buildStatusText } = await loadCommandsStatusRuntime();
           const statusText = await buildStatusText({
             cfg,
+            agentId,
             sessionEntry: statusSessionEntry,
             sessionKey: scopedResolved.key,
             parentSessionKey: statusSessionEntry.parentSessionKey,

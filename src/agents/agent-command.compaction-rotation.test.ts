@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { InternalSessionEntry, SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import {
   agentCommand,
   agentCommandFromGatewayIngress,
@@ -219,7 +220,7 @@ describe("agentCommand compaction transcript rotation", () => {
 
   it.each([42, 95_000, 0, undefined])(
     "keeps successor context %s from the private ordered fact, not public snapshots",
-    async (currentContextTokens) => {
+    async (tokens) => {
       const storePath = requireStorePath();
       const rotatedSessionFile = formatSqliteSessionFileMarker({
         agentId: "main",
@@ -230,7 +231,7 @@ describe("agentCommand compaction transcript rotation", () => {
       state.runAgentAttemptMock.mockImplementationOnce(async (params) => {
         const accepted = await commitAttemptCompaction(params, {
           count: 1,
-          currentContextSnapshot: { tokens: currentContextTokens },
+          currentContextSnapshot: { tokens },
         });
         await appendTranscriptMessage(accepted.sessionTarget, {
           message: { role: "assistant", content: "first answer after rotation", timestamp: 1 },
@@ -273,9 +274,9 @@ describe("agentCommand compaction transcript rotation", () => {
         outputTokens: usage.output,
         cacheRead: usage.cacheRead,
         cacheWrite: usage.cacheWrite,
-        totalTokensFresh: currentContextTokens !== undefined,
+        totalTokensFresh: tokens !== undefined,
       });
-      expect(entry.totalTokens).toBe(currentContextTokens);
+      expect(entry.totalTokens).toBe(tokens);
       await expect(
         loadTranscriptEvents({ agentId: "main", sessionId: "rotated-session", storePath }),
       ).resolves.toContainEqual(
@@ -385,7 +386,10 @@ describe("agentCommand compaction transcript rotation", () => {
     const sessionKey = `agent:main:explicit:${sessionId}`;
     const text = "cli reply generated before compaction";
     const pluginGeneration = {
-      pluginMetadataSnapshot: { workspaceDir: state.workspaceDir },
+      pluginMetadataSnapshot: {
+        ...createPluginMetadataSnapshotFixture(),
+        workspaceDir: state.workspaceDir,
+      },
     } as never;
     let storedEntryBeforeCompaction: SessionEntry | undefined;
     state.runAgentAttemptMock.mockResolvedValueOnce(makeResult({ sessionId, text, runner: "cli" }));
