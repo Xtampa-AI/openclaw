@@ -1,6 +1,7 @@
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { recordInboundSession } from "../../channels/session.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
@@ -9,13 +10,14 @@ import {
   applySessionEntryLifecycleMutation,
   cleanupSessionLifecycleArtifactsCore,
   loadSessionEntry,
+  loadTranscriptEventsSync,
   replaceSessionEntrySync,
   replaceTranscriptEventsSync,
 } from "./session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
 const archiveMaterializationHook = vi.hoisted(() => ({
-  beforeMaterialize: undefined as (() => void) | undefined,
+  beforeMaterialize: undefined as (() => Promise<void> | void) | undefined,
 }));
 
 vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
@@ -25,7 +27,7 @@ vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
     materializeSessionStateDeletePlans: async (
       ...args: Parameters<typeof actual.materializeSessionStateDeletePlans>
     ) => {
-      archiveMaterializationHook.beforeMaterialize?.();
+      await archiveMaterializationHook.beforeMaterialize?.();
       return await actual.materializeSessionStateDeletePlans(...args);
     },
   };
@@ -34,6 +36,7 @@ vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
+  vi.restoreAllMocks();
   archiveMaterializationHook.beforeMaterialize = undefined;
   closeOpenClawAgentDatabasesForTest();
 });
@@ -58,10 +61,49 @@ function createPlannerStore(entryCount: number) {
   return { database, storePath };
 }
 
+it.each([false, true])(
+  "does not rescan unrelated rows when no lifecycle removal matches (requested: %s)",
+  async (requestRemoval) => {
+    const { storePath } = createPlannerStore(2);
+    const retained = { sessionKey: "agent:main:planner-1", sessionId: "planner-1", storePath };
+    const transcript = [{ type: "session", id: retained.sessionId, content: "retained" }];
+    replaceTranscriptEventsSync(retained, transcript);
+    const parseSpy = vi.spyOn(JSON, "parse");
+    await expect(
+      applySessionEntryLifecycleMutation({
+        storePath,
+        skipMaintenance: true,
+        removals: requestRemoval ? [{ sessionKey: "agent:main:missing" }] : [],
+        upserts: [
+          {
+            sessionKey: "agent:main:planner-0",
+            buildEntry: async ({ currentEntry }) => ({ ...currentEntry!, label: "updated" }),
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({
+      afterCount: 2,
+      removedEntries: 0,
+      archivedTranscriptDirectories: [],
+    });
+
+    // Allow the builder snapshot and before/after counts, but no unused deletion scans.
+    expect(
+      parseSpy.mock.calls.filter(([serialized]) => serialized.includes('"planner-1"')).length,
+    ).toBeLessThanOrEqual(3);
+    parseSpy.mockRestore();
+    expect(loadSessionEntry({ sessionKey: "agent:main:planner-0", storePath })?.label).toBe(
+      "updated",
+    );
+    expect(loadSessionEntry(retained)?.sessionId).toBe(retained.sessionId);
+    expect(loadTranscriptEventsSync(retained)).toEqual(transcript);
+  },
+);
+
 it("releases the store writer before maintenance archive sizing completes", async () => {
   const tempDir = tempDirs.make("openclaw-session-maintenance-writer-");
   const storePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
-  const removedKey = "agent:main:maintenance-sizing-removed";
+  const removedKey = "agent:main:subagent:maintenance-sizing-removed";
   const writerKey = "agent:main:maintenance-sizing-writer";
   replaceSessionEntrySync(
     { sessionKey: removedKey, storePath },
@@ -116,9 +158,98 @@ it("releases the store writer before maintenance archive sizing completes", asyn
   expect(writerCompletedBeforeMaterialization).toBe(true);
 });
 
+it("does not hold channel recording behind automatic session maintenance", async () => {
+  const tempDir = tempDirs.make("openclaw-session-maintenance-ingress-");
+  const storePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
+  const staleSessionKey = "agent:main:maintenance-ingress-stale";
+  replaceSessionEntrySync(
+    { sessionKey: staleSessionKey, storePath },
+    { sessionId: "maintenance-ingress-stale", updatedAt: 1 },
+  );
+
+  let signalMaterializationStarted = () => {};
+  const materializationStarted = new Promise<void>((resolve) => {
+    signalMaterializationStarted = resolve;
+  });
+  let releaseMaterialization = () => {};
+  const materializationReleased = new Promise<void>((resolve) => {
+    releaseMaterialization = resolve;
+  });
+  archiveMaterializationHook.beforeMaterialize = async () => {
+    signalMaterializationStarted();
+    await materializationReleased;
+  };
+
+  const entryWrite = recordInboundSession({
+    storePath,
+    sessionKey: "agent:main:discord:direct:maintenance-ingress",
+    ctx: {
+      Body: "maintenance ingress proof",
+      ChatType: "direct",
+      From: "discord:maintenance-ingress",
+      Provider: "discord",
+      SenderId: "maintenance-ingress",
+      To: "discord:bot",
+    },
+    updateLastRoute: {
+      accountId: "default",
+      channel: "discord",
+      sessionKey: "agent:main:discord:direct:maintenance-ingress",
+      to: "user:maintenance-ingress",
+    },
+    onRecordError(error) {
+      throw error;
+    },
+  });
+  const firstCompleted = await Promise.race([
+    entryWrite.then(() => "entry-write" as const),
+    materializationStarted.then(() => "maintenance" as const),
+  ]);
+  const laterStaleSessionKey = "agent:main:maintenance-ingress-later-stale";
+  if (firstCompleted === "entry-write") {
+    await materializationStarted;
+    replaceSessionEntrySync(
+      { sessionKey: laterStaleSessionKey, storePath },
+      { sessionId: "maintenance-ingress-later-stale", updatedAt: 1 },
+    );
+    await recordInboundSession({
+      storePath,
+      sessionKey: "agent:main:discord:direct:maintenance-ingress-later",
+      ctx: {
+        Body: "later maintenance ingress proof",
+        ChatType: "direct",
+        From: "discord:maintenance-ingress-later",
+        Provider: "discord",
+        SenderId: "maintenance-ingress-later",
+        To: "discord:bot",
+      },
+      updateLastRoute: {
+        accountId: "default",
+        channel: "discord",
+        sessionKey: "agent:main:discord:direct:maintenance-ingress-later",
+        to: "user:maintenance-ingress-later",
+      },
+      onRecordError(error) {
+        throw error;
+      },
+    });
+  }
+  releaseMaterialization();
+  await entryWrite;
+
+  expect(firstCompleted).toBe("entry-write");
+  await vi.waitFor(() => {
+    expect(loadSessionEntry({ sessionKey: staleSessionKey, storePath })).toBeUndefined();
+    if (firstCompleted === "entry-write") {
+      expect(loadSessionEntry({ sessionKey: laterStaleSessionKey, storePath })).toBeUndefined();
+    }
+  });
+});
+
 it.each([
   {
-    expected: { afterCount: 1, capped: 65 },
+    expected: { afterCount: 66, capArchived: 65, capped: 65 },
+    expectedStat: /^66\b/u,
     name: "maintenance pruning",
     mutate: async (storePath: string) =>
       await applySessionEntryLifecycleMutation({
@@ -132,6 +263,7 @@ it.each([
   },
   {
     expected: { afterCount: 1, removedEntries: 65 },
+    expectedStat: /^1\b/u,
     name: "explicit lifecycle cleanup",
     mutate: async (storePath: string) =>
       await applySessionEntryLifecycleMutation({
@@ -144,6 +276,7 @@ it.each([
   },
   {
     expected: { archivedTranscriptArtifacts: 0, removedEntries: 65 },
+    expectedStat: /^1\b/u,
     name: "lifecycle artifact cleanup",
     mutate: async (storePath: string) =>
       await cleanupSessionLifecycleArtifactsCore({
@@ -154,7 +287,7 @@ it.each([
         nowMs: 66,
       }),
   },
-])("refreshes planner statistics after bulk $name", async ({ expected, mutate }) => {
+])("refreshes planner statistics after bulk $name", async ({ expected, expectedStat, mutate }) => {
   const { database, storePath } = createPlannerStore(66);
   expect(
     database.db
@@ -168,7 +301,7 @@ it.each([
     database.db
       .prepare("SELECT stat FROM sqlite_stat1 WHERE idx = ?")
       .get("idx_agent_session_nodes_updated_at"),
-  ).toEqual({ stat: expect.stringMatching(/^1\b/u) });
+  ).toEqual({ stat: expect.stringMatching(expectedStat) });
   expect(database.db.prepare("PRAGMA analysis_limit").get()).toEqual({ analysis_limit: 37 });
 });
 

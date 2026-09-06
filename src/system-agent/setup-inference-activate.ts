@@ -8,6 +8,7 @@ import {
 } from "../agents/cli-credentials.js";
 import { applyAutoLocalModelLean } from "../config/local-model-lean-auto.js";
 import { createMergePatch } from "../config/merge-patch.js";
+import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -19,7 +20,11 @@ import { getActivePluginRegistryWorkspaceDirFromState } from "../plugins/runtime
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { resolveUserPath } from "../utils.js";
 import { createPluginCapabilityConsentPrompter } from "../wizard/plugin-capability-consent.js";
-import { WizardCancelledError, WizardNavigationError } from "../wizard/prompts.js";
+import {
+  WizardCancelledError,
+  WizardNavigationError,
+  type WizardProgress,
+} from "../wizard/prompts.js";
 import { appendSystemAgentAuditEntry } from "./audit.js";
 import {
   projectInferenceRoute,
@@ -51,7 +56,6 @@ import {
   persistManualAuthProfiles,
   restoreSetupPluginMetadata,
   retainUnownedCodexInstall,
-  runSetupInferenceTest,
 } from "./setup-inference-persist.js";
 import {
   configureCodexCliPreparedAuth,
@@ -59,6 +63,7 @@ import {
   resolveSetupAgentRuntimeId,
 } from "./setup-inference-plan-helpers.js";
 import { buildTestPlan } from "./setup-inference-plan.js";
+import { runSetupInferenceTest } from "./setup-inference-test.js";
 import { applySystemAgentModelSelection } from "./setup-model-selection.js";
 import {
   captureSystemAgentOwnerPluginArtifacts,
@@ -157,6 +162,7 @@ async function activateSetupInferenceUnredacted(
   let pendingCodexInstall: PluginInstallRecord | undefined;
   let codexInstallOwnership: "unknown" | "owned" | "unowned" = "unknown";
   let codexMetadataNeedsRestore = false;
+  let verificationProgress: WizardProgress | undefined;
   let codexProbePluginGeneration: ReturnType<typeof loadSetupInferencePluginGeneration> | undefined;
   const withProbePluginGeneration = <T>(run: () => T): T =>
     codexProbePluginGeneration
@@ -174,6 +180,7 @@ async function activateSetupInferenceUnredacted(
       pluginWorkspaceDir: workspace,
       agentDir: testAgentDir,
       runtime: params.runtime,
+      beforePersistentEffect,
       ...(params.prompter ? { prompter: params.prompter } : {}),
       ...(params.signal ? { signal: params.signal } : {}),
       ...(params.isCancelled ? { isCancelled: params.isCancelled } : {}),
@@ -193,11 +200,19 @@ async function activateSetupInferenceUnredacted(
     }
 
     const hasPreparedAuthProfiles = (plan.manualAuth?.profiles.length ?? 0) > 0;
-    let testPlan = plan;
+    // Verify the same automatic tool surface that activation will persist. Provider
+    // preparation may already have selected the candidate; retain the prior owner.
+    const autoLocalModelLeanUpdate = applyAutoLocalModelLean({
+      config: plan.config,
+      providerId: plan.provider,
+      modelRef: plan.modelRef,
+      previousModelRef: resolveAgentModelPrimaryValue(cfg.agents?.defaults?.model),
+    });
+    let testPlan = { ...plan, config: autoLocalModelLeanUpdate.config };
     if (plan.persistModelRef) {
       const agentRuntimeId = resolveSetupAgentRuntimeId(params.kind);
       const stagedConfig = await applySystemAgentModelSelection({
-        config: plan.config,
+        config: testPlan.config,
         model: plan.persistModelRef,
         ...(params.agentId ? { targetAgentId: testPlan.routeAgentId } : {}),
         ...(agentRuntimeId ? { agentRuntimeId } : {}),
@@ -375,7 +390,7 @@ async function activateSetupInferenceUnredacted(
       stagedRoute.runner !== testPlan.runner ||
       stagedRoute.provider !== testPlan.provider ||
       stagedRoute.model !== testPlan.model ||
-      stagedRoute.modelLabel !== plan.modelRef ||
+      stagedRoute.modelLabel !== (plan.persistModelRef ?? plan.modelRef) ||
       (plan.authProfileId && stagedRoute.authProfileId !== plan.authProfileId)
     ) {
       return {
@@ -446,6 +461,7 @@ async function activateSetupInferenceUnredacted(
       return { ok: false, status: "unavailable", error: "Provider login was cancelled." };
     }
     let test: Awaited<ReturnType<typeof runSetupInferenceTest>>;
+    verificationProgress = params.prompter?.progress("Testing your AI connection…");
     try {
       test = await withProbePluginGeneration(() =>
         runSetupInferenceTest({
@@ -456,6 +472,7 @@ async function activateSetupInferenceUnredacted(
           // already exist in the isolated store and every other route stays read-only.
           authProfileStateMode: "read-only",
           requireExecutionOwner: true,
+          verifyAgentTools: true,
           ...(params.signal ? { signal: params.signal } : {}),
         }),
       );
@@ -467,8 +484,11 @@ async function activateSetupInferenceUnredacted(
       throw error;
     }
     if (!test.ok) {
-      return test;
+      // Finalization below can still supersede this rejection. Plugin preparation
+      // may persist, but no model or credential promotion has been attempted.
+      return { ...test, disposition: "rejected-before-promotion" };
     }
+    verificationProgress?.update("Finishing AI setup…");
     if (plan.authProfileId && test.auth.authProfileId !== plan.authProfileId) {
       return {
         ok: false,
@@ -477,11 +497,6 @@ async function activateSetupInferenceUnredacted(
       };
     }
 
-    const autoLocalModelLeanUpdate = applyAutoLocalModelLean({
-      config: sourceCfg,
-      providerId: testPlan.provider,
-      modelRef: plan.modelRef,
-    });
     const needsPersistence =
       plan.persistModelRef !== undefined ||
       plan.manualAuth !== undefined ||
@@ -660,6 +675,7 @@ async function activateSetupInferenceUnredacted(
         : {}),
     };
   } finally {
+    verificationProgress?.stop();
     let codexCleanupError: SetupInferenceActivationIndeterminateError | undefined;
     if (pendingCodexInstall && codexInstallOwnership !== "owned") {
       // Reassert after probing: a partial install-index commit may have cleared

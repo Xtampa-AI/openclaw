@@ -9,6 +9,8 @@ import type { SkillWorkshopProposalRevisionConstraint } from "../../skills/works
 import type { GetReplyOptions } from "../get-reply-options.types.js";
 import type { ReplyPayload } from "../reply-payload.js";
 import type { MsgContext } from "../templating.js";
+import type { VerboseLevel } from "../thinking.js";
+import type { PreparedReplyConversation } from "./prompt-session-context.js";
 import type { FollowupQueueDisposition, QueuedFollowupReplyBatch } from "./queue/types.js";
 import type { ReplyOptionsWithAdmissionTicket } from "./reply-admission-ticket.js";
 import type { ReplyOptionsWithOperationRunState } from "./reply-operation-run-state.js";
@@ -20,7 +22,18 @@ export type ReplySessionBinding = {
   storePath?: string;
 };
 
+export type PendingContinuationSettlement = {
+  settle: (statusDelivered: boolean) => Promise<void>;
+};
+
+export type ReplyRunVerbosity = {
+  verboseLevelOverride?: VerboseLevel;
+  resolvedVerboseLevel: VerboseLevel;
+};
+
 type InternalReplySessionOptions = {
+  /** Invocation-owned conversation facts; never execution or sender authority. */
+  replyConversation?: PreparedReplyConversation;
   prepareAssistantTranscriptMessage?: PrepareAssistantTranscriptMessage;
   /** Exact authority-bearing settings captured by Gateway chat admission. */
   admittedSessionSettings?: Readonly<Pick<SessionEntry, "permissionMode" | "toolOverrides">>;
@@ -30,8 +43,11 @@ type InternalReplySessionOptions = {
   /** First dispatch only: admission created this exact pinned session before reply initialization. */
   newlyCreatedSessionId?: string;
   onDeliberateSilentTerminalReply?: () => void;
-  onPendingContinuation?: () => void;
+  /** Defers the child-completion wake until the visible waiting status is delivered. */
+  onPendingContinuation?: (settlement?: PendingContinuationSettlement) => void;
   onSessionPrepared?: (binding: ReplySessionBinding) => void;
+  /** Publishes each executing turn's preferences without persisting them to its session. */
+  onRunVerbosityResolved?: (settings: ReplyRunVerbosity) => void;
   /** Prevent implicit rollover after a caller has durably admitted this exact session. */
   pinExpectedExistingSession?: boolean;
   requestedSessionId?: string;
@@ -48,6 +64,7 @@ type InternalReplySessionOptions = {
   skillOverrides?: SessionToolOverrides["skills"];
   /** Gateway-private optimistic-concurrency constraint for an operator-requested proposal revision. */
   skillWorkshopProposalRevision?: SkillWorkshopProposalRevisionConstraint;
+  skillLibraryAuthoring?: import("../../skills/library/authoring.js").SkillLibraryAuthoringCapability;
 };
 
 export type InternalGetReplyOptions = GetReplyOptions &

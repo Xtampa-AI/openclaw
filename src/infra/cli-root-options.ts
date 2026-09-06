@@ -37,6 +37,25 @@ export function consumeRootOptionToken(args: ReadonlyArray<string>, index: numbe
   return 0;
 }
 
+/** Locate the root command after supported root options without loading CLI catalogs. */
+export function findRootCommandIndex(argv: readonly string[]): number | null {
+  for (let index = 2; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (!arg || arg === FLAG_TERMINATOR) {
+      return null;
+    }
+    const consumed = consumeRootOptionToken(argv, index);
+    if (consumed > 0) {
+      index += consumed - 1;
+      continue;
+    }
+    if (!arg.startsWith("-")) {
+      return index;
+    }
+  }
+  return null;
+}
+
 /** Read positional command tokens while accepting root options at any pre-terminator position. */
 export function getRootOptionAwareCommandPath(argv: readonly string[], depth: number): string[] {
   const args = argv.slice(2);
@@ -106,6 +125,22 @@ export function getCommandPositionalsWithRootOptions(
   argv: readonly string[],
   options: CommandPositionalsParseOptions,
 ): string[] | null {
+  return parseCommandArgsWithRootOptions(argv, options, false);
+}
+
+/** Preserve the leaf's raw arguments after consuming its root and parent options. */
+export function getCommandArgsWithRootOptions(
+  argv: readonly string[],
+  options: Omit<CommandPositionalsParseOptions, "maxPositionals">,
+): string[] | null {
+  return parseCommandArgsWithRootOptions(argv, options, true);
+}
+
+function parseCommandArgsWithRootOptions(
+  argv: readonly string[],
+  options: CommandPositionalsParseOptions,
+  returnTail: boolean,
+): string[] | null {
   const args = argv.slice(2);
   const booleanFlags = new Set(options.booleanFlags ?? []);
   const valueFlags = new Set(options.valueFlags ?? []);
@@ -149,6 +184,9 @@ export function getCommandPositionalsWithRootOptions(
         return null;
       }
       commandIndex += 1;
+      if (returnTail && commandIndex === options.commandPath.length) {
+        return args.slice(index + 1);
+      }
       continue;
     }
     positionals.push(arg);

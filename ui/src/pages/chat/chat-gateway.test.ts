@@ -2135,6 +2135,33 @@ describe("handleChatGatewayEvent", () => {
     expect(state.chatRunError).toEqual({ summary: diagnostic, runId: "run-1" });
   });
 
+  it("adds bounded OAuth facts to live errors without changing the summary", () => {
+    const summary =
+      "⚠️ Your refresh token has already been used to generate a new access token. Please try signing in again.";
+    const state = createState({ sessionKey: "main", chatRunId: "run-1" });
+
+    expect(
+      handleChatGatewayEvent(state, {
+        runId: "run-1",
+        sessionKey: "main",
+        state: "error",
+        errorMessage: summary,
+        errorDetail: {
+          provider: "openai",
+          failoverReason: "refresh_token_reused",
+          providerRuntimeFailureKind: "auth_refresh",
+          providerErrorType: "invalid_request_error",
+          httpStatus: 401,
+        },
+      }),
+    ).toBe("error");
+    expect(state.chatRunError).toEqual({
+      kind: "auth_refresh",
+      runId: "run-1",
+      summary: `${summary}\n\nProvider: openai\nHTTP status: 401\nReason: refresh_token_reused\nType: invalid_request_error`,
+    });
+  });
+
   it("uses server guidance when an error follows a source-reply final", () => {
     const state = createState({
       sessionKey: "main",
@@ -2860,7 +2887,8 @@ describe("loadChatHistory filtering", () => {
     expect(request).toHaveBeenCalledWith("chat.startup", {
       agentId: "research",
       sessionKey: "global",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
     expect(state.chatMessages).toEqual([
       { role: "assistant", content: [{ type: "text", text: "ready" }] },
@@ -2943,11 +2971,13 @@ describe("loadChatHistory filtering", () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(request).toHaveBeenCalledWith("chat.startup", {
       sessionKey: "agent:main:first",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
     expect(request).toHaveBeenCalledWith("chat.startup", {
       sessionKey: "agent:main:second",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
   });
 
@@ -2997,7 +3027,8 @@ describe("loadChatHistory filtering", () => {
 
     expect(request).toHaveBeenCalledWith("chat.startup", {
       sessionKey: "main",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
   });
 });
@@ -3030,7 +3061,8 @@ describe("loadChatHistory retry handling", () => {
 
     expect(request).toHaveBeenNthCalledWith(1, "chat.startup", {
       sessionKey: "main",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
     expect(request).toHaveBeenCalledTimes(1);
     expect(getChatHistoryLoadState(state)).toMatchObject({
@@ -3140,7 +3172,8 @@ describe("loadChatHistory retry handling", () => {
 
     expect(request).toHaveBeenCalledWith("chat.history", {
       sessionKey: "main",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
     expect(state.chatMessages).toEqual([
       { role: "assistant", content: [{ type: "text", text: "visible answer" }] },
@@ -3311,7 +3344,8 @@ describe("loadChatHistory retry handling", () => {
 
     expect(request).toHaveBeenCalledWith("chat.history", {
       sessionKey: "main",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
       ...(inputRunIds ? { inputRunIds } : {}),
     });
     expect(state.chatMessages).toEqual(expected);
@@ -3977,10 +4011,15 @@ describe("loadChatHistory retry handling", () => {
     const thirdLoad = loadChatHistory(state);
 
     expect(request.mock.calls).toEqual([
-      ["chat.history", { sessionKey: "main", limit: 800 }],
+      ["chat.history", { sessionKey: "main", limit: 80, maxBytes: 256 * 1024 }],
       [
         "chat.history",
-        { sessionKey: "main", limit: 800, inputRunIds: ["same-session-pending-run"] },
+        {
+          sessionKey: "main",
+          limit: 80,
+          maxBytes: 256 * 1024,
+          inputRunIds: ["same-session-pending-run"],
+        },
       ],
     ]);
     expect(state.chatMessages).toEqual([pending]);

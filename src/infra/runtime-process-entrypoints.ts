@@ -2,15 +2,30 @@
 const currentModuleUrl = import.meta.url;
 
 export const runtimeProcessEntrypoints = {
+  githubExec: {
+    currentModuleUrl,
+    sourceWorkerName: "../agents/github-exec-launcher",
+    distWorkerPath: "agents/github-exec-launcher.js",
+  },
   sqliteReadOnly: {
     currentModuleUrl,
     sourceWorkerName: "sqlite-readonly-location.worker",
     distWorkerPath: "infra/sqlite-readonly-location.worker.js",
   },
+  sqliteIntegrity: {
+    currentModuleUrl,
+    sourceWorkerName: "sqlite-integrity.worker",
+    distWorkerPath: "infra/sqlite-integrity.worker.js",
+  },
   databaseVerify: {
     currentModuleUrl,
     sourceWorkerName: "../state/openclaw-database-verify.worker",
     distWorkerPath: "state/openclaw-database-verify.worker.js",
+  },
+  stateLeaseHeartbeat: {
+    currentModuleUrl,
+    sourceWorkerName: "../state/openclaw-state-lease-heartbeat.worker",
+    distWorkerPath: "state/openclaw-state-lease-heartbeat.worker.js",
   },
   sessionTranscriptArchive: {
     currentModuleUrl,
