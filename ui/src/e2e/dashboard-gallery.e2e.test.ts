@@ -1,5 +1,4 @@
 import path from "node:path";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it } from "vitest";
 import type { SessionsResolveResult } from "../../../packages/gateway-protocol/src/index.js";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
@@ -18,28 +17,32 @@ const selectedResolution = {
   agentId: "main",
   displayName: "Release health",
   boardFace: "dashboard",
+  boardPresentation: "expanded",
 } satisfies SessionsResolveResult;
-const dashboardRows = [
-  [selectedSessionKey, selectedResolution.displayName, "mira", "Mira", 3_000, "running"],
-  ["agent:main:dashboard:model-spend", "Model spend", "peter", "Peter", 8_000, "done"],
-  ["agent:main:dashboard:support-radar", "Support radar", "mira", "Mira", 18_000, "done"],
-  ["agent:main:dashboard:ci-signal", "CI signal", "peter", "Peter", 42_000, "done"],
-  ["agent:main:dashboard:community-pulse", "Community pulse", "mira", "Mira", 75_000, "done"],
-  ["agent:main:dashboard:gateway-fleet", "Gateway fleet", "peter", "Peter", 130_000, "done"],
-  ["agent:main:dashboard:deployments", "Deployments", "mira", "Mira", 160_000, "done"],
-  ["agent:main:dashboard:incidents", "Incidents", "peter", "Peter", 190_000, "done"],
-  ["agent:main:dashboard:traffic", "Traffic", "mira", "Mira", 220_000, "done"],
-  ["agent:main:dashboard:queues", "Queues", "peter", "Peter", 250_000, "done"],
-  ["agent:main:dashboard:workers", "Workers", "mira", "Mira", 280_000, "done"],
-  ["agent:main:dashboard:capacity", "Capacity", "peter", "Peter", 310_000, "done"],
-].map(([key, displayName, actorId, actorLabel, age, status]) => ({
-  key: String(key),
+const dashboardRows = (
+  [
+    [selectedSessionKey, selectedResolution.displayName, "mira", "Mira", 3_000, "running"],
+    ["agent:main:dashboard:model-spend", "Model spend", "peter", "Peter", 8_000, "done"],
+    ["agent:main:dashboard:support-radar", "Support radar", "mira", "Mira", 18_000, "done"],
+    ["agent:main:dashboard:ci-signal", "CI signal", "peter", "Peter", 42_000, "done"],
+    ["agent:main:dashboard:community-pulse", "Community pulse", "mira", "Mira", 75_000, "done"],
+    ["agent:main:dashboard:gateway-fleet", "Gateway fleet", "peter", "Peter", 130_000, "done"],
+    ["agent:main:dashboard:deployments", "Deployments", "mira", "Mira", 160_000, "done"],
+    ["agent:main:dashboard:incidents", "Incidents", "peter", "Peter", 190_000, "done"],
+    ["agent:main:dashboard:traffic", "Traffic", "mira", "Mira", 220_000, "done"],
+    ["agent:main:dashboard:queues", "Queues", "peter", "Peter", 250_000, "done"],
+    ["agent:main:dashboard:workers", "Workers", "mira", "Mira", 280_000, "done"],
+    ["agent:main:dashboard:capacity", "Capacity", "peter", "Peter", 310_000, "done"],
+  ] as const
+).map(([key, displayName, actorId, actorLabel, age, status]) => ({
+  key,
   kind: "direct",
   boardFace: "dashboard",
-  displayName: String(displayName),
-  updatedAt: now - Number(age),
-  status: String(status),
-  createdActor: { type: "human", id: String(actorId), label: String(actorLabel) },
+  boardPresentation: "expanded",
+  displayName,
+  updatedAt: now - age,
+  status,
+  createdActor: { type: "human", id: actorId, label: actorLabel },
 }));
 
 const previewMarkup = encodeURIComponent(
@@ -150,9 +153,7 @@ suite.define(() => {
         expect(await gateway.getRequests("board.widget.appView")).toHaveLength(0);
         const capacityKey = "agent:main:dashboard:capacity";
         const capacityRequested = async () =>
-          (await gateway.getRequests("board.get")).some(
-            (request) => isRecord(request.params) && request.params.sessionKey === capacityKey,
-          );
+          (await gateway.getRequests("board.get", { sessionKey: capacityKey })).length > 0;
         expect(await capacityRequested()).toBe(false);
         const capacityCard = gallery.locator(`[data-dashboard-session="${capacityKey}"]`);
         await capacityCard.scrollIntoViewIfNeeded();
@@ -164,14 +165,14 @@ suite.define(() => {
           .getByText("All systems nominal", { exact: true })
           .waitFor();
         expect(await releaseCard.locator("a").getAttribute("href")).toBe(
-          "/chat/main/release-health-12345678?dashboard=expanded",
+          "/dashboard/main/release-health-12345678",
         );
         if (proofDir) {
           await page.screenshot({ path: path.join(proofDir, "01-gallery.png") });
         }
 
         await releaseCard.locator("a").click();
-        await page.waitForURL(/\/chat\/main\/release-health-12345678\?dashboard=expanded$/u);
+        await page.waitForURL(/\/dashboard\/main\/release-health-12345678$/u);
         await page.locator(".board-session-surface").waitFor();
         await expect.poll(() => page.locator(".sidebar-region--expanded").count()).toBe(1);
         await expect.poll(() => page.locator(".chat-thread").isHidden()).toBe(true);

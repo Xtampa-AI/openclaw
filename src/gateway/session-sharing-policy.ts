@@ -7,6 +7,7 @@ import {
 } from "../../packages/gateway-protocol/src/index.js";
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/users.js";
 import { isSessionMember, type SessionEntry } from "../config/sessions.js";
+import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
 import {
@@ -24,13 +25,11 @@ import type { GatewayClient } from "./server-methods/types.js";
 import { prepareSessionCreatorProfile } from "./session-creator.js";
 import {
   resolveGatewaySessionStoreTargetsReadOnly,
+  resolveGatewaySessionStoreTargetWithStore,
   type GatewaySessionStoreCache,
   type GatewaySessionStoreDiscoveryCache,
 } from "./session-utils-store-lookup.js";
-import {
-  resolveCanonicalSessionStoreMatchFromStoreKeys,
-  resolveGatewaySessionStoreTargetWithStore,
-} from "./session-utils.js";
+import { resolveCanonicalSessionStoreMatchFromStoreKeys } from "./session-utils-store.js";
 
 export type SessionSharingTarget = {
   agentId: string;
@@ -45,6 +44,23 @@ export function resolveSessionVisibility(
   entry: Pick<SessionEntry, "visibility">,
 ): SessionVisibility {
   return entry.visibility ?? "shared";
+}
+
+/** Compare access facts only after the mutation owner has preserved the canonical target. */
+export function hasSessionReadAccessChanged(
+  previous: SessionEntry | undefined,
+  current: SessionEntry,
+): boolean {
+  return (
+    !previous?.sessionId?.trim() ||
+    !previous.lifecycleRevision?.trim() ||
+    previous.sessionId !== current.sessionId ||
+    previous.lifecycleRevision !== current.lifecycleRevision ||
+    sessionCreatorProfileId(previous.createdActor) !==
+      sessionCreatorProfileId(current.createdActor) ||
+    resolveSessionVisibility(previous) !== resolveSessionVisibility(current) ||
+    (previous.incognito === true) !== (current.incognito === true)
+  );
 }
 
 export function isGatewayAdmin(client: Pick<GatewayClient, "connect"> | null): boolean {
@@ -74,6 +90,7 @@ export function resolveSessionSharingTarget(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   agentId?: string;
+  exactRead?: boolean;
   storeCache?: GatewaySessionStoreCache;
   targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
 }): SessionSharingTarget | null {
@@ -86,7 +103,7 @@ export function resolveSessionSharingTarget(params: {
     projection: "list",
     // Batch callers reuse one store snapshot; single-target checks must not
     // materialize unrelated sessions for every task or authorization recheck.
-    exactRead: !params.storeCache,
+    exactRead: params.exactRead ?? !params.storeCache,
     ...(params.storeCache ? { storeCache: params.storeCache } : {}),
     ...(params.targetDiscoveryCache ? { targetDiscoveryCache: params.targetDiscoveryCache } : {}),
   });
@@ -97,12 +114,10 @@ export function resolveSessionSharingTarget(params: {
 export function resolveSessionSharingTargets(params: {
   cfg: OpenClawConfig;
   targets: readonly { sessionKey: string; agentId?: string }[];
-  targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
 }): Array<SessionSharingTarget | null> {
   return resolveGatewaySessionStoreTargetsReadOnly({
     cfg: params.cfg,
     targets: params.targets.map(({ sessionKey, agentId }) => ({ key: sessionKey, agentId })),
-    targetDiscoveryCache: params.targetDiscoveryCache,
   }).map(toSessionSharingTarget);
 }
 
@@ -323,14 +338,15 @@ export function authorizeSessionAgentRun(params: {
   return null;
 }
 
-export function authorizeSessionSharingTarget(params: {
-  cfg?: OpenClawConfig;
-  client: GatewayClient | null;
-  target: SessionSharingTarget;
-}): ErrorShape | null {
+export function authorizeSessionSharingTarget(
+  params: SessionSharingRoleParams,
+  prepared?: { value: ReturnType<typeof operatorSessionCap>; role: SessionSharingRole },
+): ErrorShape | null {
   const visibility = resolveSessionVisibility(params.target.entry);
-  const sessionCap = params.cfg && operatorSessionCap(params.client, params.cfg);
-  const role = resolveSessionSharingRole(params, { value: sessionCap });
+  const sessionCap = prepared
+    ? prepared.value
+    : params.cfg && operatorSessionCap(params.client, params.cfg);
+  const role = prepared?.role ?? resolveSessionSharingRole(params, { value: sessionCap });
   if (sessionCap === "none" && role !== "owner" && role !== "admin") {
     return hiddenSessionNotFound(params.target.canonicalKey);
   }

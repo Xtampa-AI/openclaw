@@ -118,6 +118,26 @@ describe("ShellGatewayOwner profile appearance integration", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("refreshes the cached agent roster when hello lands", async () => {
+    const { context, host, owner, snapshot } = createProfileAppearanceGateway(null);
+    const agentsList = {
+      defaultId: "main",
+      mainKey: "main",
+      scope: "per-sender" as const,
+      agents: [{ id: "main" }],
+    };
+    const ensureList = vi.fn(async () => agentsList);
+    Object.assign(context, {
+      agents: { state: { agentsList, agentsListCached: true }, ensureList },
+    });
+    host.routeState.routeId = "chat";
+
+    owner.synchronizeGateway(snapshot);
+    await Promise.resolve();
+
+    expect(ensureList).toHaveBeenCalledOnce();
+  });
+
   it("loads profile appearance when authenticated presence appears on an existing connection", async () => {
     const { completeProfileAppearance, context, owner, refreshTheme, request, snapshot } =
       createProfileAppearanceGateway(null);
@@ -127,10 +147,10 @@ describe("ShellGatewayOwner profile appearance integration", () => {
     owner.synchronizeGateway(snapshot);
 
     owner.reconcileServerUiPrefs(context.runtimeConfig);
-    expect(refreshTheme).toHaveBeenCalledOnce();
-    expect(loadSettings().accent).toBe("#ff0000");
+    expect(refreshTheme).not.toHaveBeenCalled();
+    expect(loadSettings().accent).toBeUndefined();
     await completeProfileAppearance();
-    expect(refreshTheme).toHaveBeenCalledTimes(2);
+    expect(refreshTheme).toHaveBeenCalledOnce();
     expect(loadSettings().accent).toBe("#336699");
     expect(request).toHaveBeenCalledOnce();
     // Derived from the wire contract so new appearance keys extend the

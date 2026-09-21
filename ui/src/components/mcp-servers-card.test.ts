@@ -2,15 +2,14 @@
 
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import type { ApplicationContext, ApplicationGateway } from "../app/context.ts";
 import { i18n } from "../i18n/index.ts";
-import type {
-  ConfigPatchBuilder,
-  ConfigPatchOptions,
-} from "../lib/config/config-gateway-operations.ts";
-import { createConfigCapabilityHarness, deferred } from "../lib/config/config-test-harness.ts";
+import type { ConfigPatchOptions } from "../lib/config/config-gateway-operations.ts";
+import { createConfigCapabilityHarness } from "../lib/config/config-test-harness.ts";
 import { buildRemoveMcpServerPatch, patchMcpServers } from "../lib/config/mcp-servers.ts";
+import type { RuntimeConfigCapability } from "../lib/config/runtime-config-capability.ts";
 import {
   createApplicationContextProvider,
   type ApplicationContextProvider,
@@ -19,6 +18,7 @@ import { waitForFast } from "../test-helpers/wait-for.ts";
 import "./mcp-servers-card.ts";
 
 type McpServersCard = HTMLElementTagNameMap["openclaw-mcp-servers-card"];
+type ConfigPatchBuilder = Parameters<RuntimeConfigCapability["patchFromSnapshot"]>[0];
 
 type RuntimeConfigHarness = {
   runtimeConfig: ApplicationContext["runtimeConfig"];
@@ -424,7 +424,7 @@ describe("openclaw-mcp-servers-card", () => {
       mcp: { servers: { docs: { command: "node", args: ["initial.mjs"] }, retained } },
     };
     let hash = "before";
-    const gate = deferred<void>();
+    const gate = deferred();
     const patches: unknown[] = [];
     const request = vi.fn(async (method: string, params?: unknown) => {
       if (method === "config.get") {
@@ -538,7 +538,7 @@ describe("openclaw-mcp-servers-card", () => {
   });
 
   it("ignores a load error from before a retained card reconnected", async () => {
-    const staleLoad = deferred<void>();
+    const staleLoad = deferred();
     const { card, context, provider } = await mountCard();
     const replacement = createRuntimeConfig({
       mcp: { servers: { local: { command: "node" } } },

@@ -263,9 +263,19 @@ export async function startCodexAttemptTurn(
           });
         }
       }
-      releaseCurrentRoute();
+      await releaseCurrentRoute();
       activateNativePreToolUseFailureFallback();
-      resourceState.nativeHookRelay?.unregister();
+      const relay = resourceState.nativeHookRelay;
+      relay?.unregister();
+      await runAgentCleanupStep({
+        runId: params.runId,
+        sessionId: params.sessionId,
+        step: "codex-turn-start-failure-native-hook-relay",
+        log: embeddedAgentLog,
+        cleanup: async () => {
+          await relay?.drain();
+        },
+      });
       await releaseSandboxExecEnvironment();
       await runAgentCleanupStep({
         runId: params.runId,

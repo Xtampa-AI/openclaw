@@ -1,34 +1,38 @@
 /** SQLite-backed Codex app-server thread bindings. */
+
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
-  AgentHarnessPreflightError,
   AgentHarnessSessionSupersededError,
   embeddedAgentLog,
   type AgentHarnessSessionDeletionMutation,
-  type EmbeddedRunAttemptParamsV2,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import {
-  ensureAuthProfileStore,
-  resolveDefaultAgentDir,
-  resolveProviderIdForAuth,
-  type AuthProfileStore,
-} from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN } from "./config-contracts.js";
+import {
+  normalizeCodexAppServerBindingModelProvider,
+  type CodexAppServerAuthProfileLookup,
+} from "./auth-profile.js";
 import type { CodexManagedThreadStore } from "./managed-thread-store.js";
-import type { PluginAppPolicyContext } from "./plugin-thread-config.js";
+import type { CodexNativeSubagentHistoryOwner } from "./native-subagent-history-owner.js";
+import {
+  adoptCodexNativeSubagentSubmissions,
+  mutateCodexNativeSubagentSubmissions,
+  type CodexNativeSubagentSubmission,
+} from "./native-subagent-submission.js";
 import {
   bindingStoreKey,
+  matchesCodexNativeSubagentSubmissionBinding,
   ownsStoredSessionGeneration,
+  preserveCodexNativeSubagentSubmissions,
   readCodexAppServerThreadBinding,
   readCodexBindingTimestamp,
-  readCodexBindingSessionEntry,
-  readCodexSessionOwnershipBinding,
   readCurrentCodexAppServerBinding,
+  readCurrentCodexNativeSubagentSubmissions,
+  readPluginAppPolicyContext,
   readStoredCodexAppServerBinding,
   stripUndefinedBinding,
   validateBindingForWrite,
@@ -38,7 +42,9 @@ import {
   type StoredCodexAppServerBinding,
 } from "./session-binding-record.js";
 export {
+  assertCodexBindingMayBeReplaced,
   bindingStoreKey,
+  CodexSupervisionBindingReplacementError,
   readCodexAppServerThreadBinding,
   readStoredCodexAppServerBinding,
   sessionBindingIdentity,
@@ -51,8 +57,6 @@ export {
   type StoredCodexAppServerBinding,
 } from "./session-binding-record.js";
 
-const CODEX_APP_SERVER_NATIVE_AUTH_PROVIDER = "openai";
-const PUBLIC_OPENAI_MODEL_PROVIDER = "openai";
 const BINDING_LEASE_RETRY_INTERVAL_MS = 1_000;
 const BOUNDED_BINDING_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/i;
 
@@ -68,17 +72,6 @@ const BINDING_LEASE_RENEW_INTERVAL_MS = Math.floor(BINDING_LEASE_STALE_MS / 3);
 // retirement fence only long enough for bounded stale lease work to drain.
 const PHYSICAL_SESSION_RETIRE_TTL_MS = BINDING_LEASE_WAIT_MS;
 
-type ProviderAuthAliasLookupParams = Parameters<typeof resolveProviderIdForAuth>[1];
-type ProviderAuthAliasConfig = NonNullable<ProviderAuthAliasLookupParams>["config"];
-
-/** Inputs needed to resolve whether a binding's auth profile is native Codex/OpenAI auth. */
-export type CodexAppServerAuthProfileLookup = {
-  authProfileId?: string;
-  authProfileStore?: AuthProfileStore;
-  agentDir?: string;
-  config?: ProviderAuthAliasConfig;
-};
-
 export type CodexRunSessionBindingAuthority = "current" | "ephemeral" | "superseded";
 
 /** Decides whether a run may share the durable stable-key binding owner. */
@@ -88,6 +81,45 @@ export function resolveCodexRunSessionBindingAuthority(params: {
   storePath?: string;
 }): CodexRunSessionBindingAuthority {
   return captureCodexSessionGenerationAuthority(params)[0];
+}
+
+/** Host lineage is recorded in the same transaction as its successor generation. */
+function readCodexBindingSessionEntry(params: {
+  identity: Extract<CodexAppServerBindingIdentity, { kind: "session" }>;
+  config?: OpenClawConfig;
+  storePath?: string;
+}) {
+  const { identity } = params;
+  return identity.sessionKey?.trim()
+    ? getSessionEntry({
+        agentId: identity.agentId,
+        sessionKey: identity.sessionKey.trim(),
+        storePath:
+          params.storePath?.trim() ||
+          resolveStorePath(params.config?.session?.store, { agentId: identity.agentId }),
+        hydrateSkillPromptRefs: false,
+        readConsistency: "latest",
+      })
+    : undefined;
+}
+
+/** Synchronous model selection recognizes the predecessor; admission rewrites its fence. */
+function readCodexSessionOwnershipBinding(params: {
+  bindingStore: {
+    read(identity: CodexAppServerBindingIdentity): CodexAppServerThreadBinding | undefined;
+  };
+  identity: CodexAppServerBindingIdentity;
+  config?: OpenClawConfig;
+  storePath?: string;
+}): CodexAppServerThreadBinding | undefined {
+  const binding = params.bindingStore.read(params.identity);
+  if (binding || params.identity.kind !== "session") {
+    return binding;
+  }
+  const entry = readCodexBindingSessionEntry({ ...params, identity: params.identity });
+  return entry?.sessionId === params.identity.sessionId && entry.previousSessionId
+    ? params.bindingStore.read({ ...params.identity, sessionId: entry.previousSessionId })
+    : undefined;
 }
 
 type CodexSessionGenerationAuthorityParams = Parameters<typeof readCodexBindingSessionEntry>[0];
@@ -137,32 +169,17 @@ export function createCodexSessionGenerationSupersededError(
   );
 }
 
-export class CodexSupervisionBindingReplacementError extends Error {
-  constructor(threadId: string, operation: string) {
-    super(
-      `Refusing to replace supervised Codex thread ${threadId} while ${operation}; ` +
-        "its native user-home connection and model ownership must be preserved",
-    );
-    this.name = "CodexSupervisionBindingReplacementError";
-  }
-}
-
-export function assertCodexBindingMayBeReplaced(
-  binding: CodexAppServerThreadBinding | undefined,
-  operation: string,
-  expected?: EmbeddedRunAttemptParamsV2["expectedSessionRuntimeOwnership"],
-): void {
-  // A native-prepared attempt has no host-selected model for a replacement thread.
-  if (expected) {
-    throw new AgentHarnessPreflightError(
-      `Codex native model ownership prevents ${operation}. Continue or compact the original session in its native runtime, or create a new chat with a concrete model; the original binding was preserved.`,
-    );
-  }
-  if (binding?.connectionScope === "supervision") {
-    throw new CodexSupervisionBindingReplacementError(binding.threadId, operation);
-  }
-}
 type CodexAppServerBindingMutation =
+  | {
+      kind: "record-native-subagent-submission";
+      owner: CodexNativeSubagentHistoryOwner;
+      receipt: CodexNativeSubagentSubmission;
+    }
+  | {
+      kind: "consume-native-subagent-submission";
+      owner: CodexNativeSubagentHistoryOwner;
+      receipt: CodexNativeSubagentSubmission;
+    }
   | {
       kind: "set";
       binding: CodexAppServerThreadBinding;
@@ -325,6 +342,10 @@ export type CodexAppServerBindingStore = {
   /** Durable ownership rows kept separate from replaceable session bindings. */
   managedThreads?: CodexManagedThreadStore;
   read(identity: CodexAppServerBindingIdentity): CodexAppServerThreadBinding | undefined;
+  readNativeSubagentSubmissions(
+    identity: CodexAppServerBindingIdentity,
+    owner: CodexNativeSubagentHistoryOwner,
+  ): readonly CodexNativeSubagentSubmission[];
   hasOtherThreadOwner(
     threadId: string,
     currentIdentity?: CodexAppServerBindingIdentity,
@@ -376,16 +397,39 @@ export function scopeCodexRunBindingStore(params: {
       : identity;
   const mapIdentity = (identity: CodexAppServerBindingIdentity) =>
     identity.kind === "session" ? mapSessionIdentity(identity) : identity;
+  const mapHistoryOwner = (
+    identity: CodexAppServerBindingIdentity,
+    owner: CodexNativeSubagentHistoryOwner,
+  ): CodexNativeSubagentHistoryOwner => {
+    const mapped = mapIdentity(identity);
+    return identity.kind === "session" &&
+      mapped.kind === "session" &&
+      owner.sessionId === identity.sessionId
+      ? { ...owner, sessionId: mapped.sessionId }
+      : owner;
+  };
   return {
     ...params.bindingStore,
     read: (identity) => params.bindingStore.read(mapIdentity(identity)),
+    readNativeSubagentSubmissions: (identity, owner) =>
+      params.bindingStore.readNativeSubagentSubmissions(
+        mapIdentity(identity),
+        mapHistoryOwner(identity, owner),
+      ),
     hasOtherThreadOwner: (threadId, identity) =>
       params.bindingStore.hasOtherThreadOwner(
         threadId,
         identity ? mapIdentity(identity) : undefined,
       ),
     mutate: (identity, mutation, assertCurrent) =>
-      params.bindingStore.mutate(mapIdentity(identity), mutation, assertCurrent),
+      params.bindingStore.mutate(
+        mapIdentity(identity),
+        mutation.kind === "record-native-subagent-submission" ||
+          mutation.kind === "consume-native-subagent-submission"
+          ? { ...mutation, owner: mapHistoryOwner(identity, mutation.owner) }
+          : mutation,
+        assertCurrent,
+      ),
     prepareSessionGenerationReclaim: (identity) =>
       params.bindingStore.prepareSessionGenerationReclaim(mapSessionIdentity(identity)),
     adoptSessionGeneration: (identity, expectedPreviousSessionId, assertCurrent) =>
@@ -827,6 +871,8 @@ export function createCodexAppServerBindingStore(
 
   return {
     read: (identity) => readCurrentCodexAppServerBinding(state, identity),
+    readNativeSubagentSubmissions: (identity, owner) =>
+      readCurrentCodexNativeSubagentSubmissions(state, identity, owner),
 
     async hasOtherThreadOwner(threadId, currentIdentity) {
       const currentKey = currentIdentity ? bindingStoreKey(currentIdentity) : undefined;
@@ -882,6 +928,42 @@ export function createCodexAppServerBindingStore(
         return await transactKey(
           key,
           (current, leaseToken) => {
+            if (
+              mutation.kind === "record-native-subagent-submission" ||
+              mutation.kind === "consume-native-subagent-submission"
+            ) {
+              if (!assertCurrent) {
+                throw new Error(
+                  "Codex native subagent submission mutation requires current authority.",
+                );
+              }
+              assertCurrent();
+              if (
+                current?.state !== "active" ||
+                !ownsStoredSessionGeneration(identity, current) ||
+                (identity.kind === "session" && mutation.owner.sessionId !== identity.sessionId) ||
+                !matchesCodexNativeSubagentSubmissionBinding(current.binding, mutation.owner)
+              ) {
+                return { result: false };
+              }
+              const changed = mutateCodexNativeSubagentSubmissions({
+                current: current.nativeSubagentSubmissions,
+                owner: mutation.owner,
+                receipt: mutation.receipt,
+                consume: mutation.kind === "consume-native-subagent-submission",
+              });
+              if (!changed.applied) {
+                return { result: false };
+              }
+              const { nativeSubagentSubmissions: _previous, ...bindingOwner } = current;
+              return {
+                result: true,
+                next: {
+                  ...bindingOwner,
+                  ...(changed.next ? { nativeSubagentSubmissions: changed.next } : {}),
+                },
+              };
+            }
             const ownsGeneration = ownsStoredSessionGeneration(identity, current);
             const ownedLease =
               current?.lease && current.lease.token === leaseToken ? { lease: current.lease } : {};
@@ -1004,12 +1086,20 @@ export function createCodexAppServerBindingStore(
                 threadId: mutation.threadId,
               });
             }
+            const nativeSubagentSubmissions = active
+              ? preserveCodexNativeSubagentSubmissions(
+                  active.binding,
+                  binding,
+                  active.nativeSubagentSubmissions,
+                )
+              : undefined;
             return {
               result: true,
               next: {
                 version: 1,
                 state: "active",
                 binding,
+                ...(nativeSubagentSubmissions !== undefined ? { nativeSubagentSubmissions } : {}),
                 ...storedSessionGeneration(identity, current),
                 ...ownedLease,
               },
@@ -1049,9 +1139,18 @@ export function createCodexAppServerBindingStore(
             if (current.sessionId !== expectedSessionId) {
               return { result: "conflict" as const };
             }
+            const { nativeSubagentSubmissions, ...bindingOwner } = current;
+            const adoptedSubmissions =
+              adoptCodexNativeSubagentSubmissions(nativeSubagentSubmissions);
             return {
               result: "adopted" as const,
-              next: { ...current, sessionId: targetSessionId },
+              next: {
+                ...bindingOwner,
+                sessionId: targetSessionId,
+                ...(adoptedSubmissions !== undefined
+                  ? { nativeSubagentSubmissions: adoptedSubmissions }
+                  : {}),
+              },
             };
           },
           undefined,
@@ -1232,190 +1331,10 @@ function preservedSessionGeneration(
   return storedSessionGeneration(identity, current);
 }
 
-function readPluginAppPolicyContext(
-  value: unknown,
-  bindingSchemaVersion: 1 | 2,
-): PluginAppPolicyContext | undefined {
-  const record = asOptionalRecord(value);
-  if (!record || typeof record.fingerprint !== "string") {
-    return undefined;
-  }
-  const apps = asOptionalRecord(record.apps);
-  if (!apps) {
-    return undefined;
-  }
-  const parsedApps: PluginAppPolicyContext["apps"] = {};
-  for (const [appId, rawEntry] of Object.entries(apps)) {
-    const entry = asOptionalRecord(rawEntry);
-    if (!entry) {
-      return undefined;
-    }
-    const destructiveApprovalMode = readDestructiveApprovalMode(
-      entry.destructiveApprovalMode,
-      bindingSchemaVersion,
-    );
-    const mcpServerNamesValid =
-      Array.isArray(entry.mcpServerNames) &&
-      entry.mcpServerNames.every((serverName) => typeof serverName === "string");
-    if (entry.source === "account") {
-      if (
-        "appId" in entry ||
-        typeof entry.appName !== "string" ||
-        typeof entry.allowDestructiveActions !== "boolean" ||
-        (entry.allowOpenWorld !== undefined && typeof entry.allowOpenWorld !== "boolean") ||
-        destructiveApprovalMode === "invalid" ||
-        !mcpServerNamesValid
-      ) {
-        return undefined;
-      }
-      parsedApps[appId] = {
-        source: "account",
-        appName: entry.appName,
-        allowDestructiveActions: entry.allowDestructiveActions,
-        ...(typeof entry.allowOpenWorld === "boolean"
-          ? { allowOpenWorld: entry.allowOpenWorld }
-          : {}),
-        ...(destructiveApprovalMode ? { destructiveApprovalMode } : {}),
-        mcpServerNames: entry.mcpServerNames as string[],
-      };
-      continue;
-    }
-    if (
-      "appId" in entry ||
-      (entry.source !== undefined && entry.source !== "plugin") ||
-      typeof entry.configKey !== "string" ||
-      typeof entry.marketplaceName !== "string" ||
-      !CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN.test(entry.marketplaceName) ||
-      typeof entry.pluginName !== "string" ||
-      typeof entry.allowDestructiveActions !== "boolean" ||
-      (entry.allowOpenWorld !== undefined && typeof entry.allowOpenWorld !== "boolean") ||
-      destructiveApprovalMode === "invalid" ||
-      !mcpServerNamesValid
-    ) {
-      return undefined;
-    }
-    parsedApps[appId] = {
-      configKey: entry.configKey,
-      marketplaceName: entry.marketplaceName,
-      pluginName: entry.pluginName,
-      allowDestructiveActions: entry.allowDestructiveActions,
-      ...(typeof entry.allowOpenWorld === "boolean"
-        ? { allowOpenWorld: entry.allowOpenWorld }
-        : {}),
-      ...(destructiveApprovalMode ? { destructiveApprovalMode } : {}),
-      mcpServerNames: entry.mcpServerNames as string[],
-    };
-  }
-  const parsedPluginAppIds: PluginAppPolicyContext["pluginAppIds"] = {};
-  if (
-    record.pluginAppIds !== undefined &&
-    (!record.pluginAppIds ||
-      typeof record.pluginAppIds !== "object" ||
-      Array.isArray(record.pluginAppIds))
-  ) {
-    return undefined;
-  }
-  if (record.pluginAppIds && typeof record.pluginAppIds === "object") {
-    for (const [configKey, appIds] of Object.entries(record.pluginAppIds)) {
-      if (!Array.isArray(appIds) || appIds.some((appId) => typeof appId !== "string")) {
-        return undefined;
-      }
-      parsedPluginAppIds[configKey] = appIds;
-    }
-  }
-  return {
-    fingerprint: record.fingerprint,
-    apps: parsedApps,
-    pluginAppIds: parsedPluginAppIds,
-  };
-}
-
-function readDestructiveApprovalMode(
-  value: unknown,
-  bindingSchemaVersion: 1 | 2,
-): PluginAppPolicyContext["apps"][string]["destructiveApprovalMode"] | undefined | "invalid" {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value === "allow" || value === "deny") {
-    return value;
-  }
-  if (value === "auto") {
-    return bindingSchemaVersion === 1 ? "allow" : "auto";
-  }
-  if (value === "ask" && bindingSchemaVersion === 2) {
-    return "ask";
-  }
-  if (value === "on-request" && bindingSchemaVersion === 1) {
-    return "auto";
-  }
-  return "invalid";
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-/** Returns true when an auth profile uses native Codex/OpenAI app-server auth. */
-export function isCodexAppServerNativeAuthProfile(
-  lookup: CodexAppServerAuthProfileLookup,
-): boolean {
-  const authProfileId = lookup.authProfileId?.trim();
-  if (!authProfileId) {
-    return false;
-  }
-  try {
-    const store =
-      lookup.authProfileStore ??
-      ensureAuthProfileStore(
-        lookup.agentDir?.trim() || resolveDefaultAgentDir(lookup.config ?? {}),
-        {
-          allowKeychainPrompt: false,
-          config: lookup.config,
-          externalCliProviderIds: [CODEX_APP_SERVER_NATIVE_AUTH_PROVIDER],
-          externalCliProfileIds: [authProfileId],
-        },
-      );
-    const credential = store.profiles[authProfileId];
-    if (!credential || credential.type === "api_key") {
-      return false;
-    }
-    const provider = credential.provider?.trim();
-    return Boolean(
-      provider &&
-      resolveProviderIdForAuth(provider, { config: lookup.config }) ===
-        CODEX_APP_SERVER_NATIVE_AUTH_PROVIDER,
-    );
-  } catch (error) {
-    embeddedAgentLog.debug("failed to resolve codex app-server auth profile provider", {
-      authProfileId,
-      error,
-    });
-    return false;
-  }
-}
-
-/** Hides redundant OpenAI provider attribution for native Codex auth bindings. */
-export function normalizeCodexAppServerBindingModelProvider(params: {
-  authProfileId?: string;
-  modelProvider?: string;
-  authProfileStore?: AuthProfileStore;
-  agentDir?: string;
-  config?: ProviderAuthAliasConfig;
-}): string | undefined {
-  const modelProvider = params.modelProvider?.trim();
-  if (!modelProvider) {
-    return undefined;
-  }
-  if (
-    isCodexAppServerNativeAuthProfile(params) &&
-    modelProvider.toLowerCase() === PUBLIC_OPENAI_MODEL_PROVIDER
-  ) {
-    return undefined;
-  }
-  return modelProvider;
 }
 
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

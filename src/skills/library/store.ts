@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { SkillLibraryEntry } from "../../../packages/gateway-protocol/src/schema/skill-library.js";
+import type { SelectQueryBuilder } from "kysely";
+import type {
+  SkillLibraryEntry,
+  SkillLibrarySelection,
+} from "../../../packages/gateway-protocol/src/schema/skill-library.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { authorizeOperatorScopesForRequiredScope } from "../../gateway/method-scopes.js";
 import { resolveOperatorRolePolicyForAssignment } from "../../gateway/operator-role-policy.js";
@@ -20,7 +24,7 @@ import {
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../state/openclaw-state-schema.js";
 import {
   selectResolvedUserProfile,
-  selectResolvedUserProfileById,
+  selectResolvedUserProfileMetadataById,
   userProfilesDb,
 } from "../../state/user-profiles-internal.js";
 import { managedSkillCommandName } from "./command-name.js";
@@ -88,7 +92,7 @@ export function resolveSkillLibraryActor(db: DatabaseSync, authority: SkillLibra
   authority.assertCurrent();
   const profile =
     authority.profileId && tableExists(db, "user_profiles")
-      ? selectResolvedUserProfileById(db, authority.profileId)
+      ? selectResolvedUserProfileMetadataById(db, authority.profileId)
       : undefined;
   if (authority.profileId && !profile) {
     throw new SkillLibraryError(
@@ -129,19 +133,16 @@ export function requireSkillLibraryProfile(
   return actor.profileId;
 }
 
-export function requireSkillLibraryUpload(
+function requireSelectedSkillLibraryUpload<
+  T extends Pick<SkillLibraryDatabase["skill_library_uploads"], "owner_profile_id" | "expires_at">,
+>(
   db: DatabaseSync,
   uploadId: string,
   authority: SkillLibraryAuthority,
+  query: SelectQueryBuilder<SkillLibraryDatabase, "skill_library_uploads", T>,
 ) {
   const actor = requireSkillLibraryProfile(db, authority);
-  const upload = executeSqliteQueryTakeFirstSync(
-    db,
-    skillLibraryDb(db)
-      .selectFrom("skill_library_uploads")
-      .selectAll()
-      .where("upload_id", "=", uploadId),
-  );
+  const upload = executeSqliteQueryTakeFirstSync(db, query.where("upload_id", "=", uploadId));
   if (
     !upload ||
     upload.expires_at <= Date.now() ||
@@ -153,6 +154,34 @@ export function requireSkillLibraryUpload(
     );
   }
   return upload;
+}
+
+export function requireSkillLibraryUpload(
+  db: DatabaseSync,
+  uploadId: string,
+  authority: SkillLibraryAuthority,
+) {
+  return requireSelectedSkillLibraryUpload(
+    db,
+    uploadId,
+    authority,
+    skillLibraryDb(db).selectFrom("skill_library_uploads").selectAll(),
+  );
+}
+
+export function requireSkillLibraryUploadMetadata(
+  db: DatabaseSync,
+  uploadId: string,
+  authority: SkillLibraryAuthority,
+) {
+  return requireSelectedSkillLibraryUpload(
+    db,
+    uploadId,
+    authority,
+    skillLibraryDb(db)
+      .selectFrom("skill_library_uploads")
+      .select(["owner_profile_id", "expires_at", "slug", "published_skill_id"]),
+  );
 }
 
 export function selectSkillLibraryRow(
@@ -194,6 +223,33 @@ export function selectSkillLibraryRevisionMetadata(
     db,
     skillLibraryRevisionQuery(db, skillId, revision).select("description"),
   );
+}
+
+/** Resolve a bounded session selection in its original order, including repeated pins. */
+export function selectSkillLibraryRevisionMetadataBatch(
+  db: DatabaseSync,
+  selections: readonly Pick<SkillLibrarySelection, "skillId" | "revision">[],
+) {
+  const rows = executeSqliteQuerySync(
+    db,
+    skillLibraryDb(db)
+      .selectFrom("skill_library_revisions")
+      .select(["skill_id", "revision", "description"])
+      .where((eb) =>
+        eb.or(
+          selections.map((pin) =>
+            eb.and([eb("skill_id", "=", pin.skillId), eb("revision", "=", pin.revision)]),
+          ),
+        ),
+      ),
+  ).rows;
+  const metadata = new Map(
+    rows.map((row) => [
+      JSON.stringify([row.skill_id, row.revision]),
+      { description: row.description },
+    ]),
+  );
+  return selections.map((pin) => metadata.get(JSON.stringify([pin.skillId, pin.revision])));
 }
 
 export function selectSkillLibraryOwner(db: DatabaseSync, profileId: string) {

@@ -33,6 +33,7 @@ import {
   type SessionBindingAdapter,
 } from "../../../infra/outbound/session-binding-service.js";
 import { flushLogger, resetLogger } from "../../../logging/logger.js";
+import { loadActivatedBundledPluginPublicSurfaceModule } from "../../../plugin-sdk/facade-runtime.js";
 import {
   bindGatewayContextResolver,
   getPluginRuntimeGatewayRequestScope,
@@ -103,6 +104,11 @@ beforeEach(async () => {
   );
   clearConfigCache();
   clearRuntimeConfigSnapshot();
+  // Prepare the real browser cleanup surface outside the provisional-session RPC deadline.
+  await loadActivatedBundledPluginPublicSurfaceModule({
+    dirName: "browser",
+    artifactBasename: "browser-maintenance.js",
+  });
   managerTesting.resetAcpSessionManagerForTests();
   resetSubagentRegistryForTests({ persist: false });
   resetTaskRegistryForTests({ persist: false });
@@ -223,12 +229,12 @@ describe("pending ACP spawn authority", () => {
         const run = vi.spyOn(SessionActorQueue.prototype, "run");
         run.mockImplementationOnce(function (this: SessionActorQueue, key, op) {
           run.mockRestore();
-          return this.run(key, async () => {
+          return this.run(key, async (isCurrent) => {
             if (!childKey) {
               throw new Error("ACP actor started before its child entry existed");
             }
             await pause(childKey);
-            return await op();
+            return await op(isCurrent);
           });
         });
       } else if (stage === "initialized" || stage === "metadata") {

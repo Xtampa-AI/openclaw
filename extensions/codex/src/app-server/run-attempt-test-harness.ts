@@ -23,9 +23,14 @@ import {
   resolveStorePath,
   upsertSessionEntry,
 } from "openclaw/plugin-sdk/session-store-runtime";
-import { closeOpenClawAgentDatabasesForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+  closeOpenClawStateDatabaseAsync,
+  drainSessionDiskBudgetWorkers,
+} from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
-import { afterEach, beforeEach, expect, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, vi } from "vitest";
 import { defaultCodexAppInventoryCache } from "./app-inventory-cache.js";
 import { CodexAppServerClient } from "./client.js";
 import {
@@ -215,6 +220,7 @@ export function runCodexAppServerAttempt(
   };
   const promise = runCodexAppServerAttemptImpl(trackedParams, {
     ...options,
+    startupTimeoutFloorMs: options.startupTimeoutFloorMs ?? 30_000,
     bindingStore: options.bindingStore ?? testCodexAppServerBindingStore,
     ...(clientFactory ? { clientFactory } : {}),
   }).finally(() => {
@@ -614,6 +620,22 @@ export function createAppServerHarness(
   };
 }
 
+function defaultAttemptHarnessResponse(method: string) {
+  if (method === "configRequirements/read") {
+    return { requirements: null };
+  }
+  if (method === "config/read") {
+    return { config: {}, origins: {} };
+  }
+  if (method === "turn/start") {
+    return turnStartResult();
+  }
+  if (method === "thread/backgroundTerminals/list") {
+    return { data: [], nextCursor: null };
+  }
+  return {};
+}
+
 export function createStartedThreadHarness(
   requestImpl: Parameters<typeof createAppServerHarness>[0] = async () => undefined,
   options: Parameters<typeof createAppServerHarness>[1] = {},
@@ -623,43 +645,26 @@ export function createStartedThreadHarness(
     if (override !== undefined) {
       return override;
     }
-    if (method === "configRequirements/read") {
-      return { requirements: null };
-    }
-    if (method === "config/read") {
-      return { config: {}, origins: {} };
-    }
     if (method === "thread/start") {
       return threadStartResult();
     }
-    if (method === "turn/start") {
-      return turnStartResult();
-    }
-    if (method === "thread/backgroundTerminals/list") {
-      return { data: [], nextCursor: null };
-    }
-    return {};
+    return defaultAttemptHarnessResponse(method);
   }, options);
 }
 
 export function createResumeHarness(threadId = "thread-existing") {
   return createAppServerHarness(
     async (method, params) => {
-      if (method === "configRequirements/read") {
-        return { requirements: null };
-      }
-      if (method === "config/read") {
-        return { config: {}, origins: {} };
-      }
       if (method === "thread/resume") {
         // Resume must echo the requested thread; a different id is rejected as
         // an unsafe subscription.
-        return threadStartResult((params as { threadId?: string })?.threadId ?? "thread-existing");
+        const resumeParams = params as { threadId?: string; modelProvider?: string };
+        return {
+          ...threadStartResult(resumeParams.threadId ?? "thread-existing"),
+          ...(resumeParams.modelProvider ? { modelProvider: resumeParams.modelProvider } : {}),
+        };
       }
-      if (method === "turn/start") {
-        return turnStartResult();
-      }
-      return {};
+      return defaultAttemptHarnessResponse(method);
     },
     { persistedThreads: [threadId] },
   );
@@ -687,6 +692,8 @@ export function createRuntimeDynamicTool(name: string): RuntimeDynamicToolForTes
 }
 
 export function setupRunAttemptTestHooks(): void {
+  afterAll(drainSessionDiskBudgetWorkers);
+
   beforeEach(async () => {
     // Direct runtime tests supply the plugin root normally owned by loader registration.
     setManagedCodexPluginRoot(fileURLToPath(new URL("../../", import.meta.url)));
@@ -724,8 +731,8 @@ export function setupRunAttemptTestHooks(): void {
     clearRuntimeAuthProfileStoreSnapshots();
     dynamicToolBuildState.openClawCodingToolsFactory = undefined;
     codexWorkspaceDirCache.clear();
-    nativeHookRelayUnregisterQueue.clear();
-    nativeHookRelayTesting.clearNativeHookRelaysForTests();
+    await nativeHookRelayUnregisterQueue.clear();
+    await nativeHookRelayTesting.clearNativeHookRelaysForTests();
     clearMemoryPluginState();
     clearPluginCommands();
     resetAgentEventsForTest();
@@ -741,7 +748,9 @@ export function setupRunAttemptTestHooks(): void {
     for (const owner of seededSessionOwnersForTest.splice(0)) {
       await deleteSessionEntry(owner);
     }
+    await closeOpenClawAgentDatabasesAsync();
     closeOpenClawAgentDatabasesForTest();
+    await closeOpenClawStateDatabaseAsync();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 }

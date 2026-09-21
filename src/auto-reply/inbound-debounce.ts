@@ -47,6 +47,7 @@ type InboundDebounceAdmissionLifecycleInput = {
   onAdopted?: () => void | Promise<void>;
   onDeferred?: () => boolean | void;
   onDeferredHeartbeat?: () => void;
+  deferredHeartbeatIntervalMs?: number;
   onAdoptionFinalizing?: () => void;
   onFailed?: (error: unknown) => void | Promise<void>;
   onAbandoned?: () => void | Promise<void>;
@@ -58,6 +59,7 @@ type InboundDebounceAdmissionLifecycle = {
   onAdopted: () => Promise<void>;
   onDeferred: () => boolean | void;
   onDeferredHeartbeat?: () => void;
+  deferredHeartbeatIntervalMs?: number;
   onAdoptionFinalizing: () => void;
   onFailed?: (error: unknown) => Promise<void>;
   onAbandoned: () => Promise<void>;
@@ -98,6 +100,7 @@ function createInboundDebounceFlush(params: {
       return accepted;
     },
     onDeferredHeartbeat: () => source?.onDeferredHeartbeat?.(),
+    deferredHeartbeatIntervalMs: source?.deferredHeartbeatIntervalMs,
     onAdoptionFinalizing: () => source?.onAdoptionFinalizing?.(),
     onFailed: source?.onFailed
       ? async (error) => {
@@ -347,13 +350,6 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
     buffer.timeout.unref?.();
   };
 
-  const canTrackKey = (key: string) => {
-    if (buffers.has(key) || keyChains.has(key)) {
-      return true;
-    }
-    return new Set([...buffers.keys(), ...keyChains.keys()]).size < maxTrackedKeys;
-  };
-
   const enqueue = async (item: T) => {
     const key = params.buildKey(item);
     const debounceMs = resolveDebounceMs(item);
@@ -403,7 +399,9 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>
       scheduleFlush(key, existing);
       return;
     }
-    if (!canTrackKey(key)) {
+    // Buffers reserve a chain before insertion and release it only after removal,
+    // so chain keys already cover every tracked debounce key.
+    if (!(keyChains.has(key) || keyChains.size < maxTrackedKeys)) {
       // When the debounce map is saturated, fall back to immediate keyed work
       // instead of buffering, but still preserve same-key ordering.
       const generation = resolveKeyGeneration(key);

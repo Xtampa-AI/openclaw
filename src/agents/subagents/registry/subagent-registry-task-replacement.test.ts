@@ -11,6 +11,7 @@ import { reactivateCompletedSubagentSession } from "../../../gateway/session-sub
 import type { WorkerConnectionIdentity } from "../../../gateway/worker-environments/connection-identity.js";
 import { createWorkerLiveEventReceiver } from "../../../gateway/worker-environments/live-events.js";
 import { createWorkerSessionPlacementStore } from "../../../gateway/worker-environments/placement-store.js";
+import { seedAttachedPlacementEnvironment } from "../../../gateway/worker-environments/placement-test-fixtures.js";
 import { createWorkerSessionPlacementGate } from "../../../gateway/worker-environments/placement-worker-gate.js";
 import {
   emitAgentEvent,
@@ -22,6 +23,7 @@ import {
   getAgentRunContextOwnership,
   getAgentRunContextOwnerStatus,
 } from "../../../infra/agent-run-registry.js";
+import { onSessionLifecycleEvent } from "../../../sessions/session-lifecycle-events.js";
 import { openOpenClawStateDatabase } from "../../../state/openclaw-state-db.js";
 import { reloadTaskRuntimeStateFromStore } from "../../../tasks/runtime-internal.js";
 import { failFlow, getTaskFlowById } from "../../../tasks/task-flow-registry.js";
@@ -89,6 +91,11 @@ it.each(["end", "error"] as const)(
     const lifecycleGeneration = getAgentEventLifecycleGeneration();
     const placementStore = createWorkerSessionPlacementStore();
     const placementIdentity = { sessionId, sessionKey: childSessionKey, agentId: "main" };
+    seedAttachedPlacementEnvironment(openOpenClawStateDatabase(), {
+      environmentId: "timeout-worker",
+      sessionId,
+      ownerEpoch: 1,
+    });
     let placement = placementStore.startDispatch(placementIdentity);
     for (const transition of [
       { from: "requested", to: "provisioning", patch: { environmentId: "timeout-worker" } },
@@ -157,7 +164,7 @@ it.each(["end", "error"] as const)(
         event: { kind: "lifecycle", payload: { phase: "start", startedAt } },
       } as const;
       expect(Value.Check(WorkerLiveEventParamsSchema, startRequest)).toBe(true);
-      expect(receiver.apply({ identity, request: startRequest })).toEqual({
+      expect(await receiver.apply({ identity, request: startRequest })).toEqual({
         ok: true,
         result: { ackedSeq: 1 },
       });
@@ -165,7 +172,7 @@ it.each(["end", "error"] as const)(
       const owner = getAgentRunContext(previous.runId)!;
       expect(claimId).toBeDefined();
       expect(
-        receiver.apply({
+        await receiver.apply({
           identity,
           request: {
             runId: previous.runId,
@@ -228,14 +235,14 @@ it.each(["end", "error"] as const)(
         expect(placementGate.validateWorkerTurn(turnClaim)).toBe(true);
         expect(identity.runId).toBe(terminalRequest.runId);
         expect(Value.Check(WorkerLiveEventParamsSchema, terminalRequest)).toBe(true);
-        expect(receiver.apply({ identity, request: terminalRequest })).toEqual({
+        expect(await receiver.apply({ identity, request: terminalRequest })).toEqual({
           ok: true,
           result: { ackedSeq: 3 },
         });
         expect(terminalEvents).toEqual([previous.runId]);
         expect(subagentRuns.get(successor.runId)).toBe(successor);
         expect(successor.execution.status).toBe("running");
-        reloadTaskRuntimeStateFromStore();
+        await reloadTaskRuntimeStateFromStore();
         expect.soft(getTaskById(originalTask.taskId)?.status).toBe("running");
         expect.soft(getTaskFlowById(originalTask.parentFlowId!)?.status).toBe("running");
         nextWait.resolve({
@@ -294,6 +301,17 @@ it.each(["successor", "task activation", "flow activation"] as const)(
     const flowId = terminalTask.parentFlowId!;
     expect(terminalTask.status).toBe("failed");
     expect(getTaskFlowById(flowId)?.status).toBe("failed");
+    previous.collect = true;
+    previous.swarmRequesterSessionKey = "agent:main:main";
+    previous.requesterAgentId = "main";
+    previous.groupId = "rollback-group";
+    persistSubagentRunsToDiskOrThrow(subagentRuns, [previous.runId]);
+    const parentEvents = vi.fn();
+    const unsubscribe = onSessionLifecycleEvent((event) => {
+      if (event.reason === "swarm") {
+        parentEvents(event);
+      }
+    });
     const database = openOpenClawStateDatabase().db;
     const triggerName = `reject_replacement_${
       rejectedWrite === "successor" ? "run" : rejectedWrite === "task activation" ? "task" : "flow"
@@ -329,14 +347,16 @@ it.each(["successor", "task activation", "flow activation"] as const)(
         .toBe(false);
     } finally {
       database.exec(`DROP TRIGGER ${triggerName}`);
+      unsubscribe();
     }
+    expect(parentEvents).not.toHaveBeenCalled();
     expect.soft(subagentRuns.get(previous.runId)).toBe(previous);
     expect.soft(subagentRuns.has("rollback-successor")).toBe(false);
     expect.soft(loadSubagentRegistryFromSqlite().has("rollback-successor")).toBe(false);
     expect
       .soft(loadSubagentRegistryFromSqlite().get(previous.runId)?.execution.status)
       .toBe("terminal");
-    reloadTaskRuntimeStateFromStore();
+    await reloadTaskRuntimeStateFromStore();
     const restored = getTaskById(originalTask.taskId)!;
     expect(restored.detail).toMatchObject({ generation: previous.generation });
     expect.soft(restored.status).toBe("failed");
@@ -409,7 +429,7 @@ it("rearms the canonical task and mirrored flow for an interrupted run's success
     execution: { status: "running" },
   });
   expect(successor.taskRunId).toBe(previous.runId);
-  reloadTaskRuntimeStateFromStore();
+  await reloadTaskRuntimeStateFromStore();
   const task = getTaskById(originalTask.taskId)!;
   const flow = getTaskFlowById(flowId)!;
   expect(task).toMatchObject({

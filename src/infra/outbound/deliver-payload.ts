@@ -111,13 +111,20 @@ function stripInternalRuntimeScaffoldingFromValue(value: unknown): unknown {
     return value;
   }
   let changed = false;
-  const next: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    const stripped = stripInternalRuntimeScaffoldingFromValue(entry);
-    changed ||= stripped !== entry;
-    next[key] = stripped;
+  const entries = Object.entries(value);
+  for (const entry of entries) {
+    const stripped = stripInternalRuntimeScaffoldingFromValue(entry[1]);
+    changed ||= stripped !== entry[1];
+    entry[1] = stripped;
   }
-  return changed ? next : value;
+  if (!changed) {
+    return value;
+  }
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of entries) {
+    next[key] = entry;
+  }
+  return next;
 }
 
 /** Every media reference a payload set carries, in payload order. */
@@ -199,6 +206,7 @@ export async function maybePinDeliveredMessage(params: {
   target: ChannelOutboundTargetRef;
   messageId?: string;
   gatewayClientScopes?: readonly string[];
+  assertDirectAdapterHandoff?: () => void;
 }): Promise<void> {
   const pin = normalizeDeliveryPin(params.payload);
   if (!pin) {
@@ -225,11 +233,13 @@ export async function maybePinDeliveredMessage(params: {
     return;
   }
   try {
+    params.assertDirectAdapterHandoff?.();
     await params.handler.pinDeliveredMessage({
       target: params.target,
       messageId: params.messageId,
       pin,
       gatewayClientScopes: params.gatewayClientScopes,
+      assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
     });
   } catch (err) {
     if (pin.required) {

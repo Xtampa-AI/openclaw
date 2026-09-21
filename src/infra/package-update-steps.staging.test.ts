@@ -9,7 +9,7 @@ import {
   createRootRunner,
   writePackageRoot,
 } from "./package-update-steps.test-support.js";
-import { resolveNpmGlobalPrefixLayoutFromPrefix } from "./update-global.js";
+import { resolveNpmGlobalPrefixLayoutFromPrefix } from "./update-npm-prefix.js";
 
 function stagedPrefixFromArgs(argv: string[]): string {
   const prefixIndex = argv.indexOf("--prefix");
@@ -129,7 +129,7 @@ describe("runGlobalPackageUpdateSteps staging ownership", () => {
         expect(result).toMatchObject({
           failedStep: null,
           afterVersion: "2.0.0",
-          verifiedPackageRoot: packageRoot,
+          activePackageRoot: packageRoot,
           recovery: { serviceRestartSafe: true, version: "2.0.0" },
         });
         expect(result.steps).toContainEqual(

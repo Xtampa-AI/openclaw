@@ -174,7 +174,9 @@ function readPluginDeliveryId(value: unknown): string | undefined {
   return found;
 }
 
-function projectPluginPayload(value: unknown): EmbeddedMessageDeliveryFact | undefined {
+export function projectPluginMessageDeliveryFact(
+  value: unknown,
+): EmbeddedMessageDeliveryFact | undefined {
   if (pluginEnvelopeHas(value, "dryRun")) {
     return { status: "dryRun", ...EMPTY_DELIVERY_FACT };
   }
@@ -209,7 +211,7 @@ export function pluginBroadcastHasDelivery(value: unknown): boolean {
           return false;
         }
         return [entry.payload, entry.toolResult].some(
-          (payload) => projectPluginPayload(payload)?.status === "settled",
+          (payload) => projectPluginMessageDeliveryFact(payload)?.status === "settled",
         );
       }),
   );
@@ -257,7 +259,7 @@ export function projectEmbeddedMessageDeliveryFact(
   if (currentSourceReply && result.handledBy === "plugin") {
     return result.dryRun
       ? { status: "dryRun", ...EMPTY_DELIVERY_FACT }
-      : projectPluginPayload(result.payload);
+      : projectPluginMessageDeliveryFact(result.payload);
   }
   if (result.kind === "send") {
     return result.handledBy === "core" && result.sendResult
@@ -287,13 +289,18 @@ export function projectEmbeddedMessageDeliveryFact(
       : entry.sentBeforeError
         ? { status: "settled" as const, partialDelivery: true, createdThreadIds: [] }
         : entry.ok
-          ? projectPluginPayload(entry.payload)
+          ? projectPluginMessageDeliveryFact(entry.payload)
           : undefined,
   }));
   const facts = entries.flatMap(({ fact }) => (fact ? [fact] : []));
   const settled = facts.find((fact) => fact.status === "settled");
-  if (settled || entries.some(({ entry, fact }) => entry.ok && !entry.result && !fact)) {
-    return settled;
+  if (settled) {
+    return entries.some(({ entry }) => !entry.ok) && !settled.partialDelivery
+      ? { ...settled, partialDelivery: true }
+      : settled;
+  }
+  if (entries.some(({ entry, fact }) => entry.ok && !entry.result && !fact)) {
+    return undefined;
   }
   return (
     facts.find((fact) => fact.status === "suppressed") ??
@@ -302,6 +309,14 @@ export function projectEmbeddedMessageDeliveryFact(
       partialDelivery: false,
       createdThreadIds: [],
     }
+  );
+}
+
+export function hasAcceptedBroadcastDelivery(result: MessageActionResult): boolean {
+  return (
+    !result.dryRun &&
+    result.kind === "broadcast" &&
+    result.payload.results.some((entry) => entry.ok || entry.sentBeforeError)
   );
 }
 

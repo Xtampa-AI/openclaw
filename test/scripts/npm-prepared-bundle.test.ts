@@ -195,7 +195,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
     if (endpoint.includes("/jobs?")) {
       return JSON.stringify({ total_count: 1, jobs: [job] });
     }
-    if (endpoint.endsWith("/attempts/2")) {
+    if (endpoint.endsWith("/attempts/2") || endpoint.endsWith("/runs/12")) {
       return JSON.stringify(run);
     }
     if (endpoint.endsWith("/artifacts/78")) {
@@ -216,7 +216,11 @@ type PreparedFixtureDescriptor = Awaited<ReturnType<typeof bundleFixture>>["desc
 
 async function qualificationFixture<
   Descriptor extends Pick<PreparedFixtureDescriptor, "source" | "producer">,
->(descriptor: Descriptor, pluginSdkApi: object = {}) {
+>(
+  descriptor: Descriptor,
+  pluginSdkApi: object = {},
+  dependencyReports: Record<string, object | string> = {},
+) {
   const source = descriptor.source;
   const makeProducer = (jobId: string, jobName: string) => ({
     ...descriptor.producer,
@@ -243,10 +247,14 @@ async function qualificationFixture<
     kind: string,
     id: string,
     producer: ReturnType<typeof makeProducer>,
-    files: Record<string, object>,
+    files: Record<string, object | string>,
   ) => {
     const entries = Object.entries(files).map(
-      ([name, value]) => [name, Buffer.from(`${JSON.stringify(value)}\n`)] as const,
+      ([name, value]) =>
+        [
+          name,
+          Buffer.from(typeof value === "string" ? value : `${JSON.stringify(value)}\n`),
+        ] as const,
     );
     const zip = new JSZip();
     for (const [name, bytes] of entries) {
@@ -298,6 +306,7 @@ async function qualificationFixture<
     makeProducer("49", "Check npm dependencies"),
     {
       "dependency-evidence-manifest.json": { releaseSha: source.sha },
+      ...dependencyReports,
     },
   );
   const jobs = [sourceCheck, contentsProof, sdkProof, dependencyProof].map(({ producer }) => ({
@@ -415,6 +424,97 @@ describe("prepared npm bundle", () => {
     expect(verifyNpmBundleProducer(options).job.id).toBe(fixture.job.id);
     fixture.job.conclusion = "failure";
     expect(() => verifyNpmBundleProducer(options)).toThrow("unique exact completed producer job");
+  });
+
+  it("retains the exact green qualifier when only a later receipt job is retried", async () => {
+    const fixture = await bundleFixture();
+    Object.assign(fixture.run, { status: "completed", conclusion: "failure" });
+    fixture.job.name = "Qualify prepared npm package";
+    const current = { ...fixture.run, run_attempt: 3, conclusion: "success" };
+    const receipt = { ...fixture.job, id: 46, run_attempt: 3, name: "Seal artifact receipt" };
+    const requests: string[] = [];
+    const runGh = (args: string[]) => {
+      const endpoint = args[1] ?? "";
+      requests.push(endpoint);
+      if (endpoint.endsWith("/runs/12")) {
+        return JSON.stringify(current);
+      }
+      if (endpoint.includes("/attempts/3/jobs?")) {
+        return JSON.stringify({ total_count: 1, jobs: [receipt] });
+      }
+      return fixture.runGh(args);
+    };
+    const result = verifyNpmBundleProducer({
+      producer: { ...fixture.descriptor.producer, jobName: fixture.job.name },
+      repository,
+      toolingSha,
+      qualified: true,
+      requireCompletedParent: true,
+      runGh,
+    });
+    expect(result.run.run_attempt).toBe(3);
+    expect(result.job.id).toBe(fixture.job.id);
+    expect(result.job.run_attempt).toBe(2);
+    expect(requests.filter((endpoint) => endpoint.endsWith("/runs/12"))).toHaveLength(2);
+    expect(requests.some((endpoint) => endpoint.includes("/attempts/3/jobs?"))).toBe(true);
+  });
+
+  it.each([
+    "superseded qualifier",
+    "missing attempt jobs",
+    "mismatched attempt jobs",
+    "changed current tooling",
+    "current attempt regressed",
+    "current attempt advanced during verification",
+    "current run restarted during verification",
+  ])("rejects stale producer proof: %s", async (scenario) => {
+    const fixture = await bundleFixture();
+    Object.assign(fixture.run, { status: "completed", conclusion: "success" });
+    fixture.job.name = "Qualify prepared npm package";
+    const current = { ...fixture.run, run_attempt: 3 };
+    const receipt = { ...fixture.job, id: 46, run_attempt: 3, name: "Seal artifact receipt" };
+    let currentReads = 0;
+    const runGh = (args: string[]) => {
+      const endpoint = args[1] ?? "";
+      if (endpoint.endsWith("/runs/12")) {
+        currentReads += 1;
+        return JSON.stringify({
+          ...current,
+          ...(scenario === "changed current tooling" ? { head_sha: "d".repeat(40) } : {}),
+          ...(scenario === "current attempt regressed" ? { run_attempt: 1 } : {}),
+          ...(currentReads === 2 && scenario === "current attempt advanced during verification"
+            ? { run_attempt: 4 }
+            : {}),
+          ...(currentReads === 2 && scenario === "current run restarted during verification"
+            ? { status: "in_progress", conclusion: null }
+            : {}),
+        });
+      }
+      if (endpoint.includes("/attempts/3/jobs?")) {
+        const jobs =
+          scenario === "missing attempt jobs"
+            ? []
+            : [
+                {
+                  ...receipt,
+                  ...(scenario === "superseded qualifier" ? { name: fixture.job.name } : {}),
+                  ...(scenario === "mismatched attempt jobs" ? { run_attempt: 2 } : {}),
+                },
+              ];
+        return JSON.stringify({ total_count: jobs.length, jobs });
+      }
+      return fixture.runGh(args);
+    };
+    expect(() =>
+      verifyNpmBundleProducer({
+        producer: { ...fixture.descriptor.producer, jobName: fixture.job.name },
+        repository,
+        toolingSha,
+        qualified: true,
+        requireCompletedParent: true,
+        runGh,
+      }),
+    ).toThrow(/producer|attempt evidence/);
   });
 
   it.each([
@@ -536,7 +636,7 @@ describe("prepared npm bundle", () => {
   });
 
   it.each([undefined, "v2026.8.1"])(
-    "qualifies exact package bytes with large SDK evidence (release tag=%s)",
+    "qualifies exact package bytes with large SDK and npm lock evidence (release tag=%s)",
     async (releaseTag) => {
       const fixture = await bundleFixture();
       const directory = tempDirs.make("npm-bundle-");
@@ -555,11 +655,32 @@ describe("prepared npm bundle", () => {
       expect(readFileSync(downloaded.tarballPath)).toEqual(
         fixture.files.get(fixture.manifest.tarballName),
       );
-      const proof = await qualificationFixture(fixture.descriptor, {
-        baseline: "published",
-        // Successful releases can carry multi-megabyte declaration diffs.
-        diff: { exports: [{ before: "export type Previous = unknown;\n".repeat(150_000) }] },
-      });
+      const npmLocks = `${JSON.stringify({ packages: [{ lock: { packages: { "": { description: "x".repeat(3 * 1024 * 1024) } } } }] })}\n`;
+      const dependencyReports = {
+        ...Object.fromEntries(
+          [
+            "dependency-vulnerability-gate",
+            "transitive-manifest-risk-report",
+            "dependency-ownership-surface-report",
+            "dependency-changes-report",
+          ].flatMap((name) => [
+            [`${name}.json`, {}],
+            [`${name}.md`, "# Report\n"],
+          ]),
+        ),
+        "dependency-evidence-summary.md": "# Dependency evidence\n",
+        "npm-package-locks.json": npmLocks,
+        "npm-package-locks.md": "# npm package-lock mirrors\n",
+      };
+      const proof = await qualificationFixture(
+        fixture.descriptor,
+        {
+          baseline: "published",
+          // Successful releases can carry multi-megabyte declaration diffs.
+          diff: { exports: [{ before: "export type Previous = unknown;\n".repeat(150_000) }] },
+        },
+        dependencyReports,
+      );
       const manifest = await qualifyNpmPackageBundle({
         descriptor: fixture.descriptor,
         inputDir,
@@ -573,6 +694,11 @@ describe("prepared npm bundle", () => {
       });
       expect(manifest.version).toBe(3);
       expect(manifest.preparedBundle).toEqual(fixture.descriptor);
+      for (const [name, value] of Object.entries(dependencyReports)) {
+        expect(readFileSync(join(outputDir, "dependency-evidence", name), "utf8")).toBe(
+          typeof value === "string" ? value : `${JSON.stringify(value)}\n`,
+        );
+      }
       for (const entry of [
         fixture.descriptor.package.fileName,
         ...fixture.descriptor.corePackages.map((pkg) => pkg.tarballName),
@@ -735,7 +861,7 @@ describe("prepared npm bundle", () => {
         const artifact = proof.archives.get("79")!;
         artifact.archive = Buffer.alloc(artifact.archive.length);
       },
-      "GitHub Actions artifact digest",
+      "GitHub Actions artifact download digest",
     ],
     [
       "SDK proof rebound to another tag",

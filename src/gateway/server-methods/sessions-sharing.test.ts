@@ -39,7 +39,8 @@ import {
 } from "../session-sharing.js";
 import { createControlUiHandlers } from "./control-ui.js";
 import { flushPendingSessionsChangedEvents } from "./session-change-event.js";
-import { sessionReadHandlers } from "./sessions-read.js";
+import { initializeSessionReadContext } from "./sessions-read-cache.test-support.js";
+import { sessionReadHandlers as registeredSessionReadHandlers } from "./sessions-read.js";
 import { sessionSharingHandlers } from "./sessions-sharing.js";
 import {
   identifiedClient,
@@ -47,6 +48,15 @@ import {
   soloClient,
 } from "./sessions-sharing.test-support.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
+
+const sessionReadHandlers = {
+  "sessions.list": async (
+    options: Parameters<NonNullable<(typeof registeredSessionReadHandlers)["sessions.list"]>>[0],
+  ) => {
+    await initializeSessionReadContext(options.context);
+    return registeredSessionReadHandlers["sessions.list"]?.(options);
+  },
+};
 
 type ResolveSessionSharingTarget =
   (typeof import("../session-sharing.js"))["resolveSessionSharingTarget"];
@@ -168,6 +178,7 @@ describe("session sharing handlers", () => {
         );
         const broadcast = vi.fn();
         const requestContext = context(broadcast);
+        await initializeSessionReadContext(requestContext);
         requestContext.getSessionEventSubscriberConnIds = () => new Set(["legacy-client"]);
         expect(
           await call(
@@ -217,7 +228,7 @@ describe("session sharing handlers", () => {
             item.client,
           ),
         ).toEqual([[true, { ok: true, sessionKey, identityId: member.id }, undefined]]);
-        flushPendingSessionsChangedEvents(requestContext);
+        await flushPendingSessionsChangedEvents(requestContext);
         expect(requestContext.broadcastToConnIds).toHaveBeenCalledWith(
           "sessions.changed",
           expect.objectContaining({ reason: "sharing", sessionKey }),
@@ -354,6 +365,7 @@ describe("session sharing handlers", () => {
         const listFor = async (client: GatewayClient) => {
           const responses: Parameters<RespondFn>[] = [];
           await sessionReadHandlers["sessions.list"]?.({
+            req: { type: "req", id: "session-list-test", method: "sessions.list" },
             params: { search },
             client,
             context: {
@@ -390,8 +402,8 @@ describe("session sharing handlers", () => {
         expect(creator?.path).toBe(before?.path);
         expect(creator?.sessions?.some((session) => session.key === incognitoKey)).toBe(false);
         const visible = await listFor(admin);
-        expect(visible?.sessions?.some((session) => session.key === incognitoKey)).toBe(true);
-        expect(visible?.path).not.toBe(before?.path);
+        expect(visible?.sessions?.some((session) => session.key === incognitoKey)).toBe(false);
+        expect(visible?.path).toBe(before?.path);
       });
     },
   );
@@ -543,6 +555,7 @@ describe("session sharing handlers", () => {
       ).toBe(true);
       const responses: Parameters<RespondFn>[] = [];
       await sessionReadHandlers["sessions.list"]?.({
+        req: { type: "req", id: "session-list-test", method: "sessions.list" },
         params: { agentId: "main" },
         client: identifiedClient(memberIdentity.id, memberIdentity.label),
         context: {
@@ -593,6 +606,7 @@ describe("session sharing handlers", () => {
           invalidateSessionSharingSnapshot(sessionKey);
           const responses: Parameters<RespondFn>[] = [];
           await sessionReadHandlers["sessions.list"]?.({
+            req: { type: "req", id: "session-list-test", method: "sessions.list" },
             params: { agentId: "main", search },
             client,
             context: {
@@ -670,6 +684,7 @@ describe("session sharing handlers", () => {
       const responses: Parameters<RespondFn>[] = [];
 
       await sessionReadHandlers["sessions.list"]?.({
+        req: { type: "req", id: "session-list-test", method: "sessions.list" },
         params: { agentId: "main", limit: 1 },
         client: identifiedClient("outsider@example.com"),
         context: {
@@ -698,7 +713,7 @@ describe("session sharing handlers", () => {
     });
   });
 
-  it("lists profile ids and authorizes a selected profile as a member", async () => {
+  it("lists current identities and adds members without decoding unrelated saved prompts", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const sessionKey = "agent:main:profile-member";
       const profile = ensureProfileForEmail("member@example.com");
@@ -716,21 +731,53 @@ describe("session sharing handlers", () => {
           visibility: "read-only",
         },
       );
-      const requestContext = context(vi.fn());
-
-      const listed = await call("session.members.list", { sessionKey }, requestContext);
-      expect(listed[0]?.[1]).toMatchObject({
-        identities: expect.arrayContaining([
-          expect.objectContaining({ type: "human", id: profile.id, label: "Member" }),
-        ]),
+      const savedPrompt = "unrelated saved sharing prompt".repeat(512);
+      for (const [agentId, createdActor] of [
+        ["main", { type: "human", source: "profile", id: profile.id, label: "Old member name" }],
+        ["research", { type: "agent", id: "research", label: "Alpha Research" }],
+      ] as const) {
+        await upsertSessionEntryCore(
+          { agentId, sessionKey: `agent:${agentId}:unrelated-sharing` },
+          {
+            sessionId: `unrelated-sharing-${agentId}`,
+            updatedAt: 1,
+            createdActor,
+            skillsSnapshot: { prompt: savedPrompt, skills: [] },
+          },
+        );
+      }
+      const requestContext = context(vi.fn(), {
+        agents: { ownership: "explicit", entries: { main: {}, research: {} } },
       });
-      expect(
-        await call(
-          "session.members.add",
-          { sessionKey, identityId: selectable.id },
-          requestContext,
-        ),
-      ).toEqual([[true, { ok: true, sessionKey, identityId: profile.id }, undefined]]);
+      await call("session.members.list", { sessionKey }, requestContext);
+      const parse = JSON.parse;
+      let unrelatedDecodes = 0;
+      const parsed = vi.spyOn(JSON, "parse").mockImplementation((value, reviver) => {
+        if (typeof value === "string" && value.includes(savedPrompt)) {
+          unrelatedDecodes++;
+        }
+        return parse(value, reviver);
+      });
+      try {
+        for (const method of ["session.members.list", "session.members.listEvidence"] as const) {
+          const listed = await call(method, { sessionKey }, requestContext);
+          expect(listed[0]?.[1]).toMatchObject({
+            identities: [
+              { type: "agent", id: "research", label: "Alpha Research" },
+              { type: "human", id: profile.id, label: "Member" },
+            ],
+          });
+        }
+        expect(
+          await call(
+            "session.members.add",
+            { sessionKey, identityId: selectable.id },
+            requestContext,
+          ),
+        ).toEqual([[true, { ok: true, sessionKey, identityId: profile.id }, undefined]]);
+      } finally {
+        parsed.mockRestore();
+      }
       expect(
         authorizeResolvedSessionMutation({
           cfg: {},
@@ -739,6 +786,7 @@ describe("session sharing handlers", () => {
           agentId: "main",
         }),
       ).toBeNull();
+      expect(unrelatedDecodes).toBe(0);
     });
   });
 
