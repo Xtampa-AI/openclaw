@@ -1,3 +1,4 @@
+// Interactive transcript export template used by auto-reply HTML reports.
 (function () {
   "use strict";
 
@@ -12,7 +13,16 @@
     bytes[i] = binary.charCodeAt(i);
   }
   const data = JSON.parse(new TextDecoder("utf-8").decode(bytes));
-  const { header, entries, leafId: defaultLeafId, systemPrompt, tools, renderedTools } = data;
+  const {
+    header,
+    entries,
+    leafId: defaultLeafId,
+    hasLeafControl = false,
+    systemPrompt,
+    tools,
+    renderedTools,
+    warning,
+  } = data;
 
   // ============================================================
   // URL PARAMETER HANDLING
@@ -20,7 +30,7 @@
 
   // Parse URL parameters for deep linking: leafId and targetId
   // Check for injected params (when loaded in iframe via srcdoc) or use window.location
-  const injectedParams = document.querySelector('meta[name="pi-url-params"]');
+  const injectedParams = document.querySelector('meta[name="openclaw-url-params"]');
   const searchString = injectedParams
     ? injectedParams.content
     : window.location.search.substring(1);
@@ -179,40 +189,15 @@
     return current.entry.id;
   }
 
-  /**
-   * Flatten tree into list with indentation and connector info.
-   * Returns array of { node, indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots }.
-   * Matches tree-selector.ts logic exactly.
-   */
-  function flattenTree(roots, activePathIds) {
-    const result = [];
+  /** Lay out ordered children into caller-owned records without replacing their node identity. */
+  function layoutTree(roots, getChildren, getLayoutTarget) {
     const multipleRoots = roots.length > 1;
-
-    // Mark which subtrees contain the active leaf
-    const containsActive = new Map();
-    function markActive(node) {
-      let has = activePathIds.has(node.entry.id);
-      for (const child of node.children) {
-        if (markActive(child)) {
-          has = true;
-        }
-      }
-      containsActive.set(node, has);
-      return has;
-    }
-    roots.forEach(markActive);
-
     // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
     const stack = [];
-
-    // Add roots (prioritize branch containing active leaf)
-    const orderedRoots = [...roots].toSorted(
-      (a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)),
-    );
-    for (let i = orderedRoots.length - 1; i >= 0; i--) {
-      const isLast = i === orderedRoots.length - 1;
+    for (let i = roots.length - 1; i >= 0; i--) {
+      const isLast = i === roots.length - 1;
       stack.push([
-        orderedRoots[i],
+        roots[i],
         multipleRoots ? 1 : 0,
         multipleRoots,
         multipleRoots,
@@ -226,25 +211,19 @@
       const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] =
         stack.pop();
 
-      result.push({
-        node,
-        indent,
-        showConnector,
-        isLast,
-        gutters,
-        isVirtualRootChild,
-        multipleRoots,
-      });
+      const target = getLayoutTarget(node);
+      if (!target) {
+        continue;
+      }
+      target.indent = indent;
+      target.showConnector = showConnector;
+      target.isLast = isLast;
+      target.gutters = gutters;
+      target.isVirtualRootChild = isVirtualRootChild;
+      target.multipleRoots = multipleRoots;
 
-      const children = node.children;
+      const children = getChildren(node);
       const multipleChildren = children.length > 1;
-
-      // Order children (active branch first)
-      const orderedChildren = [...children].toSorted(
-        (a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)),
-      );
-
-      // Calculate child indent (matches tree-selector.ts)
       let childIndent;
       if (multipleChildren) {
         // Parent branches: children get +1
@@ -266,10 +245,10 @@
         : gutters;
 
       // Add children in reverse order for stack
-      for (let i = orderedChildren.length - 1; i >= 0; i--) {
-        const childIsLast = i === orderedChildren.length - 1;
+      for (let i = children.length - 1; i >= 0; i--) {
+        const childIsLast = i === children.length - 1;
         stack.push([
-          orderedChildren[i],
+          children[i],
           childIndent,
           multipleChildren,
           multipleChildren,
@@ -279,7 +258,34 @@
         ]);
       }
     }
+  }
 
+  /** Flatten the full tree with the active branch first at each level. */
+  function flattenTree(roots, activePathIds) {
+    const result = [];
+    const containsActive = new Map();
+    function markActive(node) {
+      let has = activePathIds.has(node.entry.id);
+      for (const child of node.children) {
+        if (markActive(child)) {
+          has = true;
+        }
+      }
+      containsActive.set(node, has);
+      return has;
+    }
+    roots.forEach(markActive);
+
+    const activeFirst = (a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a));
+    layoutTree(
+      [...roots].toSorted(activeFirst),
+      (node) => [...node.children].toSorted(activeFirst),
+      (node) => {
+        const target = { node };
+        result.push(target);
+        return target;
+      },
+    );
     return result;
   }
 
@@ -323,6 +329,12 @@
   let filterMode = "default";
   let searchQuery = "";
 
+  function isHiddenEntry(entry) {
+    return entry.type === "message"
+      ? entry.message.display === false
+      : entry.type === "custom_message" && !entry.display;
+  }
+
   function hasTextContent(content) {
     if (typeof content === "string") {
       return content.trim().length > 0;
@@ -348,6 +360,16 @@
         .join("");
     }
     return "";
+  }
+
+  function renderableContentBlocks(content) {
+    if (Array.isArray(content)) {
+      return content;
+    }
+    if (typeof content === "string") {
+      return [{ type: "text", text: content }];
+    }
+    return [];
   }
 
   function getSearchableText(entry, label) {
@@ -401,6 +423,11 @@
       const entry = flatNode.node.entry;
       const label = flatNode.node.label;
       const isCurrentLeaf = entry.id === currentLeafId;
+
+      // All is the raw archive index; hidden input never becomes a conversation card.
+      if (isHiddenEntry(entry) && filterMode !== "all") {
+        return false;
+      }
 
       // Always show current leaf
       if (isCurrentLeaf) {
@@ -468,7 +495,7 @@
    * Recompute indentation/connectors for the filtered view
    *
    * Filtering can hide intermediate entries; descendants attach to the nearest visible ancestor.
-   * Keep indentation semantics aligned with flattenTree() so single-child chains don't drift right.
+   * Reuse the shared layout without rewriting the original tree or filtered record identities.
    */
   function recalculateVisualStructure(filteredNodes, allFlatNodes) {
     if (filteredNodes.length === 0) {
@@ -490,20 +517,19 @@
         if (visibleIds.has(currentId)) {
           return currentId;
         }
-        currentId = entryMap.get(currentId)?.node.entry.parentId;
+        const parentId = entryMap.get(currentId)?.node.entry.parentId;
+        currentId = parentId === currentId ? null : parentId;
       }
       return null;
     }
 
     // Build visible tree structure
-    const visibleParent = new Map();
     const visibleChildren = new Map();
     visibleChildren.set(null, []); // root-level nodes
 
     for (const flatNode of filteredNodes) {
       const nodeId = flatNode.node.entry.id;
       const ancestorId = findVisibleAncestor(nodeId);
-      visibleParent.set(nodeId, ancestorId);
 
       if (!visibleChildren.has(ancestorId)) {
         visibleChildren.set(ancestorId, []);
@@ -511,9 +537,7 @@
       visibleChildren.get(ancestorId).push(nodeId);
     }
 
-    // Update multipleRoots based on visible roots
     const visibleRootIds = visibleChildren.get(null);
-    const multipleRoots = visibleRootIds.length > 1;
 
     // Build a map for quick lookup: nodeId → FlatNode
     const filteredNodeMap = new Map();
@@ -521,80 +545,12 @@
       filteredNodeMap.set(flatNode.node.entry.id, flatNode);
     }
 
-    // DFS traversal of visible tree, applying same indentation rules as flattenTree()
-    // Stack items: [nodeId, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
-    const stack = [];
-
-    // Add visible roots in reverse order (to process in forward order via stack)
-    for (let i = visibleRootIds.length - 1; i >= 0; i--) {
-      const isLast = i === visibleRootIds.length - 1;
-      stack.push([
-        visibleRootIds[i],
-        multipleRoots ? 1 : 0,
-        multipleRoots,
-        multipleRoots,
-        isLast,
-        [],
-        multipleRoots,
-      ]);
-    }
-
-    while (stack.length > 0) {
-      const [nodeId, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] =
-        stack.pop();
-
-      const flatNode = filteredNodeMap.get(nodeId);
-      if (!flatNode) {
-        continue;
-      }
-
-      // Update this node's visual properties
-      flatNode.indent = indent;
-      flatNode.showConnector = showConnector;
-      flatNode.isLast = isLast;
-      flatNode.gutters = gutters;
-      flatNode.isVirtualRootChild = isVirtualRootChild;
-      flatNode.multipleRoots = multipleRoots;
-
-      // Get visible children of this node
-      const children = visibleChildren.get(nodeId) || [];
-      const multipleChildren = children.length > 1;
-
-      // Calculate child indent using same rules as flattenTree():
-      // - Parent branches (multiple children): children get +1
-      // - Just branched and indent > 0: children get +1 for visual grouping
-      // - Single-child chain: stay flat
-      let childIndent;
-      if (multipleChildren) {
-        childIndent = indent + 1;
-      } else if (justBranched && indent > 0) {
-        childIndent = indent + 1;
-      } else {
-        childIndent = indent;
-      }
-
-      // Build gutters for children (same logic as flattenTree)
-      const connectorDisplayed = showConnector && !isVirtualRootChild;
-      const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
-      const connectorPosition = Math.max(0, currentDisplayIndent - 1);
-      const childGutters = connectorDisplayed
-        ? [...gutters, { position: connectorPosition, show: !isLast }]
-        : gutters;
-
-      // Add children in reverse order (to process in forward order via stack)
-      for (let i = children.length - 1; i >= 0; i--) {
-        const childIsLast = i === children.length - 1;
-        stack.push([
-          children[i],
-          childIndent,
-          multipleChildren,
-          multipleChildren,
-          childIsLast,
-          childGutters,
-          false,
-        ]);
-      }
-    }
+    // Filtering preserves the full traversal's order; update the original last-ID records.
+    layoutTree(
+      visibleRootIds,
+      (nodeId) => visibleChildren.get(nodeId) || [],
+      (nodeId) => filteredNodeMap.get(nodeId),
+    );
   }
 
   // ============================================================
@@ -620,6 +576,25 @@
     return p;
   }
 
+  function truncateUtf16Safe(s, maxLen) {
+    const limit = Math.max(0, Math.floor(maxLen));
+    if (s.length <= limit) {
+      return s;
+    }
+
+    let end = limit;
+    if (end > 0) {
+      const lastCodeUnit = s.charCodeAt(end - 1);
+      const nextCodeUnit = s.charCodeAt(end);
+      const endsWithHighSurrogate = lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff;
+      const continuesWithLowSurrogate = nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff;
+      if (endsWithHighSurrogate && continuesWithLowSurrogate) {
+        end -= 1;
+      }
+    }
+    return s.slice(0, end);
+  }
+
   function formatToolCall(name, args) {
     switch (name) {
       case "read": {
@@ -640,11 +615,8 @@
         return `[edit: ${shortenPath(String(args.path || args.file_path || ""))}]`;
       case "bash": {
         const rawCmd = String(args.command || "");
-        const cmd = rawCmd
-          .replace(/[\n\t]/g, " ")
-          .trim()
-          .slice(0, 50);
-        return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
+        const cmd = rawCmd.replace(/[\n\t]/g, " ").trim();
+        return `[bash: ${truncateUtf16Safe(cmd, 50)}${rawCmd.length > 50 ? "..." : ""}]`;
       }
       case "grep":
         return `[grep: /${args.pattern || ""}/ in ${shortenPath(String(args.path || "."))}]`;
@@ -653,8 +625,9 @@
       case "ls":
         return `[ls: ${shortenPath(String(args.path || "."))}]`;
       default: {
-        const argsStr = JSON.stringify(args).slice(0, 40);
-        return `[${name}: ${argsStr}${JSON.stringify(args).length > 40 ? "..." : ""}]`;
+        const argsJson = JSON.stringify(args);
+        const argsStr = truncateUtf16Safe(argsJson, 40);
+        return `[${name}: ${argsStr}${argsJson.length > 40 ? "..." : ""}]`;
       }
     }
   }
@@ -665,6 +638,40 @@
     return div.innerHTML;
   }
 
+  function escapeHtmlAttr(text) {
+    return escapeHtml(text).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+
+  // Validate image fields before interpolating data URLs.
+  const SAFE_IMAGE_MIME_RE = /^image\/(png|jpeg|gif|webp|svg\+xml|bmp|tiff|avif)$/i;
+  const SAFE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+  function sanitizeImageMimeType(mimeType) {
+    if (typeof mimeType === "string" && SAFE_IMAGE_MIME_RE.test(mimeType)) {
+      return mimeType.toLowerCase();
+    }
+    return "application/octet-stream";
+  }
+
+  function sanitizeImageBase64(base64Data) {
+    if (typeof base64Data !== "string") {
+      return "";
+    }
+    const cleaned = base64Data.replace(/\s+/g, "");
+    if (!cleaned || cleaned.length % 4 !== 0 || !SAFE_BASE64_RE.test(cleaned)) {
+      return "";
+    }
+    return cleaned;
+  }
+
+  function renderDataUrlImage(img, className) {
+    const mimeType = sanitizeImageMimeType(img?.mimeType);
+    const imgBase64 = sanitizeImageBase64(img?.data);
+    if (!imgBase64) {
+      return "";
+    }
+    return `<img src="data:${mimeType};base64,${imgBase64}" class="${className}" />`;
+  }
   /**
    * Truncate string to maxLen chars, append "..." if truncated.
    */
@@ -672,7 +679,7 @@
     if (s.length <= maxLen) {
       return s;
     }
-    return s.slice(0, maxLen) + "...";
+    return truncateUtf16Safe(s, maxLen) + "...";
   }
 
   /**
@@ -680,7 +687,9 @@
    */
   function getTreeNodeDisplayHtml(entry, label) {
     const normalize = (s) => s.replace(/[\n\t]/g, " ").trim();
-    const labelHtml = label ? `<span class="tree-label">[${escapeHtml(label)}]</span> ` : "";
+    const labelHtml =
+      (isHiddenEntry(entry) ? '<span class="tree-muted">[hidden]</span> ' : "") +
+      (label ? `<span class="tree-label">[${escapeHtml(label)}]</span> ` : "");
 
     switch (entry.type) {
       case "message": {
@@ -722,13 +731,13 @@
               `<span class="tree-role-tool">${escapeHtml(formatToolCall(toolCall.name, toolCall.arguments))}</span>`
             );
           }
-          return labelHtml + `<span class="tree-role-tool">[${msg.toolName || "tool"}]</span>`;
+          return labelHtml + `<span class="tree-role-tool">[${escapeHtml(msg.toolName || "tool")}]</span>`;
         }
         if (msg.role === "bashExecution") {
           const cmd = truncate(normalize(msg.command || ""));
           return labelHtml + `<span class="tree-role-tool">[bash]:</span> ${escapeHtml(cmd)}`;
         }
-        return labelHtml + `<span class="tree-muted">[${msg.role}]</span>`;
+        return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
       }
       case "compaction":
         return (
@@ -751,11 +760,11 @@
         );
       }
       case "model_change":
-        return labelHtml + `<span class="tree-muted">[model: ${entry.modelId}]</span>`;
+        return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.modelId)}]</span>`;
       case "thinking_level_change":
-        return labelHtml + `<span class="tree-muted">[thinking: ${entry.thinkingLevel}]</span>`;
+        return labelHtml + `<span class="tree-muted">[thinking: ${escapeHtml(entry.thinkingLevel)}]</span>`;
       default:
-        return labelHtml + `<span class="tree-muted">[${entry.type}]</span>`;
+        return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.type)}]</span>`;
     }
   }
 
@@ -811,8 +820,8 @@
         div.appendChild(content);
         // Navigate to the newest leaf through this node, but scroll to the clicked node
         div.addEventListener("click", () => {
-          const leafId = findNewestLeaf(entry.id);
-          navigateTo(leafId, "target", entry.id);
+          const targetLeafId = findNewestLeaf(entry.id);
+          navigateTo(targetLeafId, "target", entry.id);
         });
 
         container.appendChild(div);
@@ -844,7 +853,7 @@
     setTimeout(() => {
       const activeNode = container.querySelector(".tree-node.active");
       if (activeNode) {
-        activeNode.scrollIntoView({ block: "nearest" });
+        activeNode.scrollIntoView?.({ block: "nearest" });
       }
     }, 0);
   }
@@ -944,6 +953,19 @@
     return null;
   }
 
+  function formatOutputLines(lines, lang) {
+    if (lang) {
+      const code = lines.join("\n");
+      try {
+        return hljs.highlight(code, { language: lang }).value;
+      } catch {
+        return escapeHtml(code);
+      }
+    }
+
+    return lines.map((line) => `<div>${escapeHtml(replaceTabs(line))}</div>`).join("");
+  }
+
   function formatExpandableOutput(text, maxLines, lang) {
     text = replaceTabs(text);
     const lines = text.split("\n");
@@ -951,21 +973,10 @@
     const remaining = lines.length - maxLines;
 
     if (lang) {
-      let highlighted;
-      try {
-        highlighted = hljs.highlight(text, { language: lang }).value;
-      } catch {
-        highlighted = escapeHtml(text);
-      }
+      const highlighted = formatOutputLines(lines, lang);
 
       if (remaining > 0) {
-        const previewCode = displayLines.join("\n");
-        let previewHighlighted;
-        try {
-          previewHighlighted = hljs.highlight(previewCode, { language: lang }).value;
-        } catch {
-          previewHighlighted = escapeHtml(previewCode);
-        }
+        const previewHighlighted = formatOutputLines(displayLines, lang);
 
         return `<div class="tool-output expandable" onclick="this.classList.toggle('expanded')">
               <div class="output-preview"><pre><code class="hljs">${previewHighlighted}</code></pre>
@@ -981,24 +992,15 @@
       let out =
         '<div class="tool-output expandable" onclick="this.classList.toggle(\'expanded\')">';
       out += '<div class="output-preview">';
-      for (const line of displayLines) {
-        out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
-      }
+      out += formatOutputLines(displayLines);
       out += `<div class="expand-hint">... (${remaining} more lines)</div></div>`;
       out += '<div class="output-full">';
-      for (const line of lines) {
-        out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
-      }
+      out += formatOutputLines(lines);
       out += "</div></div>";
       return out;
     }
 
-    let out = '<div class="tool-output">';
-    for (const line of displayLines) {
-      out += `<div>${escapeHtml(replaceTabs(line))}</div>`;
-    }
-    out += "</div>";
-    return out;
+    return `<div class="tool-output">${formatOutputLines(displayLines)}</div>`;
   }
 
   function renderToolCall(call) {
@@ -1010,7 +1012,7 @@
       if (!result) {
         return "";
       }
-      const textBlocks = result.content.filter((c) => c.type === "text");
+      const textBlocks = renderableContentBlocks(result.content).filter((c) => c.type === "text");
       return textBlocks.map((c) => c.text).join("\n");
     };
 
@@ -1018,7 +1020,7 @@
       if (!result) {
         return [];
       }
-      return result.content.filter((c) => c.type === "image");
+      return renderableContentBlocks(result.content).filter((c) => c.type === "image");
     };
 
     const renderResultImages = () => {
@@ -1028,9 +1030,7 @@
       }
       return (
         '<div class="tool-images">' +
-        images
-          .map((img) => `<img src="data:${img.mimeType};base64,${img.data}" class="tool-image" />`)
-          .join("") +
+        images.map((img) => renderDataUrlImage(img, "tool-image")).join("") +
         "</div>"
       );
     };
@@ -1209,7 +1209,7 @@
    */
   function buildShareUrl(entryId) {
     // Check for injected base URL (used when loaded in iframe via srcdoc)
-    const baseUrlMeta = document.querySelector('meta[name="pi-share-base-url"]');
+    const baseUrlMeta = document.querySelector('meta[name="openclaw-share-base-url"]');
     const baseUrl = baseUrlMeta ? baseUrlMeta.content : window.location.href.split("?")[0];
 
     const url = new URL(window.location.href);
@@ -1277,7 +1277,7 @@
    * Render the copy-link button HTML for a message.
    */
   function renderCopyLinkButton(entryId) {
-    return `<button class="copy-link-btn" data-entry-id="${entryId}" title="Copy link to this message">
+    return `<button class="copy-link-btn" data-entry-id="${escapeHtmlAttr(entryId)}" title="Copy link to this message">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
             <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
@@ -1286,9 +1286,12 @@
   }
 
   function renderEntry(entry) {
+    if (isHiddenEntry(entry)) {
+      return "";
+    }
     const ts = formatTimestamp(entry.timestamp);
     const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : "";
-    const entryId = `entry-${entry.id}`;
+    const entryId = `entry-${escapeHtmlAttr(entry.id)}`;
     const copyBtnHtml = renderCopyLinkButton(entry.id);
 
     if (entry.type === "message") {
@@ -1303,7 +1306,7 @@
           if (images.length > 0) {
             html += '<div class="message-images">';
             for (const img of images) {
-              html += `<img src="data:${img.mimeType};base64,${img.data}" class="message-image" />`;
+              html += renderDataUrlImage(img, "message-image");
             }
             html += "</div>";
           }
@@ -1312,10 +1315,12 @@
         const text =
           typeof content === "string"
             ? content
-            : content
-                .filter((c) => c.type === "text")
-                .map((c) => c.text)
-                .join("\n");
+            : Array.isArray(content)
+                ? content
+                    .filter((c) => c.type === "text")
+                    .map((c) => c.text)
+                    .join("\n")
+                : "";
         if (text.trim()) {
           html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
         }
@@ -1325,8 +1330,9 @@
 
       if (msg.role === "assistant") {
         let html = `<div class="assistant-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
+        const contentBlocks = renderableContentBlocks(msg.content);
 
-        for (const block of msg.content) {
+        for (const block of contentBlocks) {
           if (block.type === "text" && block.text.trim()) {
             html += `<div class="assistant-text markdown-content">${safeMarkedParse(block.text)}</div>`;
           } else if (block.type === "thinking" && block.thinking.trim()) {
@@ -1337,7 +1343,7 @@
           }
         }
 
-        for (const block of msg.content) {
+        for (const block of contentBlocks) {
           if (block.type === "toolCall") {
             html += renderToolCall(block);
           }
@@ -1393,7 +1399,7 @@
           </div>`;
     }
 
-    if (entry.type === "custom_message" && entry.display) {
+    if (entry.type === "custom_message") {
       return `<div class="hook-message" id="${entryId}">${tsHtml}
             <div class="hook-type">[${escapeHtml(entry.customType)}]</div>
             <div class="markdown-content">${safeMarkedParse(typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content))}</div>
@@ -1442,7 +1448,7 @@
               cost.cacheWrite += msg.usage.cost.cacheWrite || 0;
             }
           }
-          toolCalls += msg.content.filter((c) => c.type === "toolCall").length;
+          toolCalls += (Array.isArray(msg.content) ? msg.content : []).filter((c) => c.type === "toolCall").length;
         }
         if (msg.role === "toolResult") {
           toolResults++;
@@ -1513,7 +1519,11 @@
       msgParts.push(`${globalStats.branchSummaries} branch summaries`);
     }
 
-    let html = `
+    let html = "";
+    if (warning) {
+      html += `<div class="export-warning">${escapeHtml(warning)}</div>`;
+    }
+    html += `
           <div class="header">
             <h1>Session: ${escapeHtml(header?.id || "unknown")}</h1>
             <div class="help-bar">
@@ -1522,7 +1532,7 @@
             </div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : "unknown"}</span></div>
-              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(", ") || "unknown"}</span></div>
+              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${escapeHtml(globalStats.models.join(", ") || "unknown")}</span></div>
               <div class="info-item"><span class="info-label">Messages:</span><span class="info-value">${msgParts.join(", ") || "0"}</span></div>
               <div class="info-item"><span class="info-label">Tool Calls:</span><span class="info-value">${globalStats.toolCalls}</span></div>
               <div class="info-item"><span class="info-label">Tokens:</span><span class="info-value">${tokenParts.join(" ") || "0"}</span></div>
@@ -1664,7 +1674,7 @@
         const scrollTargetId = scrollToEntryId || targetId;
         const targetEl = document.getElementById(`entry-${scrollTargetId}`);
         if (targetEl) {
-          targetEl.scrollIntoView({ block: "center" });
+          targetEl.scrollIntoView?.({ block: "center" });
           // Briefly highlight the target message
           if (scrollToEntryId) {
             targetEl.classList.add("highlight");
@@ -1682,6 +1692,89 @@
   // Escape HTML tags in text (but not code blocks)
   function escapeHtmlTags(text) {
     return text.replace(/<(?=[a-zA-Z/])/g, "&lt;");
+  }
+
+  const INLINE_DATA_IMAGE_RE = /^data:image\/[a-z0-9.+-]+;base64,/i;
+
+  function normalizeMarkdownImageLabel(text) {
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    return trimmed || "image";
+  }
+
+  function renderMarkdownImage(token) {
+    const label = normalizeMarkdownImageLabel(token?.text);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!INLINE_DATA_IMAGE_RE.test(href)) {
+      return escapeHtml(label);
+    }
+    return `<img src="${escapeHtmlAttr(href)}" alt="${escapeHtmlAttr(label)}">`;
+  }
+
+  const SAFE_MARKDOWN_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:", "ftp:"]);
+
+  function decodeMarkdownHrefCodePoint(value, radix) {
+    const codePoint = Number.parseInt(value, radix);
+    if (
+      !Number.isFinite(codePoint) ||
+      codePoint < 0 ||
+      codePoint > 0x10ffff ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ) {
+      return "";
+    }
+    return String.fromCodePoint(codePoint);
+  }
+
+  function decodeMarkdownHrefEntities(text) {
+    return text.replace(
+      /&(?:#(\d+)|#x([\da-f]+)|(colon|tab|newline));/gi,
+      (_match, decimal, hex, named) => {
+        if (decimal) {
+          return decodeMarkdownHrefCodePoint(decimal, 10);
+        }
+        if (hex) {
+          return decodeMarkdownHrefCodePoint(hex, 16);
+        }
+        if (named?.toLowerCase() === "tab") {
+          return "\t";
+        }
+        if (named?.toLowerCase() === "newline") {
+          return "\n";
+        }
+        return ":";
+      },
+    );
+  }
+
+  function getMarkdownHrefProtocol(href) {
+    const normalized = decodeMarkdownHrefEntities(href)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029\ufeff\s]+/g, "")
+      .trim();
+    const match = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+    return match ? `${match[1].toLowerCase()}:` : null;
+  }
+
+  function isSafeMarkdownLinkHref(href) {
+    const trimmed = typeof href === "string" ? href.trim() : "";
+    if (!trimmed) {
+      return true;
+    }
+    const protocol = getMarkdownHrefProtocol(trimmed);
+    return protocol === null || SAFE_MARKDOWN_LINK_PROTOCOLS.has(protocol);
+  }
+
+  function renderMarkdownLink(token) {
+    const text = this.parser.parseInline(token.tokens);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!isSafeMarkdownLinkHref(href)) {
+      return text;
+    }
+
+    let html = `<a href="${escapeHtmlAttr(href)}"`;
+    if (typeof token?.title === "string" && token.title) {
+      html += ` title="${escapeHtmlAttr(token.title)}"`;
+    }
+    return `${html}>${text}</a>`;
   }
 
   // Configure marked with syntax highlighting and HTML escaping for text
@@ -1710,13 +1803,23 @@
         }
         return `<pre><code class="hljs">${highlighted}</code></pre>`;
       },
-      // Text content: escape HTML tags
+      // Delegate nested inline tokens; leaf text keeps the existing escaping.
       text(token) {
-        return escapeHtmlTags(escapeHtml(token.text));
+        return token.tokens ? false : escapeHtmlTags(escapeHtml(token.text));
       },
       // Inline code: escape HTML
       codespan(token) {
         return `<code>${escapeHtml(token.text)}</code>`;
+      },
+      // Raw HTML blocks/inline HTML: escape to prevent script execution.
+      html(token) {
+        return escapeHtml(token.text);
+      },
+      image(token) {
+        return renderMarkdownImage(token);
+      },
+      link(token) {
+        return renderMarkdownLink.call(this, token);
       },
     },
   });
@@ -1813,6 +1916,9 @@
     } else {
       navigateTo(leafId, "none");
     }
+  } else if (hasLeafControl) {
+    // A null leaf selected by a control record is an intentional empty branch.
+    navigateTo(null, "none");
   } else if (entries.length > 0) {
     // Fallback: use last entry if no leafId
     navigateTo(entries[entries.length - 1].id, "none");

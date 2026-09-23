@@ -1,13 +1,19 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import { requestUrl } from "openclaw/plugin-sdk/test-env";
 import { expect, vi } from "vitest";
+import type { OpenClawConfig } from "../../runtime-api.js";
+import type { MattermostFetch } from "./client.js";
 
-export function createMattermostTestConfig(): OpenClawConfig {
+let testConfigSequence = 0;
+
+export function createMattermostTestConfig(
+  cacheKey = String(++testConfigSequence),
+): OpenClawConfig {
   return {
     channels: {
       mattermost: {
         enabled: true,
-        botToken: "test-token",
-        baseUrl: "https://chat.example.com",
+        botToken: `test-token-${cacheKey}`,
+        baseUrl: `https://${cacheKey}.chat.example.com`,
       },
     },
   };
@@ -18,6 +24,9 @@ export function createMattermostReactionFetchMock(params: {
   emojiName: string;
   mode: "add" | "remove" | "both";
   userId?: string;
+  postChannelId?: string | null;
+  channelType?: string;
+  channelName?: string;
   status?: number;
   body?: unknown;
 }) {
@@ -29,17 +38,29 @@ export function createMattermostReactionFetchMock(params: {
   const removeStatus = params.status ?? 204;
   const removePath = `/api/v4/users/${userId}/posts/${params.postId}/reactions/${encodeURIComponent(params.emojiName)}`;
 
-  return vi.fn(async (url: any, init?: any) => {
-    if (String(url).endsWith("/api/v4/users/me")) {
-      return new Response(JSON.stringify({ id: userId }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
+  return vi.fn<typeof fetch>(async (url, init) => {
+    const urlText = requestUrl(url);
+    if (params.postChannelId !== undefined && urlText.endsWith(`/api/v4/posts/${params.postId}`)) {
+      return Response.json({ id: params.postId, channel_id: params.postChannelId });
+    }
+    if (urlText.endsWith("/api/v4/users/me")) {
+      return Response.json({ id: userId });
+    }
+    if (params.postChannelId && urlText.endsWith(`/api/v4/channels/${params.postChannelId}`)) {
+      return Response.json({
+        id: params.postChannelId,
+        type: params.channelType ?? "O",
+        name: params.channelName ?? "fixture-channel",
       });
     }
 
-    if (allowAdd && String(url).endsWith("/api/v4/reactions")) {
+    if (allowAdd && urlText.endsWith("/api/v4/reactions")) {
       expect(init?.method).toBe("POST");
-      expect(JSON.parse(init?.body)).toEqual({
+      const requestBody = init?.body;
+      if (typeof requestBody !== "string") {
+        throw new Error("expected string POST body");
+      }
+      expect(JSON.parse(requestBody)).toEqual({
         user_id: userId,
         post_id: params.postId,
         emoji_name: params.emojiName,
@@ -54,7 +75,7 @@ export function createMattermostReactionFetchMock(params: {
       );
     }
 
-    if (allowRemove && String(url).endsWith(removePath)) {
+    if (allowRemove && urlText.endsWith(removePath)) {
       expect(init?.method).toBe("DELETE");
       const responseBody = params.body === undefined ? null : params.body;
       return new Response(
@@ -65,19 +86,19 @@ export function createMattermostReactionFetchMock(params: {
       );
     }
 
-    throw new Error(`unexpected url: ${url}`);
+    throw new Error(`unexpected url: ${urlText}`);
   });
 }
 
 export async function withMockedGlobalFetch<T>(
-  fetchImpl: typeof fetch,
+  fetchImpl: MattermostFetch,
   run: () => Promise<T>,
 ): Promise<T> {
   const prevFetch = globalThis.fetch;
-  (globalThis as any).fetch = fetchImpl;
+  globalThis.fetch = fetchImpl;
   try {
     return await run();
   } finally {
-    (globalThis as any).fetch = prevFetch;
+    globalThis.fetch = prevFetch;
   }
 }

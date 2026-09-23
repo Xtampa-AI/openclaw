@@ -1,11 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// PTY command supervisor tests cover supervised terminal command lifecycles.
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createPtyAdapterMock } = vi.hoisted(() => ({
   createPtyAdapterMock: vi.fn(),
-}));
-
-vi.mock("../../agents/shell-utils.js", () => ({
-  getShellConfig: () => ({ shell: "sh", args: ["-c"] }),
 }));
 
 vi.mock("./adapters/pty.js", () => ({
@@ -33,44 +30,44 @@ function createStubPtyAdapter() {
 }
 
 describe("process supervisor PTY command contract", () => {
-  beforeEach(() => {
-    createPtyAdapterMock.mockReset();
+  let createProcessSupervisor: typeof import("./supervisor.js").createProcessSupervisor;
+
+  beforeAll(async () => {
+    ({ createProcessSupervisor } = await import("./supervisor.js"));
   });
 
-  it("passes PTY command verbatim to shell args", async () => {
+  beforeEach(() => {
+    createPtyAdapterMock.mockClear();
+  });
+
+  it("launches the supplied executable and argv verbatim without rediscovering a shell", async () => {
     createPtyAdapterMock.mockResolvedValue(createStubPtyAdapter());
-    const { createProcessSupervisor } = await import("./supervisor.js");
     const supervisor = createProcessSupervisor();
     const command = `printf '%s\\n' "a b" && printf '%s\\n' '$HOME'`;
 
     const run = await supervisor.spawn({
-      sessionId: "s1",
-      backendId: "test",
       mode: "pty",
-      ptyCommand: command,
+      argv: ["/trusted/launcher", "--literal", command],
       timeoutMs: 1_000,
     });
     const exit = await run.wait();
 
     expect(exit.reason).toBe("exit");
-    expect(createPtyAdapterMock).toHaveBeenCalledTimes(1);
-    const params = createPtyAdapterMock.mock.calls[0]?.[0] as { args?: string[] };
-    expect(params.args).toEqual(["-c", command]);
+    expect(createPtyAdapterMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ shell: "/trusted/launcher", args: ["--literal", command] }),
+    );
   });
 
-  it("rejects empty PTY command", async () => {
+  it("rejects empty PTY argv", async () => {
     createPtyAdapterMock.mockResolvedValue(createStubPtyAdapter());
-    const { createProcessSupervisor } = await import("./supervisor.js");
     const supervisor = createProcessSupervisor();
 
     await expect(
       supervisor.spawn({
-        sessionId: "s1",
-        backendId: "test",
         mode: "pty",
-        ptyCommand: "   ",
+        argv: [],
       }),
-    ).rejects.toThrow("PTY command cannot be empty");
+    ).rejects.toThrow("spawn argv cannot be empty");
     expect(createPtyAdapterMock).not.toHaveBeenCalled();
   });
 });

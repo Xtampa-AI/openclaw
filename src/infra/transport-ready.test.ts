@@ -1,28 +1,59 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { waitForTransportReady } from "./transport-ready.js";
+// Covers transport readiness polling.
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
+import { createTestRuntime } from "../commands/test-runtime-config-helpers.js";
 
-// Perf: `sleepWithAbort` uses `node:timers/promises` which isn't controlled by fake timers.
-// Route sleeps through global `setTimeout` so tests can advance time deterministically.
-vi.mock("./backoff.js", () => ({
-  sleepWithAbort: async (ms: number) => {
-    if (ms <= 0) {
-      return;
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, ms));
-  },
+const transportReadyMocks = vi.hoisted(() => ({
+  injectedSleepError: null as Error | null,
 }));
 
+type TransportReadyModule = typeof import("./transport-ready.js");
+let waitForTransportReady: TransportReadyModule["waitForTransportReady"];
+
+vi.mock("./backoff.js", async (importOriginal) => {
+  const { sleepWithAbort } = await importOriginal<typeof import("./backoff.js")>();
+  return {
+    sleepWithAbort: async (ms: number, signal?: AbortSignal) => {
+      if (transportReadyMocks.injectedSleepError) {
+        throw transportReadyMocks.injectedSleepError;
+      }
+      return sleepWithAbort(ms, signal);
+    },
+  };
+});
+
+function runtimeErrorMessageAt(
+  runtime: ReturnType<typeof createTestRuntime>,
+  index: number,
+): string {
+  const call = runtime.error.mock.calls[index];
+  if (!call || typeof call[0] !== "string") {
+    throw new Error(`expected runtime error call ${index + 1}`);
+  }
+  return call[0];
+}
+
+function latestRuntimeErrorMessage(runtime: ReturnType<typeof createTestRuntime>): string {
+  return runtimeErrorMessageAt(runtime, runtime.error.mock.calls.length - 1);
+}
+
 describe("waitForTransportReady", () => {
+  beforeAll(async () => {
+    ({ waitForTransportReady } = await import("./transport-ready.js"));
+  });
+
   beforeEach(() => {
     vi.useFakeTimers();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    transportReadyMocks.injectedSleepError = null;
   });
 
   it("returns when the check succeeds and logs after the delay", async () => {
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const runtime = createTestRuntime();
     let attempts = 0;
     const readyPromise = waitForTransportReady({
       label: "test transport",
@@ -48,7 +79,7 @@ describe("waitForTransportReady", () => {
   });
 
   it("throws after the timeout", async () => {
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const runtime = createTestRuntime();
     const waitPromise = waitForTransportReady({
       label: "test transport",
       timeoutMs: 110,
@@ -64,8 +95,33 @@ describe("waitForTransportReady", () => {
     expect(runtime.error).toHaveBeenCalled();
   });
 
+  it("caps oversized timeout values before computing the deadline", async () => {
+    vi.setSystemTime(1_000);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const runtime = createTestRuntime();
+    const waitPromise = waitForTransportReady({
+      label: "test transport",
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+      logAfterMs: Number.MAX_SAFE_INTEGER,
+      pollIntervalMs: Number.MAX_SAFE_INTEGER,
+      runtime,
+      check: async () => ({ ok: false, error: "still down" }),
+    });
+    const asserted = expect(waitPromise).rejects.toThrow("test transport not ready");
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runtime.error).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
+
+    await vi.runOnlyPendingTimersAsync();
+    await asserted;
+    expect(latestRuntimeErrorMessage(runtime)).toContain(
+      `not ready after ${MAX_TIMER_TIMEOUT_MS}ms`,
+    );
+  });
+
   it("returns early when aborted", async () => {
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const runtime = createTestRuntime();
     const controller = new AbortController();
     controller.abort();
     await waitForTransportReady({
@@ -75,6 +131,99 @@ describe("waitForTransportReady", () => {
       abortSignal: controller.signal,
       check: async () => ({ ok: false, error: "still down" }),
     });
+    expect(runtime.error).not.toHaveBeenCalled();
+  });
+
+  it.each([50, 150])(
+    "stops quietly when aborted during a probe (%dms elapsed)",
+    async (elapsedMs) => {
+      vi.setSystemTime(0);
+      const runtime = createTestRuntime();
+      const controller = new AbortController();
+      const probe = createDeferred<{ ok: boolean; error: string }>();
+      const check = vi.fn(() => probe.promise);
+      const waitPromise = waitForTransportReady({
+        label: "test transport",
+        timeoutMs: 100,
+        logAfterMs: 0,
+        runtime,
+        abortSignal: controller.signal,
+        check,
+      });
+
+      expect(check).toHaveBeenCalledOnce();
+      controller.abort();
+      vi.setSystemTime(elapsedMs);
+      probe.resolve({ ok: false, error: "still down" });
+
+      await expect(waitPromise).resolves.toBeUndefined();
+      expect(check).toHaveBeenCalledOnce();
+      expect(runtime.error).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops polling when aborted during the sleep interval", async () => {
+    const runtime = createTestRuntime();
+    const controller = new AbortController();
+    let attempts = 0;
+
+    const waitPromise = waitForTransportReady({
+      label: "test transport",
+      timeoutMs: 500,
+      pollIntervalMs: 50,
+      runtime,
+      abortSignal: controller.signal,
+      check: async () => {
+        attempts += 1;
+        setTimeout(() => controller.abort(), 10);
+        return { ok: false, error: "still down" };
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+    await waitPromise;
+
+    expect(attempts).toBe(1);
+    expect(runtime.error).not.toHaveBeenCalled();
+  });
+
+  it("logs repeated unknown-error retries and the final timeout message", async () => {
+    const runtime = createTestRuntime();
+    const waitPromise = waitForTransportReady({
+      label: "test transport",
+      timeoutMs: 120,
+      logAfterMs: 0,
+      logIntervalMs: 50,
+      pollIntervalMs: 50,
+      runtime,
+      check: async () => ({ ok: false, error: null }),
+    });
+
+    const asserted = expect(waitPromise).rejects.toThrow(
+      "test transport not ready (unknown error)",
+    );
+    await vi.advanceTimersByTimeAsync(200);
+    await asserted;
+
+    expect(runtime.error).toHaveBeenCalledTimes(2);
+    expect(runtimeErrorMessageAt(runtime, 0)).toContain("unknown error");
+    expect(latestRuntimeErrorMessage(runtime)).toContain("not ready after 120ms");
+  });
+
+  it("rethrows non-abort sleep failures", async () => {
+    const runtime = createTestRuntime();
+    transportReadyMocks.injectedSleepError = new Error("sleep exploded");
+
+    await expect(
+      waitForTransportReady({
+        label: "test transport",
+        timeoutMs: 500,
+        pollIntervalMs: 50,
+        runtime,
+        check: async () => ({ ok: false, error: "still down" }),
+      }),
+    ).rejects.toThrow("sleep exploded");
+
     expect(runtime.error).not.toHaveBeenCalled();
   });
 });
