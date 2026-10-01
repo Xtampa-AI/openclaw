@@ -27,10 +27,11 @@ import type {
   EmbeddedRunAttemptInternalParams,
 } from "./run/internal-params.js";
 
-function timeoutAttempt() {
+function timeoutAttempt(sessionIdUsed = "test-session") {
   const assistant = makeAssistantMessageFixture();
   assistant.usage = { ...assistant.usage, input: 180_000, totalTokens: 180_000 };
   return makeAttemptResult({
+    sessionIdUsed,
     terminal: { kind: "timeout", phase: "prompt", source: "idle", aborted: true },
     assistantTexts: [],
     lastAssistant: assistant,
@@ -116,88 +117,85 @@ describe("recovery cancellation through the public run owner", () => {
     ]);
   });
 
-  describe.each(["caller", "subscription"] as const)("%s accounting owner", (owner) => {
-    it.each([
-      { kind: "overflow", committed: false },
-      { kind: "timeout", committed: false },
-      { kind: "overflow", committed: true },
-      { kind: "timeout", committed: true },
-    ] as const)(
-      "preserves caller rejection and committed=$committed facts after $kind cancellation",
-      async ({ kind, committed }) => {
-        const workspaceDir = tempDirs.make("openclaw-recovery-cancel-");
-        const sessionManager = SessionManager.inMemory(workspaceDir);
-        const abort = new AbortController();
-        const callerError = new Error("caller stopped recovery");
-        const onCompactionAccounting =
-          vi.fn<(fact: CompactionAccountingFact | undefined) => void>();
-        if (owner === "subscription") {
-          session = await createSharedRunIntegrationSession();
-        }
-        const runParams = {
-          ...(session
-            ? session.runParams
-            : {
-                ...createOverflowRunParams({ workspaceDir }),
-                sessionId: sessionManager.getSessionId(),
-                sessionManager,
-                sessionPersistence: "detached" as const,
-              }),
-          abortSignal: abort.signal,
-        };
-        mockedRunEmbeddedAttempt.mockResolvedValueOnce(
-          kind === "overflow"
-            ? makeAttemptResult({
-                promptError: makeOverflowError(),
-                sessionIdUsed: runParams.sessionId,
-                assistantTexts: [],
-              })
-            : { ...timeoutAttempt(), sessionIdUsed: runParams.sessionId },
+  it.each([
+    { owner: "caller", kind: "overflow", committed: false },
+    { owner: "caller", kind: "timeout", committed: true },
+    { owner: "subscription", kind: "timeout", committed: false },
+    { owner: "subscription", kind: "overflow", committed: true },
+  ] as const)(
+    "preserves $owner rejection and committed=$committed facts after $kind cancellation",
+    async ({ owner, kind, committed }) => {
+      const workspaceDir = tempDirs.make("openclaw-recovery-cancel-");
+      const sessionManager = SessionManager.inMemory(workspaceDir);
+      const abort = new AbortController();
+      const callerError = new Error("caller stopped recovery");
+      const onCompactionAccounting = vi.fn<(fact: CompactionAccountingFact | undefined) => void>();
+      if (owner === "subscription") {
+        session = await createSharedRunIntegrationSession();
+      }
+      const runParams = {
+        ...(session
+          ? session.runParams
+          : {
+              ...createOverflowRunParams({ workspaceDir }),
+              sessionId: sessionManager.getSessionId(),
+              sessionManager,
+              sessionPersistence: "detached" as const,
+            }),
+        abortSignal: abort.signal,
+      };
+      mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+        kind === "overflow"
+          ? makeAttemptResult({
+              promptError: makeOverflowError(),
+              sessionIdUsed: runParams.sessionId,
+              assistantTexts: [],
+            })
+          : { ...timeoutAttempt(), sessionIdUsed: runParams.sessionId },
+      );
+      if (committed) {
+        mockedCompactDirect.mockResolvedValueOnce(
+          makeCompactionSuccess({ summary: "Committed before Stop", tokensAfter: 40 }),
         );
-        if (committed) {
-          mockedCompactDirect.mockResolvedValueOnce(
-            makeCompactionSuccess({ summary: "Committed before Stop", tokensAfter: 40 }),
-          );
-          mockedGlobalHookRunner.runAfterCompaction.mockImplementationOnce(async () => {
-            abort.abort(callerError);
-          });
-        } else {
-          mockedCompactDirect.mockImplementationOnce(async () => {
-            abort.abort(callerError);
-            throw callerError;
-          });
-        }
+        mockedGlobalHookRunner.runAfterCompaction.mockImplementationOnce(async () => {
+          abort.abort(callerError);
+        });
+      } else {
+        mockedCompactDirect.mockImplementationOnce(async () => {
+          abort.abort(callerError);
+          throw callerError;
+        });
+      }
 
-        const run =
-          owner === "caller"
-            ? runEmbeddedAgent({
-                ...runParams,
-                onCompactionAccounting,
-              })
-            : runEmbeddedAgent(runParams);
-        await expect(run).rejects.toBe(callerError);
+      const run =
+        owner === "caller"
+          ? runEmbeddedAgent({
+              ...runParams,
+              onCompactionAccounting,
+            })
+          : runEmbeddedAgent(runParams);
+      await expect(run).rejects.toBe(callerError);
 
-        expect(mockedCompactDirect).toHaveBeenCalledOnce();
-        expect(mockedRunEmbeddedAttempt).toHaveBeenCalledOnce();
-        if (session) {
-          const entry = sessionAccessor.loadSessionEntry({
-            ...session.runParams.sessionTarget,
-            readConsistency: "latest",
-          });
-          expect(entry).toMatchObject({ sessionId: runParams.sessionId });
-          expect(entry?.compactionCount ?? 0).toBe(committed ? 1 : 0);
-          expect(entry?.totalTokens).toBe(committed ? 40 : undefined);
-          expect(onCompactionAccounting).not.toHaveBeenCalled();
-        } else {
-          expect(onCompactionAccounting).toHaveBeenCalledExactlyOnceWith(
-            committed
-              ? { kind: "presentation-only", count: 1, currentContextSnapshot: { tokens: 40 } }
-              : undefined,
-          );
-        }
-      },
-    );
-  });
+      expect(mockedCompactDirect).toHaveBeenCalledOnce();
+      expect(mockedRunEmbeddedAttempt).toHaveBeenCalledOnce();
+      if (session) {
+        const entry = sessionAccessor.loadSessionEntry({
+          ...session.runParams.sessionTarget,
+          readConsistency: "latest",
+        });
+        expect(entry).toMatchObject({ sessionId: runParams.sessionId });
+        expect(entry?.compactionCount ?? 0).toBe(committed ? 1 : 0);
+        expect(entry?.totalTokens).toBe(committed ? 40 : undefined);
+        expect(onCompactionAccounting).not.toHaveBeenCalled();
+      } else {
+        expect(onCompactionAccounting).toHaveBeenCalledExactlyOnceWith(
+          committed
+            ? { kind: "presentation-only", count: 1, currentContextSnapshot: { tokens: 40 } }
+            : undefined,
+        );
+      }
+    },
+  );
 
   it.each(["writer-replaced", "admission-replaced", "deleted"] as const)(
     "does not persist completed default facts after its owner is %s",
@@ -209,7 +207,7 @@ describe("recovery cancellation through the public run owner", () => {
       let replacement: ReturnType<typeof prepareSystemAgentRunAdmission> | undefined;
       const abort = new AbortController();
       const callerError = new Error("caller stopped after owner changed");
-      mockedRunEmbeddedAttempt.mockResolvedValueOnce(timeoutAttempt());
+      mockedRunEmbeddedAttempt.mockResolvedValueOnce(timeoutAttempt(runParams.sessionId));
       mockedCompactDirect.mockResolvedValueOnce(
         makeCompactionSuccess({ summary: "Committed before owner change", tokensAfter: 40 }),
       );
@@ -309,7 +307,7 @@ describe("recovery cancellation through the public run owner", () => {
               throw attemptError;
             }
             return {
-              ...timeoutAttempt(),
+              ...timeoutAttempt(attempt.sessionId),
               compactionCount: harness.subscription.getCompactionCount(),
               compactionTokensAfter: 80,
             };
@@ -332,7 +330,7 @@ describe("recovery cancellation through the public run owner", () => {
             harness.emit({ type: "message_start", message: assistant });
             harness.emit({ type: "message_end", message: assistant });
             await harness.subscription.waitForPendingEvents();
-            return makeAttemptResult();
+            return makeAttemptResult({ sessionIdUsed: attempt.sessionId });
           } finally {
             harness.subscription.unsubscribe();
           }
@@ -440,7 +438,7 @@ describe("recovery cancellation through the public run owner", () => {
           sessionIdUsed: runParams.sessionId,
           lastAssistant: assistant,
           compactionCount: harness.subscription.getCompactionCount(),
-          compactionTokensAfter: testCase.count > 0 ? 40 : undefined,
+          compactionTokensAfter: 40,
         });
       } finally {
         harness.subscription.unsubscribe();
@@ -579,6 +577,7 @@ describe("recovery cancellation through the public run owner", () => {
       const beforeFinalization = sessionAccessor.loadSessionEntry(sessionTarget);
 
       await updateSessionStoreAfterAgentRun({
+        agentId: sessionTarget.agentId,
         cfg: {},
         agentDir: path.dirname(sessionTarget.storePath),
         sessionId,

@@ -1,18 +1,24 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expect, test, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   deleteSessionEntryLifecycle,
   replaceSessionEntrySync,
 } from "../config/sessions/session-accessor.js";
-import { addSessionMember, removeSessionMember } from "../config/sessions/session-sharing-store.js";
+import {
+  addSessionMember,
+  removeSessionMember,
+} from "../config/sessions/session-sharing-store.native.js";
 import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { createGatewayConnectionState } from "./server-connection-state.js";
 import type { GatewayClient } from "./server-methods/types.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { prepareProjectedSessionPresentation } from "./session-row-presentation.js";
 import { bindSessionRowProjection } from "./session-row-projection-access.js";
+import * as projectionRecords from "./session-row-projection-record.js";
 import { createSessionRowProjection } from "./session-row-projection.js";
 import { sharingPolicyClient } from "./session-sharing.test-utils.js";
 import type { SessionsListResult } from "./session-utils.types.js";
@@ -188,16 +194,13 @@ test("sessions.list preserves separate registered targets under a fixed store ow
 });
 
 test.for(
-  (["delete", "draft", "join", "leave"] as const).flatMap((change) => [
-    { change, alias: false },
-    { change, alias: true },
-  ]),
+  (["delete", "draft", "join", "leave"] as const).map((change) => ({
+    change,
+    alias: process.platform !== "win32",
+  })),
 )(
   "sessions.list refreshes $change against the selected physical database (alias=$alias)",
-  async ({ change, alias }, context) => {
-    if (alias && process.platform === "win32") {
-      context.skip();
-    }
+  async ({ change, alias }) => {
     const rootStateDir = process.env.OPENCLAW_STATE_DIR;
     if (!rootStateDir) {
       throw new Error("OPENCLAW_STATE_DIR is required for gateway session tests");
@@ -220,6 +223,7 @@ test.for(
       const entry = {
         sessionId: "ops-physical-session",
         updatedAt: 10,
+        displayName: "Physical database title",
         visibility:
           change === "join" || change === "leave" ? ("read-only" as const) : ("shared" as const),
         createdActor: { type: "human" as const, source: "profile" as const, id: "owner" },
@@ -228,7 +232,7 @@ test.for(
       await seedSessionTranscript({
         ...scope,
         sessionId: entry.sessionId,
-        messages: [{ role: "user", content: "Physical database title" }],
+        messages: [{ role: "user", content: "Physical database preview" }],
       });
       if (change === "leave") {
         addSessionMember(scope, {
@@ -238,19 +242,37 @@ test.for(
         });
       }
       const cfg = (await getGatewayConfigModule()).getRuntimeConfig();
+      const previewPublished = createDeferred();
+      const publishTranscriptFields = projectionRecords.publishTranscriptFields;
+      using publication = vi
+        .spyOn(projectionRecords, "publishTranscriptFields")
+        .mockImplementation((...args) => {
+          const published = publishTranscriptFields(...args);
+          const [row] = args;
+          if (
+            row.key === key &&
+            row.entry.sessionId === entry.sessionId &&
+            row.lastMessagePreview === "Physical database preview"
+          ) {
+            previewPublished.resolve();
+          }
+          return published;
+        });
       const projection = await createSessionRowProjection({ cfg });
-      await vi.waitFor(() =>
-        expect(
-          projection.snapshot({ key, agentId: "ops" }, { includeDerivedTitles: true }).row
-            ?.derivedTitle,
-        ).toBe("Physical database title"),
-      );
       const ensure = projection.ensureMaterialized;
       const spy = vi.spyOn(projection, "ensureMaterialized").mockImplementationOnce(async () => {
         await ensure();
         expect(
-          projection.snapshot({ key, agentId: "ops" }, { includeDerivedTitles: true }).row,
-        ).toMatchObject({ key, agentId: "ops", derivedTitle: "Physical database title" });
+          projection.snapshot(
+            { key, agentId: "ops" },
+            { includeDerivedTitles: true, includeLastMessage: true },
+          ).row,
+        ).toMatchObject({
+          key,
+          agentId: "ops",
+          derivedTitle: "Physical database title",
+          lastMessagePreview: "Physical database preview",
+        });
         if (change === "delete") {
           await deleteSessionEntryLifecycle({
             agentId: scope.agentId,
@@ -273,9 +295,20 @@ test.for(
         await ensure();
       });
       try {
+        await previewPublished.promise;
+        publication.mockRestore();
+        expect(
+          projection.snapshot(
+            { key, agentId: "ops" },
+            { includeDerivedTitles: true, includeLastMessage: true },
+          ).row,
+        ).toMatchObject({
+          derivedTitle: "Physical database title",
+          lastMessagePreview: "Physical database preview",
+        });
         const result = await directSessionReq<SessionsListResult>(
           "sessions.list",
-          { configuredAgentsOnly: true, includeDerivedTitles: true },
+          { configuredAgentsOnly: true, includeDerivedTitles: true, includeLastMessage: true },
           {
             client: sharingPolicyClient({ user: "viewer" }),
             context: bindSessionRowProjection({}, () => projection),
@@ -291,6 +324,7 @@ test.for(
               key,
               agentId: "ops",
               sessionId: entry.sessionId,
+              derivedTitle: "Physical database title",
               visibility: "read-only",
               sharingRole: change === "join" ? "member" : "viewer",
             },
@@ -299,6 +333,7 @@ test.for(
       } finally {
         spy.mockRestore();
         projection.dispose();
+        await projection.ensureMaterialized();
       }
     });
   },
@@ -347,7 +382,11 @@ test("captured sentinel rows never substitute a later same-owner session after d
       });
       await projection.ensureMaterialized();
       expect(prepareProjectedSessionPresentation(projection, client).present(captured)).toBeNull();
-      const connection = createGatewayConnectionState({ bootId: "retired-sentinel", cfg });
+      const connection = createGatewayConnectionState({
+        scheduler: createTestGatewayScheduler(),
+        bootId: "retired-sentinel",
+        cfg,
+      });
       const send = vi.fn();
       const recipient = {
         ...client,

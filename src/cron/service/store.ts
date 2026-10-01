@@ -21,9 +21,11 @@ import {
 } from "../store/run-receipt-store.js";
 import type { CronStoreTransactionHooks } from "../store/transaction-hooks.types.js";
 import type { CronJob, CronStoreFile } from "../types.js";
-import { computeJobNextRunAtMs, recomputeNextRuns } from "./jobs-scheduling.js";
 import { assertTimeScheduleSatisfiable } from "./jobs-validation.js";
-import { emit, type CronServiceState, type DeferredCronNotifications } from "./state.js";
+import { dispatchCronNotification } from "./notification-dispatch.js";
+import { resolveForcePreservedOneShotAtMs } from "./one-shot-schedule.js";
+import { publishDurableNextRunChanges } from "./runtime-publication.js";
+import type { CronServiceState, DeferredCronNotifications } from "./state.js";
 
 const loadedCronStoreRevisions = new WeakMap<CronServiceState, number>();
 
@@ -47,62 +49,6 @@ export type CronRollbackSnapshot = {
   durableNextRunAtMsByJobId: Map<string, number | undefined>;
 };
 
-function durableNextRunsFromJobs(jobs: readonly CronJob[]) {
-  return new Map(jobs.map((job) => [job.id, job.state.nextRunAtMs] as const));
-}
-
-function publishDurableNextRunChanges(params: {
-  state: CronServiceState;
-  storeJobs: readonly CronJob[];
-  stateOnly: boolean;
-  suppressScheduledJobId?: string;
-}) {
-  const previous = params.state.durableNextRunAtMsByJobId;
-  const next = params.stateOnly ? new Map(previous) : durableNextRunsFromJobs(params.storeJobs);
-
-  if (params.stateOnly) {
-    const currentJobsById = new Map(params.storeJobs.map((job) => [job.id, job] as const));
-    // State-only writes cannot create or delete rows. Preserve durable topology
-    // and update only rows that both snapshots know SQLite already contains.
-    for (const jobId of previous.keys()) {
-      const job = currentJobsById.get(jobId);
-      if (job) {
-        next.set(jobId, job.state.nextRunAtMs);
-      }
-    }
-  }
-
-  const changedJobs = params.storeJobs.filter((job) => {
-    if (!previous.has(job.id) || !next.has(job.id)) {
-      return false;
-    }
-    return previous.get(job.id) !== next.get(job.id);
-  });
-
-  // Advance durable truth before callbacks so re-entrant observers cannot
-  // publish the same committed transition twice.
-  params.state.durableNextRunAtMsByJobId = next;
-  for (const job of changedJobs) {
-    if (job.id === params.suppressScheduledJobId) {
-      continue;
-    }
-    emit(params.state, {
-      jobId: job.id,
-      action: "scheduled",
-      job,
-      nextRunAtMs: job.state.nextRunAtMs,
-    });
-  }
-}
-
-/** Publishes scheduled-row changes after a targeted runtime transaction commits. */
-export function publishCronRuntimeRows(state: CronServiceState): void {
-  if (!state.store) {
-    return;
-  }
-  publishDurableNextRunChanges({ state, storeJobs: state.store.jobs, stateOnly: false });
-}
-
 function invalidateStaleNextRunOnScheduleChange(params: {
   previousJobsById: ReadonlyMap<string, CronJob>;
   hydrated: CronJob;
@@ -117,7 +63,12 @@ function invalidateStaleNextRunOnScheduleChange(params: {
   params.hydrated.state.nextRunAtMs = undefined;
   params.hydrated.state.startupCatchupAtMs = undefined;
   params.hydrated.state.pacedNextRunAtMs = undefined;
-  params.hydrated.state.forcePreservedNextRunAtMs = undefined;
+  params.hydrated.state.forcePreservedNextRunAtMs = cronSchedulingInputsEqual(
+    { ...previousJob, enabled: params.hydrated.enabled },
+    params.hydrated,
+  )
+    ? resolveForcePreservedOneShotAtMs(params.hydrated)
+    : undefined;
 }
 
 function warnInvalidPersistedCronJob(params: {
@@ -154,9 +105,6 @@ export async function ensureLoaded(
   state: CronServiceState,
   opts?: {
     forceReload?: boolean;
-    /** Skip recomputing nextRunAtMs after load so the caller can run due
-     *  jobs against the persisted values first (see onTimer). */
-    skipRecompute?: boolean;
     /** A disabled writer commits only its changed rows, so quarantine cleanup
      *  must not turn its fresh read back into a full-store replacement. */
     deferQuarantinePersist?: boolean;
@@ -214,11 +162,7 @@ export async function ensureLoaded(
     const hydratedIsValid = !invalidReason && isValidatedCronJob(hydratedRaw);
     if (hydratedIsValid && hydratedRaw.enabled && hydratedSchedule.kind === "every") {
       try {
-        assertTimeScheduleSatisfiable(
-          { ...hydratedRaw, state: {} },
-          loadNowMs,
-          computeJobNextRunAtMs,
-        );
+        assertTimeScheduleSatisfiable({ ...hydratedRaw, state: {} }, loadNowMs);
       } catch {
         invalidReason = "unsatisfiable-schedule";
       }
@@ -291,17 +235,12 @@ export async function ensureLoaded(
       );
     }
   }
-
-  if (!opts?.skipRecompute) {
-    recomputeNextRuns(state);
-  }
 }
 
 /** Loads authoritative passive state without discarding enabled-scheduler transients. */
 export async function ensureLoadedForOperation(state: CronServiceState): Promise<void> {
   await ensureLoaded(state, {
     forceReload: !state.deps.cronEnabled,
-    skipRecompute: true,
     deferQuarantinePersist: !state.deps.cronEnabled,
   });
   if (!state.deps.cronEnabled) {
@@ -398,9 +337,9 @@ export function runPostPersistCronNotifications(
   state: CronServiceState,
   notifications: DeferredCronNotifications | undefined,
 ) {
-  for (const notify of notifications ?? []) {
+  for (const notification of notifications ?? []) {
     try {
-      notify();
+      dispatchCronNotification(state, notification);
     } catch (err) {
       state.deps.log.warn(
         { error: err instanceof Error ? err.message : String(err) },

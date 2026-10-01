@@ -1,6 +1,8 @@
 // Ambient trusted caller context for model-mediated Gateway tool calls.
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
+import type { ReplyTurnParticipants } from "../../auto-reply/reply/reply-run-registry.contracts.js";
+import type { AgentRuntimeIdentity } from "../../gateway/agent-runtime-identity-token.js";
 import type { CronCreatorAuthorityGrant } from "../../gateway/cron-creator-authority-grant.types.js";
 import type {
   GatewayContextResolver,
@@ -9,15 +11,26 @@ import type {
 import type { GatewayUiCommandTarget } from "../../gateway/ui-command-target.types.js";
 import type { WorkerSessionTurnClaim } from "../../gateway/worker-environments/placement-record.js";
 import type { WorkerTurnExecutionIdentityCapability } from "../../gateway/worker-environments/placement-turn-claim-events.js";
-import type { AgentRunDelegatedAuthority } from "../../infra/agent-run-registry.js";
-import { getGatewayContextResolver } from "../../plugins/runtime/gateway-request-scope.js";
+import {
+  validateAgentRunDelegatedAuthority,
+  type AgentRunDelegatedAuthority,
+} from "../../infra/agent-run-registry.js";
+import {
+  bindGatewayContextResolver,
+  getGatewayContextResolver,
+} from "../../plugins/runtime/gateway-request-scope.js";
 import {
   getAdmittedRunDelegatedAuthority,
+  readAdmittedRunOperatorAuthority,
+  type AdmittedRunOperatorAuthority,
   type AdmittedRunContext,
   type OperationalRunInstanceRef,
 } from "../admitted-run-context.js";
 import { copyAgentToolMetadata } from "../agent-tool-metadata.js";
-import type { EmbeddedRunToolAuthorityBinding } from "../embedded-agent-runner/run-state.js";
+import {
+  captureActiveEmbeddedRunPersonalToolParticipants,
+  type EmbeddedRunToolAuthorityBinding,
+} from "../embedded-agent-runner/run-state.js";
 import {
   attachInternalToolExecutionPreparer,
   getInternalToolExecutionPreparer,
@@ -25,6 +38,8 @@ import {
 import type { AnyAgentTool } from "./common.js";
 
 type GatewayToolCallerIdentity = {
+  personalToolParticipants?: ReplyTurnParticipants;
+  personalToolUser?: string;
   agentId: string;
   sessionKey: string;
   gatewayUiCommandTarget?: GatewayUiCommandTarget;
@@ -34,6 +49,8 @@ type GatewayToolCallerIdentity = {
   embeddedRunToolAuthorityBinding?: EmbeddedRunToolAuthorityBinding;
   /** Exact run authority used to fence delegated system-agent approvals. */
   approvalAuthority?: AgentRunDelegatedAuthority;
+  /** Original operator restriction, separate from this tool/turn's execution lifetime. */
+  operatorAuthority?: AdmittedRunOperatorAuthority;
   approvalAuthorityCheck?: () => boolean | void;
   /** Exact host-resolved owner of this individual approval request. */
   approvalOwnerPluginId?: string;
@@ -44,6 +61,8 @@ type GatewayToolCallerIdentity = {
   executionIdentityToken?: ExecutionIdentityAdmissionToken;
   /** Synchronous host-owned fence for tool effects and decision receipts. */
   receiptAuthority?: () => boolean | void;
+  /** Captured conversation policy for tools delegated through another tool's transport. */
+  assertToolAllowed?: (toolName: string) => void;
   /** Exact Gateway-owned worker claim; never sourced from model or RPC arguments. */
   workerTurnClaim?: WorkerSessionTurnClaim;
   /** Closure-bound Gateway capability; revalidates both owners at child admission. */
@@ -101,13 +120,15 @@ function bindGatewayToolContextResolver(
   if (!admittedContext) {
     return () => undefined;
   }
-  return () => {
+  const resolveAdmittedContext = () => {
     try {
       return resolveGatewayContext() === admittedContext ? admittedContext : undefined;
     } catch {
       return undefined;
     }
   };
+  bindGatewayContextResolver(resolveAdmittedContext, admittedContext.resolveGatewayContext);
+  return resolveAdmittedContext;
 }
 
 type AdmittedGatewayToolCallerParams = {
@@ -157,11 +178,13 @@ export function createAdmittedGatewayToolCallerIdentity(
     return undefined;
   }
   const delegatedAuthority = getAdmittedRunDelegatedAuthority(params.admittedRunContext);
+  const operatorAuthority = readAdmittedRunOperatorAuthority(params.admittedRunContext);
   return {
     agentId,
     sessionKey,
     operationalRunInstance: params.admittedRunContext.operationalRunInstance,
     ...(delegatedAuthority ? { approvalAuthority: delegatedAuthority } : {}),
+    ...(operatorAuthority ? { operatorAuthority } : {}),
     ...(params.receiptAuthority ? { approvalAuthorityCheck: params.receiptAuthority } : {}),
     ...(params.cronAuthorityCheck ? { cronAuthorityCheck: params.cronAuthorityCheck } : {}),
     executionIdentityToken: params.admittedRunContext.executionIdentityToken,
@@ -190,6 +213,53 @@ export function getGatewayToolCallerIdentity(): GatewayToolCallerIdentity | unde
   return gatewayToolCallerStorage.getStore();
 }
 
+/** Selection is model input; only the turn's host-owned participants grant a target. */
+export async function withGatewayPersonalToolUser<T>(
+  user: string | undefined,
+  run: () => Promise<T> | T,
+): Promise<T> {
+  const caller = getGatewayToolCallerIdentity();
+  if (!caller) {
+    if (user !== undefined) {
+      throw new Error("Selecting user requires an active personal-tool turn.");
+    }
+    return await run();
+  }
+  return await gatewayToolCallerStorage.run({ ...caller, personalToolUser: user }, run);
+}
+
+export function resolveGatewayPersonalToolParticipant(
+  runtimeIdentity?: AgentRuntimeIdentity,
+  options?: { requireSingleParticipant?: boolean },
+) {
+  const caller = getGatewayToolCallerIdentity();
+  if (caller?.personalToolParticipants) {
+    return caller.personalToolParticipants.resolve(
+      options?.requireSingleParticipant ? undefined : caller.personalToolUser,
+    );
+  }
+  if (caller?.personalToolUser !== undefined) {
+    throw new Error("Selecting user requires an active personal-tool turn.");
+  }
+  if (!caller && runtimeIdentity) {
+    const registered = captureActiveEmbeddedRunPersonalToolParticipants(runtimeIdentity);
+    if (!registered) {
+      return undefined;
+    }
+    const participant = registered.participants?.resolve();
+    return (
+      participant && {
+        ...participant,
+        assertCurrent: () => {
+          registered.assertCurrent();
+          participant.assertCurrent();
+        },
+      }
+    );
+  }
+  return undefined;
+}
+
 /** Capture the admitted run and worker owner, independently of optional audit collection. */
 export function captureGatewayToolCallerAssertion(): ((method?: string) => void) | undefined {
   const caller = getGatewayToolCallerIdentity();
@@ -199,6 +269,7 @@ export function captureGatewayToolCallerAssertion(): ((method?: string) => void)
   const isCurrent = caller.receiptAuthority;
   const signals = caller.approvalSignals ?? [];
   return (method) => {
+    caller.operatorAuthority?.assertCurrent();
     if (!isCurrent || signals.some((signal) => signal.aborted) || isCurrent() === false) {
       throw new Error("agent tool caller authority is no longer active");
     }
@@ -235,7 +306,29 @@ export async function withGatewayToolCallerIdentity<T>(
     inheritedOwner?.fullPermission === false || identity.fullPermission === false
       ? false
       : (inheritedOwner?.fullPermission ?? identity.fullPermission);
-  const approvalAuthority = inheritedOwner?.approvalAuthority ?? identity.approvalAuthority;
+  let approvalAuthority = inheritedOwner?.approvalAuthority ?? identity.approvalAuthority;
+  if (
+    inheritedOwner?.approvalAuthority &&
+    identity.approvalAuthority &&
+    inheritedOwner.approvalAuthority !== identity.approvalAuthority
+  ) {
+    if (
+      validateAgentRunDelegatedAuthority(
+        identity.approvalAuthority,
+        inheritedOwner.approvalAuthority,
+      )
+    ) {
+      approvalAuthority = identity.approvalAuthority;
+    } else if (
+      !validateAgentRunDelegatedAuthority(
+        inheritedOwner.approvalAuthority,
+        identity.approvalAuthority,
+      )
+    ) {
+      throw new Error("agent tool caller approval scopes do not retain the same source");
+    }
+  }
+  const operatorAuthority = inheritedOwner?.operatorAuthority ?? identity.operatorAuthority;
   const approvalAuthorityCheck =
     inheritedOwner?.approvalAuthorityCheck ?? identity.approvalAuthorityCheck;
   const signedAgentRuntimeIdentityToken =
@@ -247,6 +340,20 @@ export async function withGatewayToolCallerIdentity<T>(
     inheritedOwner?.receiptAuthority,
     identity.receiptAuthority,
   );
+  const toolPolicyAssertions = [
+    ...new Set(
+      [inheritedOwner?.assertToolAllowed, identity.assertToolAllowed].filter(
+        (assertion): assertion is (toolName: string) => void => assertion !== undefined,
+      ),
+    ),
+  ];
+  const assertToolAllowed = toolPolicyAssertions.length
+    ? (toolName: string) => {
+        for (const assertion of toolPolicyAssertions) {
+          assertion(toolName);
+        }
+      }
+    : undefined;
   const approvalSignals = [
     ...new Set([...(inheritedOwner?.approvalSignals ?? []), ...(identity.approvalSignals ?? [])]),
   ];
@@ -283,10 +390,14 @@ export async function withGatewayToolCallerIdentity<T>(
     {
       agentId: inheritedOwner?.agentId ?? identity.agentId.trim(),
       sessionKey: inheritedOwner?.sessionKey ?? identity.sessionKey.trim(),
+      personalToolParticipants:
+        inheritedOwner?.personalToolParticipants ?? identity.personalToolParticipants,
+      personalToolUser: inheritedOwner?.personalToolUser ?? identity.personalToolUser,
       ...(fullPermission !== undefined ? { fullPermission } : {}),
       ...(operationalRunInstance ? { operationalRunInstance } : {}),
       ...(embeddedRunToolAuthorityBinding ? { embeddedRunToolAuthorityBinding } : {}),
       ...(approvalAuthority ? { approvalAuthority } : {}),
+      ...(operatorAuthority ? { operatorAuthority } : {}),
       ...(approvalAuthorityCheck ? { approvalAuthorityCheck } : {}),
       ...(identity.approvalOwnerPluginId?.trim()
         ? { approvalOwnerPluginId: identity.approvalOwnerPluginId.trim() }
@@ -303,6 +414,7 @@ export async function withGatewayToolCallerIdentity<T>(
       ...(cronAuthorityCheck ? { cronAuthorityCheck } : {}),
       ...(executionIdentityToken ? { executionIdentityToken } : {}),
       ...(receiptAuthority ? { receiptAuthority } : {}),
+      ...(assertToolAllowed ? { assertToolAllowed } : {}),
       ...(approvalSignals.length ? { approvalSignals } : {}),
       ...(workerTurnClaim ? { workerTurnClaim } : {}),
       ...(workerTurnExecutionIdentityCapability ? { workerTurnExecutionIdentityCapability } : {}),
@@ -343,7 +455,9 @@ export function wrapToolWithGatewayCallerIdentity(
     execute: async (...args) =>
       await withGatewayToolCallerIdentity(identity, async () => await tool.execute?.(...args)),
   };
-  copyAgentToolMetadata(tool, wrapped);
+  copyAgentToolMetadata(tool, wrapped, (source) =>
+    wrapToolWithGatewayCallerIdentity(source, identity),
+  );
   const sourcePreparer = getInternalToolExecutionPreparer(tool);
   if (sourcePreparer) {
     attachInternalToolExecutionPreparer(wrapped, async (params) => {

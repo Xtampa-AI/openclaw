@@ -12,8 +12,13 @@ export type GatewayCronCreatorAuthorityAdmission = Readonly<{
   runId: string;
   callerOrigin: { kind: "local" } | { kind: "unknown" };
   managementEntitlement?: CronCreatorAuthorityCapability["managementEntitlement"];
+  requesterOwner?: CronCreatorAuthorityCapability["requesterOwner"];
+  /** Fresh remote user input may create under its existing caller restrictions. */
+  callerScopedCreation?: true;
   isCurrent?: () => boolean;
   bindRunScope?: (scope: CronCreatorAuthorityCapability) => void;
+  /** Retires accepted continuation custody even when dispatch never starts. */
+  release?: () => void;
 }>;
 
 type DirectOperatorAuthorityParams = {
@@ -73,6 +78,7 @@ function resolveDirectOperatorAuthority(
         ...(internal?.controlUiAdmin === true
           ? { managementEntitlement: { source: "control-ui-admin" as const } }
           : {}),
+        ...(internal?.isLocalClient !== true ? { callerScopedCreation: true as const } : {}),
         ...(params.isCurrent ? { isCurrent: params.isCurrent } : {}),
       })
     : undefined;
