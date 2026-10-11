@@ -126,7 +126,9 @@ export function normalizeBuiltInProviderModelId(provider: string, model: string)
       "fable-5": "claude-fable-5",
       "fable-5.1": "claude-fable-5-1",
       "fable-5-1": "claude-fable-5-1",
-      haiku: "claude-haiku-4-5",
+      haiku: "claude-haiku-5-5",
+      "haiku-5.5": "claude-haiku-5-5",
+      "haiku-5-5": "claude-haiku-5-5",
       "opus-5.5": "claude-opus-5-5",
       "opus-5-5": "claude-opus-5-5",
       "opus-5": "claude-opus-5",
@@ -209,21 +211,15 @@ export function normalizeConfiguredProviderCatalogModelId(
 
 /** Normalize embedded Google model aliases inside provider/model catalog refs. */
 export function normalizeConfiguredProviderCatalogModelRef(providerModel: string): string {
-  const googlePrefix = "google/";
-  if (!providerModel.startsWith(googlePrefix)) {
-    const parsed = parseModelCatalogRef(providerModel);
-    if (!parsed) {
-      return providerModel;
-    }
-    if (!parsed.modelId.startsWith(googlePrefix)) {
-      return providerModel;
-    }
-    const normalizedModelId = normalizeGooglePreviewModelId(parsed.modelId);
-    return normalizedModelId === parsed.modelId
-      ? providerModel
-      : `${parsed.provider}/${normalizedModelId}`;
+  if (providerModel.startsWith("google/")) {
+    return normalizeGooglePreviewModelId(providerModel);
   }
-  const modelId = providerModel.slice(googlePrefix.length);
-  const normalizedModelId = normalizeGooglePreviewModelId(modelId);
-  return normalizedModelId === modelId ? providerModel : `${googlePrefix}${normalizedModelId}`;
+  const parsed = parseModelCatalogRef(providerModel);
+  if (!parsed?.modelId.startsWith("google/")) {
+    return providerModel;
+  }
+  const normalizedModelId = normalizeGooglePreviewModelId(parsed.modelId);
+  return normalizedModelId === parsed.modelId
+    ? providerModel
+    : `${parsed.provider}/${normalizedModelId}`;
 }

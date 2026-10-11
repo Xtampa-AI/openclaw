@@ -241,8 +241,9 @@ same, and systemd's own 90-second default is unaffected.
 
 Service-child cleanup uses the remaining Gateway shutdown budget, leaving time
 for final exit bookkeeping. A forced restart drains admitted work within the same
-budget. When the restart scheduler has already exhausted its deferral budget,
-cleanup retains the 10-second reserve without starting a second drain.
+budget. Expiring the restart scheduler's idle deferral starts the normal drain:
+new work is fenced and admitted work gets the computed grace period, still capped
+by the native shutdown deadline. Deferral time does not spend that shutdown budget.
 For a supervisor's SIGTERM restart, a shorter requested drain limits when active
 runs are interrupted, not when database cleanup must finish: cleanup can use the
 remaining native stop budget. The Gateway still exits before the supervisor's
@@ -845,6 +846,15 @@ For pre-June installations, use the [bridge upgrade procedure](/install/updating
   `channel autostart suppressed by crash-loop breaker; refusing automatic
 start for <channel>… Start a channel manually with: openclaw gateway call
 channels.start --params '{"channel":"<id>"}'`
+
+  Safe mode also pauses main-session restart recovery. Interrupted entries and
+  transcripts stay unchanged: the pause does not charge an attempt, settle a
+  turn, send a notice, or tombstone a session. The recovery log names the pause
+  and the breaker window end. Once the full window drains, the same healthy
+  process automatically re-arms its existing recovery scheduler and resumes the
+  interrupted work once, using the original startup cutoff and ownership checks.
+  A new unclean boot extends the pause; shutdown or lifecycle replacement cancels
+  the pending re-arm. No manual retry or extra Gateway restart is required.
 
   Operator recovery SOP:
 

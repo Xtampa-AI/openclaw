@@ -19,7 +19,10 @@ import {
   type UpdateCompatibilityInventory,
   type UpdateCompatibilityRelease,
 } from "../../scripts/lib/update-compat-chunks.mts";
-import { buildUpdateConfigRuntimeAlias } from "../../scripts/lib/update-config-runtime-compat.mts";
+import {
+  buildUpdateConfigRuntimeAlias,
+  isUpdateConfigRuntimeAlias,
+} from "../../scripts/lib/update-config-runtime-compat.mts";
 import {
   rewriteRootRuntimeImportsToStableAliases,
   runRuntimePostBuild,
@@ -132,8 +135,6 @@ describe("runtime postbuild static assets", () => {
     `);
 
     expect(payload.outputs).toEqual([
-      "dist/extensions/acpx/mcp-command-line.mjs",
-      "dist/extensions/acpx/mcp-proxy.mjs",
       "dist/extensions/apple-fm/assets/AppleFoundationModels.swift",
       "dist/extensions/code-mode-quickjs/assets/encoding.so",
       "dist/extensions/code-mode-quickjs/assets/quickjs.wasm",
@@ -755,7 +756,6 @@ describe("runtime postbuild static assets", () => {
       path.join(distDir, "install.runtime-Aaa111.mjs"),
       [
         "export const scanPackageInstallSource = true;",
-        "export const scanFileInstallSource = true;",
         "export const scanInstalledPackageDependencyTree = true;",
         "export const scanBundleInstallSource = true;",
         "",
@@ -1003,7 +1003,6 @@ describe("runtime postbuild static assets", () => {
       path.join(distDir, "install.runtime-Aaa111.mjs"),
       [
         "export const scanPackageInstallSource = true;",
-        "export const scanFileInstallSource = true;",
         "export const scanInstalledPackageDependencyTree = true;",
         "export const scanBundleInstallSource = true;",
         "",
@@ -1237,45 +1236,67 @@ describe("previous release update compatibility", () => {
     return { root, inventory };
   }
 
-  it.each(["generated", "changed delegation", "missing source region"])(
-    "traces only verified delegating config aliases (%s)",
-    (variant) => {
-      const facade =
-        'export { createConfigIO, readConfigFileSnapshot } from "./config-abcdefgh.mjs";\nexport * from "./extra.mjs";\n';
-      const alias = buildUpdateConfigRuntimeAlias(
-        "io.runtime-abcdefgh.mjs",
-        parser.parseSourceFile("facade.mjs", facade),
-      );
-      const record = () =>
-        recordImportedFixture('(await import("./io.runtime.js"))', {
-          "io.runtime.js":
-            variant === "changed delegation"
-              ? alias.replace("return runtime[name]", "return undefined")
-              : alias,
-          "io.runtime-abcdefgh.mjs": facade,
-          "extra.mjs": "//#region src/config/extra.ts\nexport const targetOnly = true;\n",
-          "config-abcdefgh.mjs": [
-            'throw new Error("The recorder must not execute release code");',
-            ...(variant === "missing source region" ? [] : ["//#region src/config/io.ts"]),
-            "export function createConfigIO() {}",
-            "export function readConfigFileSnapshot() {}",
-          ].join("\n"),
-        });
-      if (variant !== "generated") {
-        expect(record).toThrow("Cannot trace io.runtime.js export createConfigIO");
-        return;
-      }
-      expect(record().inventory.releases[0]?.chunks).toMatchObject([
-        {
-          path: "io.runtime.js",
-          exports: ["createConfigIO", "readConfigFileSnapshot"].map((exported) => ({
-            exported,
-            origin: { module: "src/config/io.ts", symbol: exported },
-          })),
-        },
-      ]);
-    },
-  );
+  it.each([
+    "generated",
+    "historical",
+    "historical changed delegation",
+    "historical changed binding",
+    "historical changed target",
+    "changed delegation",
+    "missing source region",
+  ])("traces only verified delegating config aliases (%s)", (variant) => {
+    const facade =
+      'export { createConfigIO, readConfigFileSnapshot } from "./config-abcdefgh.mjs";\nexport * from "./extra.mjs";\n';
+    let alias = variant.startsWith("historical")
+      ? fsSync.readFileSync(
+          path.join(MODULE_ROOT, "test/fixtures/update-config-runtime-alias-2026.9.5.txt"),
+          "utf8",
+        )
+      : buildUpdateConfigRuntimeAlias(
+          "io.runtime-abcdefgh.mjs",
+          parser.parseSourceFile("facade.mjs", facade),
+        );
+    if (variant.endsWith("changed delegation")) {
+      alias = alias.replace("return runtime[name]", "return undefined");
+    } else if (variant === "historical changed binding") {
+      alias = alias.replace('select("createConfigIO")', 'select("readConfigFileSnapshot")');
+    } else if (variant === "historical changed target") {
+      alias = alias.replace('"./io.runtime-abcdefgh.mjs"', '"./"');
+      // Verify the alias owner independently of ModuleGraph's target-name guard.
+      expect(
+        isUpdateConfigRuntimeAlias(
+          alias,
+          "io.runtime-abcdefgh.mjs",
+          parser.parseSourceFile("facade.mjs", facade),
+        ),
+      ).toBe(false);
+    }
+    const record = () =>
+      recordImportedFixture('(await import("./io.runtime.js"))', {
+        "io.runtime.js": alias,
+        "io.runtime-abcdefgh.mjs": facade,
+        "extra.mjs": "//#region src/config/extra.ts\nexport const targetOnly = true;\n",
+        "config-abcdefgh.mjs": [
+          'throw new Error("The recorder must not execute release code");',
+          ...(variant === "missing source region" ? [] : ["//#region src/config/io.ts"]),
+          "export function createConfigIO() {}",
+          "export function readConfigFileSnapshot() {}",
+        ].join("\n"),
+      });
+    if (variant !== "generated" && variant !== "historical") {
+      expect(record).toThrow("Cannot trace io.runtime.js export createConfigIO");
+      return;
+    }
+    expect(record().inventory.releases[0]?.chunks).toMatchObject([
+      {
+        path: "io.runtime.js",
+        exports: ["createConfigIO", "readConfigFileSnapshot"].map((exported) => ({
+          exported,
+          origin: { module: "src/config/io.ts", symbol: exported },
+        })),
+      },
+    ]);
+  });
 
   it.each(["source scripts", "different owner", "mutable binding", "dist path", "unknown script"])(
     "distinguishes source completion contracts from unknown dynamic imports (%s)",
@@ -1851,6 +1872,41 @@ describe("previous release update compatibility", () => {
     const current = await import(pathToFileURL(path.join(root, "dist/worker.runtime.js")).href);
     expect(current.x()).toBe("node");
     expect(current.y()).toBe("npm");
+  });
+
+  it("retains published cleanup-scope imports after package replacement", () => {
+    const target = "runtime-cleanup-abcdefgh.mjs";
+    const { root, inventory } = recordImportedFixture(
+      `(await import("./${target}")).runCliDisposerAfterPending()`,
+      {
+        [target]:
+          '//#region src/cli/runtime-cleanup.ts\nexport function runCliDisposerAfterPending() { return "old"; }\n',
+      },
+      undefined,
+      "src/cli/runtime-cleanup-scope.ts",
+    );
+    fsSync.unlinkSync(path.join(root, "dist", target));
+    write(
+      root,
+      "dist/current.mjs",
+      '//#region src/cli/runtime-cleanup.ts\nfunction runCliDisposerAfterPending() { return "current"; } export { runCliDisposerAfterPending as cleanup };\n',
+    );
+    writeUpdateCompatibilityChunks({
+      distDir: path.join(root, "dist"),
+      sourceDir: root,
+      inventory,
+    });
+    const result = childProcess.execFileSync(
+      testNodeExecPath,
+      [
+        "--input-type=module",
+        "-e",
+        'import { unlinkSync } from "node:fs"; import { fileURLToPath } from "node:url"; const scope = await import(process.argv[1]); unlinkSync(fileURLToPath(process.argv[1])); console.log(await scope.restart());',
+        pathToFileURL(path.join(root, "dist/command.js")).href,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.trim()).toBe("current");
   });
 
   it("records emitted aliases and forwards old consumers to the current implementations", async () => {

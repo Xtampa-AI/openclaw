@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { isMainThread } from "node:worker_threads";
 import { publishedBackupRollback } from "./backup-rollback-summary.mjs";
 import { publishedNativeAssignments } from "./native-assignment-summary.mjs";
+import { assertPackageRecoveryEvidence } from "./package-activation-recovery.mjs";
 import { publishedPluginPolicy } from "./plugin-policy-summary.mjs";
 
 // Capture and snapshot validation stay plain Node. The host entrypoint owns
@@ -50,6 +51,10 @@ const nativeAssignmentLogs = [
   "native-assignment-eligibility.json",
   "native-assignment-baseline.json",
   "native-assignment-first-hop.json",
+  "native-assignment-inventory-after-first-hop.json",
+  "native-assignment-inventory-before-recovery.json",
+  "native-assignment-inventory-after-recovery.json",
+  "native-assignment-inventory-live-final.json",
   "native-assignment-proof.json",
   "native-assignment-messages.jsonl",
   "native-assignment-server.log",
@@ -80,6 +85,12 @@ const logNames = [
   "repair.err",
   "recovery-update.json",
   "recovery-update.err",
+  "interrupted-update.json",
+  "interrupted-update.err",
+  "next-update.json",
+  "next-update.err",
+  "stranded-update.json",
+  "stranded-update.err",
   "post-update-validate.json",
   "post-update-validate.err",
   "doctor.log",
@@ -116,6 +127,7 @@ const logNames = [
   "legacy-operator-post-update-cron-history.json",
   "legacy-operator-candidate-cron-history.json",
   "dreaming-cron-proof.json",
+  "cron-owner-proof.json",
   "legacy-operator-baseline-turn.out",
   "legacy-operator-baseline-turn.err",
   "legacy-operator-candidate-turn.out",
@@ -1676,6 +1688,36 @@ function publishedSuccessSummary(artifactRoot, sanitize) {
   }
   const pluginPolicy = publishedPluginPolicy(snapshot, { sanitize, boundedList });
   const nativeAssignments = publishedNativeAssignments(snapshot);
+  let packageActivationRecovery;
+  if (
+    ["package-publication-recovery", "package-verification-recovery"].includes(snapshot.scenario)
+  ) {
+    const proof = snapshot.packageActivationRecovery;
+    assertPackageRecoveryEvidence(proof);
+    packageActivationRecovery = {
+      status: proof.status,
+      cut: proof.interruption.cut,
+      phase: proof.interruption.phase,
+      writerVersion: proof.interruption.writerVersion,
+      candidateVersion: proof.candidate.version,
+      candidateSha256: proof.candidate.tarballSha256,
+      nextVersion: proof.nextUpdate.installed.version,
+      helperPreserved: true,
+      retainedBytesPreserved: true,
+      repeatRepairPassed: true,
+      distinctNextUpdatePassed: true,
+    };
+  } else if (snapshot.scenario === "package-stranded-first-hop") {
+    const proof = snapshot.packageActivationRecovery;
+    assertPackageRecoveryEvidence(proof);
+    packageActivationRecovery = {
+      status: proof.status,
+      writerVersion: "2026.9.7",
+      installedVersion: "2026.9.8",
+      firstHop: proof.firstHop,
+      newerCandidateInvoked: false,
+    };
+  }
   for (const value of [
     snapshot.baseline?.spec,
     snapshot.baseline?.version,
@@ -1769,6 +1811,7 @@ function publishedSuccessSummary(artifactRoot, sanitize) {
     backupRollback: publishedBackupRollback(snapshot, { sanitize, boundedList, textFields }),
     ...(pluginPolicy ? { pluginPolicy } : {}),
     ...(nativeAssignments ? { nativeAssignments } : {}),
+    ...(packageActivationRecovery ? { packageActivationRecovery } : {}),
     timings,
     phases: boundedList(snapshot.phases).map((event) => {
       if (
@@ -1818,6 +1861,7 @@ function publishedSuccessSummary(artifactRoot, sanitize) {
             ]
           : []),
         ...(snapshot.scenario === "dreaming-cron-doctor" ? ["dreaming-cron-proof.json"] : []),
+        ...(snapshot.scenario === "cron-owner-doctor" ? ["cron-owner-proof.json"] : []),
         ...(snapshot.scenario === "legacy-operator-state" &&
         snapshot.updateRestartMode === "manual" &&
         ["2026.9.3", "2026.9.4"].includes(snapshot.baseline.version)

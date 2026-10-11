@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -135,6 +136,36 @@ describe("Periphery intersection", () => {
 describe("shared OpenClawKit Periphery workflow", () => {
   const workflow = parse(readFileSync(WORKFLOW_PATH, "utf8")) as Workflow;
 
+  it.runIf(process.platform !== "win32").each(["scan-ios", "scan-macos"])(
+    "fails %s when the scanner crashes while preserving its status artifact",
+    (jobName) => {
+      const root = mkdtempSync(join(tmpdir(), "openclaw-periphery-producer-"));
+      const platform = jobName === "scan-ios" ? "ios" : "macos";
+      const scan = workflow.jobs?.[jobName]?.steps?.find((step) => step.name === "Scan shared kit");
+      try {
+        mkdirSync(join(root, "apps", platform), { recursive: true });
+        mkdirSync(join(root, `shared-periphery-${platform}`));
+        mkdirSync(join(root, "bin"));
+        writeFileSync(join(root, "bin", "periphery"), "#!/bin/sh\nexit 138\n", { mode: 0o755 });
+        const result = spawnSync("bash", ["-c", scan?.run ?? ""], {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            RUNNER_TEMP: root,
+            PATH: `${join(root, "bin")}:${process.env.PATH}`,
+          },
+        });
+        expect(result.status, result.stderr).toBe(138);
+        expect(
+          readFileSync(join(root, `shared-periphery-${platform}`, "periphery.status"), "utf8"),
+        ).toBe("138\n");
+      } finally {
+        rmSync(root, { force: true, recursive: true });
+      }
+    },
+  );
+
   it("runs two consumer scans and a same-run intersection", () => {
     expect(workflow.jobs?.["scan-ios"]?.name).toBe("Scan shared kit from iOS");
     expect(workflow.jobs?.["scan-macos"]?.name).toBe("Scan shared kit from macOS");
@@ -186,7 +217,7 @@ describe("shared OpenClawKit Periphery workflow", () => {
       const scan = workflow.jobs?.[jobName]?.steps?.find((step) => step.name === "Scan shared kit");
       expect(scan?.run).toContain("--report-include '../shared/OpenClawKit/Sources/**'");
       expect(scan?.run).toContain(
-        "--retain-files '../shared/OpenClawKit/Sources/OpenClawProtocol/GatewayModels.swift'",
+        "--retain-files '**/GenerateGatewayProtocol/GatewayModels.swift'",
       );
       expect(scan?.run).not.toContain("--strict");
     }

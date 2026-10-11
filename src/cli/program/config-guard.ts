@@ -1,6 +1,9 @@
 // CLI config readiness guard and invalid-config recovery.
 import { withSuppressedNotes } from "../../../packages/terminal-core/src/note.js";
-import type { StartupConfigPreflightResult } from "../../commands/startup-config-preflight.js";
+import type {
+  StartupConfigPreflightOptions,
+  StartupConfigPreflightResult,
+} from "../../commands/startup-config-preflight.js";
 import { readConfigFileSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import {
   configFailureHeading,
@@ -30,7 +33,6 @@ const ALLOWED_INVALID_GATEWAY_SUBCOMMANDS = new Set([
   "probe",
   "health",
   "discover",
-  "call",
   "install",
   "uninstall",
   "start",
@@ -94,7 +96,7 @@ export async function ensureConfigReady(
     commandPath?: string[];
     suppressDoctorStdout?: boolean;
     allowInvalid?: boolean;
-    beforeStatePreparation?: (snapshot?: ConfigFileSnapshot) => Promise<boolean>;
+    beforeStatePreparation?: StartupConfigPreflightOptions["beforeStatePreparation"];
     measure?: ConfigSnapshotReadMeasure;
     validateConfigOnly?: boolean;
   },
@@ -126,8 +128,6 @@ export async function ensureConfigReady(
     commandName !== "health" &&
     commandName !== "logs" &&
     commandName !== "sessions" &&
-    // Remote RPC clients validate without preparing state owned by the running Gateway.
-    !(commandName === "gateway" && subcommandName === "call") &&
     // A newer restart client may be controlling an older live Gateway. Validate
     // config without advancing the persistent schema owned by that process.
     !isRestartController &&
@@ -186,10 +186,7 @@ export async function ensureConfigReady(
   const configSnapshotOptions =
     params.validateConfigOnly || commandName === "logs"
       ? ({ observe: false, pluginValidation: "core-only" } as const)
-      : isManagedNodeRuntime ||
-          commandName === "status" ||
-          (commandName === "gateway" && subcommandName === "call") ||
-          isRestartController
+      : isManagedNodeRuntime || commandName === "status" || isRestartController
         ? ({ observe: false } as const)
         : undefined;
   const snapshot =
