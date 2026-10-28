@@ -462,14 +462,6 @@ function decodeSqliteValue(value: unknown): null | string | number | bigint | Bu
   throw new Error("Git backup row contains an invalid encoded object.");
 }
 
-function convergeRestoredSchema(database: DatabaseSync, identity: GitBackupIdentity): void {
-  database.exec(
-    identity.role === "global"
-      ? getOpenClawStateRuntimeSchema({ includeVersionLazyAdditiveTables: false })
-      : OPENCLAW_AGENT_SCHEMA_SQL,
-  );
-}
-
 function validateRestoredOwner(
   database: DatabaseSync,
   databasePath: string,
@@ -580,12 +572,13 @@ export async function restoreGitBackupDirectory(params: {
     targetDirectory,
     ".git-backup-restore-",
   );
-  applyPrivateModeSync(stagingDirectory, 0o700);
-  const stagedPath = path.join(stagingDirectory, SNAPSHOT_SQLITE_FILENAME);
-  const stagedHandle = await fs.open(stagedPath, "wx", 0o600);
-  await stagedHandle.close();
-  const database = openNodeSqliteDatabase(stagedPath);
+  let database: DatabaseSync | undefined;
   try {
+    applyPrivateModeSync(stagingDirectory, 0o700);
+    const stagedPath = path.join(stagingDirectory, SNAPSHOT_SQLITE_FILENAME);
+    const stagedHandle = await fs.open(stagedPath, "wx", 0o600);
+    await stagedHandle.close();
+    database = openNodeSqliteDatabase(stagedPath);
     database.exec("PRAGMA foreign_keys = OFF; PRAGMA journal_mode = DELETE;");
     for (const statement of [...plainTables, ...indexes]) {
       database.exec(statement);
@@ -628,7 +621,11 @@ export async function restoreGitBackupDirectory(params: {
     database.exec(`PRAGMA user_version = ${manifest.userVersion};`);
     // Redacted and operational projection tables are absent from Git. Recreate
     // their canonical empty schemas before enforcing database ownership.
-    convergeRestoredSchema(database, restoreIdentity);
+    database.exec(
+      restoreIdentity.role === "global"
+        ? getOpenClawStateRuntimeSchema({ includeVersionLazyAdditiveTables: false })
+        : OPENCLAW_AGENT_SCHEMA_SQL,
+    );
     validateRestoredOwner(database, stagedPath, restoreIdentity);
     const tables: GitBackupTableResult[] = [];
     for (const [table, expected] of Object.entries(manifest.tables)) {
@@ -674,7 +671,7 @@ export async function restoreGitBackupDirectory(params: {
       excludedConfigStateKeyPrefixes: manifest.excludedConfigStateKeyPrefixes,
     };
   } catch (error) {
-    if (database.isOpen) {
+    if (database?.isOpen) {
       database.close();
     }
     throw error;

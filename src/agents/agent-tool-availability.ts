@@ -1,5 +1,6 @@
 import { createToolExecutionMatcher } from "./tool-policy-shared.js";
 import type { AnyAgentTool } from "./tools/common.js";
+import { textResult } from "./tools/tool-results.js";
 
 type ToolDefinition = Pick<AnyAgentTool, "name" | "parameters" | "description">;
 
@@ -48,6 +49,19 @@ export function markAgentToolExecutionUnavailable<T extends object>(tool: T): T 
   return tool;
 }
 
+/** Keep a stable definition while refusing execution for this turn. */
+export function gateAgentToolExecution<T extends AnyAgentTool>(tool: T, message: string): T {
+  return markAgentToolExecutionUnavailable(
+    copyAgentToolAvailability(tool, {
+      ...tool,
+      prepareArguments: undefined,
+      prepareBeforeToolCallParams: undefined,
+      finalizeBeforeToolCallParams: undefined,
+      execute: async () => textResult(message, { gated: true }),
+    }),
+  );
+}
+
 /** Finalize owner-controlled affordances after filtering; never rebind or grant tools. */
 export function finalizeAgentToolAvailability<T extends ToolDefinition>(
   tools: readonly T[],
@@ -63,14 +77,13 @@ export function finalizeAgentToolAvailability<T extends ToolDefinition>(
   const executionAllowed = options?.toolExecutionAllow
     ? createToolExecutionMatcher(options.toolExecutionAllow)
     : undefined;
-  const callableTools = new Map<string, T>();
-  for (const callableTool of [...winners.values()].filter(
-    (tool) =>
-      !availabilityBindings.get(tool)?.executionDenied &&
-      (!executionAllowed || executionAllowed(tool.name)),
-  )) {
-    callableTools.set(callableTool.name, callableTool);
-  }
+  const callableTools = new Map(
+    [...winners].filter(
+      ([, tool]) =>
+        !availabilityBindings.get(tool)?.executionDenied &&
+        (!executionAllowed || executionAllowed(tool.name)),
+    ),
+  );
   for (const tool of tools) {
     const binding = availabilityBindings.get(tool)?.binding;
     if (binding && (!options?.beforeNormalization || binding.prepareBeforeNormalization)) {

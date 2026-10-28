@@ -67,9 +67,11 @@ if [[ -z "$BINDING_STORE_CONTRACT" ]]; then
     BINDING_STORE_CONTRACT="legacy-sidecar"
   fi
 fi
-if grep -q \
+# The source-reply contract moved out of dynamic-tools.ts (#164558); search the app-server
+# sources so split candidates still select the explicit-finality contract.
+if grep -rqs --include='*.ts' --exclude='*.test.ts' \
   'continuesSourceReplyProgress' \
-  "$CANDIDATE_ROOT/extensions/codex/src/app-server/dynamic-tools.ts" 2>/dev/null; then
+  "$CANDIDATE_ROOT/extensions/codex/src/app-server/"; then
   FOLLOWTHROUGH_PROGRESS_FINAL_MODE="explicit"
 else
   # Frozen candidates continue after omitted finality; current candidates require false.

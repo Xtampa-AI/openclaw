@@ -4,7 +4,7 @@ import type { Model } from "../llm/types.js";
 import type { ActiveRemoteModelCatalog } from "../model-catalog/remote-overlay.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PreparedSyntheticAuthFacts } from "../plugins/provider-synthetic-auth.js";
-import type { AuthProfileStore } from "./auth-profiles/types.js";
+import type { AuthProfileStore, SharedAuthStoreOwnership } from "./auth-profiles/types.js";
 import type { ModelCatalogAuthLabels } from "./model-catalog-auth-labels.js";
 import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
 import type { PreparedModelRuntimeAuth } from "./prepared-model-runtime-auth.js";
@@ -23,6 +23,7 @@ export type PreparedModelCatalogWorkerInput = Readonly<{
   configResolutionFacts: ReturnType<typeof serializeConfigResolutionFacts>;
   sourceConfigResolutionFacts: ReturnType<typeof serializeConfigResolutionFacts>;
   authStore: AuthProfileStore;
+  sharedAuthStoreOwnership?: SharedAuthStoreOwnership;
   providerIds: readonly string[];
   catalogFacts: Pick<
     PreparedModelRuntimeAgentFacts,
@@ -38,7 +39,7 @@ export type PreparedModelCatalogWorkerTask = {
 };
 
 export type PreparedModelWorkerCommand =
-  | Readonly<{ kind: "catalog"; providerIds?: readonly string[] }>
+  | Readonly<{ kind: "catalog"; providerIds?: readonly string[]; refresh?: boolean }>
   | Readonly<{
       kind: "auth-refresh";
       profileIds?: readonly string[];

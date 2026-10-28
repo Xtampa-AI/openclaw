@@ -28,6 +28,27 @@ import { createWorkerSessionPlacementStore } from "../worker-environments/placem
 import { handleChatSend } from "./chat-send-handler.js";
 import type { GatewayClient, RespondFn } from "./types.js";
 
+export function setClientProfile(
+  client: GatewayClient,
+  profile: { id: string; updatedAt: number },
+) {
+  client.authenticatedUserProfile = {
+    profileId: profile.id,
+    displayName: null,
+    hasAvatar: false,
+    updatedAt: profile.updatedAt,
+  };
+}
+
+export function setNativeIosClient(client: GatewayClient) {
+  client.connect.client = {
+    id: "openclaw-ios",
+    version: "test",
+    platform: "ios",
+    mode: "ui",
+  };
+}
+
 export function useBrowserFollowupFixture() {
   const temporaryDirs = useAutoCleanupTempDirTracker((cleanup) => {
     afterEach(async () => {
@@ -47,11 +68,20 @@ export function useBrowserFollowupFixture() {
       preserveContent?: boolean;
       transientProjectionFailures?: number;
       persistDuringDispatch?: boolean;
+      /** Configure an absolute per-agent `{agentId}` store outside the state directory. */
+      perAgentStore?: boolean;
     } = {},
   ) {
     const active = options.active !== false;
-    const storePath = path.join(temporaryDirs.make("openclaw-chat-custody-"), "sessions.json");
-    testState.sessionStorePath = storePath;
+    const storeRoot = options.perAgentStore
+      ? path.join(temporaryDirs.make("openclaw-chat-custody-"), "agents")
+      : undefined;
+    const storePath = storeRoot
+      ? path.join(storeRoot, "main", "sessions", "sessions.json")
+      : path.join(temporaryDirs.make("openclaw-chat-custody-"), "sessions.json");
+    testState.sessionStorePath = storeRoot
+      ? path.join(storeRoot, "{agentId}", "sessions", "sessions.json")
+      : storePath;
     const scope = {
       agentId: "main",
       sessionKey: "agent:main:main",
@@ -59,11 +89,12 @@ export function useBrowserFollowupFixture() {
       storePath,
     };
     await writeSessionStore({
+      storePath,
       entries: {
         main: {
           sessionId: scope.sessionId,
           updatedAt: Date.now(),
-          status: active ? "running" : "done",
+          status: active ? undefined : "done",
           ...(options.createdActor ? { createdActor: options.createdActor } : {}),
           ...(options.sandbox ? { sandbox: options.sandbox } : {}),
         },

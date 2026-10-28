@@ -229,6 +229,12 @@ export const DEFERRED_CANONICAL_COERCION_EXPORTS = [
     name: "formatErrorMessage",
     reason: "Dependency-light scripts retain a deliberately smaller formatting policy.",
   },
+  {
+    file: "scripts/lib/error-format.mts",
+    name: "formatErrorMessageWithCauses",
+    reason:
+      "Dependency-light release diagnostics need bounded cause-chain rendering before install.",
+  },
 ] as const satisfies readonly { file: string; name: string; reason: string }[];
 
 const EXCEPTIONAL_COERCION_HELPER_CARVE_OUTS = [
@@ -342,19 +348,15 @@ export type CoercionHelperCarveOut = {
   reason: string;
 };
 
-function canonicalOwnerCarveOuts(
-  owner: (typeof CANONICAL_COERCION_HELPER_OWNERS)[number],
-): CoercionHelperCarveOut[] {
-  return owner.names.map((name) => ({
-    file: owner.file,
-    kind: owner.kind,
-    name,
-    reason: "Canonical coercion helper owned by this module.",
-  }));
-}
-
 export const COERCION_HELPER_CARVE_OUTS: readonly CoercionHelperCarveOut[] = [
-  ...CANONICAL_COERCION_HELPER_OWNERS.flatMap(canonicalOwnerCarveOuts),
+  ...CANONICAL_COERCION_HELPER_OWNERS.flatMap(({ file, kind, names }) =>
+    names.map((name) => ({
+      file,
+      kind,
+      name,
+      reason: "Canonical coercion helper owned by this module.",
+    })),
+  ),
   ...EXCEPTIONAL_COERCION_HELPER_CARVE_OUTS,
 ];
 
@@ -381,7 +383,6 @@ function carveOutKey(entry: Pick<CoercionHelperCarveOut, "file" | "kind" | "name
   return `${entry.file}\0${entry.name}\0${entry.kind}`;
 }
 
-/** Returns true for tracked source files governed by the declaration guard. */
 export function isGovernedCoercionHelperPath(filePath: string) {
   return (
     isCodeFile(filePath) &&
@@ -424,7 +425,6 @@ function isCallableOrDirectAlias(expression: ts.Expression) {
   );
 }
 
-/** Finds banned callable declarations in one source file. */
 export function findBannedCoercionHelperDeclarations(
   source: string,
   file: string,
@@ -648,7 +648,6 @@ function auditDefaultCanonicalExports(repoRoot: string, parser: API): CanonicalC
   return auditCanonicalCoercionExports(exportsByFile, classifications);
 }
 
-/** Runs the full tracked-source declaration guard. */
 export async function runCoercionHelperDeclarationGuard(
   options: {
     carveOuts?: readonly CoercionHelperCarveOut[];

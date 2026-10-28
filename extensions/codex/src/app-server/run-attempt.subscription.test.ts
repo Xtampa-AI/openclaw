@@ -25,7 +25,10 @@ import {
   userMessage,
 } from "./run-attempt-test-harness.js";
 import * as runAttemptTurnRequest from "./run-attempt-turn-request.js";
-import { createContextEngine } from "./run-attempt.context-engine.test-support.js";
+import {
+  createContextEngine,
+  requestMethodsExcludingSkillDiscovery,
+} from "./run-attempt.context-engine.test-support.js";
 import {
   readCodexAppServerBinding,
   writeCodexAppServerBinding,
@@ -41,12 +44,14 @@ describe("Codex attempt subscription recovery", () => {
     const sessionFile = path.join(tempDir, "interrupted.jsonl");
     const abort = new AbortController();
     const params = createParams(sessionFile, workspaceDir);
+    params.timeoutMs = 60_000;
     params.abortSignal = abort.signal;
     const siblingParams = createParams(path.join(tempDir, "sibling.jsonl"), workspaceDir, {
       sessionId: "session-sibling",
       sessionKey: "agent:main:sibling",
       runId: "run-sibling",
     });
+    siblingParams.timeoutMs = 60_000;
     await seedRunSessionOwnerForTest(siblingParams.sessionId, siblingParams.sessionKey!);
     let starts = 0;
     let turns = 0;
@@ -89,9 +94,9 @@ describe("Codex attempt subscription recovery", () => {
       expect(getCurrentSharedClientEntry(harness.client)).toBeDefined();
       expect(siblingSettled).not.toHaveBeenCalled();
 
-      next = runCodexAppServerAttempt(
-        createParams(sessionFile, workspaceDir, { runId: "run-next" }),
-      );
+      const nextParams = createParams(sessionFile, workspaceDir, { runId: "run-next" });
+      nextParams.timeoutMs = 60_000;
+      next = runCodexAppServerAttempt(nextParams);
       await next.waitForTurnAccepted();
       expect(siblingSettled).not.toHaveBeenCalled();
       expect(starts).toBe(2);
@@ -112,7 +117,6 @@ describe("Codex attempt subscription recovery", () => {
     failureAt: "monitor" | "turn request";
     revoked?: "abort" | "host" | "binding" | "closed" | "expired" | "successor";
   }>([
-    { nativeOwned: false, failureAt: "monitor" },
     { nativeOwned: true, failureAt: "turn request" },
     { nativeOwned: true, failureAt: "monitor", revoked: "abort" },
     { nativeOwned: true, failureAt: "monitor", revoked: "host" },
@@ -417,7 +421,7 @@ describe("Codex attempt subscription recovery", () => {
         "Codex ran out of room in the model's context window",
       );
       expect(compact).not.toHaveBeenCalled();
-      expect(harness.requests.map((request) => request.method)).toEqual([
+      expect(requestMethodsExcludingSkillDiscovery(harness)).toEqual([
         "config/read",
         "configRequirements/read",
         "thread/read",

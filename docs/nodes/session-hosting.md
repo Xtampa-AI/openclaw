@@ -59,14 +59,29 @@ Each new dispatch still validates the installed artifact and reuses it when vali
 avoiding another download. Cloud-enrolled nodes keep their own execution-mode-specific
 installation and retention lifecycle.
 
-You can also enroll and enable a service host in one step with
-`openclaw connect --service --session-host`.
+The command printed by `openclaw devices join-code` enrolls and enables a
+service host in one step with `openclaw connect <join-url> --service --session-host`.
+Omit `--session-host` for a command-only node service.
+
+To enable hosting on an already-paired headless node, run on that device:
+
+```bash
+openclaw config set nodeHost.workerRuns.enabled true
+openclaw node install --force
+```
 
 For a process-scoped host, enroll in the foreground with
 `openclaw connect <join-url> --session-host`. The join URL is single-use; after
 that process stops, restart the host with `openclaw node run --session-host`,
 which reuses the saved pairing. See
 [Reconnect a paired node](/cli/connect#reconnect-a-paired-node).
+
+After a host reboot, the node releases interrupted native worker slots and records
+the interrupted turn when its saved launch boot identity differs from the current
+OS boot identity. The next turn can start normally after the node reconnects.
+Older launch records and hosts whose boot identity cannot be read keep the existing
+conservative cleanup checks. Container workers still require their container
+engine to confirm cleanup, including when that engine runs on another host.
 
 In Control UI New Session, a
 write-scoped operator chooses either a specific paired device or **Auto**.
@@ -238,12 +253,11 @@ exec-server directly, so it does not consume or require a worker slot. Its
 required command must appear in the node's effective `invocableCommands`,
 not merely its declared capabilities. A declared command is usable only when
 the approved pairing and Gateway command allowlist both authorize it.
-Connected non-hosts, ineligible
-or saturated hosts, update-required devices, and unavailable hosts remain
-visible but disabled with an actionable reason. Enable hosting with
-`openclaw connect --service --session-host` or the `nodeHost.workerRuns`
-setting, then restart the node host. Update-required hosts must be upgraded and
-restarted before selection.
+Connected non-hosts, ineligible or saturated hosts, update-required devices,
+and unavailable hosts remain visible but disabled with an actionable reason.
+For an already-paired headless node, enable `nodeHost.workerRuns.enabled` and
+run `openclaw node install --force` as shown above. Update-required hosts must
+be upgraded and restarted before selection.
 
 While node inventory refreshes, or if that refresh fails, the picker keeps known
 devices visible but disables remote selection and Start until fresh inventory
@@ -267,7 +281,7 @@ slots does not cancel it; the node checks physical capacity when the session
 launches a turn.
 Node identity and command authorization remain checked throughout preparation.
 
-If no host is eligible, the error explains whether no session hosts are paired,
+If no host is eligible, the error explains whether no devices have session hosting enabled,
 hosts are disconnected or at capacity, a host needs an update, or the selected
 runtime is unsupported. The dispatch response identifies the device that was
 selected.
@@ -306,8 +320,8 @@ the credential fence before returning success, and the periodic sweep retries
 failed provider or placement cleanup.
 
 While a device runner is unavailable, including after session hosting is disabled,
-the Gateway pauses advisory disk-space probes and retains the last sample for
-that placement. Probes resume on the next scheduled sweep after the current
+the Gateway pauses advisory disk-space checks and retains the last sample for
+that placement. Checks resume on the next scheduled sweep after the current
 runner reconnects. Disabling hosting does not discard the session's workspace.
 
 See [Anthropic: Claude sessions across computers](/providers/anthropic#claude-sessions-across-computers)
@@ -326,7 +340,7 @@ worker inside its own container instead:
       enabled: true,
       isolation: "container",
       // Optional: use a digest-pinned, private-registry, or preloaded image.
-      // containerImage: "registry.example.com/openclaw/node:24.21.0-slim",
+      // containerImage: "registry.example.com/openclaw/node:24.22.1-slim",
     },
   },
 }
@@ -353,10 +367,10 @@ If an engine command times out, the launch error names the engine and operation
 (for example, `docker info`) and its deadline. It omits command arguments and
 environment values. Check that operation against the selected daemon before retrying.
 
-The default image is `node:24.21.0-slim`; the engine pulls it on first use when it
+The default image is `node:24.22.1-slim`; the engine pulls it on first use when it
 is not already present. Set `nodeHost.workerRuns.containerImage` to choose a
 digest-pinned image, a private-registry image, or an image already available
-to the engine. The image must provide a supported Node.js 24.16+ or 26.1+ runtime on
+to the engine. The image must provide a supported Node.js 24.22.1+ or 26.12.1+ runtime on
 its standard executable search path. If the image cannot be pulled, is
 inaccessible, or does not provide a suitable Node.js runtime, that session
 launch fails visibly; it never retries as a bare host process. Preload the
@@ -364,7 +378,7 @@ image or configure registry access before hosting sessions on an offline or
 restricted node. The default image can advance when OpenClaw updates its dependencies.
 Before upgrading an offline node, preload the new default image or set
 `nodeHost.workerRuns.containerImage` to a supported image already cached on that node.
-For example, a cached `node:24.19.0-slim` remains supported and can be selected explicitly.
+For example, a cached `node:26.12.1-slim` can be selected explicitly.
 Existing explicit image settings are preserved; replace unsupported Node images before
 upgrading OpenClaw. Worker startup requires a supported runtime; older releases may
 fail before the runtime diagnostic can run.

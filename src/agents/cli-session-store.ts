@@ -1,6 +1,11 @@
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { CliSessionBinding, InternalSessionEntry, SessionEntry } from "../config/sessions.js";
 import { patchSessionEntryCore } from "../config/sessions/session-accessor.js";
+import {
+  sessionEntryCommitGuardOptions,
+  composeSessionSourceAssertion,
+  type SessionSourceAssertion,
+} from "../config/sessions/session-source-authority.js";
 import { formatErrorMessageForDisplay } from "../infra/error-diagnostics.js";
 import { redactSensitiveText } from "../logging/redact.js";
 import { appendAgentRunFailure } from "./agent-run-result.js";
@@ -27,7 +32,7 @@ async function patchCliSessionBindingInStore(
     fallbackEntry?: SessionEntry;
     preserveActivity?: boolean;
     skipMaintenance?: boolean;
-    assertCommitAllowed?: () => void;
+    assertCommitAllowed?: SessionSourceAssertion;
     update: (entry: SessionEntry) => boolean;
     onCommitted?: () => void;
   },
@@ -61,7 +66,7 @@ async function patchCliSessionBindingInStore(
     },
     {
       fallbackEntry: params.fallbackEntry,
-      assertCommitAllowed: params.assertCommitAllowed,
+      ...sessionEntryCommitGuardOptions(params.assertCommitAllowed),
       preserveActivity: params.preserveActivity,
       skipMaintenance: params.skipMaintenance,
       onCommitted: (entry) => {
@@ -78,7 +83,7 @@ async function patchCliSessionBindingInStore(
 
 type CliSessionForkStoreParams = Required<CliSessionStoreTarget> & {
   expectedCliSessionId: string;
-  assertCommitAllowed?: () => void;
+  assertCommitAllowed?: SessionSourceAssertion;
 };
 
 async function patchCliSessionForkBinding(
@@ -141,10 +146,13 @@ export function buildCliSessionForkRunParams(
 } {
   const activeParams = {
     ...params,
-    assertCommitAllowed: () => {
-      params.assertCommitAllowed?.();
-      params.abortSignal?.throwIfAborted();
-    },
+    assertCommitAllowed: composeSessionSourceAssertion(
+      [params.assertCommitAllowed],
+      (assertSource) => {
+        assertSource();
+        params.abortSignal?.throwIfAborted();
+      },
+    ),
   };
   return {
     claimCliSessionFork: async () => {
@@ -213,7 +221,8 @@ export async function persistCliSessionBindingResult(
   params: CliSessionStoreTarget & {
     result: EmbeddedAgentRunResult;
     expectedSession?: InternalSessionEntry;
-    assertSettlementCurrent: () => void;
+    preserveBinding?: boolean;
+    assertSettlementCurrent: SessionSourceAssertion;
     abortSignal?: AbortSignal;
   },
 ): Promise<EmbeddedAgentRunResult> {
@@ -227,15 +236,67 @@ export async function persistCliSessionBindingResult(
       expectedSession,
       preserveActivity: true,
       skipMaintenance: true,
-      update: (entry) =>
-        applyCliSessionBindingResult(entry, params.provider, params.result.meta.agentMeta),
-      assertCommitAllowed: () =>
-        assertCliSessionBindingResultCommitAllowed(
-          params.result.meta.agentMeta,
-          params.assertSettlementCurrent,
-          params.abortSignal,
-        ),
+      update: (entry) => {
+        const meta = params.result.meta.agentMeta;
+        if (!params.preserveBinding) {
+          return applyCliSessionBindingResult(entry, params.provider, meta);
+        }
+        const binding = getCliSessionBinding(entry, params.provider);
+        const resultBinding = meta?.cliSessionBinding;
+        const transcriptCursor = resultBinding?.transcriptCursor;
+        if (
+          meta?.clearCliSessionBinding === true ||
+          !binding ||
+          binding.sessionId !== resultBinding?.sessionId ||
+          !transcriptCursor
+        ) {
+          return false;
+        }
+        // Preserved completions acknowledge input only in the native session they resumed.
+        setCliSessionBinding(entry, params.provider, { ...binding, transcriptCursor });
+        return true;
+      },
+      assertCommitAllowed: composeSessionSourceAssertion(
+        [params.assertSettlementCurrent],
+        (assertSource) =>
+          assertCliSessionBindingResultCommitAllowed(
+            params.result.meta.agentMeta,
+            assertSource,
+            params.abortSignal,
+          ),
+      ),
     });
+  });
+}
+
+/**
+ * A directly stopped first turn has no settled result, but its flushed native session is
+ * the chat's only continuity. The turn owner still guards the write; caller abort does not,
+ * and an existing binding is never replaced.
+ */
+export async function persistStoppedFirstCliSessionInStore(
+  params: CliSessionStoreTarget & {
+    binding: CliSessionBinding;
+    expectedSession?: InternalSessionEntry;
+    assertSettlementCurrent: SessionSourceAssertion;
+  },
+): Promise<void> {
+  if (!params.expectedSession || getCliSessionBinding(params.expectedSession, params.provider)) {
+    return;
+  }
+  await patchCliSessionBindingInStore({
+    ...params,
+    expectedSession: params.expectedSession,
+    preserveActivity: true,
+    skipMaintenance: true,
+    assertCommitAllowed: params.assertSettlementCurrent,
+    update: (entry) => {
+      if (getCliSessionBinding(entry, params.provider)) {
+        return false;
+      }
+      setCliSessionBinding(entry, params.provider, params.binding);
+      return true;
+    },
   });
 }
 
@@ -245,7 +306,7 @@ export async function clearCliSessionInStore(
     expectedSessionId?: string;
     expectedCliSessionId?: string;
     activeSessionEntry?: SessionEntry;
-    assertCommitAllowed?: () => void;
+    assertCommitAllowed?: SessionSourceAssertion;
   },
 ): Promise<SessionEntry | undefined> {
   const entry =

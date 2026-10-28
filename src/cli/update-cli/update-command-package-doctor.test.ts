@@ -5,6 +5,9 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as backupConfigCapture from "../../infra/backup-config-capture.js";
+import { GatewayStateOwnerContentionError } from "../../infra/gateway-state-owner.js";
+import { runPackagePostInstallVerification } from "../../infra/package-update-verification-step.js";
+import { SqliteSchemaVersionError } from "../../infra/sqlite-user-version.js";
 import * as tempRoot from "../../infra/tmp-openclaw-dir.js";
 import {
   createDeferredConfiguredPluginRepairDoctorResult,
@@ -28,11 +31,14 @@ import {
 import * as processRunner from "../../process/exec.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../../state/openclaw-state-db-contract.js";
+import * as stateSnapshots from "../../state/openclaw-state-db-readonly.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
+import * as configCapture from "./update-command-config-snapshot.js";
 import { createUpdateCommandExecutionGuards } from "./update-command-execution-guards.js";
 import { runPackageUpdateDoctor } from "./update-command-package.js";
-import { createUpdateRunProgress } from "./update-command-run.js";
+import { completeUpdateCommandRun, createUpdateRunProgress } from "./update-command-run.js";
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -55,6 +61,62 @@ async function createDoctorFixture() {
   return { root, env };
 }
 
+it.each([
+  { restart: false, contention: true },
+  { restart: false, contention: true, wrapped: true },
+  { restart: true, contention: true },
+  { restart: false, contention: false },
+  { restart: false, contention: false, wrapped: true },
+])(
+  "defers package replacement state handoff ($restart, contention=$contention, wrapped=$wrapped)",
+  async ({ restart, contention, wrapped }) => {
+    const { root, env } = await createDoctorFixture();
+    const cause = contention
+      ? new GatewayStateOwnerContentionError(resolveOpenClawStateSqlitePath(env))
+      : new SqliteSchemaVersionError("This OpenClaw build cannot open your existing data.");
+    const error = wrapped ? new Error("Cannot read shared state for discovery", { cause }) : cause;
+    vi.spyOn(configCapture, "captureUpdateConfigSnapshot").mockRejectedValue(error);
+    const spawn = vi.spyOn(processRunner, "runCommandWithTimeout");
+    const onStepComplete = vi.fn();
+    const results: UpdateStepResult[] = [];
+    const operation = runPackageUpdateDoctor({
+      root,
+      restart,
+      managedServiceEnv: env,
+      results,
+      progress: { onStepComplete },
+      onConfigSnapshot: vi.fn(),
+    });
+    if (restart) {
+      await expect(operation).rejects.toBe(error);
+    } else {
+      const step = await operation;
+      assert(step);
+      expect(step).toMatchObject({
+        name: "post-install-verify",
+        exitCode: null,
+        advisory: {
+          kind: "recoverable-maintenance",
+          message: expect.stringContaining("deferred"),
+        },
+      });
+      expect(step && isFailedUpdateStep(step)).toBe(false);
+      expect(step?.advisory?.message).toContain("openclaw update status");
+      expect(step?.advisory?.message).toContain("openclaw doctor");
+      expect(results).toEqual([step]);
+      expect(onStepComplete).toHaveBeenCalledWith(expect.objectContaining(step));
+      const run = { runId: createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+      const result = completeUpdateCommandRun(
+        { status: "ok", mode: "npm", root, steps: results, durationMs: 0 },
+        run,
+      );
+      expect(result.status).toBe("ok");
+      expect(getUpdateRun(run.runId, { env })?.status).toBe("succeeded");
+    }
+    expect(spawn).not.toHaveBeenCalled();
+  },
+);
+
 it.each(["missing", "malformed", "newer-schema", "changed-during-capture"] as const)(
   "runs Doctor with %s include capture without broadening rollback ownership",
   async (includeState) => {
@@ -73,7 +135,8 @@ it.each(["missing", "malformed", "newer-schema", "changed-during-capture"] as co
       await fs.writeFile(includePath, originalInclude);
     }
     if (completeGraph) {
-      await fs.mkdir(path.dirname(databasePath), { recursive: true });
+      openOpenClawStateDatabase({ env });
+      await closeStateDatabaseForTest();
       const database = new DatabaseSync(databasePath);
       try {
         database.exec(`PRAGMA user_version = ${newerSchema}`);
@@ -104,10 +167,15 @@ it.each(["missing", "malformed", "newer-schema", "changed-during-capture"] as co
         assert(resultPath, "Missing Doctor result path");
         await writeUpdatePostInstallDoctorResult({
           resultPath,
-          result: { status: "ok", configHash: "unchanged" },
+          result: completeGraph
+            ? {
+                ...createDeferredConfiguredPluginRepairDoctorResult(["Optional repair deferred."]),
+                configHash: "unchanged",
+              }
+            : { status: "ok", configHash: "unchanged" },
         });
         return {
-          code: 0,
+          code: completeGraph ? UPDATE_POST_INSTALL_DOCTOR_ADVISORY_EXIT_CODE : 0,
           stdout: "",
           stderr: "",
           signal: null,
@@ -117,15 +185,21 @@ it.each(["missing", "malformed", "newer-schema", "changed-during-capture"] as co
       });
     const onConfigSnapshot = vi.fn();
     const onStepComplete = vi.fn();
+    const stateRead = vi.spyOn(stateSnapshots, "withOpenClawStateDatabaseReadSnapshot");
 
-    const step = await runPackageUpdateDoctor({
-      root,
-      timeoutMs: 1_000,
-      progress: { onStepComplete },
-      managedServiceEnv: env,
-      onConfigSnapshot,
-    });
+    const step = await runPackagePostInstallVerification(root, (candidateRoot, results) =>
+      runPackageUpdateDoctor({
+        root: candidateRoot,
+        timeoutMs: 1_000,
+        progress: { onStepComplete },
+        managedServiceEnv: env,
+        onConfigSnapshot,
+        results,
+      }),
+    );
 
+    expect(isFailedUpdateStep(step), JSON.stringify(step)).toBe(false);
+    expect(stateRead).not.toHaveBeenCalled();
     expect(invokeDoctor).toHaveBeenCalledOnce();
     expect(onConfigSnapshot).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
@@ -134,8 +208,15 @@ it.each(["missing", "malformed", "newer-schema", "changed-during-capture"] as co
         doctorOwned: completeGraph,
       }),
     );
-    expect(step).toMatchObject({ exitCode: 0 });
+    expect(step.failureFacts ?? []).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "runtime-verification-failed" })]),
+    );
     if (completeGraph) {
+      expect(step).toMatchObject({
+        exitCode: UPDATE_POST_INSTALL_DOCTOR_ADVISORY_EXIT_CODE,
+        advisory: { kind: "package-post-install-doctor" },
+        warnings: [expect.stringContaining("Optional repair deferred.")],
+      });
       expect(onConfigSnapshot.mock.calls[0]?.[0]).toMatchObject({
         includedFiles: [
           {
@@ -326,7 +407,8 @@ it.each([
 
 it("leaves the run ledger unchanged while the activation Doctor child is pending", async () => {
   const { root, env } = await createDoctorFixture();
-  vi.useFakeTimers();
+  // Ledger receipts still need real worker scheduling and monotonic clocks.
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   const { runId } = createUpdateRun({ trigger: "control-ui" }, { env });
   expect(adoptUpdateRun(runId, { env }).origin.driver?.pid).toBe(process.pid);
   const spawned = createDeferredCore();

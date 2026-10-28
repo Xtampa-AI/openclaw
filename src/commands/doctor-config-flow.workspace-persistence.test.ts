@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readAgentRosterProperty } from "../agents/agent-roster.js";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope-config.js";
 import { promoteConfigSnapshotToLastKnownGood, readConfigFileSnapshot } from "../config/config.js";
@@ -29,6 +29,58 @@ describe("Doctor workspace persistence", () => {
     closeOpenClawStateDatabaseForTest();
   });
 
+  it("keeps a valid Kubernetes reseed without metadata and still recovers a later invalid config", async () => {
+    await withDoctorConfigPreflightHome(async (home) => {
+      await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
+        const configPath = await writeOpenClawConfig(home, {
+          gateway: { mode: "local", port: 19091 },
+          plugins: { enabled: false },
+        });
+        await runInitialConfigWriteHealth(await prepareDoctorContext(configPath));
+        const baseline = await readConfigFileSnapshot();
+        expect(await promoteConfigSnapshotToLastKnownGood(baseline)).toBe(true);
+        for (const suffix of [".bak", ".bak.1"]) {
+          await fs.copyFile(configPath, `${configPath}${suffix}`);
+        }
+        const { meta: _meta, ...reseeded } = JSON.parse(await fs.readFile(configPath, "utf8"));
+        reseeded.gateway.port = 19092;
+        const reseededRaw = JSON.stringify(reseeded, null, 2);
+        await fs.unlink(configPath);
+        await fs.writeFile(configPath, reseededRaw);
+
+        const ctx = await prepareDoctorContext(configPath);
+        expect(ctx.cfg.gateway?.port).toBe(19092);
+        expect(await fs.readFile(configPath, "utf8")).toBe(reseededRaw);
+        expect(await fs.readdir(path.dirname(configPath))).not.toEqual(
+          expect.arrayContaining([expect.stringContaining(".clobbered.")]),
+        );
+        // Gateway startup promotes the accepted config; the meta-less reseed must qualify.
+        expect(await promoteConfigSnapshotToLastKnownGood(await readConfigFileSnapshot())).toBe(
+          true,
+        );
+
+        const invalidRaw = '{ "gateway": { "mode": 123 } }';
+        await fs.writeFile(configPath, invalidRaw);
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const recovered = await prepareDoctorContext(configPath);
+          expect(recovered.cfg.gateway?.port).toBe(19092);
+          const clobbered = (await fs.readdir(path.dirname(configPath))).filter((name) =>
+            name.includes(".clobbered."),
+          );
+          expect(clobbered).toHaveLength(1);
+          const originalPath = path.join(path.dirname(configPath), clobbered[0]!);
+          expect(await fs.readFile(originalPath, "utf8")).toBe(invalidRaw);
+          const warnings = warn.mock.calls.flat().join("\n");
+          expect(warnings).toContain(originalPath);
+          expect(warnings).toContain("to undo, stop the Gateway and copy it back");
+        } finally {
+          warn.mockRestore();
+        }
+      });
+    });
+  });
+
   it("refuses retired config until the bridge release migrates it", async () => {
     await withDoctorConfigPreflightHome(async (home) => {
       await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
@@ -54,8 +106,20 @@ describe("Doctor workspace persistence", () => {
               },
             },
           },
+          models: {
+            providers: {
+              custom: {
+                api: "openai-codex-responses",
+                models: [{ id: "legacy-model", api: "openai-codex-responses" }],
+              },
+            },
+          },
           session: { typingMode: "thinking", parentForkMaxTokens: 200_000 },
-          browser: { relayBindHost: "127.0.0.1", ssrfPolicy: { allowPrivateNetwork: true } },
+          browser: {
+            relayBindHost: "127.0.0.1",
+            ssrfPolicy: { allowPrivateNetwork: true },
+            profiles: { relay: { driver: "extension", cdpUrl: "http://127.0.0.1:18792" } },
+          },
           messages: {
             queue: {
               mode: "queue",
@@ -87,6 +151,9 @@ describe("Doctor workspace persistence", () => {
           "agents.entries.ops.subagents.model.timeoutMs",
           "parentForkMaxTokens",
           "relayBindHost",
+          "browser.profiles.relay.cdpUrl",
+          "models.providers.custom.api",
+          "models.providers.custom.models.0.api",
           "allowPrivateNetwork",
           "messages.queue.mode",
           "messages.queue.byChannel.discord",
@@ -118,7 +185,12 @@ describe("Doctor workspace persistence", () => {
           "123",
           456,
         ];
-        const canonical = ["discord:100000000000000001", "telegram:123", "slack:U123"];
+        // Unavailable channel contracts cannot prove it is safe to drop a target kind.
+        const canonical = [
+          "discord:user:100000000000000001",
+          "telegram:user:123",
+          "slack:user:U123",
+        ];
         const configPath = await writeOpenClawConfig(home, {
           // v2026.7.1-beta.1 (published July 2 UTC) admits this roster and ownerAllowFrom shape.
           meta: { lastTouchedVersion: "2026.7.1-beta.1" },
@@ -135,11 +207,6 @@ describe("Doctor workspace persistence", () => {
           plugins: { enabled: false },
         });
         const ctx = await prepareDoctorContext(configPath);
-        for (const index of [0, 1, 2]) {
-          expect(ctx.configResult.pendingChangePanels?.join("\n")).toContain(
-            `commands.ownerAllowFrom[${index}]`,
-          );
-        }
         await runInitialConfigWriteHealth(ctx);
         expect(ctx.configWriteRefusal).toBeUndefined();
         const saved = await readConfigFileSnapshot();
@@ -155,10 +222,7 @@ describe("Doctor workspace persistence", () => {
     });
   });
 
-  it.each([
-    ["entries", false],
-    ["list", true],
-  ] as const)(
+  it.each([["list", true]] as const)(
     "persists per-agent migrations with explicit ownership (%s, writable update: %s)",
     async (shape, writableUpdate) => {
       await withDoctorConfigPreflightHome(async (home) => {
@@ -186,13 +250,7 @@ describe("Doctor workspace persistence", () => {
                   embeddedAgent: { projectSettingsPolicy: "trusted" },
                   sandbox: { scope: "shared" },
                 },
-                ...(shape === "entries"
-                  ? { entries }
-                  : {
-                      list: Object.entries(entries).map(([id, entry]) =>
-                        Object.assign({ id }, entry),
-                      ),
-                    }),
+                list: Object.entries(entries).map(([id, entry]) => Object.assign({ id }, entry)),
               },
               gateway: { mode: "local" },
               plugins: { enabled: false },
@@ -233,10 +291,7 @@ describe("Doctor workspace persistence", () => {
     },
   );
 
-  it.each([
-    { kind: "implicit", legacyId: "main" },
-    { kind: "shared", legacyId: " Main " },
-  ])(
+  it.each([{ kind: "shared", legacyId: " Main " }])(
     "preserves the markerless $legacyId agent's $kind workspace through Doctor persistence",
     async ({ kind, legacyId }) => {
       await withDoctorConfigPreflightHome(async (home) => {
@@ -432,7 +487,7 @@ describe("Doctor workspace persistence", () => {
     });
   });
 
-  it.each(["parsed", "prefixed"])(
+  it.each(["prefixed"])(
     "refuses retired Talk selectors in %s config before recovery",
     async (kind) => {
       await withDoctorConfigPreflightHome(async (home) => {

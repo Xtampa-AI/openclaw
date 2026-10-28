@@ -39,10 +39,10 @@ import {
   isCodexAppServerStartSelectionChangedError,
   type createIsolatedCodexAppServerClient,
 } from "./shared-client.js";
-import { buildCodexRuntimeThreadConfig } from "./thread-lifecycle.js";
 import {
   assertCodexManagedRequirementsDoNotOverrideToolPolicy,
   attestCodexRestrictedToolSurfaceMcpServersDisabled,
+  buildCodexRuntimeThreadConfig,
   buildCodexRingZeroThreadConfigPatch,
   readCodexInheritedMcpServerNames,
 } from "./thread-requests.js";
@@ -88,7 +88,10 @@ type CodexBoundedTurnModelSelection = { mode: "required"; id: string } | { mode:
 class CodexBoundedTurnTimeoutError extends Error {
   override name = "TimeoutError";
 
-  constructor(taskLabel: string, timeoutMs: number) {
+  constructor(
+    taskLabel: string,
+    readonly timeoutMs: number,
+  ) {
     const bound = timeoutMs % 1_000 === 0 ? `${timeoutMs / 1_000}s` : `${timeoutMs}ms`;
     super(`codex app-server ${taskLabel} turn timed out after ${bound}`);
   }
@@ -440,18 +443,13 @@ function resolveBoundedThreadConfig(
   inheritedMcpServerNames: readonly string[],
   enableManagedHooks: boolean,
 ): JsonObject {
-  const boundedConfig =
-    mergeCodexThreadConfigs(CODEX_BOUNDED_THREAD_CONFIG, params.threadConfig) ??
-    CODEX_BOUNDED_THREAD_CONFIG;
-  const privateConfig = workspace.codexHome
-    ? (mergeCodexThreadConfigs(boundedConfig, CODEX_PRIVATE_BOUNDED_THREAD_CONFIG) ?? boundedConfig)
-    : boundedConfig;
-  if (!params.requireNoExternalCapabilities) {
-    return privateConfig;
-  }
-  return (
-    mergeCodexThreadConfigs(
-      privateConfig,
+  const configs = [
+    CODEX_BOUNDED_THREAD_CONFIG,
+    params.threadConfig,
+    workspace.codexHome ? CODEX_PRIVATE_BOUNDED_THREAD_CONFIG : undefined,
+  ];
+  if (params.requireNoExternalCapabilities) {
+    configs.push(
       CODEX_SETTLED_FINALIZER_THREAD_CONFIG,
       buildCodexRingZeroThreadConfigPatch(
         { toolsAllow: ["openclaw"] },
@@ -461,8 +459,9 @@ function resolveBoundedThreadConfig(
       // Native administrator hooks remain active; the private process has no
       // operator/project hook sources or model-callable tools to inherit.
       enableManagedHooks ? { "features.hooks": true } : undefined,
-    ) ?? privateConfig
-  );
+    );
+  }
+  return mergeCodexThreadConfigs(...configs) ?? CODEX_BOUNDED_THREAD_CONFIG;
 }
 
 function buildPrivateCodexAppServerStartOptions(

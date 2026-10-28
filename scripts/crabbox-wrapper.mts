@@ -33,11 +33,13 @@ import { StringDecoder } from "node:string_decoder";
 import { setImmediate as yieldToSignals } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { sanitizeForLog, stripAnsi } from "@openclaw/terminal-core/ansi";
 import {
   ensureManagedCrabboxBinary,
   findCrabboxBinary,
   type CrabboxBinary,
 } from "../extensions/crabbox/cli-runtime-api.js";
+import { redactSupportString } from "../src/logging/diagnostic-support-redaction.js";
 import { crabboxProviderChain, normalizeCrabboxWorkload } from "./crabbox-routing-policy.mts";
 import {
   prepareCrabboxSourceCapsule,
@@ -81,7 +83,12 @@ type RunFacts = ReturnType<typeof analyzeRemoteCommand>;
 type AwsMacosScriptRequirements = ReturnType<typeof awsMacosScriptBootstrapRequirements>;
 type FullCheckout = ReturnType<typeof prepareFullCheckoutForSync>;
 type KeepaliveOptions = { intervalMs?: number; onMissing?: () => void };
-type DoctorCheck = { status: string; check: string; details?: Record<string, string> };
+type DoctorCheck = {
+  status: string;
+  check: string;
+  message?: string;
+  details?: Record<string, string>;
+};
 type DoctorResult = { ok: boolean; provider: string; checks: DoctorCheck[] };
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -486,6 +493,7 @@ function checkedOutput(
     status: timedOut ? 124 : (result.status ?? 1),
     text: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim(),
     stdout: (result.stdout ?? "").trim(),
+    stderr: (result.stderr ?? "").trim(),
   };
 }
 
@@ -861,14 +869,18 @@ function crabboxProviderReadiness(provider: string, context: TargetContext) {
       (check) => check.status === "failed" && check.details?.class === "broker_auth",
     ) === true;
   const ready = result?.ok === true && brokerReady;
-  const diagnostic = compactDiagnosticText(doctor.text);
+  // The JSON report is on stdout; stderr can contain bracket-prefixed CLI errors.
+  const cliError = doctor.stderr || (/^[[{]/u.test(doctor.stdout) ? "" : doctor.stdout);
+  const diagnostic = result
+    ? doctorFailureDiagnostic(result, brokerReady)
+    : compactDiagnosticText(cliError);
   return {
     ready,
     reason: ready
       ? "doctor-ready"
       : result
         ? `doctor exited ${doctor.status}${diagnostic ? `: ${diagnostic}` : ""}`
-        : `invalid doctor JSON${diagnostic ? `: ${diagnostic}` : ""}`,
+        : `invalid doctor JSON (exit ${doctor.status})${diagnostic ? `: ${diagnostic}` : ""}`,
     ...(ready ? {} : { recovery: `run \`${recoveryCommand(doctorArgs)}\`` }),
     brokerReady,
     brokerAuthFailure,
@@ -882,6 +894,7 @@ function isDoctorCheck(value: unknown): value is DoctorCheck {
     Boolean(value.status) &&
     typeof value.check === "string" &&
     Boolean(value.check) &&
+    (value.message === undefined || typeof value.message === "string") &&
     (value.details === undefined ||
       (isRecord(value.details) &&
         Object.values(value.details).every((detail) => typeof detail === "string")))
@@ -915,11 +928,43 @@ function parseDoctorResult(value: string, provider: string, status: number): Doc
 }
 
 function compactDiagnosticText(value: string, maxLength = 500) {
-  const compact = value.replace(/\s+/gu, " ").trim();
-  if (compact.length <= maxLength) {
-    return compact;
+  const plain = stripAnsi(value)
+    .split(/\r\n?|\n/u)
+    .map(sanitizeForLog)
+    .join("\n");
+  // Redact the complete value before compaction or truncation can split a credential.
+  const redacted = redactSupportString(
+    plain,
+    { env: process.env, stateDir: "" },
+    { maxLength: Number.MAX_SAFE_INTEGER },
+  );
+  const compact = redacted.replace(/\s+/gu, " ").trim();
+  return compact.length <= maxLength ? compact : `${compact.slice(0, maxLength - 3)}...`;
+}
+
+function doctorFailureDiagnostic(result: DoctorResult, brokerReady: boolean) {
+  const failed = result.checks.filter((check) =>
+    ["failed", "missing"].includes(check.status.trim().toLowerCase()),
+  );
+  // Project only failure fields; successful checks and arbitrary provider details
+  // can contain configuration, identities, and response payloads.
+  const summaries = failed.slice(0, 4).map((check) => {
+    const reason = [
+      ...["class", "hint"].flatMap((key) => {
+        const value = check.details?.[key];
+        return value ? [`${key}=${compactDiagnosticText(value, 80)}`] : [];
+      }),
+      ...(check.message ? [compactDiagnosticText(check.message, 160)] : []),
+    ].join(" ");
+    return `${compactDiagnosticText(check.check, 60)} (${check.status.trim().toLowerCase()})${reason ? `: ${reason}` : ""}`;
+  });
+  if (failed.length > summaries.length) {
+    summaries.push(`${failed.length - summaries.length} more failed checks omitted`);
   }
-  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+  if (!brokerReady && !failed.some((check) => check.check === "broker")) {
+    summaries.push("broker: required ok check missing");
+  }
+  return summaries.join("; ");
 }
 
 function formatProviderReadiness(readiness: ReadonlyMap<string, ProviderReadiness>) {
@@ -982,6 +1027,7 @@ function enforceBrokeredCloud(
   if ("brokerAuthFailure" in readiness && readiness.brokerAuthFailure) {
     const instructions = [
       `[crabbox] provider=${canonicalProvider} requires managed Crabbox broker authentication for OpenClaw proof.`,
+      `[crabbox] ${readiness.reason}.`,
       `[crabbox] run \`${recoveryCommand(["login", "--url", "https://crabbox.openclaw.ai"])}\`, then retry.`,
     ];
     if (canonicalProvider !== "aws") {
@@ -1400,7 +1446,7 @@ function replaceRunPayload(invocation: CommandInvocation, payload: string[]) {
 
 function renderRunShellCommand(invocation: CommandInvocation, join = shellJoin) {
   return invocation.options.has("shell") && invocation.commandArgs.length === 1
-    ? invocation.commandArgs[0]
+    ? (invocation.commandArgs[0] ?? "")
     : join(invocation.commandArgs);
 }
 
@@ -2639,7 +2685,7 @@ function remoteAwsMacosJsBootstrap({
   bun = false,
   sourceBootstrap = "",
 } = {}) {
-  const nodeVersion = process.env.OPENCLAW_CRABBOX_MACOS_NODE_VERSION?.trim() || "24.21.0";
+  const nodeVersion = process.env.OPENCLAW_CRABBOX_MACOS_NODE_VERSION?.trim() || "24.22.1";
   const bootstrap = [
     "openclaw_crabbox_bootstrap_macos_js() {",
     'tool_root="${OPENCLAW_CRABBOX_MACOS_TOOLCHAIN_DIR:-$HOME/.openclaw-crabbox-toolchain}";',
@@ -2737,7 +2783,7 @@ function remoteAwsMacosJsBootstrap({
 }
 
 function remoteWsl2JsBootstrap({ packageManager = false, sourceBootstrap = "" } = {}) {
-  const nodeVersion = process.env.OPENCLAW_CRABBOX_WSL2_NODE_VERSION?.trim() || "24.21.0";
+  const nodeVersion = process.env.OPENCLAW_CRABBOX_WSL2_NODE_VERSION?.trim() || "24.22.1";
   const bootstrap = [
     "openclaw_crabbox_bootstrap_wsl2_js() {",
     'tool_root="${OPENCLAW_CRABBOX_WSL2_TOOLCHAIN_DIR:-$HOME/.openclaw-crabbox-toolchain}";',
@@ -3610,7 +3656,11 @@ function injectFullCheckoutLeaseReclaim(commandArgs: string[]) {
   return normalizedArgs;
 }
 
-function injectRemoteTestboxCi(commandArgs: string[], providerName: string) {
+function injectRemoteTestboxCi(
+  commandArgs: string[],
+  providerName: string,
+  sourceBootstrap: string,
+) {
   if (commandArgs[0] !== "run" || canonicalProviderName(providerName) !== "blacksmith-testbox") {
     return commandArgs;
   }
@@ -3620,7 +3670,7 @@ function injectRemoteTestboxCi(commandArgs: string[], providerName: string) {
   }
   return replaceRunCommandWithShell(
     invocation,
-    `export CI=true; ${renderRunShellCommand(invocation)}`,
+    `export CI=true; ${sourceBootstrap ? `${sourceBootstrap} || exit $?; ` : ""}exec node scripts/crabbox-remote-redact.mjs -- bash -c ${shellQuote(renderRunShellCommand(invocation))}`,
   );
 }
 
@@ -3674,6 +3724,7 @@ async function applyRunTransforms(
         transformedArgs = replaceRunScript(invocation, scriptPath);
       } else if (
         invocation.start >= 0 &&
+        !testboxWorkspace &&
         !isAwsMacosRemoteTarget(transformedArgs, options.provider)
       ) {
         transformedArgs = replaceRunCommandWithShell(
@@ -3703,7 +3754,7 @@ async function applyRunTransforms(
       options.provider,
     );
     return {
-      args: injectRemoteTestboxCi(transformedArgs, options.provider),
+      args: injectRemoteTestboxCi(transformedArgs, options.provider, sourceBootstrap),
       wsl2ScriptBootstrap: {
         ...wsl2ScriptBootstrap,
         cleanup() {

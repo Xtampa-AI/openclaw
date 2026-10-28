@@ -4,6 +4,7 @@ import { property } from "lit/decorators.js";
 import { keyed } from "lit/directives/keyed.js";
 import { repeat } from "lit/directives/repeat.js";
 import type { ApplicationContext } from "../../app/context.ts";
+import { hostDesktopSetupCopy } from "../../components/desktop/host-desktop-setup.ts";
 import { icons } from "../../components/icons.ts";
 import "../../components/sparkline-tile.ts";
 import { DESKTOP_PANEL_TOGGLE_EVENT } from "../../components/panel-toggle-contract.ts";
@@ -223,7 +224,7 @@ class SystemsPage extends OpenClawLightDomElement {
         <button
           class="systems-icon-button"
           aria-label=${t("systems.closeDetails")}
-          @click=${() => controller.toggleDetails()}
+          @click=${() => controller.updatePresentation({ showDetails: !controller.showDetails })}
         >
           ${icons.x}
         </button>
@@ -289,30 +290,11 @@ class SystemsPage extends OpenClawLightDomElement {
     const enabled = controller.hostDesktopEnabled;
     const isMac = systemPlatform(row)?.startsWith("macOS") === true;
     const ready = setup?.state === "ready" || setup?.state === "managed";
-    const title = enabled
-      ? "systems.desktopSetupEnabled"
-      : setup?.state === "managed"
-        ? "systems.managedDesktopConfigured"
-        : setup?.state === "ready"
-          ? isMac
-            ? "systems.screenSharingDetected"
-            : "systems.desktopDetected"
-          : setup?.state === "needs-server"
-            ? isMac
-              ? "systems.screenSharingNeeded"
-              : "systems.desktopServerNeeded"
-            : "systems.desktopSetupAttention";
-    const hint = enabled
-      ? "systems.desktopSetupConnecting"
-      : ready
-        ? "systems.desktopSetupEnableHint"
-        : isMac && setup?.state === "needs-server"
-          ? "systems.screenSharingSetupHint"
-          : "systems.desktopServerSetupHint";
+    const copy = hostDesktopSetupCopy(setup?.state, isMac, enabled);
     return html`<div class="systems-state" role="status">
       <span class="systems-state__icon" aria-hidden="true">${icons.monitor}</span>
-      <h2>${t(title)}</h2>
-      <p>${t(hint)}</p>
+      <h2>${t(copy.title)}</h2>
+      <p>${t(copy.hint)}</p>
       ${setup?.state === "unsupported" && setup.detail ? html`<p>${setup.detail}</p>` : nothing}
       ${controller.desktopSetupError ? html`<p class="systems-callout--error" role="alert">${controller.desktopSetupError}</p>` : nothing}
       ${
@@ -401,7 +383,7 @@ class SystemsPage extends OpenClawLightDomElement {
           title=${t(controller.showStats ? "systems.hideStats" : "systems.stats")}
           aria-label=${t(controller.showStats ? "systems.hideStats" : "systems.stats")}
           aria-pressed=${controller.showStats}
-          @click=${() => controller.toggleStats()}
+          @click=${() => controller.updatePresentation({ showStats: !controller.showStats })}
         >
           ${icons.activity}
         </button>
@@ -411,7 +393,7 @@ class SystemsPage extends OpenClawLightDomElement {
           aria-label=${t("systems.details")}
           aria-pressed=${controller.showDetails}
           ?disabled=${!row}
-          @click=${() => controller.toggleDetails()}
+          @click=${() => controller.updatePresentation({ showDetails: !controller.showDetails })}
         >
           ${icons.panelRightOpen}
         </button>
@@ -455,7 +437,7 @@ class SystemsPage extends OpenClawLightDomElement {
                     <span class="systems-state__icon" aria-hidden="true">${icons.monitor}</span>
                     <h2>${emptyTitle}</h2>
                     <p>${emptyHint}</p>
-                    ${row ? html`<button class="systems-text-button" @click=${() => controller.toggleDetails()}>${t("systems.details")}</button>` : nothing}
+                    ${row ? html`<button class="systems-text-button" @click=${() => controller.updatePresentation({ showDetails: !controller.showDetails })}>${t("systems.details")}</button>` : nothing}
                   </div>`
           }
         </div>

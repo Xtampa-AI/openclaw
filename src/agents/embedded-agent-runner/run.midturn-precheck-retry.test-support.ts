@@ -2,6 +2,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTextToolResult } from "../../../test/helpers/text-tool-result.js";
 import { buildEmbeddedRunnerAssistant } from "../test-helpers/embedded-agent-runner-e2e-fixtures.js";
+import { serializeCacheTtlToolResultProjections } from "./cache-ttl-checkpoint.js";
 import { makeCompactionSuccess, makeOverflowError } from "./run.overflow-compaction.fixture.js";
 import {
   mockedCompactDirect,
@@ -54,6 +55,7 @@ function makeReplayUnsafeMidTurnOverflow(params?: {
   resultRecorded?: boolean;
   codeModeEngaged?: boolean;
   codeModeSuspended?: boolean;
+  steeredAfterResult?: boolean;
 }) {
   const activeCount = params?.activeCount ?? 0;
   const resultRecorded = params?.resultRecorded ?? true;
@@ -70,7 +72,13 @@ function makeReplayUnsafeMidTurnOverflow(params?: {
     lastAssistant: settledExecAssistant,
     currentAttemptAssistant: settledExecAssistant,
     messagesSnapshot: resultRecorded
-      ? [settledExecAssistant, settledExecResult]
+      ? [
+          settledExecAssistant,
+          settledExecResult,
+          ...(params?.steeredAfterResult
+            ? [{ role: "user" as const, content: "also check the logs", timestamp: 3 }]
+            : []),
+        ]
       : [settledExecAssistant],
     toolMetas: [
       {
@@ -172,11 +180,8 @@ describe("runEmbeddedAgent mid-turn precheck retry", () => {
 
   it("recovers a successor transcript from its own frozen tool projection", async () => {
     const { SessionManager } = await import("../sessions/session-manager.js");
-    const {
-      getEmbeddedSessionPromptState,
-      clearEmbeddedSessionPromptStates,
-      serializeCacheTtlToolResultProjections,
-    } = await import("./session-prompt-state.js");
+    const { getEmbeddedSessionPromptState, clearEmbeddedSessionPromptStates } =
+      await import("./session-prompt-state.js");
     const actualTruncation = await vi.importActual<typeof import("./tool-result-truncation.js")>(
       "./tool-result-truncation.js",
     );
@@ -296,6 +301,29 @@ describe("runEmbeddedAgent mid-turn precheck retry", () => {
       truncate.mockImplementation(previousTruncate);
       clearEmbeddedSessionPromptStates([session.runParams.sessionId, successorId]);
     }
+  });
+
+  it("compacts a settled batch when a steering message follows its result", async () => {
+    mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(makeReplayUnsafeMidTurnOverflow({ steeredAfterResult: true }))
+      .mockResolvedValueOnce(session.makeAttemptResult());
+    mockedCompactDirect.mockResolvedValueOnce(
+      makeCompactionSuccess({
+        summary: "Compacted after steering",
+        firstKeptEntryId: "entry-steered-exec",
+        tokensBefore: 201_000,
+      }),
+    );
+
+    const result = await runEmbeddedAgent({
+      ...session.runParams,
+      runId: "run-midturn-steered-exec",
+    });
+
+    expect(mockedCompactDirect).toHaveBeenCalledOnce();
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+    expectRetryContinuesFromTranscript();
+    expect(result.meta.error).toBeUndefined();
   });
 
   it("compacts while a code-mode exec still waits on nested tool work", async () => {

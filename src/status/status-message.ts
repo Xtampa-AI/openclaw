@@ -12,7 +12,7 @@ import {
 import { resolveAuthoredModelContextTokens } from "../agents/context-resolution.js";
 import { resolveContextTokensForModel } from "../agents/context.js";
 import { resolveCronStyleNow } from "../agents/current-time.js";
-import { DEFAULT_CONTEXT_TOKENS, DEFAULT_PROVIDER } from "../agents/defaults.js";
+import { DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { resolveExtraParams } from "../agents/embedded-agent-runner/extra-params.js";
 import { resolveFastModeState } from "../agents/fast-mode.js";
 import { resolveModelAuthMode } from "../agents/model-auth.js";
@@ -42,7 +42,7 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
-import { resolveSessionLifecycleTimestamps } from "../config/sessions/lifecycle.js";
+import { resolveTimestamp } from "../config/sessions/lifecycle-timestamps.js";
 import {
   hasSessionActiveAutoModelFallback,
   hasSessionAutoModelFallbackProvenance,
@@ -107,6 +107,7 @@ type StatusArgs = {
   parentSessionKey?: string;
   sessionScope?: SessionScope;
   sessionStorePath?: string;
+  sessionStartedAt?: number;
   groupActivation?: "mention" | "always";
   resolvedThink?: ThinkLevel;
   resolvedFast?: FastMode;
@@ -130,16 +131,7 @@ type StatusArgs = {
   now?: number;
 };
 
-type NormalizedAuthMode =
-  | "api-key"
-  | "oauth"
-  | "token"
-  | "aws-sdk"
-  | "native"
-  | "mixed"
-  | "unknown";
-
-function normalizeAuthMode(value?: string): NormalizedAuthMode | undefined {
+function normalizeAuthMode(value?: string) {
   const normalized = normalizeOptionalLowercaseString(value);
   if (!normalized) {
     return undefined;
@@ -199,12 +191,11 @@ function resolveExecutionLabel(
 }
 
 const formatTokens = (total: number | null | undefined, contextTokens: number | null) => {
-  const ctx = contextTokens ?? null;
-  const ctxLabel = ctx ? formatTokenCount(ctx) : "?";
+  const ctxLabel = contextTokens ? formatTokenCount(contextTokens) : "?";
   if (total == null) {
     return `?/${ctxLabel}`;
   }
-  const pct = ctx ? Math.min(999, Math.round((total / ctx) * 100)) : null;
+  const pct = contextTokens ? Math.min(999, Math.round((total / contextTokens) * 100)) : null;
   const totalLabel = formatTokenCount(total);
   return `${totalLabel}/${ctxLabel}${pct !== null ? ` (${pct}%)` : ""}`;
 };
@@ -221,8 +212,7 @@ const formatEstimatedContextBudgetTokens = (
     return null;
   }
   const estimatedPromptTokens = Math.floor(estimate);
-  const ctx =
-    asPositiveFiniteNumber(contextTokens) ?? asPositiveFiniteNumber(status.contextTokenBudget);
+  const ctx = asPositiveFiniteNumber(contextTokens);
   const pct = ctx ? Math.min(999, Math.round((estimatedPromptTokens / ctx) * 100)) : null;
   const totalLabel = formatTokenCount(estimatedPromptTokens);
   const ctxLabel = ctx ? formatTokenCount(ctx) : "?";
@@ -505,13 +495,9 @@ function resolveChannelModelNote(params: {
   return "channel override";
 }
 
-export type StatusMessageParts = {
-  text: string;
-  /** Structured mirror of the text body for channels with native table rendering. */
-  presentation: MessagePresentation;
-};
+export type StatusMessageParts = ReturnType<typeof buildStatusMessageParts>;
 
-export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
+export function buildStatusMessageParts(args: StatusArgs) {
   const now = args.now ?? Date.now();
   // Derive the live wall clock here so both /status and session_status expose
   // the same configured timezone without duplicating formatting at each caller.
@@ -550,24 +536,18 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
     const fallbackMatchesRuntimeModel =
       initialFallbackState.active &&
       normalizeLowercaseStringOrEmpty(runtimeModelRaw) ===
-        normalizeLowercaseStringOrEmpty(
-          normalizeOptionalString(entry?.fallbackNotice?.activeModel ?? "") ?? "",
-        );
+        normalizeLowercaseStringOrEmpty(entry?.fallbackNotice?.activeModel);
     const runtimeMatchesSelectedModel =
       normalizeLowercaseStringOrEmpty(runtimeModelRaw) ===
       normalizeLowercaseStringOrEmpty(modelRefs.selected.label || "unknown");
-    // Legacy fallback sessions can persist provider-qualified runtime ids
-    // without a separate modelProvider field. Preserve provider-aware lookup
-    // when the stored slash id is the selected model or the active fallback
-    // target; otherwise keep the raw model-only lookup for OpenRouter-style
-    // slash ids.
-    if (
-      (fallbackMatchesRuntimeModel || runtimeMatchesSelectedModel) &&
-      embeddedProvider === normalizeLowercaseStringOrEmpty(activeProvider)
+    // A slash can be part of a provider-local model ID. Prefer its current
+    // catalog identity before interpreting a legacy provider-qualified ID.
+    if (findModelInCatalog(args.thinkingCatalog ?? [], activeProvider, runtimeModelRaw)) {
+      contextLookupModel = runtimeModelRaw;
+    } else if (
+      (!fallbackMatchesRuntimeModel && !runtimeMatchesSelectedModel) ||
+      embeddedProvider !== normalizeLowercaseStringOrEmpty(activeProvider)
     ) {
-      contextLookupProvider = activeProvider;
-      contextLookupModel = activeModel;
-    } else {
       contextLookupProvider = undefined;
       contextLookupModel = runtimeModelRaw;
     }
@@ -606,7 +586,10 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
       }
       if (!entry?.model && !args.activeModel && logUsage.model) {
         const slashIndex = logUsage.model.indexOf("/");
-        if (slashIndex > 0) {
+        if (
+          slashIndex > 0 &&
+          !findModelInCatalog(args.thinkingCatalog ?? [], activeProvider, logUsage.model)
+        ) {
           const provider = logUsage.model.slice(0, slashIndex).trim();
           const model = logUsage.model.slice(slashIndex + 1).trim();
           if (provider && model) {
@@ -619,9 +602,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
           }
         } else {
           activeModel = logUsage.model;
-          // Bare transcript model IDs should keep provider-aware lookup when the
-          // active provider is already known so shared model names still resolve
-          // to the correct provider-specific window.
+          // Bare IDs and catalog-owned slash IDs retain the known provider.
           contextLookupProvider = activeProvider;
           contextLookupModel = logUsage.model;
         }
@@ -658,6 +639,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
     modelContextWindow: args.selectedContextWindow,
     modelContextTokens: args.selectedContextTokens,
     allowAsyncLoad: false,
+    allowCacheLookup: false,
   });
   const activeCatalogEntry = contextLookupProvider
     ? findModelInCatalog(args.thinkingCatalog ?? [], contextLookupProvider, contextLookupModel)
@@ -685,6 +667,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
         ? args.runtimeContextTokens
         : undefined),
     allowAsyncLoad: false,
+    allowCacheLookup: false,
   });
   const channelModelNote = resolveChannelModelNote({
     config: args.config,
@@ -717,9 +700,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
     entry?.modelSelectionLocked !== true &&
     runtimeDiffersFromSelected &&
     !runtimeSnapshotHasFallbackProvenance;
-  const contextTokens = useSelectedContext
-    ? (selectedContextTokens ?? DEFAULT_CONTEXT_TOKENS)
-    : (projectedActiveContextTokens ?? DEFAULT_CONTEXT_TOKENS);
+  const contextTokens = useSelectedContext ? selectedContextTokens : projectedActiveContextTokens;
 
   const thinkLevel =
     args.resolvedThink ?? args.sessionEntry?.thinkingLevel ?? args.agent?.thinkingDefault ?? "off";
@@ -753,12 +734,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
   });
 
   const updatedAt = entry?.updatedAt;
-  const sessionStartedAt = resolveSessionLifecycleTimestamps({
-    entry,
-    agentId: args.agentId,
-    sessionKey: args.sessionKey,
-    storePath: args.sessionStorePath,
-  }).sessionStartedAt;
+  const sessionStartedAt = resolveTimestamp(args.sessionStartedAt ?? entry?.sessionStartedAt);
   const sessionDuration =
     typeof sessionStartedAt === "number"
       ? formatDurationCompact(now - sessionStartedAt, { spaced: true })
@@ -946,7 +922,7 @@ export function buildStatusMessageParts(args: StatusArgs): StatusMessageParts {
   const queueHasSignal = (args.queue?.depth ?? 0) > 0 || args.queue?.showDetails === true;
   const compactionCount = entry?.compactionCount ?? 0;
   const contextPct =
-    typeof totalTokens === "number" && totalTokens > 0 && contextTokens > 0
+    typeof totalTokens === "number" && totalTokens > 0 && contextTokens != null && contextTokens > 0
       ? Math.min(999, Math.round((totalTokens / contextTokens) * 100))
       : null;
   const contextMeter =

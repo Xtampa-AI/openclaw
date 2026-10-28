@@ -225,12 +225,7 @@ export function prepareGatewaySessionStoreReadSources(params: {
 
 /** Capture source routing for the existing history worker; no native discovery runs here. */
 export async function prepareGatewaySessionStoreReadSourcesAsync(
-  params: {
-    cfg: OpenClawConfig;
-    currentSource: SessionEntryReadSource;
-    env: NodeJS.ProcessEnv;
-    registryPath: string;
-  },
+  params: Parameters<typeof prepareGatewaySessionStoreReadSources>[0],
   signal?: AbortSignal,
 ) {
   signal?.throwIfAborted();
@@ -348,7 +343,7 @@ export async function prepareGatewaySessionStoreReadSourcesAsync(
           throw error;
         }
       }
-      const current = await readRegistry(assertCallerCurrent, signal);
+      const current = await readRegistry(assertCallerCurrent);
       assertCallerCurrent();
       assertSourceCurrent();
       current.assertCurrent();

@@ -57,7 +57,7 @@ import {
   createSlackBoltApp,
   gracefulStopSlackApp,
   publishSlackConnectedStatus,
-  publishSlackBlockedStatus,
+  trackSlackAuthFailure,
   publishSlackDisconnectedStatus,
   resolveSlackBoltInterop,
   startSlackSocketAndWaitForDisconnect,
@@ -65,7 +65,6 @@ import {
 } from "./provider-support.js";
 import {
   formatSlackSocketModeSharedConnectionWarning,
-  isNonRecoverableSlackAuthError,
   registerSlackSocketModeConnectionDiagnostics,
   SLACK_SOCKET_RECONNECT_POLICY,
 } from "./reconnect-policy.js";
@@ -557,10 +556,7 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts) {
 
   let workspaceRuntimePromise: Promise<void> | undefined;
   const installSlackWorkspaceRuntime = async () => {
-    if (workspaceRuntimePromise) {
-      return await workspaceRuntimePromise;
-    }
-    workspaceRuntimePromise = (async () => {
+    workspaceRuntimePromise ??= (async () => {
       registerSlackWorkspaceEvents({
         ctx,
         appHomeSlashCommandName,
@@ -690,14 +686,18 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts) {
 
     if (slackMode === "socket") {
       let reconnectAttempts = 0;
+      const authState = { consecutiveInvalidAuth: 0 };
+      const logError = (message: string) => runtime.error?.(message);
       let hasLoggedSocketConnected = false;
       while (!opts.abortSignal?.aborted) {
+        let delayMs: number;
         try {
           const disconnect = await startSlackSocketAndWaitForDisconnect({
             app,
             abortSignal: opts.abortSignal,
             onStarted: async () => {
               reconnectAttempts = 0;
+              authState.consecutiveInvalidAuth = 0;
               await recoverSlackIdentity();
               publishSlackConnectedStatus(opts.setStatus, ctx.identityHealth);
               if (!hasLoggedSocketConnected) {
@@ -718,19 +718,16 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts) {
           }
           publishSlackDisconnectedStatus(opts.setStatus, disconnect.error);
 
-          // Permanent account and credential failures need operator action.
-          if (disconnect.error && isNonRecoverableSlackAuthError(disconnect.error)) {
-            publishSlackBlockedStatus(opts.setStatus, disconnect.error);
-            runtime.error?.(
-              `slack socket mode disconnected due to non-recoverable auth error — skipping channel (${formatSlackError(disconnect.error)})`,
-            );
-            throw disconnect.error instanceof Error
-              ? disconnect.error
-              : new Error(formatSlackError(disconnect.error));
-          }
+          trackSlackAuthFailure(
+            disconnect.error,
+            "auth: disconnected, skipping channel",
+            opts.setStatus,
+            logError,
+            authState,
+          );
 
           reconnectAttempts += 1;
-          const delayMs = computeBackoff(SLACK_SOCKET_RECONNECT_POLICY, reconnectAttempts);
+          delayMs = computeBackoff(SLACK_SOCKET_RECONNECT_POLICY, reconnectAttempts);
           runtime.log?.(
             warn(
               formatSlackSocketReconnectMessage({
@@ -742,22 +739,17 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts) {
             ),
           );
           await gracefulStopSlackApp(app);
-          try {
-            await sleepWithAbort(delayMs, opts.abortSignal);
-          } catch {
-            break;
-          }
         } catch (err) {
-          if (isNonRecoverableSlackAuthError(err)) {
-            publishSlackBlockedStatus(opts.setStatus, err);
-            runtime.error?.(
-              `slack socket mode failed to start due to non-recoverable auth error — skipping channel (${formatSlackError(err)})`,
-            );
-            throw err;
-          }
+          trackSlackAuthFailure(
+            err,
+            "auth: start failed, skipping channel",
+            opts.setStatus,
+            logError,
+            authState,
+          );
           publishSlackDisconnectedStatus(opts.setStatus, err);
           reconnectAttempts += 1;
-          const delayMs = computeBackoff(SLACK_SOCKET_RECONNECT_POLICY, reconnectAttempts);
+          delayMs = computeBackoff(SLACK_SOCKET_RECONNECT_POLICY, reconnectAttempts);
           runtime.error?.(
             formatSlackSocketStartRetryMessage({
               attempt: reconnectAttempts,
@@ -766,12 +758,11 @@ export async function monitorSlackProvider(opts: MonitorSlackOpts) {
               sdkContext: socketModeLogger.getLastMessage(),
             }),
           );
-          try {
-            await sleepWithAbort(delayMs, opts.abortSignal);
-          } catch {
-            break;
-          }
-          continue;
+        }
+        try {
+          await sleepWithAbort(delayMs, opts.abortSignal);
+        } catch {
+          break;
         }
       }
     } else if (slackMode === "relay" && relayConfig) {
@@ -828,8 +819,7 @@ function createSlackWorkspaceClientResolver(params: {
     return () => params.appClient;
   }
   const clients = new Map<string, WebClient>();
-  return (rawTeamId?: string) => {
-    const teamId = rawTeamId;
+  return (teamId?: string) => {
     if (!teamId || !/^T[A-Z0-9]+$/.test(teamId)) {
       throw new Error("Slack Enterprise Grid workspace client requires a valid teamId");
     }

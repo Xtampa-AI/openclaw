@@ -26,7 +26,10 @@ import {
 import { readDaemonRuntimePinForInstall } from "../../daemon/runtime-pin-state.js";
 import { readEmbeddedGatewayToken } from "../../daemon/service-audit.js";
 import { mergeGatewayServiceEnv } from "../../daemon/service-env-merge.js";
-import { sanitizeServiceInspectionError } from "../../daemon/service-inspection-error.js";
+import {
+  sanitizeServiceInspectionError,
+  ServiceStartRefusalError,
+} from "../../daemon/service-inspection-error.js";
 import { reconcileGatewayServiceDefinition } from "../../daemon/service-reconciliation.js";
 import type {
   GatewayServiceDefinitionBackupReceipt,
@@ -61,6 +64,7 @@ import { defaultRuntime } from "../../runtime.js";
 import { createLazyPromise } from "../../shared/lazy-promise.js";
 import { formatCliCommand } from "../command-format.js";
 import { formatInvalidConfigPort, formatInvalidPortOption } from "../error-format.js";
+import { resolveRestoreServiceCli } from "./install-restore-cli.js";
 import { buildDaemonServiceSnapshot, installDaemonServiceAndEmit } from "./response.js";
 import { createDaemonInstallActionContext, resolveDaemonInstallBlockMessage } from "./shared.js";
 import type { DaemonInstallOptions } from "./types.js";
@@ -186,9 +190,18 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
   const service = resolveGatewayService();
   let existingServiceCommand: GatewayServiceCommandConfig | null;
   try {
-    existingServiceCommand = await service.readCommand(process.env, { requireEffective: true });
+    existingServiceCommand = await service.readCommand(process.env, {
+      requireEffective: true,
+      allowMissingDefinition: true,
+    });
   } catch (error) {
-    fail(sanitizeServiceInspectionError(error).message);
+    const message = sanitizeServiceInspectionError(error).message;
+    // No installer writes precede this read; the updater can retain the unchanged definition.
+    fail(
+      error instanceof ServiceStartRefusalError
+        ? `SERVICE_DEFINITION_UNKNOWN: ${message}`
+        : message,
+    );
     return;
   }
   let loaded;
@@ -235,7 +248,20 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
       );
       return;
     }
-    // This interop path defers startup preparation until the caller's observation still matches.
+  }
+  let restoreServiceCli: Parameters<typeof buildGatewayInstallPlan>[0]["serviceCli"];
+  let restoredRuntimePath: string | undefined;
+  if (opts.restoreServiceCli !== undefined) {
+    try {
+      ({ serviceCli: restoreServiceCli, runtimePath: restoredRuntimePath } =
+        await resolveRestoreServiceCli(opts.restoreServiceCli, opts, installEnv));
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
+  if (opts.expectedRuntimePin !== undefined) {
+    // This interop path defers startup preparation until custody and recovery inputs are valid.
     const { ensureConfigReady } = await import("../program/config-guard.js");
     await ensureConfigReady({
       runtime: defaultRuntime,
@@ -323,7 +349,7 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
         installEnv,
       );
     }
-    runtimePath = wrapperPath ? undefined : pinnedRuntimePath;
+    runtimePath = wrapperPath ? undefined : (pinnedRuntimePath ?? restoredRuntimePath);
   } catch (error) {
     fail(
       `Invalid runtime pin: ${String(error)}; reinstall with an explicit --runtime or --runtime-path to replace the saved runtime pin.`,
@@ -356,11 +382,8 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
     runtimePath = recordedRuntime.path;
   }
   if (recordedRuntime?.runtime === "node") {
-    if (recordedRuntime.status !== "probe-failed") {
-      const diagnostic = recordedRuntime.capabilityError ?? recordedRuntime.note;
-      if (diagnostic) {
-        warn(diagnostic);
-      }
+    if (recordedRuntime.status !== "probe-failed" && recordedRuntime.capabilityError) {
+      warn(recordedRuntime.capabilityError);
     }
     const missingRuntime =
       recordedRuntime.status === "probe-failed" &&
@@ -409,6 +432,7 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
       runtimePath,
       pinnedRuntimePath,
       wrapperPath,
+      serviceCli: restoreServiceCli,
       existingCommand: existingServiceCommand,
       existingEnvironment: existingServiceEnv,
       existingEnvironmentValueSources: existingManagedCommand?.environmentValueSources,
@@ -503,7 +527,10 @@ export async function runDaemonInstall(opts: DaemonInstallOptions) {
         ...(opts.expectedRuntimePin !== undefined
           ? {
               requireDefinitionMatch: true as const,
-              ...(pinSnapshot.definition !== undefined ? { requireRunning: true as const } : {}),
+              // Recovery replaces a failed service; definition and pin custody still fence changes.
+              ...(!restoreServiceCli && pinSnapshot.definition !== undefined
+                ? { requireRunning: true as const }
+                : {}),
             }
           : {}),
       },
@@ -568,7 +595,9 @@ async function getGatewayServiceAutoRefreshMessage(params: {
   try {
     const currentCommand = resolveManagedGatewayServiceCommand(params.currentCommand);
     if (!currentCommand) {
-      return undefined;
+      return params.currentCommand
+        ? undefined
+        : "Gateway service definition is missing; refreshing the install.";
     }
     if (params.pinChanged) {
       return "Gateway runtime selection changed; refreshing the install.";

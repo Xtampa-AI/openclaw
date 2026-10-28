@@ -2,6 +2,7 @@ import {
   createGatewayRestartDeadline,
   GatewayRestartDeadlineError,
 } from "../cli/daemon-cli/restart-health-deadline.js";
+import { getGatewayChannelWarnings } from "../cli/daemon-cli/restart-health-diagnostics.js";
 import {
   resolveGatewayRestartProbeContext,
   waitForGatewayHttpReadiness,
@@ -32,21 +33,13 @@ import {
 export type ImmutableGatewayVerification = {
   pid: number;
   bootId: string;
-  port: number;
   version: string;
   buildId: string;
   generationSha: string;
-  buildDigest: string;
-  healthz: 200;
-  readyz: 200;
-  channelsReady: true;
-  pluginsReady: true;
 };
 
 export type ImmutableGatewayObservation = {
   outcome: "verified" | "still-starting" | "unverified" | "failed";
-  phase: string;
-  elapsedMs: number;
   service?: ImmutableServiceObservation;
   verification?: ImmutableGatewayVerification;
 };
@@ -54,7 +47,7 @@ export type ImmutableGatewayObservation = {
 /** Read-only settlement: the caller owns publication, rollback, and the durable receipt. */
 export async function waitForImmutableGateway(params: {
   descriptor: ImmutableInstallDescriptor;
-  generation: Pick<ImmutablePreparedGeneration, "path" | "sha" | "buildDigest">;
+  generation: Pick<ImmutablePreparedGeneration, "path" | "sha">;
   timeoutMs: number;
   assertCurrent: () => void;
   onReceipt?: (line: string) => void;
@@ -71,8 +64,6 @@ export async function waitForImmutableGateway(params: {
     params.onReceipt?.(`readiness-${outcome}`);
     return {
       outcome,
-      phase: waited?.startupPhase ?? deadline.expiredPhase ?? deadline.phase,
-      elapsedMs: Math.round(deadline.elapsedMs()),
       ...(observed ? { service: observed } : {}),
     };
   };
@@ -152,6 +143,7 @@ export async function waitForImmutableGateway(params: {
         expectedVersion: version,
         expectedBuildId: buildId,
         requirePluginHealth: true,
+        requireChannelHealth: false,
       };
       waited = await waitForGatewayHealthyRestart({
         ...probe,
@@ -165,6 +157,7 @@ export async function waitForImmutableGateway(params: {
       }
       const http = await deadline.read("readiness:http", () =>
         waitForGatewayHttpReadiness({
+          requireChannelHealth: false,
           config: context.config,
           port,
           attempts: 1,
@@ -193,28 +186,24 @@ export async function waitForImmutableGateway(params: {
         !isSameGatewayRestartGeneration(waited, after) ||
         after.gatewayVersion !== version ||
         after.gatewayBuildId !== buildId ||
-        http.healthz !== 200 ||
-        http.readyz !== 200
+        !(http.coreReady ?? (http.healthz === 200 && http.readyz === 200))
       ) {
         return result("unverified");
       }
       assertImmutableServiceProcessCurrent(current);
       assertCurrent();
       observed = current;
+      for (const { id } of getGatewayChannelWarnings(after, http)) {
+        params.onReceipt?.(`Channel health warning (${id}); run openclaw channels status --probe.`);
+      }
       return {
         ...result("verified"),
         verification: {
           pid: current.pid,
           bootId: after.gatewayBootId,
-          port,
           version,
           buildId,
           generationSha: params.generation.sha,
-          buildDigest: params.generation.buildDigest,
-          healthz: 200,
-          readyz: 200,
-          channelsReady: true,
-          pluginsReady: true,
         },
       };
     });

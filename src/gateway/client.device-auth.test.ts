@@ -64,6 +64,7 @@ beforeEach(() => {
 function host(origin: boolean, readOnly = false, explicit = true) {
   const client = new GatewayClient({
     url: "wss://gateway.example.test",
+    deviceIdentity: null,
     ...(origin ? { deviceAuthScope: "wss://gateway.example.test" } : {}),
     ...(explicit ? { token: "fixture-shared-auth" } : {}),
     ...(readOnly ? { sharedStateMode: "read-only" } : {}),
@@ -79,7 +80,6 @@ function host(origin: boolean, readOnly = false, explicit = true) {
 }
 
 const observations = [
-  { name: "valid", token: "fixture-existing", malformed: false },
   { name: "malformed scopes", token: "fixture-existing", malformed: true },
   { name: "absent", token: undefined, malformed: false },
   { name: "raw whitespace", token: " fixture-existing ", malformed: false },

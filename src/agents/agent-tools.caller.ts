@@ -1,3 +1,4 @@
+import type { SessionEventSourcePolicy } from "../auto-reply/reply/session-event-contract.js";
 import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
 import type { OpenClawCodingToolsOptions } from "./agent-tools.options.js";
 import type { ResolvedConversationCapabilityProfile } from "./conversation-capability-profile.js";
@@ -11,6 +12,7 @@ export function createCodingToolsGatewayCaller(params: {
   sessionKey?: string;
   accountId?: string;
   capabilityProfile: ResolvedConversationCapabilityProfile;
+  sessionEventSourcePolicy?: SessionEventSourcePolicy;
 }) {
   const { options, agentId, sessionKey, capabilityProfile } = params;
   const settleBatch =
@@ -22,6 +24,13 @@ export function createCodingToolsGatewayCaller(params: {
       ? {
           agentId,
           sessionKey: sessionKey.trim(),
+          sessionEventToolsAllow: params.sessionEventSourcePolicy?.toolsAllow,
+          sessionEventSettings: params.sessionEventSourcePolicy?.settings ?? {
+            permissionMode: options.sessionPermissionPolicy?.mode,
+          },
+          ...(options.sourceReplyDeliveryMode === "message_tool_only"
+            ? { sessionEventDelivery: false as const }
+            : {}),
           // The existing source fence rechecks this after tool preparation and at final I/O.
           receiptAuthority: settleBatch?.isCurrent,
           receiptAdmissions: settleBatch?.receiptAdmission

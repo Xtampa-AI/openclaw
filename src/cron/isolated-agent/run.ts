@@ -32,7 +32,6 @@ import { withPluginRuntimeGenerationScope } from "../../plugins/runtime/generati
 import { isCommandLaneTaskTimeoutError } from "../../process/command-queue.js";
 import { CommandLane } from "../../process/lanes.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
-import { CronExecutionRootRuntimeError } from "../execution-root-runtime.js";
 import { removeCronRunContinuationSessionIfIdle } from "../run-continuation-cleanup.js";
 import { createCronRunDiagnosticsFromError, mergeCronRunDiagnostics } from "../run-diagnostics.js";
 import { resolveCronRunErrorReason } from "../run-error-reason.js";
@@ -40,7 +39,9 @@ import {
   normalizeCronRunErrorText,
   resolveCronAbortReasonText,
 } from "../service/execution-errors.js";
+import { isCronOneShotContinuationJob } from "../service/one-shot-schedule.js";
 import type { CronAgentExecutionPhaseUpdate } from "../types.js";
+import type { CronRunExecutionParams } from "./run-execution.types.js";
 import { finalizeCronRun } from "./run-finalize.js";
 import type { RunCronAgentTurnParams } from "./run-prepare-runtime.js";
 import { prepareCronRunContext } from "./run-prepare.js";
@@ -51,6 +52,9 @@ import type { CronCompletedPromptRun, RunCronAgentTurnResult } from "./run.types
 import { cleanupCronRunSessionAfterRun } from "./session-cleanup.js";
 
 const cronExecutorRuntimeLoader = createLazyImportLoader(() => import("./run-executor.runtime.js"));
+const cronOperatorSourceLoader = createLazyImportLoader(
+  () => import("../../gateway/cron-operator-source.js"),
+);
 
 // Release the full session snapshot after persistence and delivery to avoid retaining skill prompts.
 async function disposeCronRunContext(params: {
@@ -105,9 +109,6 @@ async function runCronIsolatedAgentTurnInTrace(
       onLifecycleInterrupt: () => lifecycleAbortController.abort(createAgentRunRestartAbortError()),
     });
   } catch (err) {
-    if (err instanceof CronExecutionRootRuntimeError) {
-      return { status: "error", error: err.message, admissionDisposition: "rejected" };
-    }
     if (err instanceof CronSessionLifecycleClaimError) {
       return {
         status: "error",
@@ -120,6 +121,7 @@ async function runCronIsolatedAgentTurnInTrace(
   if (!prepared.ok) {
     return { ...prepared.result, admissionDisposition: "rejected" };
   }
+  using operatorLease = new DisposableStack();
   await using _ = {
     [Symbol.asyncDispose]: async () => {
       await prepared.context.workspaceLease?.release();
@@ -212,6 +214,9 @@ async function runCronIsolatedAgentTurnInTrace(
           let outcomeError: string | undefined;
           let cronRunSessionCleanupHandled = false;
           let completedPromptRuns: readonly CronCompletedPromptRun[] = [];
+          let promptAdmission:
+            | Parameters<CronRunExecutionParams["onPromptAdmission"]>[0]
+            | undefined;
           let usage: RunCronAgentTurnResult["usage"];
           let usageSettlement: Promise<void> | undefined;
           const settleUsage = async (contextTokens?: number) => {
@@ -248,7 +253,13 @@ async function runCronIsolatedAgentTurnInTrace(
                 agentId: prepared.context.agentId,
                 lifecycleGeneration: runLifecycleGeneration,
                 cronRunsByJobId: new Map([
-                  [params.job.id, { pacingEnabled: params.job.pacing !== undefined }],
+                  [
+                    params.job.id,
+                    {
+                      nextCheckEnabled:
+                        params.job.pacing !== undefined || isCronOneShotContinuationJob(params.job),
+                    },
+                  ],
                 ]),
               },
               {
@@ -257,8 +268,24 @@ async function runCronIsolatedAgentTurnInTrace(
               },
             );
             const { executeCronRun } = await cronExecutorRuntimeLoader.load();
+            const operator = params.job.operatorSource
+              ? await (
+                  await cronOperatorSourceLoader.load()
+                ).restoreCronOperatorSource({
+                  job: params.job,
+                  agentId: prepared.context.agentId,
+                  sessionKey: prepared.context.runSessionKey,
+                  entry: prepared.context.cronSession.sessionEntry,
+                  signal: abortSignal,
+                  deliveryAttemptFence: params.deliveryAttemptFence,
+                })
+              : undefined;
+            if (operator) {
+              operatorLease.defer(operator.release);
+            }
             const executionParams: Parameters<typeof executeCronRun>[0] = {
               ...prepared.context,
+              operatorAuthority: operator?.authority,
               runId,
               cfg: params.cfg,
               job: params.job,
@@ -270,6 +297,10 @@ async function runCronIsolatedAgentTurnInTrace(
                 prepared.context.runContinuationSession?.setCliExecutionProvider,
               abortSignal,
               lifecycle,
+              onPromptAdmission: (admission) => {
+                promptAdmission?.close();
+                promptAdmission = admission;
+              },
               onExecutionStarted: notifyExecutionStarted,
               onExecutionPhase: notifyExecutionPhase,
               onLaneWait: params.onLaneWait,
@@ -292,6 +323,7 @@ async function runCronIsolatedAgentTurnInTrace(
             // Publish the execution fact captured before bookkeeping; cron persistence
             // and delivery retain their separate workflow outcome.
             lifecycle.emit("end", execution.runResult);
+            await promptAdmission?.finish();
             const finalized = await finalizeCronRun({
               prepared: prepared.context,
               execution,
@@ -315,6 +347,7 @@ async function runCronIsolatedAgentTurnInTrace(
               : { ...finalized, nextCheck: { delayMs } };
           } catch (err) {
             lifecycle.emit("error", err);
+            await promptAdmission?.finish();
             consumeCronNextCheckProposal(runId, params.job.id);
             const isCronLaneTimeout =
               isAborted() || isCommandLaneTaskTimeoutError(err, CommandLane.CronNested);
@@ -329,7 +362,7 @@ async function runCronIsolatedAgentTurnInTrace(
             const admissionDisposition =
               err instanceof CronSessionLifecycleClaimError
                 ? err.admissionDisposition
-                : err instanceof CronExecutionRootRuntimeError || !executionStarted
+                : !executionStarted
                   ? "rejected"
                   : undefined;
             if (completedPromptRuns.length > 0) {
@@ -367,6 +400,8 @@ async function runCronIsolatedAgentTurnInTrace(
               ),
             });
           } finally {
+            // Terminal persistence must settle before the continuation rejects late events.
+            await promptAdmission?.finish();
             try {
               await prepared.context.runContinuationSession?.seal();
             } catch (sealError) {

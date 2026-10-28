@@ -205,15 +205,15 @@ describe("SQLite read-only session operation custody", () => {
     const transfer = createSqliteWorkerTransferOwner();
     const handle = transfer.start(
       [
-        { kind: "store", value: { status: "missing" } },
-        { kind: "state", value: { status: "missing" } },
+        { kind: "fields", value: [{ kind: "object" }] },
+        { kind: "fields", value: [{ kind: "key", value: "store" }, { kind: "object" }] },
       ][Symbol.iterator](),
-      { kinds: ["store", "state"] },
+      { kinds: ["fields"] },
     );
     try {
       child.emit("message", {
         id,
-        result: { type: "start", handle: { ...handle, cacheable: false } },
+        result: { type: "start", handle },
       });
       expect(child.send).toHaveBeenLastCalledWith(
         { id, transfer: { type: "next", transferId: handle.id } },
@@ -359,7 +359,11 @@ it.each([
       emitChildProcessSpawnSample();
       setDiagnosticsEnabledForProcess(true);
       const { child } = createSession("/usr/bin/node");
-      expect(mock.spawn).toHaveBeenCalledWith(execPath, expect.any(Array), expect.any(Object));
+      expect(mock.spawn).toHaveBeenCalledWith(
+        execPath,
+        expect.any(Array),
+        expect.objectContaining({ windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] }),
+      );
       now = 60_000;
       emitChildProcessSpawnSample();
       expect(events).toEqual([]);

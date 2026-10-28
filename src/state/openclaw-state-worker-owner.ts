@@ -1,4 +1,3 @@
-import { channel } from "node:diagnostics_channel";
 import { performance } from "node:perf_hooks";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { resolveRuntimeProcessEntrypointUrl } from "../infra/runtime-process-url.js";
@@ -11,6 +10,7 @@ import {
 import type { SqliteWorkerStateContext } from "../infra/sqlite-worker-state-context.js";
 import {
   openSharedStateSqliteWorkerStore,
+  prepareSharedStateSqliteWorkerRuntime,
   closeUnclaimedSharedStateSqliteWorkers,
   hasUnclaimedSharedStateSqliteCleanup,
   isSqliteWorkerStoreAvailable,
@@ -20,8 +20,7 @@ import {
   SqliteWorkerError,
 } from "../infra/sqlite-worker-store.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { runInDetachedAsyncContext } from "../shared/async-work-scope.js";
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { isStateDatabaseReadAdmissionInvalidatedError } from "./openclaw-state-db-async-lifecycle.js";
 import {
   captureOpenClawStateDatabaseReadAdmission,
@@ -30,11 +29,13 @@ import {
   registerOpenClawStateDatabaseAsyncResource,
   registerOpenClawStateDatabaseLifecycleListener,
 } from "./openclaw-state-db-cache.js";
+import type { OpenClawDatabaseMaintenanceScope } from "./openclaw-state-maintenance-context.js";
 import type { OpenClawStateWorkerContext } from "./openclaw-state-worker-context.types.js";
 import type {
   OpenClawStateWorkerCleanupOperations,
   OpenClawStateWorkerOperationOptions as OperationOptions,
 } from "./openclaw-state-worker-contract.js";
+import { createStateWorkerMemoryPressureSubscription } from "./openclaw-state-worker-memory-pressure.js";
 import {
   assertOpenClawStateWorkerActorPath,
   assertOpenClawStateWorkerSchemaContext,
@@ -52,27 +53,16 @@ import type {
 const log = createSubsystemLogger("state/worker");
 const SHARED_STATE_WORKER_IDLE_INSPECT_MS = 60_000;
 
-function createSharedStateWorkerOwner() {
+export function createSharedStateWorkerOwner() {
   const moduleUrl = resolveRuntimeProcessEntrypointUrl("sharedStateStore");
   const stores = new Set<Entry>();
   const activeEntries = new Set<Entry>();
   const retiring = new Map<Entry, { pending?: Promise<void>; actorSettlement?: Promise<void> }>();
   const retiringActors = new Map<object, ActorRetirement>();
-  const memoryPressure = channel("openclaw.memory.critical");
-  let pressureSubscribed = false;
-  const refreshPressureSubscription = () => {
-    const hasCustody =
-      stores.size > 0 || retiring.size > 0 || retiringActors.size > 0 || activeEntries.size > 0;
-    if (hasCustody === pressureSubscribed) {
-      return;
-    }
-    pressureSubscribed = hasCustody;
-    if (hasCustody) {
-      memoryPressure.subscribe(retireIdleWorkers);
-    } else {
-      memoryPressure.unsubscribe(retireIdleWorkers);
-    }
-  };
+  const refreshPressureSubscription = createStateWorkerMemoryPressureSubscription(
+    () => stores.size > 0 || retiring.size > 0 || retiringActors.size > 0 || activeEntries.size > 0,
+    retireIdleWorkers,
+  );
   const matches = (entry: Entry, identity?: DatabasePathIdentity) =>
     identity === undefined || entry.context.admission.identity.key === identity.key;
   const hasActiveActorOperations = (entry: Entry) =>
@@ -436,6 +426,9 @@ function createSharedStateWorkerOwner() {
     }
   }
   return {
+    prepareRuntime() {
+      return prepareSharedStateSqliteWorkerRuntime(captureRuntimeWorkerSource(moduleUrl));
+    },
     close,
     retainOperation,
     // Source and bundled callers must share the owner's backend URL.
@@ -444,6 +437,7 @@ function createSharedStateWorkerOwner() {
       context: SqliteWorkerStateContext,
       assertOwned: () => void,
       identity: DatabasePathIdentity,
+      maintenanceScope?: OpenClawDatabaseMaintenanceScope,
     ) {
       const expectedIdentity = { ...identity };
       assertOwned();
@@ -495,15 +489,26 @@ function createSharedStateWorkerOwner() {
         { ...captureRuntimeWorkerSource(moduleUrl), databasePath, existingOnly: true },
         context,
         assertCurrent,
+        {
+          cleanupAccess: maintenanceScope && {
+            assertDatabaseAccess: maintenanceScope.assertCleanupDatabaseAccess,
+          },
+        },
       );
     },
     async open(
       context: OpenClawStateWorkerContext,
       options: Omit<OperationOptions, "createAdmission"> = {},
     ): Promise<Store | undefined> {
-      const { existingOnly = false, assertCurrent, preparation, signal } = options;
-      const wait = <T>(pending: Promise<T>) => racePromiseWithAbortSignal(pending, signal);
+      const {
+        existingOnly = false,
+        assertCurrent,
+        preparation,
+        runtimePreparation,
+        signal,
+      } = options;
       const { admission } = context;
+      const wait = <T>(pending: Promise<T>) => racePromiseWithAbortSignal(pending, signal);
       const source = captureRuntimeWorkerSource(moduleUrl);
       const assertAdmission = () => {
         signal?.throwIfAborted();
@@ -621,6 +626,7 @@ function createSharedStateWorkerOwner() {
               {
                 maintenanceScope: context.maintenanceScope,
                 preparation,
+                runtimePreparation,
                 signal,
                 retainCleanup: (cleanup) => {
                   admitted.cleanup = cleanup;
@@ -649,6 +655,7 @@ function createSharedStateWorkerOwner() {
             stores.delete(admitted);
             refreshPressureSubscription();
           }
+          admitted.openingAdmission.assertCurrent = undefined;
           return store;
         });
         stores.add(entry);
@@ -656,6 +663,7 @@ function createSharedStateWorkerOwner() {
         context.maintenanceScope?.own(entry, "shared-resources", () => retire(admitted));
         void entry.opening.catch(() => {
           stores.delete(admitted);
+          admitted.openingAdmission.assertCurrent = undefined;
           if (hasPendingCleanup(admitted) && !retiring.has(admitted)) {
             retiring.set(admitted, {});
           }
@@ -711,12 +719,4 @@ function createSharedStateWorkerOwner() {
       return store;
     },
   };
-}
-
-export function getOpenClawStateWorkerOwner() {
-  return resolveGlobalSingleton(
-    Symbol.for("openclaw.sharedStateWorkerOwner"),
-    createSharedStateWorkerOwner,
-    (sharedOwner) => sharedOwner.close(),
-  );
 }

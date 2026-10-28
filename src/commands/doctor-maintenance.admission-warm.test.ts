@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import { createSystemdCommandQuery } from "../daemon/systemd-command-query.js";
@@ -8,8 +9,10 @@ import { readUpdateRunDriver } from "../infra/update-run-driver.js";
 import { createUpdateRun, recordUpdateRunRepairContinuation } from "../infra/update-run-ledger.js";
 import { recordOpenClawDatabaseQuarantine } from "../state/openclaw-quarantine-store.js";
 import { createOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
-import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
-import * as doctorSchema from "../state/openclaw-state-db-doctor-schema.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  isOpenClawStateDatabaseOpen,
+} from "../state/openclaw-state-db-cache.js";
 import { withOpenClawStateDatabaseReadSnapshot } from "../state/openclaw-state-db-readonly.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { resolveDoctorUpdateAdmission } from "./doctor-maintenance-admission.js";
@@ -73,30 +76,6 @@ it("admits fast systemd inspection after slow continuation integrity validation"
   }
 });
 
-it("rechecks warm Doctor maintenance without hashing or copying the complete shared store", async () => {
-  const schemaAdmission = vi.spyOn(doctorSchema, "openDoctorStateSchemaReadAdmission");
-  const { admission, assertIsolation } = fixture(true);
-  const maintenance = maintenanceScope(admission);
-  const hashes = vi.spyOn(snapshots, "readSqliteSourceContentVersionSync");
-  const copies = vi.spyOn(snapshots, "prepareSqliteReadOnlyLocationSync");
-  try {
-    schemaAdmission.mockClear();
-    maintenance.run(() => {
-      hashes.mockClear();
-      copies.mockClear();
-      maintenance.assertAdmission();
-      maintenance.assertAdmission();
-      maintenance.assertAdmission();
-      expect(hashes).not.toHaveBeenCalled();
-      expect(copies).not.toHaveBeenCalled();
-      expect(schemaAdmission).toHaveBeenCalledOnce();
-    });
-  } finally {
-    await maintenance.close();
-    assertIsolation();
-  }
-});
-
 it("refuses replacement while the current maintenance reader is bound", async () => {
   const { database, admission, assertIsolation } = fixture(true);
   const maintenance = maintenanceScope(admission);
@@ -151,6 +130,7 @@ it("refuses new quarantine under the retained native maintenance reader", async 
         }),
       ).toBe(true);
       expect(() => maintenance.assertAdmission()).toThrow("new maintenance quarantine");
+      expect(isOpenClawStateDatabaseOpen(database)).toBe(false);
     });
   } finally {
     await maintenance.close();
@@ -162,10 +142,12 @@ it("binds the reader to Doctor's native source and drains before cold restoratio
   const { env, admission, assertIsolation } = fixture();
   const maintenance = maintenanceScope(admission);
   const hashes = vi.spyOn(snapshots, "readSqliteSourceContentVersionSync");
+  const copies = vi.spyOn(snapshots, "prepareSqliteReadOnlyLocationSync");
   try {
     maintenance.run(() => {
       const native = openOpenClawStateDatabase({ env });
       hashes.mockClear();
+      copies.mockClear();
       maintenance.assertAdmission();
       native.db.exec("BEGIN IMMEDIATE");
       try {
@@ -179,6 +161,7 @@ it("binds the reader to Doctor's native source and drains before cold restoratio
         native.db.exec("ROLLBACK");
       }
       expect(hashes).not.toHaveBeenCalled();
+      expect(copies).not.toHaveBeenCalled();
     });
     await maintenance.close();
     hashes.mockClear();
@@ -218,6 +201,71 @@ it("observes foreign commits without uncommitted rows or inherited discovery sna
     }
     await maintenance.close();
     peer.close();
+    assertIsolation();
+  }
+});
+
+it("refuses committed WAL updates while preserving all live source artifacts", () => {
+  const { env, admission, family, assertIsolation } = fixture(true);
+  const before = family();
+  admission();
+  expect(family()).toEqual(before);
+  const competing = createUpdateRun({ trigger: "cli" }, { env });
+  const committed = family();
+  try {
+    expect(() => admission()).toThrow(competing.runId);
+    expect(family()).toEqual(committed);
+  } finally {
+    assertIsolation();
+  }
+});
+
+it("refuses a competing run after replacement of an already admitted source", async () => {
+  const { env, database, admission, createStateDir, assertIsolation } = fixture(true);
+  const replacement = createStateDir();
+  const competing = createUpdateRun(
+    { trigger: "cli" },
+    { env: { ...env, OPENCLAW_STATE_DIR: replacement } },
+  );
+  await closeOpenClawStateDatabaseAsync();
+  fs.renameSync(path.join(replacement, "state", "openclaw.sqlite"), database);
+  try {
+    expect(() => admission()).toThrow(competing.runId);
+  } finally {
+    assertIsolation();
+  }
+});
+
+it("does not borrow a retained discovery snapshot for current admission", async () => {
+  const { env, admission, assertIsolation } = fixture();
+  try {
+    await withOpenClawStateDatabaseReadSnapshot(
+      async () => {
+        const competing = createUpdateRun({ trigger: "cli" }, { env });
+        expect(() => admission()).toThrow(competing.runId);
+      },
+      { env },
+    );
+  } finally {
+    assertIsolation();
+  }
+});
+
+it("refuses new quarantine with a cold reader and unchanged ledger bytes", () => {
+  const { env, database, admission, family, assertIsolation } = fixture();
+  const before = family();
+  expect(
+    recordOpenClawDatabaseQuarantine({
+      env,
+      kind: "state",
+      path: database,
+      reason: "fresh quarantine refusal",
+    }),
+  ).toBe(true);
+  try {
+    expect(() => admission()).toThrow("fresh quarantine refusal");
+    expect(family()).toEqual(before);
+  } finally {
     assertIsolation();
   }
 });

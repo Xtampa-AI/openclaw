@@ -86,6 +86,7 @@ export class UpdateFinalizationLifecycle {
   private driver?: UpdateRunDriver;
   private ledgerOptions?: { env: NodeJS.ProcessEnv };
   private ownsRun = false;
+  private ownsRepairRun = false;
   private warnedHeartbeat = false;
   private deferredExitWatch?: () => void;
   completed = false;
@@ -94,6 +95,7 @@ export class UpdateFinalizationLifecycle {
   private reportTimeout?: () => void;
   private failureObservation?: UpdateRunResult;
   private failureReason?: string;
+  private readonly recordedWarningCounts = new Map<"doctor" | "plugins", number>();
 
   constructor(
     private readonly json: boolean,
@@ -117,7 +119,8 @@ export class UpdateFinalizationLifecycle {
     this.ownsRun = !inherited;
     adoptUpdateRun(this.runId, admissionOptions);
     this.handoff?.bindRun(this.runId);
-    if (repair && this.ownsRun) {
+    this.ownsRepairRun = repair && this.ownsRun;
+    if (this.ownsRepairRun) {
       recordUpdateRunRepairContinuation(this.runId, this.runId, admissionOptions);
     }
     if (this.active) {
@@ -193,10 +196,33 @@ export class UpdateFinalizationLifecycle {
     }
   }
 
+  /** Records the phase's complete current warning list, retiring rows a shorter list drops. */
   recordWarnings(warnings: readonly string[], phase: "doctor" | "plugins" = "doctor"): void {
     warnings.forEach((detail, index) => {
       this.record(`warning:finalize:${phase}:${index}`, "completed", Date.now(), detail);
     });
+    const recorded = this.recordedWarningCounts.get(phase) ?? 0;
+    this.recordedWarningCounts.set(phase, warnings.length);
+    if (!this.runId) {
+      return;
+    }
+    // Reports render only completed warning rows; retired rows stay as bounded history.
+    for (let index = warnings.length; index < recorded; index += 1) {
+      try {
+        recordUpdateRunStep(
+          this.runId,
+          {
+            step: `warning:finalize:${phase}:${index}`,
+            status: "skipped",
+            endedAtMs: Date.now(),
+            detail: "Settled or superseded later in this update.",
+          },
+          this.ledgerOptions,
+        );
+      } catch {
+        defaultRuntime.error("[update finalize] Could not retire a settled warning.");
+      }
+    }
   }
 
   recordDoctorStep(step: UpdateStepResult): void {
@@ -366,16 +392,29 @@ export class UpdateFinalizationLifecycle {
         failure.message = `Update finalization timed out in ${phase} after ${budgetMs}ms`;
         deadline.start(failure, budgetMs);
       }
-      const result = await deadline.run(() =>
-        withCommandProcessScope(async (stop) => {
-          stopPhaseChildren = stop;
-          scope.assertCurrent();
-          return await output.run(() => run(scope));
-        }, scope.signal),
+      const result = await deadline.run(
+        () =>
+          withCommandProcessScope(async (stop) => {
+            stopPhaseChildren = stop;
+            scope.assertCurrent();
+            return await output.run(() => run(scope));
+          }, scope.signal),
+        // Optional cache failure can settle during cancellation; unjoined work
+        // and cleanup errors still refuse finalization in the deadline owner.
+        phase === "completionCache" ? (cacheResult) => cacheResult === "failed" : undefined,
       );
       await withCommandProcessScope(async () => {
         await custody?.restore?.(result);
       });
+      if (deadline.failure) {
+        this.record(
+          `warning:finalize:${phase}:deadline`,
+          "completed",
+          Date.now(),
+          deadline.failure.message,
+        );
+        this.reportTimeout = undefined;
+      }
       const completed = outcome?.(result) ?? "completed";
       end(
         typeof completed === "string" ? completed : completed.outcome,
@@ -391,21 +430,16 @@ export class UpdateFinalizationLifecycle {
       const doctorFailure = collectNestedErrorCandidates(error).find(
         (cause): cause is UpdateDoctorError => cause instanceof UpdateDoctorError,
       );
-      const facts = failure
-        ? [
-            createUpdateFailureFact({
-              check: phase,
-              code: "finalization-timeout",
-              message: failure.message,
-            }),
-          ]
-        : doctorFailure
+      const facts =
+        !failure && doctorFailure
           ? collectUpdateDoctorFailureFacts(error)
           : [
               createUpdateFailureFact({
                 check: phase,
-                code: extractErrorCode(error) ?? "finalization-failed",
-                message: formatErrorMessage(error),
+                code: failure
+                  ? "finalization-timeout"
+                  : (extractErrorCode(error) ?? "finalization-failed"),
+                message: failure ? failure.message : formatErrorMessage(error),
               }),
             ];
       const deferred =
@@ -446,8 +480,8 @@ export class UpdateFinalizationLifecycle {
             failure: { cause: error },
             durationMs: Math.round(performance.now() - this.startedAt),
           });
-    if (result.reason === "update-failed" && this.failureReason) {
-      result.reason = this.failureReason;
+    if (result.reason === "update-failed") {
+      result.reason = this.failureReason ?? (this.ownsRepairRun ? "repair-failed" : result.reason);
     }
     try {
       this.failureObservation = await verifyUpdateFailureRecovery({
@@ -471,13 +505,19 @@ export class UpdateFinalizationLifecycle {
     }
   }
 
-  private finishLedger(exitCode: number): void {
+  private finishLedger(exitCode: number, deferredMaintenance?: string): void {
     if (this.runId && this.ownsRun) {
       try {
         finishUpdateRun(
           this.runId,
           {
-            status: exitCode ? "failed" : "succeeded",
+            status: exitCode ? "failed" : deferredMaintenance ? "skipped" : "succeeded",
+            reason: deferredMaintenance
+              ? "doctor-maintenance-pending"
+              : this.failureObservation?.reason === "repair-failed"
+                ? "repair-failed"
+                : undefined,
+            nextAction: deferredMaintenance,
             diagnostics: this.failureObservation,
           },
           this.ledgerOptions,
@@ -513,12 +553,12 @@ export class UpdateFinalizationLifecycle {
     watch?.();
   }
 
-  complete(exitCode: number): void {
+  complete(exitCode: number, deferredMaintenance?: string): void {
     if (this.completed) {
       return;
     }
     this.completed = true;
-    this.finishLedger(exitCode);
+    this.finishLedger(exitCode, deferredMaintenance);
     this.reportTimeout?.();
     if (!hasCliProcessScope()) {
       return;

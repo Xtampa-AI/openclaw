@@ -32,11 +32,14 @@ const tempRoots: string[] = [];
 const workerDeployArtifactNames = [
   "code-mode-node.worker.mjs",
   "file-tool-planning.worker.mjs",
+  "gateway-state-owner-heartbeat.worker.mjs",
   "github-exec-launcher.mjs",
   "image-processor.worker.mjs",
+  "openclaw-state-read.worker.mjs",
   "service-child-group-anchor.mjs",
   "service-child-relay.mjs",
   "sqlite-store.worker.mjs",
+  "worker-native-lifecycle.worker.mjs",
   "worker.mjs",
   "workspace-rsync-receiver.mjs",
 ];
@@ -609,9 +612,11 @@ describe("check-cli-bootstrap-imports", () => {
     ["three", "github-exec-launcher.mjs"],
     ["default", "file-tool-planning.worker.mjs"],
     ["default", "github-exec-launcher.mjs"],
+    ["default", "openclaw-state-read.worker.mjs"],
     ["default", "service-child-group-anchor.mjs"],
     ["default", "service-child-relay.mjs"],
     ["default", "sqlite-store.worker.mjs"],
+    ["default", "worker-native-lifecycle.worker.mjs"],
   ] as const)(
     "enforces the %s-artifact worker deployment contract with missing artifact %s",
     (contract, missingArtifact) => {

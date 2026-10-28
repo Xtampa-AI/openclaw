@@ -146,6 +146,11 @@ hashing. Plugin lifecycle operations prepare fresh metadata in their own cache
 generation. Account health and authentication state are not part of the
 immutable package inventory.
 
+Native SDK alias resolution retains each importing file's canonical path, root
+membership, and alias targets in that same generation. Alias registration or
+replacement clears those results, as does metadata invalidation; repeated
+imports do not repeat filesystem canonicalization or containment checks.
+
 The same cache generation prepares installed-index scope lookups, compiled model
 matching patterns, parsed install-record projections, and manifest fingerprints
 once per immutable index. Mutable management indexes remain uncached. Lookup
@@ -248,9 +253,11 @@ root and entry, preserving source overlays and retained module instances.
 Bundled provider policy lookups retain their resolved surface, including absence,
 in the metadata cache. Repeated model-reference canonicalization reuses that
 surface without resolving artifact candidates again. The memo follows the
-selected registry's publication version and bundled-directory selection;
-registration and unpublished registries remain uncached. A new generation or
-explicit metadata invalidation resolves the surface again, and managed surfaces
+selected registry's publication version and bundled-directory selection, with
+separate weakly held entries for each registry. Completed private registries
+become cacheable when their loader publishes its identity; registration and
+incomplete registries remain uncached. A new generation or explicit metadata
+invalidation resolves the surface again, and managed surfaces
 retain their instance's admission checks.
 
 The CLI invocation owns one operation cache across config reads, output metadata,

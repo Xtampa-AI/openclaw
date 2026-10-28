@@ -62,7 +62,7 @@ endpoint.
 The app prepares the local Chrome native helper at startup and after CLI
 installation. Release builds reuse a matching CLI or install a version-matched
 browser runtime under their own app-data directory. This download does not
-create, probe, refresh, or restart a Gateway service, replace its runtime, or
+create, check, refresh, or restart a Gateway service, replace its runtime, or
 change the selected remote connection. It requires an internet connection.
 
 Choose **Set Up Chrome Extension…** in the tray to retry setup and open the
@@ -135,7 +135,10 @@ Changing it requires the separate **Set as Primary** confirmation on a saved
 token-authenticated connection. Other Gateway windows retain their own targets.
 The companion remembers successful explicit selections, returns to Primary when
 that saved connection is removed, and keeps credentials in the operating
-system's credential store. Linux requires an unlocked Secret Service, such as
+system's credential store. Each saved Gateway keeps its own dashboard storage, so
+an approved device pairing survives restarts. Removing the Gateway retires that
+storage: saving it again pairs a new dashboard session, and the old storage is
+deleted at the next launch. Linux requires an unlocked Secret Service, such as
 GNOME Keyring or KWallet's Secret Service support.
 
 An unavailable credential store shows a dismissible notice without blocking the
@@ -425,7 +428,7 @@ and its reply.
 The CLI remains the simplest option for a headless server or VPS. Use a manual
 SSH tunnel when connecting without the Linux desktop companion:
 
-1. Install Node 26 (recommended), or another supported release: Node 24.16+ or Node 26.1+.
+1. Install Node 26 (recommended), or another supported release: Node 24.22.1+ or Node 26.12.1+.
 2. On npm 12 or npm 11.16+, run `npm i -g openclaw@latest --allow-scripts=openclaw`. On npm 11.15 and earlier, omit `--allow-scripts=openclaw`.
 3. `openclaw onboard --install-daemon`
 4. From your laptop: `ssh -N -L 18789:127.0.0.1:18789 <user>@<host>`
@@ -498,7 +501,7 @@ On Linux hosts without a supported service manager, run the Gateway in the
 foreground or through your own supervisor, such as rc.d. `openclaw gateway status
 --deep` reports **no supported service manager detected** and identifies a
 remaining service unit as stale. That recorded unit does not select the status
-probe's configuration or port. Updates continue with a service warning; restart
+check's configuration or port. Updates continue with a service warning; restart
 your manually launched Gateway after the update. An unavailable user session bus
 on a systemd host remains a separate service-access diagnostic.
 

@@ -69,6 +69,8 @@ DM the bot or @ mention it in a group channel.
 
 OpenClaw persists accepted Tlon DM and group-chat events before agent dispatch. Pending or retryable turns survive a Gateway restart, and work remains serialized per group channel or direct peer. Stable Urbit message IDs also suppress a redelivered event while its queue record or retained completion record exists.
 
+If the connection stops delivering data or heartbeats for about 60 seconds, OpenClaw reconnects to the same Eyre channel so unacknowledged events can replay. Time spent handling a received event does not count toward this idle timeout.
+
 Delivery is at least once across the queue-to-agent boundary: a crash during handoff can replay a turn. Agent actions that produce external side effects should therefore remain idempotent where practical.
 
 ## Private/LAN ships
@@ -190,6 +192,16 @@ top-level channel posts or DMs.
 The owner ship is authorized everywhere: DM invites are always auto-accepted, group invites are
 always auto-accepted, and channel messages always pass authorization. The owner does not need to
 be in `dmAllowlist`, `defaultAuthorizedShips`, or `groupInviteAllowlist`.
+
+Group DMs are the exception. Tlon does not verify who wrote a group DM message, so group DM
+messages never carry owner authority: owner commands, approval replies, and admin commands only
+work in a 1:1 DM with the bot. A group DM message whose claimed author is on `dmAllowlist` is still
+answered, but as an ordinary unverified sender.
+
+Pending DM requests saved by versions before this behavior cannot be told apart from group DM
+claims. Approving one still adds the ship to `dmAllowlist`, but its stored message is not
+replayed. The approval confirmation tells the owner the message was not processed and that the
+sender has to send it again.
 
 When `ownerShip` is set, unauthorized requests do not just get dropped — they queue a pending
 approval and DM the owner:

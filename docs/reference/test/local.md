@@ -91,7 +91,7 @@ reconcile dependencies before the remote wrapper starts.
 
 ## Core commands
 
-Run the test toolchain on Node 24.16+ or Node 26.1+, matching the packaged
+Run the test toolchain on Node 24.22.1+ or Node 26.12.1+, matching the packaged
 runtime floor. Older Node bindings can truncate SQLite TEXT values at embedded NUL characters.
 
 To compare the same Vitest selection on Node and Bun, use the existing wrapper:
@@ -249,11 +249,6 @@ The session-title and child-link retention tests declare their title-reader,
 session-utils, and listing roots in this same generation. Each fresh
 heap-measurement child runs their JavaScript without spending its execution
 deadline on TypeScript imports.
-
-Native Bash output-lifecycle fixtures also prepare the real tool and executor
-roots in this generation. Each scenario still uses a fresh process and real
-shell, pipe, and spill file; its unchanged child deadline covers prepared
-JavaScript startup and output handling instead of repeated TypeScript compilation.
 
 Automatic-triage process fixtures share this generation for admission, failure handling, execution, process identity, and respawn checks. Compilation finishes before readiness deadlines begin, so children load prepared JavaScript. The detached helper uses the same sealed lease runtime as the installed package.
 

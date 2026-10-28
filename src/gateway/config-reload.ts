@@ -228,7 +228,10 @@ export function startGatewayConfigReloader(
         installRecords: PluginInstallRecords;
       }
     | undefined;
-  const pluginDrain = createConfigPluginDrainTracker();
+  const pluginDrain = createConfigPluginDrainTracker({
+    signal: lifecycle.signal,
+    onWorkSettled: () => schedule(),
+  });
   const readPluginInstallRecords = opts.readPluginInstallRecords ?? readCurrentInstallRecords;
   const appliedRevision = createConfigAppliedRevisionTracker({
     onConfigApplied: opts.onConfigApplied,
@@ -676,6 +679,29 @@ export function startGatewayConfigReloader(
       notifyCommitted();
     };
     if (changedPaths.length === 0 && !pluginLifecycle) {
+      if (
+        candidate &&
+        acceptedSourceSnapshot &&
+        persistedHash !== lastSourceOnly?.hash &&
+        configSourceSnapshotsMatch(sourceSnapshot, acceptedSourceSnapshot) &&
+        resolveConfigWriteFollowUp(afterWrite).mode === "auto" &&
+        !runtimeRefresh?.includeAuthStoreRefs &&
+        !runtimeRefresh?.requireImmediateApplication &&
+        !candidate.application?.prepare &&
+        !candidate.application?.requireImmediateApplication
+      ) {
+        // The watcher can publish before the writer's notification arrives. Consume
+        // that accepted runtime, not the notification's unresolved SecretRefs.
+        await acceptCurrentRuntimeEcho(
+          initialEpoch,
+          sourceSnapshot,
+          true,
+          assertInvokerOwned,
+          candidate.application,
+        );
+        settleRuntimeApplication();
+        return completeApplication();
+      }
       await commitReloadBaseline();
       pluginDrain.applied();
       publishedSource?.commit?.();
@@ -797,6 +823,7 @@ export function startGatewayConfigReloader(
     snapshot: ConfigFileSnapshot,
     runtimeApplied: boolean,
     assertLeaseOwned: () => void,
+    application?: RuntimeConfigWriteApplicationClaim,
   ) => {
     const sourceOnly = runtimeApplied ? undefined : lastSourceOnly;
     const runtimeRefresh = runtimeApplied ? currentRuntimeRefresh : sourceOnly?.runtimeRefresh;
@@ -836,7 +863,7 @@ export function startGatewayConfigReloader(
       if (snapshot.valid && typeof snapshot.hash === "string") {
         await updateAcceptedSnapshot(hashConfigRaw(snapshot.raw), snapshot.parsed);
       }
-    });
+    }, application);
     source.accept(transactionEpoch);
     if (snapshot.valid) {
       await source.acceptPaths(snapshot.includedPaths ?? []);
@@ -1051,7 +1078,11 @@ export function startGatewayConfigReloader(
       } else if (pluginDrain.shouldReport(err)) {
         opts.log.error(`config reload failed: ${String(err)}`);
       } else {
-        opts.log.info("config reload deferred: retry the failed plugin reload with --wait");
+        opts.log.info(
+          pluginDrain.retriesWhenIdle()
+            ? "config reload deferred: retries when the failed plugin's work settles"
+            : "config reload deferred: retry the failed plugin reload with --wait",
+        );
       }
     } finally {
       running = false;
@@ -1090,6 +1121,7 @@ export function startGatewayConfigReloader(
       }
       if (
         !enteredReload &&
+        leaseRetryDelayMs < LEASE_RETRY_MAX_DELAY_MS &&
         error instanceof OpenClawStateLeaseAcquisitionError &&
         error.outcome.kind === "store-unavailable" &&
         (error.outcome.reason === "lifecycle-busy" || error.outcome.reason === "sqlite-busy")
@@ -1101,6 +1133,14 @@ export function startGatewayConfigReloader(
         );
         opts.log.warn(`config reload retry in ${leaseRetryDelayMs}ms: ${String(error)}`);
       } else {
+        if (!enteredReload) {
+          // The maximum-backoff attempt exhausts admission. Retain writer intent
+          // for a later observation, but release its waiting RPC.
+          pendingInProcessConfig?.application?.settle("failed");
+          retryWriteCandidate?.application?.settle("failed");
+          pending = false;
+          clearReloadTimer();
+        }
         leaseRetryDelayMs = 0;
         opts.log.error(`config reload failed: ${String(error)}`);
       }

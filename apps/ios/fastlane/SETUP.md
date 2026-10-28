@@ -4,11 +4,11 @@ Install the pinned Ruby bundle:
 
 ```bash
 cd apps/ios
-# Install Ruby 3.4.10 with mise or another .ruby-version-aware manager.
+# Install Ruby 3.4.11 with mise or another .ruby-version-aware manager.
 ruby --version
-gem install bundler -v 4.0.21
-bundle _4.0.21_ install
-bundle _4.0.21_ check
+gem install bundler -v 4.0.22
+bundle _4.0.22_ install
+bundle _4.0.22_ check
 ```
 
 The expected runtime is recorded in `apps/ios/.ruby-version`, and the Gemfile
@@ -87,7 +87,7 @@ pnpm ios:release:signing:check
 pnpm ios:release:signing:setup
 ```
 
-`signing:setup` uses Fastlane `produce` and `modify_services` to create Developer Portal bundle IDs and enable required services before running `match`. The main app also requires App Attest, and the main app and share extension both require the shared App Group from `apps/ios/Config/AppStoreSigning.json`; associate that group with both bundle IDs in the Apple Developer Portal before regenerating profiles. If Fastlane does not already have a valid Apple Developer Portal session, run `cd apps/ios && BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.21_ exec fastlane spaceauth` for a release-owner Apple ID and export the resulting `FASTLANE_SESSION`.
+`signing:setup` uses Fastlane `produce` and `modify_services` to create Developer Portal bundle IDs and enable required services before running `match`. The main app also requires App Attest, and the main app and share extension both require the shared App Group from `apps/ios/Config/AppStoreSigning.json`; associate that group with both bundle IDs in the Apple Developer Portal before regenerating profiles. If Fastlane does not already have a valid Apple Developer Portal session, run `cd apps/ios && BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.22_ exec fastlane spaceauth` for a release-owner Apple ID and export the resulting `FASTLANE_SESSION`.
 
 Shared encrypted signing storage:
 
@@ -104,7 +104,7 @@ Validate auth:
 
 ```bash
 cd apps/ios
-BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.21_ exec fastlane ios auth_check
+BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.22_ exec fastlane ios auth_check
 ```
 
 App Store Connect API auth is required when:
@@ -224,7 +224,7 @@ node --import ./scripts/tsx.mjs scripts/ios-release-e2e.ts \
 ```
 
 These diagnostics produce `native-build`/`built` or `gateway-probe`/`probe-passed`
-proofs, respectively. Neither is release qualification. The Gateway probe uses the
+proofs, respectively. Neither is release qualification. The Gateway check uses the
 same published-package selection and installation path as full qualification.
 
 The stock gate runs for the `release` operation in **iOS Store Release** after
@@ -348,7 +348,7 @@ APP_STORE_CONNECT_KEYCHAIN_ACCOUNT=YOUR_MAC_USERNAME
 
 ```bash
 cd apps/ios
-BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.21_ exec fastlane ios auth_check
+BUNDLE_GEMFILE="$PWD/Gemfile" bundle _4.0.22_ exec fastlane ios auth_check
 ```
 
 4. Inspect the live plan if needed, then run the release entry point:
@@ -381,4 +381,5 @@ Versioning rules:
 - App Store release uses `OpenClawPushMode=appStore`, which derives the canonical production hosted relay, production APNs, production relay profile, and `appleStrict` proof. The release lane rejects custom production relay URL overrides.
 - The exported IPA is validated before upload by inspecting its push mode, signed entitlements, and embedded App Store profile.
 - The default `pnpm ios:release:upload` destination stages screenshots and the App Review PDF attachment before uploading the IPA, waits for processing, then stages saved notes and selects the build. It does not submit for App Review or upload the App Store Connect `Notes` field
+- Screenshot processing allows two replacement rounds, ten minutes apart, for assets stuck in `UPLOAD_COMPLETE`. Completed screenshots are preserved, and the final set must match the local files in count, order, and checksum. Replacements do not reset the existing one-hour processing deadline (`DELIVER_SCREENSHOT_PROCESSING_TIMEOUT` overrides that total budget). Explicit processing failures and upload or deletion errors stop the release.
 - See `apps/ios/VERSIONING.md` for the detailed workflow

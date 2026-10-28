@@ -12,6 +12,9 @@ import type { PluginMetadataSnapshot } from "../../../plugins/plugin-metadata-sn
 import type { CronCodexRuntimePolicyTarget } from "../cron/store-migration.js";
 
 export type DoctorConfigPreflightOptions = {
+  /** The full Doctor flow admits retired sources before entering maintenance. */
+  retiredStateAdmitted?: boolean;
+  stateSchemaPreparation?: LegacyStateMigrationStepReceipt;
   agentDatabaseMigrationDiscovery?: PreparedAgentDatabaseMigrationDiscovery;
   migrateState?: boolean;
   /** Select Doctor normalization without enabling repair-only migrations. */
@@ -31,6 +34,8 @@ export type DoctorConfigPreflightOptions = {
 export type DoctorConfigPreflightResult = {
   snapshot: ConfigFileSnapshot;
   baseConfig: OpenClawConfig;
+  /** Repair diagnostics retained for managed update parents, not only terminal notes. */
+  warnings?: string[];
   /** Original resolved roster retained until its config and data migrations finish. */
   rosterMigrationSource?: OpenClawConfig;
   rosterMigrationOwnerId?: string;
@@ -41,6 +46,8 @@ export type DoctorConfigPreflightResult = {
   stateMigrationStepReceipts?: LegacyStateMigrationStepReceipt[];
   postSessionPluginMigration?: PreparedPostSessionPluginMigration;
   postSessionPluginMigrationPlanBound?: boolean;
+  /** Config whose pre-session state migrations completed without unresolved work. */
+  preflightLegacyStateConfig?: OpenClawConfig;
 };
 
 /** Preserve migration provenance before repairs, then prepare the post-write health handoff. */
@@ -116,6 +123,11 @@ export function prepareDoctorConfigMigrationResult(
       ...(receipts ? { stateMigrationStepReceipts: receipts } : {}),
       ...(postSession ? { postSessionPluginMigration: postSession } : {}),
       ...(planBound ? { postSessionPluginMigrationPlanBound: true } : {}),
+      ...(!params.shouldWriteConfig &&
+      !params.pluginInventoryChanged &&
+      isDeepStrictEqual(preflight.preflightLegacyStateConfig, params.cfg)
+        ? { preflightLegacyStateConfig: preflight.preflightLegacyStateConfig }
+        : {}),
     };
   };
 }

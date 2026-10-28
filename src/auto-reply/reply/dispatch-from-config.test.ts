@@ -2,6 +2,7 @@ import "./dispatch-from-config.base.test-utils.js";
 import "./dispatch-from-config.routing.test-utils.js";
 import "./dispatch-from-config.media-ownership.test-utils.js";
 import "./dispatch-from-config.progress.test-utils.js";
+import "./dispatch-from-config.visibility.test-utils.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createTestRegistry } from "../../test-utils/channel-plugins.js";
@@ -70,6 +71,7 @@ describe("dispatchReplyFromConfig", () => {
       expect(preparedLookup).toHaveBeenCalledTimes(2);
       expect(preparedLookup).toHaveBeenNthCalledWith(1, {
         agentId: "main",
+        demand: "interactive",
         onRuntimeLease: expect.any(Function),
       });
       expect(preparedLookup).toHaveBeenNthCalledWith(2, { agentId: "main" });

@@ -23,6 +23,7 @@ import { cliRecoveryEntrypoints } from "./cli-entrypoint.test-support.js";
 import { runCliProcessChild } from "./cli-process-child.test-helpers.js";
 import {
   prepareGatewayCliFixture,
+  prepareSharedStateReadArtifacts,
   prepareUnreachableGatewayCliFixture,
   runIsolatedGatewayCli,
   snapshotDirectoryContents,
@@ -163,6 +164,7 @@ describe("gateway-backed CLI process exit", () => {
       env: stateEnv,
     });
     closeOpenClawStateDatabaseForTest();
+    prepareSharedStateReadArtifacts(stateDir);
     const before = await snapshotDirectoryContents(stateDir);
 
     const result = await runIsolatedGatewayCli({
@@ -237,6 +239,7 @@ describe("gateway-backed CLI process exit", () => {
       env: stateEnv,
     });
     closeOpenClawStateDatabaseForTest();
+    prepareSharedStateReadArtifacts(stateDir);
     const before = await snapshotSharedStateArtifacts(stateDir);
 
     const result = await runIsolatedGatewayCli({
@@ -291,6 +294,7 @@ describe("gateway-backed CLI process exit", () => {
           env: stateEnv,
         });
         closeOpenClawStateDatabaseForTest();
+        prepareSharedStateReadArtifacts(stateDir);
       }
       const before = await snapshotSharedStateArtifacts(stateDir);
       expect(Object.keys(before).includes("openclaw.sqlite")).toBe(seeded);
@@ -664,10 +668,10 @@ describe("gateway-backed CLI process exit", () => {
       method: "device.pair.list",
     },
     {
-      label: "skills workshop apply",
-      args: ["skills", "workshop", "apply", "proposal-missing-credentials"],
+      label: "skills workshop archive",
+      args: ["skills", "workshop", "archive", "missing-credentials-skill"],
       gatewayOwnsLock: true,
-      method: "skills.proposals.inspect",
+      method: "skills.workshop.archive",
     },
   ])(
     "renders missing $label credentials as expected guidance, not a crash",

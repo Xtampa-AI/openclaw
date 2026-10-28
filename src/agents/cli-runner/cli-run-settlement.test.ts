@@ -21,6 +21,7 @@ import {
   buildBlockedCliRunResult,
   buildCliDeliveredFailure,
   buildCliRunResult,
+  buildCliSessionBinding,
   settleCliPreparationError,
   settlePreparedCliRun,
 } from "./cli-run-settlement.js";
@@ -249,6 +250,30 @@ describe.each(["anthropic", undefined])(
   },
 );
 
+describe.each([false, true])("CLI run rejection (cleanupFails=%s)", (cleanupFails) => {
+  it.each([undefined, null, 0, false])(
+    "rejects the thrown value %s after cleanup",
+    async (error) => {
+      const context = buildPreparedCliRunContext();
+      const cleanup = vi.fn(async () => {
+        if (cleanupFails) {
+          throw new Error("synthetic cleanup failure");
+        }
+      });
+      context.params.cleanupCliLiveSessionOnRunEnd = true;
+      context.preparedBackend.closeLiveSession = cleanup;
+
+      await expect(
+        settlePreparedCliRun({
+          context,
+          run: vi.fn().mockRejectedValue(error),
+        }),
+      ).rejects.toThrow(new Error(String(error)));
+      expect(cleanup).toHaveBeenCalledOnce();
+    },
+  );
+});
+
 it("preserves completed result boundaries for independent final delivery", async () => {
   const context = buildPreparedCliRunContext({ provider: "claude-cli" });
   const result = buildCliRunResult({
@@ -366,3 +391,23 @@ describe("CLI MCP retirement", () => {
     }
   });
 });
+
+it.each([false, true])(
+  "records the native input cursor only for an uninterrupted turn (interrupted=%s)",
+  (interrupted) => {
+    const context = buildPreparedCliRunContext();
+    context.transcriptCursor = {
+      localSessionId: context.params.sessionId,
+      entryId: "current-input",
+      runId: "current-run",
+    };
+    const binding = buildCliSessionBinding(
+      context,
+      "native-session",
+      interrupted ? { terminalInterruption: { reason: "aborted" as const } } : {},
+    );
+    expect(binding.transcriptCursor).toEqual(
+      interrupted ? undefined : { ...context.transcriptCursor, userEntryId: undefined },
+    );
+  },
+);

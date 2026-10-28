@@ -18,6 +18,7 @@ import {
   selectPreparedEnvironmentReservations,
 } from "./prepared-environment-store.js";
 import type { WorkerEnvironmentSessionIdentity } from "./session-attachment.js";
+import { WorkerEnvironmentInventoryClosedError } from "./store-errors.js";
 import { workerEnvironmentProjections } from "./store-projection.js";
 import { normalizeCredentialHash, requireWorkerEnvironmentString } from "./store-validation.js";
 import type { WorkerEnvironmentWorkerOperations } from "./store-worker-contract.js";
@@ -32,7 +33,6 @@ import type {
 
 export type {
   PreparedEnvironmentPlacementBinding,
-  PreparedEnvironmentSelection,
   WorkerEnvironmentRecord,
 } from "./environment-record.js";
 export type { WorkerEnvironmentTransitionPatch } from "./store-write-types.js";
@@ -93,7 +93,7 @@ export async function createWorkerEnvironmentStore(
   let closing: Promise<void> | undefined;
   const assertActive = () => {
     if (closed || !owner.active) {
-      throw new Error("Worker environment inventory has closed");
+      throw new WorkerEnvironmentInventoryClosedError();
     }
     context.admission.assertCurrent();
   };

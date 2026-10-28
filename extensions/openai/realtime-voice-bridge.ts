@@ -10,7 +10,7 @@ import {
   sleepWithAbort,
   toStringifiedError,
 } from "openclaw/plugin-sdk/realtime-voice-provider";
-import WebSocket from "ws";
+import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import type { OpenAIRealtimeHost } from "./realtime-host.js";
 import { readRealtimeErrorDetail } from "./realtime-provider-shared.js";
 import { buildOpenAIRealtimeSidebandUrl } from "./realtime-quicksilver-wire.js";
@@ -472,7 +472,18 @@ export class OpenAIRealtimeBridge extends OpenAIRealtimeEvents implements Realti
   ): { url: string; headers: Record<string, string> } {
     const cfg = this.config;
     let url: string;
-    if (cfg.azureEndpoint) {
+    if (cfg.baseUrl) {
+      const endpoint = new URL(cfg.baseUrl);
+      // Signed endpoint queries can depend on the original escaping of other fields.
+      const query = endpoint.search
+        ? endpoint.search
+            .slice(1)
+            .split("&")
+            .filter((part) => !new URLSearchParams(part).has("model"))
+        : [];
+      endpoint.search = [...query, `model=${encodeURIComponent(model)}`].join("&");
+      url = endpoint.toString();
+    } else if (cfg.azureEndpoint) {
       const base = cfg.azureEndpoint
         .replace(/\/$/, "")
         .replace(/^http(s?):/, (_, secure: string) => `ws${secure}:`);

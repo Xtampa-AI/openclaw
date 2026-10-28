@@ -87,7 +87,8 @@ async function inspectRestorableDatabaseFiles(
 ) {
   const identities = new Map<string, Awaited<ReturnType<typeof fs.lstat>>>();
   for (const database of databases) {
-    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    // Readers mutate/recreate the transient WAL index; only durable files fence capture.
+    for (const suffix of ["", "-wal", "-journal"]) {
       const file = `${database}${suffix}`;
       let info;
       try {
@@ -107,7 +108,10 @@ async function inspectRestorableDatabaseFiles(
       if (before && !sameFileIdentity(before, info)) {
         throw new Error(`Update database file changed during backup: ${file}.`);
       }
-      identities.set(file, info);
+      // Readers can create an empty WAL beside a checkpointed database.
+      if (suffix !== "-wal" || info.size !== 0) {
+        identities.set(file, info);
+      }
     }
   }
   return identities;
@@ -254,13 +258,15 @@ export async function createUpdateDatabaseBackupInProcess(
   // Compare the same admitted dialect; absent metadata must not become an inventory change.
   const inspectionPlan = input.inspectionPlan;
   const includeOwners = inspectionPlan.files.some(([, database]) => database.owners !== undefined);
-  const inventory = await canonicalDatabaseInventory(
-    inspectionPlan,
-    includeOwners,
-    input.additionalPaths,
-    input.additionalFiles,
-    input.excludedDatabasePaths,
-  );
+  const inventoryFor = (plan: InspectionPlan) =>
+    canonicalDatabaseInventory(
+      plan,
+      includeOwners,
+      input.additionalPaths,
+      input.additionalFiles,
+      input.excludedDatabasePaths,
+    );
+  const inventory = await inventoryFor(inspectionPlan);
   const identities = await inspectRestorableDatabaseFiles(inventory.present);
   const warnings = await checkDatabaseBackupSpace(directory, inventory.present);
   const { buildBackupArchivePath } = await import("../commands/backup-shared.js");
@@ -316,13 +322,7 @@ export async function createUpdateDatabaseBackupInProcess(
       sizeBytes: snapshot.sizeBytes,
     });
   }
-  const current = await canonicalDatabaseInventory(
-    await discoverUpdateStateSchemaInspectionInProcess(input),
-    includeOwners,
-    input.additionalPaths,
-    input.additionalFiles,
-    input.excludedDatabasePaths,
-  );
+  const current = await inventoryFor(await discoverUpdateStateSchemaInspectionInProcess(input));
   if (JSON.stringify(current) !== JSON.stringify(inventory)) {
     throw new Error("Update database inventory changed during backup; retry after writers stop.");
   }
@@ -345,6 +345,7 @@ export async function createUpdateDatabaseBackup({
   timeoutMs,
   signal: callerSignal,
   rehearsal,
+  retryAdvice,
   ...input
 }: BackupInput & {
   acquisition?: UpdateRecoveryCaptureAcquisition;
@@ -352,6 +353,7 @@ export async function createUpdateDatabaseBackup({
   timeoutMs?: number;
   signal?: AbortSignal;
   rehearsal?: DoctorRehearsalDatabaseCoverage;
+  retryAdvice?: boolean;
 }): Promise<UpdateDatabaseBackup> {
   const controller = new AbortController();
   const additionalPaths = input.additionalPaths?.map((file) => path.resolve(file));
@@ -392,6 +394,7 @@ export async function createUpdateDatabaseBackup({
           : parseUpdateStateInspectionWorker(
               await runUpdateStateInspectionWorker({
                 ...worker,
+                retryAdvice,
                 input: { ...workerInput, mode: "discover" },
                 databases: custody
                   ? await readUpdateStateDatabaseSizesInProcess([shared], signal)
@@ -413,6 +416,7 @@ export async function createUpdateDatabaseBackup({
       const backup = parseUpdateStateInspectionWorker(
         await runUpdateStateInspectionWorker({
           ...worker,
+          retryAdvice,
           input: { ...capturedInput, mode: "database-backup", inspectionPlan },
           ...(custody ? { ioBudget: "deadline" as const } : {}),
           databases: custody

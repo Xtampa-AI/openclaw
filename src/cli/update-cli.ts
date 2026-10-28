@@ -9,6 +9,7 @@ import { formatHelpExamples } from "./help-format.js";
 import { isJsonOutputModeActive } from "./json-output-mode.js";
 import { setCommandJsonMode } from "./program/json-mode.js";
 import { getProgramContext } from "./program/program-context.js";
+import type { UpdateCommandOptions } from "./update-cli/shared.js";
 import { UPDATE_OPTION_SPECS } from "./update-option-specs.js";
 export type {
   UpdateCommandOptions,
@@ -35,26 +36,11 @@ function inheritedUpdateTimeout(
   option: "timeout" | "drainTimeout" = "timeout",
 ): string | undefined {
   const timeout = opts[option] as string | undefined;
-  if (timeout !== undefined) {
-    return timeout;
-  }
-  return inheritOptionFromParent<string>(command, option);
+  return timeout !== undefined ? timeout : inheritOptionFromParent<string>(command, option);
 }
 
-type CommanderUpdateOptions = Record<string, unknown> & {
-  acceptCapabilities?: boolean;
-  admission?: string;
-  channel?: string;
-  dryRun?: boolean;
-  json?: boolean;
-  restart?: boolean;
-  reapplyLocalOverrides?: boolean;
-  tag?: string;
-  sha?: string;
-  timeout?: string;
-  drainTimeout?: string;
-  yes?: boolean;
-};
+type CommanderUpdateOptions = Record<string, unknown> &
+  Omit<UpdateCommandOptions, "admission"> & { admission?: string };
 
 function requiredUpdateLeafString(opts: Record<string, unknown>, key: string): string {
   const value = opts[key];
@@ -110,7 +96,7 @@ function registerUpdateFinalizationCommand(update: Command, name: string, hidden
     .option("--timeout <seconds>", "Override per-phase repair deadlines in seconds")
     .option("--yes", "Skip confirmation prompts (non-interactive)", false)
     .option("--accept-capabilities", "Accept widened plugin capabilities", false)
-    .option("--no-restart", "Skip update activation; Doctor may restore a service it stops")
+    .option("--no-restart", "Skip updater restart (package Gateways may restart themselves)")
     .addHelpText(
       "after",
       () =>
@@ -169,7 +155,7 @@ export function registerUpdateCli(program: Command) {
         ["openclaw update --channel dev", "Switch to dev channel (git + npm)"],
         ["openclaw update --tag beta", "One-off update to a dist-tag or version"],
         ["openclaw update --dry-run", "Preview actions without changing anything"],
-        ["openclaw update --no-restart", "Update without restarting the service"],
+        ["openclaw update --no-restart", "Update without an updater-managed restart"],
         ["openclaw update --json", "Output result as JSON"],
         ["openclaw update --yes", "Non-interactive (accept downgrade prompts)"],
         ["openclaw update --accept-capabilities", "Accept reviewed plugin capability changes"],

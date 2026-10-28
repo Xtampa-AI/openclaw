@@ -38,7 +38,8 @@ let fixture: ReturnType<typeof createDoctorNoCowToolFixture>;
 const nativeStatfs = fs.statfsSync;
 
 beforeEach(() => {
-  root = tempDirs.make("openclaw-nocow-");
+  // The real socket fixture must fit sockaddr_un even with a deeply nested TMPDIR.
+  root = tempDirs.make("openclaw-nocow-", process.platform === "win32" ? undefined : "/tmp");
   directory = path.join(root, "state");
   fs.mkdirSync(directory);
   sqlitePath = path.join(directory, "openclaw.sqlite");
@@ -71,6 +72,7 @@ async function repair(assertCurrent = () => {}) {
   const result = await repairDoctorSqliteNoCow({
     paths: [sqlitePath],
     stateDir: root,
+    env: { ...process.env, OPENCLAW_STATE_DIR: root },
     assertCurrent,
   });
   return [...result.changes, ...result.warnings];

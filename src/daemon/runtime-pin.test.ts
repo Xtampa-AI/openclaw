@@ -20,7 +20,7 @@ function runtimeFixture(script: string, name = "node"): string {
   return file;
 }
 
-function runtimeMetadata(nodeVersion = "26.8.1", sqliteVersion = "3.53.4") {
+function runtimeMetadata(nodeVersion = "26.12.1", sqliteVersion = "3.53.4") {
   return {
     nodeVersion,
     bunVersion: null,
@@ -49,9 +49,9 @@ describe.skipIf(process.platform === "win32")("runtime pin executable boundary",
 
   it.each([
     ["old Node", runtimeOutput(runtimeMetadata("22.16.0")), /unsupported/],
-    ["unsafe SQLite", runtimeOutput(runtimeMetadata("26.8.1", "3.51.0")), /unsupported/],
-    ["malformed output", runtimeOutput({}), /probe failed/],
-    ["oversized output", 'process.stdout.write("x".repeat(2 * 1024 * 1024));', /probe failed/],
+    ["unsafe SQLite", runtimeOutput(runtimeMetadata("26.12.1", "3.51.0")), /unsupported/],
+    ["malformed output", runtimeOutput({}), /check failed/],
+    ["oversized output", 'process.stdout.write("x".repeat(2 * 1024 * 1024));', /check failed/],
   ] as const)("refuses %s without selecting a replacement", async (_name, script, error) => {
     const file = runtimeFixture(script);
     await expect(resolvePinnedDaemonRuntimePath(file, "node", {})).rejects.toThrow(error);
@@ -59,7 +59,7 @@ describe.skipIf(process.platform === "win32")("runtime pin executable boundary",
 
   it("terminates a hung runtime probe", async () => {
     const file = runtimeFixture("setInterval(() => {}, 1000);");
-    await expect(resolvePinnedDaemonRuntimePath(file, "node", {})).rejects.toThrow(/probe failed/);
+    await expect(resolvePinnedDaemonRuntimePath(file, "node", {})).rejects.toThrow(/check failed/);
   }, 15_000);
 
   it("rejects a mismatched runtime family before executing it", async () => {

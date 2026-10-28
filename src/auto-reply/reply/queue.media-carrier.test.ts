@@ -19,7 +19,9 @@ import {
   getGatewayLocalUserIngress,
   prepareGatewayLocalUserIngress,
 } from "../../gateway/local-user-ingress.js";
+import { applyRunHydrationSuppression, readPersistedMediaFacts } from "../../media/media-facts.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import { runActiveReplySteer } from "./agent-runner-steer-adoption.js";
 import { prepareChannelRunAdmission } from "./channel-run-admission.js";
 import { createQueueCase } from "./queue.case.test-support.js";
@@ -28,6 +30,7 @@ import { enqueueFollowupRun, FollowupRunDeferredError, scheduleFollowupDrain } f
 import { createQueueTestRun, installQueueRuntimeErrorSilencer } from "./queue.test-helpers.js";
 import { clearFollowupQueue } from "./queue/state.js";
 import { createReplyOperation } from "./reply-run-registry.js";
+import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
 import { createMockTypingController } from "./test-helpers.js";
 import { createTypingSignaler } from "./typing-mode.js";
 const queueKeys = new Set<string>();
@@ -83,9 +86,10 @@ describe("followup prompt metadata carrier", () => {
       sessionId: run.run.sessionId,
       resetTriggered: false,
     });
-    operation.bindToolAuthoritySnapshot({
-      fingerprint: () => "media-authority",
-      project: () => "media-authority",
+    await operation.bindToolAuthoritySnapshotAsync(prepareReplyToolAuthority(run));
+    const toolAuthorityFingerprint = await operation.bindToolAuthorityRouteAsync({
+      provider: run.run.provider,
+      model: run.run.model,
     });
     const reject = vi.fn(async () => {
       throw new Error("no active turn to steer");
@@ -93,7 +97,7 @@ describe("followup prompt metadata carrier", () => {
     operation.attachBackend({
       kind: "embedded",
       supportsQueueMessageImages: true,
-      toolAuthorityFingerprint: "media-authority",
+      toolAuthorityFingerprint,
       cancel: vi.fn(),
       messageInjection: { isAvailable: () => true, queueMessage: reject },
     });
@@ -120,7 +124,6 @@ describe("followup prompt metadata carrier", () => {
           touchActiveSessionEntry: async () => {},
           typing,
           typingSignals: createTypingSignaler({ typing, mode: "never", isHeartbeat: false }),
-          toolAuthorityFingerprint: "media-authority",
         }),
       ).resolves.toBe("handled");
       expect(reject).toHaveBeenCalledOnce();
@@ -300,6 +303,39 @@ describe("followup prompt metadata carrier", () => {
       expect(calls[2]?.prompt).toContain("task 3");
     },
   );
+  it("pairs each collected source's run-only image skip with the transcript facts", async () => {
+    const key = "collect-run-only-image-skip";
+    queueKeys.add(key);
+    const shared = { path: "/tmp/shared.png", contentType: "image/png" };
+    // Same path in both sources: only the second one could not be read this turn.
+    for (const [prompt, skipped] of [
+      ["one", false],
+      ["two", true],
+    ] as const) {
+      const run = createQueueTestRun({ prompt, messageId: `skip-${prompt}` });
+      run.media = [
+        skipped ? { ...shared, hydrationSuppressed: true, unresolvedThisTurn: true } : shared,
+      ];
+      run.userTurnTranscriptRecorder = createUserTurnTranscriptRecorder({
+        input: { text: prompt, media: [shared] },
+        target: createTestUserTurnTranscriptTarget(),
+        updateMode: "none",
+      });
+      enqueueFollowupRun(key, run, { mode: "collect", debounceMs: 0 });
+    }
+    const delivered = createDeferred<FollowupRun>();
+    scheduleFollowupDrain(key, async (run) => {
+      delivered.resolve(run);
+    });
+    const collected = await delivered.promise;
+    const message = await collected.userTurnTranscriptRecorder?.resolveMessage();
+    const recorded = message ? readPersistedMediaFacts(message) : undefined;
+    expect(
+      applyRunHydrationSuppression(recorded ?? [], collected.media).map(
+        (fact) => fact.hydrationSuppressed === true,
+      ),
+    ).toEqual([false, true]);
+  });
 });
 describe("queued Gateway attach evidence", () => {
   installQueueRuntimeErrorSilencer();

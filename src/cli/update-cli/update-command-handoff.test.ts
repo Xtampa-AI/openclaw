@@ -167,6 +167,38 @@ const callerService = {
 } satisfies GatewayServiceState;
 
 describe("gatewayMaintenanceBlock", () => {
+  it.runIf(process.platform === "darwin").each([
+    { membership: "outside", ancestor: false, code: undefined },
+    { membership: "absent", ancestor: false, code: "service-ancestry-unverified" },
+    { membership: "inside", ancestor: false, code: "inside-gateway-service" },
+    { membership: "unknown", ancestor: false, code: "service-membership-unverified" },
+    { membership: "outside", ancestor: true, code: "inside-gateway-process-tree" },
+  ] as const)(
+    "uses native $membership containment with an unreadable login ancestor (gateway ancestor: $ancestor)",
+    ({ membership, ancestor, code }) => {
+      const gatewayPid = process.pid + 1_000_000;
+      // An unreadable root-owned login parent leaves the ancestry walk incomplete.
+      vi.spyOn(ancestry, "inspectSelfAndAncestorPidsSync").mockReturnValue({
+        complete: false,
+        pids: new Set(ancestor ? [process.pid, gatewayPid] : [process.pid]),
+      });
+      vi.spyOn(serviceMembership, "inspectServiceProcessMembershipSync").mockReturnValue(
+        membership,
+      );
+      const block = gatewayMaintenanceBlock(
+        { ...callerService, runtime: { status: "running", pid: gatewayPid } },
+        process.cwd(),
+      );
+      if (code === undefined) {
+        expect(block).toBeUndefined();
+      } else {
+        expect(block?.failureFacts).toEqual([
+          expect.objectContaining({ check: "managed-service-preflight", code }),
+        ]);
+      }
+    },
+  );
+
   it("never advises stopping the gateway service or running update from the caller", () => {
     const message = gatewayMaintenanceBlock(callerService, process.cwd())?.message;
     expect(message).toContain("inside the gateway process tree");

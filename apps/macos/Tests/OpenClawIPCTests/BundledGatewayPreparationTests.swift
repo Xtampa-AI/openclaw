@@ -48,7 +48,7 @@ struct BundledGatewayPreparationTests {
             try """
             #!/bin/sh
             if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
-              printf '%s\n' 'v24.16.0'
+              printf '%s\n' 'v24.22.1'
               exit 0
             fi
             for argument in "$@"; do
@@ -63,7 +63,7 @@ struct BundledGatewayPreparationTests {
               printf '%s\n' '2026.9.1' > "$OPENCLAW_PREPARATION_FIXTURE_ROOT/version"
             fi
             if [ -f "$OPENCLAW_PREPARATION_FIXTURE_ROOT/fail" ]; then
-              printf '%s\n' '{"status":"error","reason":"fixture offline"}'
+              printf '%s\n' '{"status":"error","reason":"fixture offline","steps":[{"name":"package update","exitCode":1,"stderrTail":"registry unavailable: fixture offline"}]}'
               exit 1
             fi
             printf '%s\n' '2026.9.1' > "$OPENCLAW_PREPARATION_FIXTURE_ROOT/version"
@@ -126,9 +126,10 @@ struct BundledGatewayPreparationTests {
                         try PostAppUpdateReceiptStore.recordCoreUpdateDispatch(receipt: notice, owner: owner)
                     },
                     statusHandler: { _ in })
-                guard case .failure = failed else { Issue.record("Expected interrupted core update")
+                guard case let .failure(_, details) = failed else { Issue.record("Expected interrupted core update")
                     return
                 }
+                #expect(details?.contains("registry unavailable") == true)
                 try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("fail"))
             }
             let pending: PostAppUpdateReceipt = if fresh {
@@ -249,9 +250,10 @@ struct BundledGatewayPreparationTests {
                     currentVersion: target, owner: .gateway)?.coreUpdate == .node)
                 let stale = PostAppUpdateReceipt(
                     fromVersion: "2026.8.1", toVersion: target, recordedAt: .distantPast)
-                #expect(throws: GatewayHostingError.self) {
-                    try PostAppUpdateReceiptStore.recordCoreUpdateDispatch(receipt: stale, owner: .gateway)
-                }
+                let foreignBytes = AppDefaults.standard.data(forKey: postAppUpdateReceiptKey)
+                let independent = try PostAppUpdateReceiptStore.recordCoreUpdateDispatch(receipt: stale, owner: .gateway)
+                #expect(independent.coreUpdate == .gateway)
+                #expect(AppDefaults.standard.data(forKey: postAppUpdateReceiptKey) == foreignBytes)
                 #expect(PostAppUpdateReceiptStore.setGatewayUpdateIncomplete(
                     true, receipt: stale).coreUpdate == .node)
                 #expect(PostAppUpdateReceiptStore.recordNotificationFailure(receipt: stale).coreUpdate == .node)
@@ -261,11 +263,10 @@ struct BundledGatewayPreparationTests {
                 #expect(PostAppUpdateReceiptStore.pending(currentVersion: target)?.notificationAttempts == 1)
                 #expect(!PostUpdateController.shouldRepairNodeMigration(
                     receipt: reloaded, migrationNeedsCoreRepair: true, migrationFailed: false))
-                do {
-                    _ = try await CLIInstaller.prepareBundledGateway(
-                        targetVersion: target, restartGateway: false, statusHandler: { _ in })
-                    Issue.record("Local repair must not replace pending node core work")
-                } catch {}
+                let pendingNodeBytes = AppDefaults.standard.data(forKey: postAppUpdateReceiptKey)
+                _ = try await CLIInstaller.prepareBundledGateway(
+                    targetVersion: target, restartGateway: false, statusHandler: { _ in })
+                #expect(AppDefaults.standard.data(forKey: postAppUpdateReceiptKey) == pendingNodeBytes)
                 #expect(PostAppUpdateReceiptStore.pending(currentVersion: target)?.coreUpdatePending == true)
                 #expect(!FileManager.default.fileExists(atPath: local.root.appendingPathComponent("updates").path))
                 return
@@ -344,7 +345,7 @@ struct BundledGatewayPreparationTests {
                 var runtimeActions: [String] = []
                 var failHealth = scenario == "runtime-failure"
                 var operations = ManagedNodeGatewayMigration.liveOperations(
-                    checkCurrent: {}, resolveLegacyCLI: { cli }, allowNamedServiceRetry: true,
+                    checkCurrent: {}, resolveLegacyCLI: { cli },
                     verifyHealth: {
                         runtimeActions.append("health")
                         if failHealth {
@@ -1082,6 +1083,27 @@ struct BundledGatewayPreparationTests {
                 after: .ready, currentVersion: "2026.9.1")
             #expect(PostAppUpdateReceiptStore.pending(currentVersion: "2026.9.1") == nil)
             #expect(manager.retainedServiceCLI?.prefix == cli.prefix)
+        }
+    }
+
+    @Test func `bundled setup reuses a newer managed Node package without updating it`() async throws {
+        let home = try makeTempDirForTests()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try await TestIsolation.withIsolatedState(
+            launchAgentHomeDirectory: home,
+            defaults: [cliInstallPolicyKey: "exact", postAppUpdateReceiptKey: nil])
+        {
+            let fixture = try Fixture(home: home)
+            defer { fixture.remove() }
+            try "2026.10.2\n".write(
+                to: fixture.root.appendingPathComponent("version"), atomically: false, encoding: .utf8)
+            let original = GatewayLaunchAgentManager.launchdConfigSnapshot()
+            let location = try await CLIInstaller.prepareBundledGateway(
+                targetVersion: "2026.10.1", statusHandler: { _ in })
+            #expect(location == fixture.cli.prefix.last)
+            #expect(GatewayLaunchAgentManager.launchdConfigSnapshot() == original)
+            #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("updates").path))
+            #expect(PostAppUpdateReceiptStore.pendingSetupRecovery() == nil)
         }
     }
 

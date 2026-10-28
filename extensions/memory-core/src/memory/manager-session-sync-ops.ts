@@ -22,14 +22,16 @@ import {
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { listMemorySessionTombstones } from "../memory-entry-origins.js";
 import { readMemoryTranscriptStatsInWorker } from "./manager-cpu-worker-runtime.js";
-import { shouldSyncSessionsForReindex } from "./manager-session-reindex.js";
 import {
   isMemorySessionIndexable,
   resolveMemorySessionStartupState,
   type MemorySessionStartupFileState,
 } from "./manager-session-sync-state.js";
-import { inspectMemorySourceState, loadMemorySourceFileState } from "./manager-source-state.js";
-import { memorySessionSyncTargetKey } from "./manager-sync-control.js";
+import { inspectMemorySourceState } from "./manager-source-state.js";
+import {
+  hasTargetedSessionSyncParams,
+  memorySessionSyncTargetKey,
+} from "./manager-sync-control.js";
 import { MemoryManagerWatchOps } from "./manager-watch-ops.js";
 
 const SESSION_DIRTY_DEBOUNCE_MS = 5000;
@@ -43,9 +45,10 @@ export abstract class MemoryManagerSessionSyncOps extends MemoryManagerWatchOps 
   protected async inspectDiagnosticSourceState(): Promise<void> {
     if (this.sources.has("memory")) {
       try {
+        const database = this.database;
         const inspection = await inspectMemorySourceState({
           files: this.memoryFiles,
-          db: this.db,
+          readIndexedRows: () => database.readSourceState({ source: "memory" }),
           workspaceDir: this.workspaceDir,
           settings: this.settings,
           concurrency: this.getIndexConcurrency(),
@@ -180,8 +183,7 @@ export abstract class MemoryManagerSessionSyncOps extends MemoryManagerWatchOps 
     if (this.closed) {
       return [];
     }
-    const existingRows = loadMemorySourceFileState({
-      db: this.db,
+    const existingRows = await this.database.readSourceState({
       source: "sessions",
     });
     const indexedPaths = new Set(existingRows.map((row) => row.path));
@@ -450,12 +452,17 @@ export abstract class MemoryManagerSessionSyncOps extends MemoryManagerWatchOps 
   }
 
   protected shouldSyncSessions(params?: MemorySyncParams, needsFullReindex = false) {
-    return shouldSyncSessionsForReindex({
-      hasSessionSource: this.sources.has("sessions"),
-      sessionsDirty: this.sessionsDirty,
-      sessionsFullRetryDirty: this.sessionsFullRetryDirty,
-      sync: params,
-      needsFullReindex,
-    });
+    if (!this.sources.has("sessions")) {
+      return false;
+    }
+    if (
+      hasTargetedSessionSyncParams(params) ||
+      params?.force ||
+      needsFullReindex ||
+      this.sessionsFullRetryDirty
+    ) {
+      return true;
+    }
+    return params?.reason !== "session-start" && params?.reason !== "watch" && this.sessionsDirty;
   }
 }

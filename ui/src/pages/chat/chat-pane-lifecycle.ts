@@ -70,7 +70,7 @@ import { exportChatMarkdown } from "./export.ts";
 import { admitChatSubmission } from "./history-merge.ts";
 import { admitInitialTurnHandoff, subscribeInitialTurnHandoff } from "./initial-turn-handoff.ts";
 import { applyChatCacheSnapshot, readChatSessionSnapshot } from "./session-message-cache.ts";
-import { closeSlot, isSidebarSlotVisible } from "./sidebar-layout.ts";
+import { closeSlot } from "./sidebar-layout.ts";
 
 export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
   private readonly sessionPanelToggles = new ChatPaneSessionPanelToggleController({
@@ -219,7 +219,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
     ) {
       event.preventDefault();
       const { slot } = shortcut;
-      const visible = isSidebarSlotVisible(state.sidebarLayout, slot);
+      const visible = this.isSlotShown(state.sidebarLayout, slot);
       if (visible) {
         releaseAttachmentWorkspaceOwner(state, slot);
       }
@@ -577,6 +577,7 @@ export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
       this.state.handleChatDraftChange(this.draft, []);
     }
     this.syncSessionReactions();
+    this.syncRetainedBoardSession(this.resolveBoardView());
   }
 
   override updated(changedProperties: Map<PropertyKey, unknown> = new Map()) {
@@ -599,8 +600,6 @@ export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
     this.retireArchivedPresentation();
     this.cancelResetConfirmationForSessionChange();
     this.syncHistoryObserver();
-    const board = this.resolveBoardView();
-    this.syncRetainedBoardSession(board);
     this.sessionPanelToggles.flush();
     this.activeSessionResources.syncPane({
       state: () => this.state,
@@ -621,9 +620,9 @@ export abstract class ChatPaneLifecycle extends ChatPaneSessionObservation {
     this.setConversationVisible(
       Boolean(
         this.state &&
-        isSidebarSlotVisible(
+        this.isSlotShown(
           resolveSidebarLayoutForBoard({
-            board,
+            board: this.resolveBoardView(),
             layout: this.state.sidebarLayout,
             paneWidth: this.paneWidth,
           }),

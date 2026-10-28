@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { runTasksWithConcurrency } from "../../utils/run-with-concurrency.js";
-import { supportsCurrentWorkerLaunch } from "./admission.js";
+import { supportsCurrentWorkerLaunch } from "../../worker/worker-build-identity.js";
 import { hasForcedWorkerEnvironmentAbandonment } from "./environment-errors.js";
 import {
-  isCurrentActiveWorkerEnvironment,
   isUnavailableEnvironment,
   workerDisappearanceError,
   type WorkerActiveDispatchPlacement,
@@ -26,7 +25,11 @@ import type {
   PlacementRecoveryDeps,
   WorkerPlacementRecoveryAdmission,
 } from "./placement-recovery-contract.js";
-import { matchesWorkerPlacementTarget } from "./placement-target.js";
+import type { WorkerSessionPlacementRecord } from "./placement-store.js";
+import {
+  isCurrentActiveWorkerEnvironment,
+  matchesWorkerPlacementTarget,
+} from "./placement-target.js";
 import { WorkerRuntimeRefreshPendingError } from "./provider-runtime-refresh.js";
 import { boundedWorkerError } from "./worker-error.js";
 
@@ -67,6 +70,10 @@ export function createPlacementRecoveryActions(deps: PlacementRecoveryDeps) {
       return claim ? [serializeWorkerSessionTurnClaim(claim)] : [];
     }),
   );
+  const isInterruptedTurn = (placement: WorkerSessionPlacementRecord) => {
+    const claim = projectWorkerSessionTurnClaim(placement);
+    return Boolean(claim && interruptedClaims.has(serializeWorkerSessionTurnClaim(claim)));
+  };
   // Retire orphan refs in bounded post-start sweeps, never on readiness or targeted recovery.
   // Completed roots belong to this startup pass; settlement removes new refs itself.
   let orphanCleanupPending: PendingWorkspaceResultOrphanCleanup | undefined;
@@ -81,7 +88,7 @@ export function createPlacementRecoveryActions(deps: PlacementRecoveryDeps) {
     // Retire the old turn, not its machine. The node stop acknowledgement fences the
     // physical worker; the replacement turn receives a fresh claim on the same workspace.
     const claim = projectWorkerSessionTurnClaim(placement);
-    const interrupted = claim && interruptedClaims.has(serializeWorkerSessionTurnClaim(claim));
+    const interrupted = isInterruptedTurn(placement);
     if ((mode === "restart" || interrupted) && placement.turnClaim) {
       if (
         claim &&
@@ -93,14 +100,17 @@ export function createPlacementRecoveryActions(deps: PlacementRecoveryDeps) {
         try {
           await environments.stopTunnel(placement.environmentId, placement.activeOwnerEpoch);
           await placements.closeWorkerTurnToolState(claim);
-          const current = placements.get(placement.sessionId);
+          const currentFacts = await placements.readProjection([placement.sessionId], {
+            current: true,
+          });
+          const current = currentFacts.placements.get(placement.sessionId);
           const currentEnvironment = environments.get(placement.environmentId);
           if (
             current?.state !== "active" ||
             current.generation !== placement.generation ||
             currentEnvironment?.nodeDeviceId !== environment.nodeDeviceId ||
             !isCurrentActiveWorkerEnvironment(current, currentEnvironment) ||
-            placements.getPlacementMove(placement.sessionId)
+            currentFacts.moves.has(placement.sessionId)
           ) {
             throw new Error("Interrupted worker owner changed while stopping");
           }
@@ -178,7 +188,7 @@ export function createPlacementRecoveryActions(deps: PlacementRecoveryDeps) {
           ownerEpoch: environment.ownerEpoch,
         });
       }
-      placements.adoptActive({
+      await placements.adoptActive({
         sessionId: placement.sessionId,
         expectedGeneration: placement.generation,
         environmentId: environment.environmentId,
@@ -414,5 +424,5 @@ export function createPlacementRecoveryActions(deps: PlacementRecoveryDeps) {
     }
   };
 
-  return { reconcile, reconcileActive };
+  return { reconcile, reconcileActive, isInterruptedTurn };
 }

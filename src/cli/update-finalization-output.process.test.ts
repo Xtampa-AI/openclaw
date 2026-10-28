@@ -236,7 +236,15 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
             "Gateway restarted and verified after Doctor repair.",
           );
           if (scenario === repairDeadlineScenarios.starting) {
-            expect(result.stderr, failure).toContain("Gateway is still starting");
+            expect(result.stderr, failure).toContain(
+              "Gateway started but readiness was not verified",
+            );
+            expect(result.stderr, failure).toContain("openclaw gateway status --deep");
+            expect(result.stderr, failure).toContain("openclaw gateway diagnostics export");
+          } else {
+            expect(result.stderr, failure).not.toContain(
+              "Gateway started but readiness was not verified",
+            );
           }
         }
         return;
@@ -262,7 +270,10 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
           (entry: { phase: string }) => entry.phase === "doctor",
         );
         expect(timing.durationMs, failure).toBeGreaterThanOrEqual(1_000);
-        expect(timing.durationMs, failure).toBeLessThan(3_000);
+        // Exact deadline/nonrenewal timing lives in update-finalization-lifecycle.test.ts;
+        // this duration also includes service custody, diagnostics, and joined cleanup.
+        expect(timing.outcome, failure).toBe("failed");
+        expect(readRun(), failure).toMatchObject({ reason: "finalization-timeout" });
         if (scenario === "doctor-progress") {
           expect(output.doctorOutput.stderr.excerpt, failure).toContain(
             "PROGRESS fixture-validation",
@@ -468,14 +479,25 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
         expect(report.body).toContain("Reason code: doctor-failed");
         expect(report.body).toContain("Failed phase finalize-doctor: exit 1");
         expect(report.body).toContain("Recovery outcome: not serving (timeout)");
+        expect(report.body).toContain(
+          "Gateway readiness was not verified; service status: unknown. Check openclaw gateway status --deep.",
+        );
         expect(run.steps.filter((step) => step.step === "gateway recovery verification")).toEqual([
           {
             step: "gateway recovery verification",
             status: "failed",
             exitCode: 1,
-            detail:
-              "Exit code: 1; Gateway did not settle; startup phase: waiting for managed service",
-            failureFacts: [{ check: "settled", code: "timeout", message: expect.any(String) }],
+            detail: expect.stringContaining(
+              "Gateway readiness was not verified; service status: unknown; startup phase: waiting for managed service.",
+            ),
+            failureFacts: [
+              {
+                check: "settled",
+                code: "timeout",
+                message:
+                  "Gateway readiness was not verified; service status: unknown; startup phase: waiting for managed service. Check openclaw gateway status --deep.",
+              },
+            ],
           },
         ]);
         expect({

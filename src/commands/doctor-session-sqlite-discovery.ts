@@ -56,6 +56,7 @@ import {
 export type LegacySessionRecord = {
   entry: SessionEntry;
   sessionKey: string;
+  preserveCurrentSession?: boolean;
   transcriptPath?: string;
   transcriptDependencies: string[];
   recovery?: { complete: boolean; repaired: boolean; events: number; sqliteEvents?: number };
@@ -179,9 +180,11 @@ function readArchivedSessionOwnership(
           "Archived session registry no longer matches its migration receipt (file metadata or contents changed).",
         );
       }
-      records.push(
-        ...readLegacySessionRecords(target, ownershipIssues, { sourcePath: move.archivePath }),
-      );
+      for (const record of readLegacySessionRecords(target, ownershipIssues, {
+        sourcePath: move.archivePath,
+      })) {
+        records.push(record);
+      }
       if (
         ownershipIssues.length ||
         !sameMigrationArtifact(readMigrationArtifactIdentity(move.archivePath), identity)

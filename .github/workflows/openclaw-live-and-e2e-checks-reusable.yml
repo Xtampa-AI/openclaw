@@ -624,7 +624,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  NODE_VERSION: "24.21.0"
+  NODE_VERSION: "24.22.1"
   OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG: ${{ inputs.allow_unreleased_changelog }}
   OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: ${{ inputs.allow_frozen_target_scenario_omissions && '1' || '0' }}
   OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: ${{ github.workspace }}
@@ -722,6 +722,8 @@ jobs:
           sparse-checkout: |
             package.json
             .github/actions/setup-test-bun
+            scripts/stage-openclaw-bun.sh
+            scripts/lib/openclaw-bun.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -757,7 +759,7 @@ jobs:
 
       - name: Setup admission Node.js
         env:
-          REQUESTED_NODE_VERSION: "24.x"
+          REQUESTED_NODE_VERSION: "24.22.1"
         run: |
           set -euo pipefail
           source .release-harness/.github/actions/setup-pnpm-store-cache/ensure-node.sh
@@ -1222,7 +1224,7 @@ jobs:
 
       - name: Setup admission Node.js
         env:
-          REQUESTED_NODE_VERSION: "24.x"
+          REQUESTED_NODE_VERSION: "24.22.1"
         run: |
           set -euo pipefail
           source .github/actions/setup-pnpm-store-cache/ensure-node.sh
@@ -4450,9 +4452,11 @@ jobs:
           - suite_id: native-live-src-gateway-profiles-opencode-go-deepseek-glm
             suite_group: native-live-src-gateway-profiles-opencode-go
             label: Native live gateway profiles OpenCode Go DeepSeek/GLM
-            # The release workspace does not enable Global regions, so the other DeepSeek V4
-            # routes reject every request. These refs were proven reachable in the Docker lane.
-            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/deepseek-v4-flash-vision-exp,opencode-go/glm-5.2,opencode-go/glm-5.3 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
+            # The release workspace does not enable Global regions, so the active DeepSeek V4
+            # routes reject every request, and upstream metadata deprecated
+            # deepseek-v4-flash-vision-exp, so discovery no longer lists it. These GLM refs
+            # were proven reachable from the release workspace.
+            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/glm-5.2,opencode-go/glm-5.3 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
             timeout_minutes: 30
             profile_env_only: false
             profiles: full
@@ -4479,10 +4483,12 @@ jobs:
             profiles: full
           - suite_id: native-live-src-gateway-profiles-opencode-go-smoke
             label: Native live gateway profiles OpenCode Go smoke
-            # Pinned while the release OpenCode workspace lacks Global regions: deepseek-v4-flash and
-            # deepseek-v4.1-flash now return 400 "requires Global regions". Restore dynamic selection
-            # (drop OPENCLAW_LIVE_GATEWAY_MODELS) once the workspace enables Global.
-            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/deepseek-v4-flash-vision-exp OPENCLAW_LIVE_GATEWAY_SMOKE=1 OPENCLAW_LIVE_GATEWAY_MAX_MODELS=1 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
+            # Pinned while the release OpenCode workspace lacks Global regions: deepseek-v4.1-flash
+            # returns 400 "requires Global regions", and upstream metadata deprecated the V4 Flash
+            # routes. Restore dynamic selection (drop OPENCLAW_LIVE_GATEWAY_MODELS) once the
+            # workspace enables Global. Release-workspace discovery stopped listing glm-5.3 on
+            # 2026-10-18, so the smoke pins glm-5.2.
+            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/glm-5.2 OPENCLAW_LIVE_GATEWAY_SMOKE=1 OPENCLAW_LIVE_GATEWAY_MAX_MODELS=1 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
             timeout_minutes: 45
             profile_env_only: false
             profiles: stable

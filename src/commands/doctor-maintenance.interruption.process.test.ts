@@ -18,7 +18,8 @@ function interruptionScript(
   pendingApproval: boolean,
   restoringApproval: boolean,
   progress: boolean,
-  archiveSignal?: "SIGINT" | "SIGTERM",
+  archiveSignal?: "SIGINT" | "SIGTERM" | "SIGHUP",
+  closedChildStdin = false,
 ) {
   return `
     import { registerHooks } from "node:module";
@@ -110,6 +111,19 @@ function interruptionScript(
       try {
         await maintenance.run(async () => {
           if (${pendingApproval}) await fixture.approve();
+          if (${closedChildStdin}) {
+            // A live child that closes its stdin makes Doctor's next write raise EPIPE and SIGPIPE.
+            const { spawn } = await import("node:child_process");
+            const child = spawn(process.execPath, ["-e", "require('fs').closeSync(0); console.log('closed'); setTimeout(() => {}, 5000)"], { stdio: ["pipe", "pipe", "ignore"] });
+            await once(child.stdout, "data");
+            const sigpipe = once(process, "SIGPIPE");
+            child.stdin.write(Buffer.alloc(1 << 20));
+            const [error] = await once(child.stdin, "error");
+            if (error.code !== "EPIPE") throw error;
+            await sigpipe;
+            child.kill();
+            record("child-stdin-closed");
+          }
           if (${Boolean(archiveSignal)}) {
             const { DatabaseSync } = await import("node:sqlite");
             const { createHash } = await import("node:crypto");
@@ -195,10 +209,11 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32").each([
-  { interruption: "closed stdout", code: 0 },
+  { interruption: "closed stdout", code: 141 },
   { interruption: "SIGINT during archives", code: 130 },
-  { interruption: "SIGPIPE", code: 141 },
+  { interruption: "closed child stdin", code: 0 },
   { interruption: "SIGTERM with progress", code: 143 },
+  { interruption: "SIGHUP during archives", code: 129 },
   { interruption: "SIGTERM while approving", code: 143 },
   { interruption: "SIGTERM while restoring", code: 143 },
 ] as const)(
@@ -208,8 +223,14 @@ it.skipIf(process.platform === "win32").each([
     const eventsPath = path.join(root, "events.json");
     const pendingApproval = interruption === "SIGTERM while approving";
     const restoringApproval = interruption === "SIGTERM while restoring";
-    const archives =
-      interruption === "SIGINT during archives" || interruption === "SIGTERM with progress";
+    const archiveSignal =
+      interruption === "SIGINT during archives"
+        ? "SIGINT"
+        : interruption === "SIGHUP during archives"
+          ? "SIGHUP"
+          : interruption === "SIGTERM with progress"
+            ? "SIGTERM"
+            : undefined;
     const child = spawn(
       resolveTestNodeExecPath(),
       createNodeEvalArgs(
@@ -218,7 +239,8 @@ it.skipIf(process.platform === "win32").each([
           pendingApproval,
           restoringApproval,
           interruption === "SIGTERM with progress",
-          archives ? (interruption === "SIGINT during archives" ? "SIGINT" : "SIGTERM") : undefined,
+          archiveSignal,
+          interruption === "closed child stdin",
         ),
       ),
       {
@@ -254,12 +276,7 @@ it.skipIf(process.platform === "win32").each([
         }),
       ]);
       expect(ready[0]).toBe("stopped");
-      const terminationSignal =
-        interruption === "SIGINT during archives"
-          ? "SIGINT"
-          : interruption === "SIGPIPE"
-            ? "SIGPIPE"
-            : "SIGTERM";
+      const terminationSignal = archiveSignal ?? "SIGTERM";
       if (pendingApproval || restoringApproval) {
         const approval = Promise.race([
           once(child, "message"),
@@ -272,7 +289,7 @@ it.skipIf(process.platform === "win32").each([
         child.kill("SIGTERM");
       } else if (interruption === "closed stdout") {
         child.stdout!.destroy();
-      } else if (!archives) {
+      } else if (!archiveSignal && interruption !== "closed child stdin") {
         child.kill(terminationSignal);
       }
       if (!pendingApproval && !restoringApproval) {
@@ -283,7 +300,8 @@ it.skipIf(process.platform === "win32").each([
       expect(JSON.parse(fs.readFileSync(eventsPath, "utf8")), stderr).toEqual([
         "stopped",
         ...(pendingApproval ? ["approval-declined"] : []),
-        ...(archives
+        ...(interruption === "closed child stdin" ? ["child-stdin-closed"] : []),
+        ...(archiveSignal
           ? ["archive-started", "archives-cancelled", "repair-cancelled"]
           : ["repair-complete"]),
         "stores-closed",
@@ -293,9 +311,11 @@ it.skipIf(process.platform === "win32").each([
       ]);
       expect(signal, stderr).toBeNull();
       expect(exitCode, stderr).toBe(code);
-      if (interruption !== "closed stdout") {
+      if (interruption === "closed child stdin") {
+        expect(stderr).not.toContain("Doctor interrupted");
+      } else {
         expect(stderr).toContain(
-          interruption === "SIGPIPE"
+          interruption === "closed stdout"
             ? "Doctor interrupted;"
             : `Doctor interrupted by ${terminationSignal};`,
         );

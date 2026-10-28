@@ -9,7 +9,6 @@ import { resolveGatewayPort } from "../../src/config/paths.js";
 import type { OpenClawConfig } from "../../src/config/types.openclaw.js";
 import { resolveGatewayUrlOverride } from "../../src/gateway/client-bootstrap.js";
 import { reserveGatewayTestListener } from "../../src/gateway/test-helpers.listener.js";
-import { probeTcpListener } from "../../src/infra/ports-probe.js";
 import { captureFullEnv, withEnvAsync } from "../../src/test-utils/env.js";
 import {
   acquireTestPortBlock,

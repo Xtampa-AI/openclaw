@@ -248,6 +248,10 @@ Use `--gateway-onboarding` in place of `--gateway-switch` to exercise local
 installation with a synthetic installer, leave Model Setup, and verify native
 window controls and Gateway actions under a non-root Gateway path. This scenario
 uses the same isolated fixtures and also runs in the Linux App workflow.
+Stage the verified runtime with `node apps/linux/scripts/stage-runtime.mjs`
+before `cargo build --locked`. The driver copies the compiled app's runtime
+resources into its private Cargo layout and exercises the real Bun launcher
+against a synthetic CLI/service, including explicit runtime activation.
 
 ## First-run setup
 
@@ -317,6 +321,11 @@ opens or focuses an existing Gateway window without reloading its current page;
 **Open … in New Window** creates an independent window. Successful explicit
 selection is remembered across app restarts. Removing a selected Gateway returns
 the main window to Primary and closes that Gateway's other windows.
+
+Each saved Gateway keeps its own dashboard storage, so an approved device pairing
+survives switching and restarts. Removing a saved Gateway retires that storage:
+saving the same address again starts a new dashboard session that pairs again,
+and the old storage is deleted the next time the app starts.
 
 If a saved Gateway cannot load, its window returns to the local connection editor
 so you can correct the address or credentials. An edited endpoint becomes the

@@ -440,6 +440,22 @@ export function redactPublicSupportDiagnosticLine(
   context: SupportRedactionContext,
 ): string {
   const line = redactSupportDiagnosticLine(value, context);
+  const gatewayStatus =
+    /^Gateway readiness was not verified; service status: (running|stopped|unknown)(?=[;.])/u.exec(
+      line,
+    )?.[1];
+  if (gatewayStatus) {
+    // Startup phases and profile arguments can contain private text. Publish only
+    // the closed service status and canonical read-only recovery advice.
+    return `Gateway readiness was not verified; service status: ${gatewayStatus}. Check openclaw gateway status --deep.`;
+  }
+  if (
+    /^Package recovery (?:anchor|control|journal|helper|rollback-journal) "[A-Za-z0-9_.-]{1,64}" unsafe: mode=[0-7]{4} nlink=\d{1,8} uid=\d{1,8}; expected owner-only mode(?: nlink=1)?\.(?: Run openclaw doctor --fix\.)?$/u.test(
+      line,
+    )
+  ) {
+    return line;
+  }
   // Package drift reports carry only a bounded relative entry and closed field names,
   // never contents, hash values, absolute installation paths, or arbitrary error prose.
   const packageEntry =
@@ -487,6 +503,17 @@ export function redactPublicSupportDiagnosticLine(
   if (maintenance) {
     return maintenance[0];
   }
+  const requirement = /^Required: openclaw@(\S+) (.*); detected: Node (\S+) at /u.exec(line);
+  if (requirement) {
+    const [, target = "", required = "", detected = ""] = requirement;
+    const engine = /^(?:Node [0-9.<>=|^~* +]+|a working Node runtime)$/u.test(required)
+      ? required
+      : "[redacted-requirement]";
+    return truncateUtf16Safe(
+      `Target package: openclaw@${redactPublicSupportVersion(target)}; Required runtime: ${engine}; Running Node: ${redactPublicSupportVersion(detected)}`,
+      200,
+    );
+  }
   const runtime =
     /^Target package: openclaw@(\S+); Minimum Node engine: (\S+); Running Node: (\S+)$/u.exec(line);
   if (runtime) {
@@ -512,7 +539,7 @@ export function redactPublicSupportDiagnosticLine(
   );
   const causes = (
     lines.match(
-      /\b(?:GLIBC_\d{1,3}(?:\.\d{1,3}){1,2} not found|[Cc]onnection (?:refused|closed|timed out)|[Pp]ermission denied|[Nn]o space left on device|MCP error -?\d{1,5}|HTTP [1-5]\d{2}|Invalid package dist content inventory|Package rollback (?:launcher backup changed|verification (?:timed out|failed))|managed update handoff (?:exited before (?:responding|signaling readiness)|did not (?:respond|signal readiness)))\b/gu,
+      /\b(?:GLIBC_\d{1,3}(?:\.\d{1,3}){1,2} not found|[Cc]onnection (?:refused|closed|timed out)|[Pp]ermission denied|[Nn]o space left on device|MCP error -?\d{1,5}|HTTP [1-5]\d{2}|Invalid package dist content inventory|SQLite (?:snapshot hash mismatch|file generation (?:changed while reading|did not stabilize)|source did not stabilize|WAL commit (?:header is unavailable or changing|publication could not be verified))|Package rollback (?:launcher backup changed|verification (?:timed out|failed))|managed update handoff (?:exited before (?:responding|signaling readiness)|did not (?:respond|signal readiness)))\b/gu,
     ) ?? []
   ).map((cause) => cause.replace(/^permission denied$/u, "Permission denied"));
   // Candidate admission's existing text protocol carries only these fixed validation lines.

@@ -17,6 +17,11 @@ While an update is active, the table shows its phase instead of advertising anot
 update, and the final line points to `openclaw update status`. JSON still includes
 registry/Git `availability` separately from `activeRun`.
 
+When a package publication journal no longer matches its installation, status
+names the changed parent, control directory, or journal bindings with their
+recorded and current `dev:ino` values. It identifies device-number-only changes
+and directs you to `openclaw update repair` for verified recovery.
+
 Git availability checks, including the Gateway's background check after startup,
 refresh only the selected upstream. They do not import other remote branches or
 tags, prune existing refs, or change shallow-history boundaries. A fresh detached
@@ -33,6 +38,13 @@ initialization warning and the `update.status` RPC reports
 `schedule.install.git.status: "unavailable"` with reason `"git-unavailable"`.
 Status reads reuse that result; an explicit Dev checkout refresh can recover it.
 Package directories without Git metadata skip the Git discovery subprocess.
+
+Reconnecting Control UI clients share one preparation of the Gateway's restart
+notification snapshot. Update producers and the update-run watcher refresh that
+snapshot when an update changes; ordinary status reads do not reread or finalize
+the notification. The watcher also waits for a detached updater's late terminal
+notification for up to 30 minutes, then logs a warning if it remains pending.
+Run history continues to report the recorded outcome independently.
 
 For a clean source checkout configured with `update.channel: "stable"` or `"beta"`, `update status --json` can include `update.git.preferredTarget` with `channel`, `tag`, and the exact commit `sha`.
 This uses the updater's release selector and fetches into a temporary private Git repository, preserving the installed refs and checkout.
@@ -76,8 +88,17 @@ JSON exposes these messages as `migrationWarnings`; they clear when the plugin m
 completes. If migration state cannot be read, `migrationWarningsError` reports
 that failure while availability and run history remain visible.
 
+The final update summary reconciles plugin migration warnings with the pending
+ledger after the last repair pass. Completed obligations leave the final summary
+and persisted warning steps; pending obligations keep their retry command.
+If the ledger cannot be read, the summary retains the warnings. Messages already
+printed during an earlier phase can remain in the terminal scrollback.
+Repeated warnings appear once in the final report. If update Doctor deferred
+agent database path repair to preserve the rollback inventory, its warning points
+to `openclaw doctor --fix` without telling you to wait for the completed update.
+
 When the Gateway is reachable, status also reads its recorded channel warnings
-without probing channel services. JSON exposes these as `channelIssues`. This
+without checking channel services. JSON exposes these as `channelIssues`. This
 includes blocked channel startup after a local plugin requests trusted runtime
 state, with the source and supported installation remedy. An unavailable Gateway
 does not prevent availability or run-history output.
@@ -241,6 +262,13 @@ marker within that budget. A failed package baseline scan records
 `baseline-scan-failed` with the scan's original cause, including when its identity
 fallback also fails. A timeout with a successful fallback remains a warning.
 
+Recovery permission refusals identify the object role and basename, observed mode,
+link count and owner UID, and the required private mode and file link count.
+Installation paths and file contents are omitted. Preserve the recovery evidence;
+do not remove links or change permissions without identifying their owner. These
+diagnostics require the updated installed updater; a candidate cannot add them to
+an older updater already running.
+
 When a managed-service handoff cannot start or transfer ownership, the Gateway
 records the refusal on the failed `requested` step. Status includes the recorded
 diagnostic after the reason code; chat and failure reports use the same facts.
@@ -258,7 +286,13 @@ a process exit code (for example, `exit 1 (EACCES; Permission denied)`). Arbitra
 log text stays private; steps without a recognized diagnostic show only their exit.
 
 Recoverable maintenance failures appear as recorded warnings even when the update
-succeeds. Each warning names the skipped work, the cause, and a repair command.
+succeeds. The final console summary, saved Markdown report, and human
+`update status` show every recorded warning. Successful runs put warnings before
+informational diagnostics,
+including disabled automatic database restoration and local changes that were
+preserved but not reapplied, with their recorded recovery paths. Short chat
+summaries remain size-limited. Each maintenance warning names the skipped work,
+the cause, and a repair command.
 Doctor also shows warnings from the latest run as historical observations: a later
 repair may already have resolved them. The existing report and history size limits
 still apply.
@@ -394,9 +428,9 @@ service and port inspection, health settlement, and final identity checks. The
 report and warning log record settlement, timeout with elapsed time and phase,
 or an unverified observation. A timeout is a warning and leaves the run eligible
 for later reconciliation; repeated diagnostics do not renew its abandonment timer.
-Runs without a recorded completed managed-service restart skip the probe and
+Runs without a recorded completed managed-service restart skip the check and
 record that skip. No fresh service-status read can permanently exclude a managed run.
-If native probe cleanup is still pending at the deadline, completion remains
+If native check cleanup is still pending at the deadline, completion remains
 unknown. Later cleanup confirmation preserves the original timeout; cleanup
 failure records both facts and names the failure in the report and warning log.
 Unknown cleanup never records success. Inspect `openclaw update status` before

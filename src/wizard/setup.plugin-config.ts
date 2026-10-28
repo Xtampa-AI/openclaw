@@ -13,7 +13,7 @@ import { parseConfigPathArrayIndex } from "../shared/path-array-index.js";
 import { t } from "./i18n/index.js";
 import type { WizardPrompter } from "./prompts.js";
 
-export type ConfigurablePlugin = {
+type ConfigurablePlugin = {
   id: string;
   name: string;
   uiHints: Record<string, PluginConfigUiHint>;
@@ -28,7 +28,6 @@ const loadPluginMetadataSnapshotModule = createLazyRuntimeModule(
 type JsonSchemaProperty = {
   type?: string;
   enum?: unknown[];
-  description?: string;
 };
 
 function resolveJsonSchemaProperty(
@@ -112,17 +111,11 @@ function parseJsonNumberInput(value: string): number | undefined {
   }
 }
 
-export function discoverConfigurablePlugins(params: {
-  manifestPlugins: ReadonlyArray<{
-    id: string;
-    name?: string;
-    configUiHints?: Record<string, PluginConfigUiHint>;
-    configSchema?: Record<string, unknown>;
-    enabled?: boolean;
-  }>;
-}): ConfigurablePlugin[] {
+function discoverConfigurablePlugins(
+  manifestPlugins: readonly PluginManifestRecord[],
+): ConfigurablePlugin[] {
   const result: ConfigurablePlugin[] = [];
-  for (const plugin of params.manifestPlugins) {
+  for (const plugin of manifestPlugins) {
     if (!plugin.configUiHints) {
       continue;
     }
@@ -143,19 +136,6 @@ export function discoverConfigurablePlugins(params: {
     });
   }
   return result.toSorted((a, b) => a.name.localeCompare(b.name));
-}
-
-export function discoverUnconfiguredPlugins(
-  params: Parameters<typeof discoverConfigurablePlugins>[0] & { config: OpenClawConfig },
-): ConfigurablePlugin[] {
-  const all = discoverConfigurablePlugins(params);
-  return all.filter((plugin) => {
-    const existing = getExistingPluginConfig(params.config, plugin.id);
-    return Object.keys(plugin.uiHints).some((key) => {
-      const val = getPath(existing, toPathSegments(key, existing, plugin.jsonSchema).map(String));
-      return val === undefined || val === null || val === "";
-    });
-  });
 }
 
 async function listEnabledConfigurableManifestPlugins(params: {
@@ -243,6 +223,10 @@ async function promptPluginFields(params: {
       }
     } else {
       const isArray = schemaProp?.type === "array";
+      const numberType =
+        schemaProp?.type === "number" || schemaProp?.type === "integer"
+          ? schemaProp.type
+          : undefined;
       const currentStr = isArray
         ? Array.isArray(currentValue)
           ? currentValue.join(", ")
@@ -253,6 +237,22 @@ async function promptPluginFields(params: {
         initialValue: currentStr,
         placeholder:
           hint.placeholder ?? (isArray ? t("wizard.plugins.arrayPlaceholder") : undefined),
+        validate: numberType
+          ? (value) => {
+              const trimmed = value.trim();
+              if (!trimmed) {
+                return undefined;
+              }
+              const parsed = parseJsonNumberInput(trimmed);
+              return parsed !== undefined && (numberType === "number" || Number.isInteger(parsed))
+                ? undefined
+                : t(
+                    numberType === "integer"
+                      ? "wizard.plugins.invalidInteger"
+                      : "wizard.plugins.invalidNumber",
+                  );
+            }
+          : undefined,
       });
       const trimmed = input.trim();
       if (trimmed === currentStr) {
@@ -263,12 +263,8 @@ async function promptPluginFields(params: {
           ? normalizeStringEntries(trimmed.split(","))
           : trimmed
         : undefined;
-      if (trimmed && (schemaProp?.type === "number" || schemaProp?.type === "integer")) {
-        const parsed = parseJsonNumberInput(trimmed);
-        if (parsed === undefined || (schemaProp.type === "integer" && !Number.isInteger(parsed))) {
-          continue;
-        }
-        nextValue = parsed;
+      if (trimmed && numberType) {
+        nextValue = JSON.parse(trimmed);
       }
     }
     setPathCreateStrict(updatedConfig, pathSegments, nextValue);
@@ -301,9 +297,12 @@ export async function setupPluginConfig(params: {
 }): Promise<OpenClawConfig> {
   const manifestPlugins = await listEnabledConfigurableManifestPlugins(params);
 
-  const unconfigured = discoverUnconfiguredPlugins({
-    manifestPlugins,
-    config: params.config,
+  const unconfigured = discoverConfigurablePlugins(manifestPlugins).filter((plugin) => {
+    const existing = getExistingPluginConfig(params.config, plugin.id);
+    return Object.keys(plugin.uiHints).some((key) => {
+      const val = getPath(existing, toPathSegments(key, existing, plugin.jsonSchema).map(String));
+      return val === undefined || val === null || val === "";
+    });
   });
 
   if (unconfigured.length === 0) {
@@ -356,9 +355,7 @@ export async function configurePluginConfig(params: {
 }): Promise<OpenClawConfig> {
   const manifestPlugins = await listEnabledConfigurableManifestPlugins(params);
 
-  const configurable = discoverConfigurablePlugins({
-    manifestPlugins,
-  });
+  const configurable = discoverConfigurablePlugins(manifestPlugins);
 
   if (configurable.length === 0) {
     await params.prompter.note(

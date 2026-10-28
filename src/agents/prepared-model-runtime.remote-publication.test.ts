@@ -34,13 +34,17 @@ import { markPluginRegistryActive, quiescePluginRegistry } from "../plugins/regi
 import { createPluginRegistryOwner } from "../plugins/runtime.js";
 import { createPluginRecord } from "../plugins/status.test-helpers.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
+import * as runtimePluginLoadPlan from "./harness/runtime-plugin-load-plan.js";
 import * as catalogWorker from "./prepared-model-catalog-worker.js";
+import { scopePreparedModelRuntimeLease } from "./prepared-model-runtime-generation-scope.js";
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
 import {
   acquireAgentRunPreparedModelRuntime,
+  acquirePublishedPreparedModelRuntime,
   acquireReadOnlyPreparedModelRuntime,
   applyRemoteModelCatalogUpdate,
   beginPreparedModelRuntimePluginDrain,
+  getPreparedModelRuntimeSnapshot,
   prepareModelRuntimeSnapshot,
   refreshPreparedModelRuntimeSnapshots,
 } from "./prepared-model-runtime.js";
@@ -120,7 +124,7 @@ async function setup(options: { allowGatewaySubagentBinding?: true } = {}) {
   });
   stored.mockReturnValue(bundle(300));
 }
-async function refresh() {
+async function listModels(refresh: boolean) {
   const respond = vi.fn();
   const loader = (params: Parameters<typeof loadPreparedGatewayModelCatalogSnapshot>[0]) =>
     loadPreparedGatewayModelCatalogSnapshot({ ...params, getConfig: () => config });
@@ -130,8 +134,8 @@ async function refresh() {
       readPreparedGatewayModelCatalogOwnerSnapshot({ ...params, getConfig: () => config }),
   });
   await modelsHandlers["models.list"]!({
-    req: { type: "req", id: "refresh", method: "models.list" },
-    params: { agentId: "default", view: "all", refresh: true },
+    req: { type: "req", id: "list", method: "models.list" },
+    params: { agentId: "default", view: "all", refresh },
     respond,
     client: null,
     isWebchatConnect: () => false,
@@ -213,6 +217,132 @@ it("delivers the first reply when catalog adoption retires its captured dispatch
     await dispatcher.waitForIdle();
   }
   expect(deliver.mock.calls.map(([payload]) => payload.text)).toEqual(["first reply completed"]);
+});
+
+it("re-admits an uncovered selection on the configured generation after a catalog publication", async () => {
+  await setup();
+  const input = fixture.agentInput("default", config);
+  // Admission retains the configured generation before the downloaded catalog commits.
+  await using parent = scopePreparedModelRuntimeLease(
+    await acquirePublishedPreparedModelRuntime(input),
+  );
+  expect(parent.pluginGeneration.remoteCatalog?.generatedAt).toBe(200);
+  expect(await applyRemoteModelCatalogUpdate(() => config)).toBe("published");
+  await using configured = await acquirePublishedPreparedModelRuntime(input);
+  expect(configured.pluginGeneration.remoteCatalog?.generatedAt).toBe(300);
+  // Provider-owner plugins activated per selection are absent from the admitted registry.
+  const ownersSpy = vi
+    .spyOn(runtimePluginLoadPlan, "resolveAgentRuntimePluginSelectionOwners")
+    .mockReturnValue({ pluginIds: ["openai"], forceActivatedPluginIds: ["openai"] });
+  try {
+    // The configured owner's own key, as cron and Gateway chat admission resolve it.
+    await using lease = await parent.run(() =>
+      acquireAgentRunPreparedModelRuntime(
+        {
+          ...input,
+          workspaceDir: parent.snapshot.workspaceDir,
+          runtimePluginSelections: [
+            { provider: "custom", modelId: "remote-200", agentId: "default" },
+          ],
+        },
+        { catalogMode: "static", pluginGeneration: parent.pluginGeneration },
+      ),
+    );
+    expect(lease.pluginGeneration).toBe(configured.pluginGeneration);
+  } finally {
+    ownersSpy.mockRestore();
+  }
+  // Historic work never replaced the published owner for newly admitted work.
+  await using next = await acquirePublishedPreparedModelRuntime(input);
+  expect(next.pluginGeneration).toBe(configured.pluginGeneration);
+});
+
+it("rejects re-admission when the run is aborted while its selection resolves", async () => {
+  await setup();
+  const input = fixture.agentInput("default", config);
+  await using parent = scopePreparedModelRuntimeLease(
+    await acquirePublishedPreparedModelRuntime(input),
+  );
+  expect(await applyRemoteModelCatalogUpdate(() => config)).toBe("published");
+  const controller = new AbortController();
+  // Revocation lands inside acquisition, after the superseded generation was inspected.
+  const ownersSpy = vi
+    .spyOn(runtimePluginLoadPlan, "resolveAgentRuntimePluginSelectionOwners")
+    .mockImplementation(() => {
+      controller.abort(new Error("run revoked"));
+      return { pluginIds: ["openai"], forceActivatedPluginIds: ["openai"] };
+    });
+  try {
+    await expect(
+      parent.run(() =>
+        acquireAgentRunPreparedModelRuntime(
+          {
+            ...input,
+            workspaceDir: parent.snapshot.workspaceDir,
+            runtimePluginSelections: [
+              { provider: "custom", modelId: "remote-200", agentId: "default" },
+            ],
+          },
+          {
+            catalogMode: "static",
+            pluginGeneration: parent.pluginGeneration,
+            abortSignal: controller.signal,
+          },
+        ),
+      ),
+    ).rejects.toThrow("Prepared model runtime lease admission aborted");
+    expect(ownersSpy).toHaveBeenCalled();
+  } finally {
+    ownersSpy.mockRestore();
+  }
+});
+
+it("keeps derived parents confined to their selections after a catalog publication", async () => {
+  await setup();
+  const input = fixture.agentInput("default", config);
+  await using configured = await acquirePublishedPreparedModelRuntime(input);
+  const selected = {
+    ...input,
+    workspaceDir: configured.snapshot.workspaceDir,
+    runtimePluginSelections: [{ provider: "custom", modelId: "selected", runtime: "first" }],
+  };
+  // Each selection resolves its own harness owner; the parent registry holds only "first".
+  const ownersSpy = vi
+    .spyOn(runtimePluginLoadPlan, "resolveAgentRuntimePluginSelectionOwners")
+    .mockImplementation(({ selections }) => {
+      const pluginIds = selections.map((selection) =>
+        selection.provider === "openai" ? "openai" : "first",
+      );
+      return { pluginIds, forceActivatedPluginIds: pluginIds };
+    });
+  const registry = createEmptyPluginRegistry();
+  registry.plugins.push(createPluginRecord({ id: "first", status: "loaded" }));
+  mocks.loadAgentRuntimePluginRegistryHandle.mockReturnValue(registry);
+  try {
+    await using parent = scopePreparedModelRuntimeLease(
+      await acquireAgentRunPreparedModelRuntime(selected, {
+        catalogMode: "static",
+        pluginGeneration: configured.pluginGeneration,
+      }),
+    );
+    expect(parent.pluginGeneration).not.toBe(configured.pluginGeneration);
+    expect(await applyRemoteModelCatalogUpdate(() => config)).toBe("published");
+    await expect(
+      parent.run(() =>
+        acquireAgentRunPreparedModelRuntime(
+          {
+            ...selected,
+            runtimePluginSelections: [
+              { provider: "openai", modelId: "gpt-5.6-luna", runtime: "openclaw" },
+            ],
+          },
+          { catalogMode: "static", pluginGeneration: parent.pluginGeneration },
+        ),
+      ),
+    ).rejects.toThrow(PreparedModelRuntimePublicationSupersededError);
+  } finally {
+    ownersSpy.mockRestore();
+  }
 });
 
 it("keeps downloaded catalogs pending while plugin work drains", async ({ signal }) => {
@@ -331,15 +461,7 @@ it("does not reuse a dynamic build captured before a remote publication", async 
   expect(next.snapshot.modelCatalog.entries.map((row) => row.id)).toContain("remote-300");
 });
 
-it("returns usable refresh rows when the saved remote bundle is corrupt", async () => {
-  await setup();
-  stored.mockReturnValue({ source_url: sourceUrl, bundle_json: "{" });
-  const result = await refresh();
-  expect(result.models.map((row: { id: string }) => row.id)).toContain("remote-200");
-  expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(200);
-});
-
-it("bounds refresh with two agents while another discovery is held and publishes later", async ({
+it("bounds refresh with two agents while another discovery is held and adopts after it", async ({
   signal,
 }) => {
   const release = createDeferred();
@@ -377,11 +499,13 @@ it("bounds refresh with two agents while another discovery is held and publishes
   });
   void other.catch(() => undefined);
   await discovering.promise;
-  const pending = refresh();
+  const pending = listModels(true);
   try {
-    // Discovery stays held until `finally`: a refresh or adoption that joined it never settles.
+    // The refresh stays bounded while discovery is held; adoption publishes after it completes.
     const result = await withinTest(pending, signal);
     expect(result.models.map((row: { id: string }) => row.id)).toContain("remote-200");
+    expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(200);
+    release.resolve();
     await withinTest(published.promise, signal);
     expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(300);
   } finally {
@@ -392,19 +516,47 @@ it("bounds refresh with two agents while another discovery is held and publishes
   }
 });
 
-it("publishes the accepted bundle despite a provider discovery failure", async () => {
+it("keeps discovered rows published until the adopted catalog's discovery completes", async ({
+  signal,
+}) => {
   await setup();
-  mocks.runPreparedModelCatalogWorker.mockResolvedValue({
-    entries: [],
-    routeVariants: [],
-    authoritative: false,
-    refreshFailed: true,
+  const owner = getPreparedModelRuntimeSnapshot(fixture.agentInput("default", config))!;
+  // Settle startup's full discovery so the refresh below runs with this test's worker.
+  await owner.loadFullModelCatalog!();
+  const discovering = createDeferred();
+  const release = createDeferred();
+  let held = false;
+  mocks.runPreparedModelCatalogWorker.mockImplementation(async () => {
+    // Discovery observes the catalog version of the generation that runs it.
+    const id = `discovered-${captureRemoteModelCatalogSnapshot()?.generatedAt}`;
+    if (held) {
+      discovering.resolve();
+      await release.promise;
+    }
+    const row = { id, provider: "custom", name: id };
+    return { entries: [row], routeVariants: [row] };
   });
-  expect(await applyRemoteModelCatalogUpdate(() => config)).toBe("published");
-  expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(300);
-  expect(captureRemoteModelCatalogStartupSnapshot()?.pricing["custom/remote-300"]?.cost.input).toBe(
-    300,
-  );
+  const rows = async () =>
+    (await listModels(false)).models.map((row: { id: string }) => row.id) as string[];
+  await owner.loadFullModelCatalog!({ refresh: true });
+  expect(await rows()).toContain("discovered-200");
+  held = true;
+  const adoption = applyRemoteModelCatalogUpdate(() => config);
+  try {
+    await withinTest(discovering.promise, signal);
+    // Readers keep the accepted catalog's rows and prices while its successor discovers.
+    expect(await withinTest(rows(), signal)).toContain("discovered-200");
+    expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(200);
+    release.resolve();
+    expect(await withinTest(adoption, signal)).toBe("published");
+    const adopted = await rows();
+    expect(adopted).toContain("discovered-300");
+    expect(adopted).not.toContain("discovered-200");
+    expect(captureRemoteModelCatalogStartupSnapshot()?.generatedAt).toBe(300);
+  } finally {
+    release.resolve();
+    await adoption.catch(() => undefined);
+  }
 });
 
 it("retries a scheduled adoption when its pending auth owner settles", async ({

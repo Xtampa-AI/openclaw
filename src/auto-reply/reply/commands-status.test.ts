@@ -463,7 +463,7 @@ describe("buildStatusReply subagent summary", () => {
         activeModelAuthOverride: "api-key",
       });
 
-      expect(normalizeTestText(text)).toContain("Context: 1.0k/200k");
+      expect(normalizeTestText(text)).toContain("Context: 1.0k/?");
     });
   });
 
@@ -555,7 +555,7 @@ describe("buildStatusReply subagent summary", () => {
       rejectedContext: "Context: 45k/200k",
     },
     {
-      name: "keeps a cross-route qualified transcript model unbound",
+      name: "binds a provider-local slash transcript model to its admitted catalog entry",
       sessionId: "sess-status-recovered-cross-route-model-context",
       provider: "openrouter",
       model: "google/gemini-2.5-pro",
@@ -568,8 +568,8 @@ describe("buildStatusReply subagent summary", () => {
           contextTokens: 1_000_000,
         },
       ],
-      expectedContext: "Context: 45k/200k",
-      rejectedContext: "Context: 45k/1.0m",
+      expectedContext: "Context: 45k/1.0m",
+      rejectedContext: "Context: 45k/200k",
     },
   ])("$name", async (testCase) => {
     await withTempHome(async (dir) => {
@@ -754,7 +754,7 @@ describe("buildStatusReply subagent summary", () => {
         ...baseCfg,
         agents: {
           defaults: {
-            agentRuntime: { id: "codex" },
+            models: { "openai/gpt-5.4": { agentRuntime: { id: "codex" } } },
           },
         },
       },
@@ -846,7 +846,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "codex" },
+                models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
               },
             },
           },
@@ -913,7 +913,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "codex" },
+                models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
               },
             },
           },
@@ -1051,7 +1051,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "codex" },
+                models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
               },
             },
           },
@@ -1088,11 +1088,9 @@ describe("buildStatusReply subagent summary", () => {
               authProfileId: "work",
             },
           ],
-          config: expect.objectContaining({
-            agents: expect.objectContaining({
-              defaults: expect.objectContaining({ agentRuntime: { id: "codex" } }),
-            }),
-          }),
+        });
+        expect(providerUsageCall[0]?.config?.agents?.defaults?.models).toEqual({
+          "openai/gpt-5.5": { agentRuntime: { id: "codex" } },
         });
       },
       { skipSessionCleanup: true, skipHomeCleanup: true },
@@ -1119,7 +1117,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "codex" },
+                models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
               },
             },
           },
@@ -1172,7 +1170,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "codex" },
+                models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
               },
             },
           },
@@ -1282,7 +1280,7 @@ describe("buildStatusReply subagent summary", () => {
     );
   });
 
-  it("uses live runtime context for unresolved active fallback notices", async () => {
+  it("does not reuse stale live context for unresolved active fallback notices", async () => {
     const selectedModel: ModelDefinitionConfig = {
       id: "mimo-v2-flash",
       name: "MiMo V2 Flash",
@@ -1334,7 +1332,8 @@ describe("buildStatusReply subagent summary", () => {
 
     const normalized = normalizeTestText(text);
     expect(normalized).toContain("Fallback: custom-runtime/unknown-fallback-model");
-    expect(normalized).toContain("Context: 49k/123k");
+    expect(normalized).toContain("Context: 49k/?");
+    expect(normalized).not.toContain("Context: 49k/123k");
     expect(normalized).not.toContain("Context: 49k/1.0m");
   });
 
@@ -1632,7 +1631,7 @@ describe("buildStatusReply subagent summary", () => {
             ...baseCfg,
             agents: {
               defaults: {
-                agentRuntime: { id: "claude-cli" },
+                models: { "anthropic/claude-opus-4-7": { agentRuntime: { id: "claude-cli" } } },
               },
             },
           },
@@ -1667,7 +1666,7 @@ describe("buildStatusReply subagent summary", () => {
         ...baseCfg,
         agents: {
           defaults: {
-            agentRuntime: { id: "claude-cli" },
+            models: { "anthropic/claude-opus-4-7": { agentRuntime: { id: "claude-cli" } } },
           },
         },
       },
@@ -1718,7 +1717,7 @@ describe("buildStatusReply subagent summary", () => {
         },
         agents: {
           defaults: {
-            agentRuntime: { id: "codex" },
+            models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
           },
         },
       },
@@ -1758,7 +1757,7 @@ describe("buildStatusReply subagent summary", () => {
         },
         agents: {
           defaults: {
-            agentRuntime: { id: "codex" },
+            models: { "openai/gpt-5.5": { agentRuntime: { id: "codex" } } },
           },
         },
       },
@@ -1856,7 +1855,7 @@ describe("buildStatusReply subagent summary", () => {
         ...baseCfg,
         agents: {
           defaults: {
-            agentRuntime: { id: "codex" },
+            models: { "openai/gpt-5.4": { agentRuntime: { id: "codex" } } },
           },
         },
       },
@@ -1947,7 +1946,7 @@ describe("buildStatusReply subagent summary", () => {
         ...baseCfg,
         agents: {
           defaults: {
-            agentRuntime: { id: "codex" },
+            models: { "openai/gpt-5.4": { agentRuntime: { id: "codex" } } },
           },
         },
       },

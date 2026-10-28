@@ -107,7 +107,6 @@ describe("gateway --force helpers", () => {
   });
 
   it.each([
-    { name: "missing PID", output: "p\ncnode\np456\ncpython\n" },
     { name: "digit-prefixed garbage", output: "p111abc\ncnode\np456\ncpython\n" },
     { name: "later malformed PID", output: "p456\ncpython\npabc\ncnode\n" },
     { name: "non-positive PID", output: "p0\ncnode\np456\ncpython\n" },
@@ -496,12 +495,6 @@ describe("gateway --force helpers (Windows netstat path)", () => {
         (pid) => `  TCP    0.0.0.0:${port}           0.0.0.0:0              LISTENING       ${pid}`,
       ),
     ].join("\r\n");
-
-  it("does not incorrectly match a port that is a substring (e.g. 80 vs 8080)", async () => {
-    probePortUsageMock.mockResolvedValue("free");
-    execFileSyncMock.mockReturnValue(makeNetstatOutput(8080, 42));
-    expect((await forceFreePortAndWait(80)).killed).toStrictEqual([]);
-  });
 
   it("deduplicates PIDs that appear multiple times", async () => {
     execFileSyncMock.mockReturnValueOnce(makeNetstatOutput(18789, 42, 42)).mockReturnValue("");

@@ -54,6 +54,8 @@ Rules:
 - Write plain JavaScript. TypeScript annotations, interfaces, and other
   TypeScript-only syntax are not accepted. Tool signatures and `API.read`
   declarations remain available as documentation for composing calls.
+- `API.read(path)` returns `{ path, description, content, bytes }`, not a string.
+  Use `(await API.read(path)).content` for the declaration text.
 - The retired `language` and `typecheck` fields are rejected with `invalid_input`.
   Tool arguments are validated when each call reaches its normal execution owner;
   Code Mode does not typecheck the whole program before execution.
@@ -256,6 +258,16 @@ returns `waiting` again, parking starts a fresh snapshot TTL.
 - a `wait` is already in flight for that `runId`.
 - the selected executor cannot resume (for example, its worker exited or QuickJS restore fails).
 - a QuickJS checkpoint would exceed `maxSnapshotBytes`. Ordinary oversized successful output is truncated and remains successful.
+
+An unavailable or expired ID is not evidence that earlier actions had no effect.
+Review the earlier `exec` and `wait` results before continuing; do not replay the
+original operation just because its continuation is no longer resumable. If another
+`wait` is already resuming the same run, use that wait’s result instead of starting
+a concurrent wait.
+
+A background shell `sessionId` is not a Code Mode `runId`. When the native process
+tool is available, the diagnostic names its callable so you can poll that same
+shell session with `action: "poll"` in a new `exec`. Do not launch the command again.
 
 ## Tool catalog
 

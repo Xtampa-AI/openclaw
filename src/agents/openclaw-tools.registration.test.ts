@@ -6,14 +6,15 @@ import type { WidgetPresenter } from "../plugins/plugin-registration.types.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import * as userProfileList from "../state/user-profile-list.js";
+import { finalizeAgentToolAvailability } from "./agent-tool-availability.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
-import { execCompletionSchema } from "./bash-tools.schemas.js";
 import { createCodeModeTools } from "./code-mode.js";
 import { resolveCoreToolFactoryFamily } from "./core-tool-factory-descriptors.js";
 import {
   createCronCreatorAuthorityCapability,
   runWithCronCreatorAuthorityCapability,
 } from "./cron-creator-authority-context.js";
+import { createLazyExecTool } from "./lazy-exec-tool.js";
 import { createOpenClawTools } from "./openclaw-tools.js";
 import {
   shouldIncludePrimarySessionToolForOpenClawTools,
@@ -89,10 +90,13 @@ it("keeps top-level tool argument names distinct from the required schema keywor
   const codeModeTools = createCodeModeTools({ config, agentId: "main" });
   expect(toolNames(directTools)).toEqual(expect.arrayContaining(["exec", "agents_wait"]));
   expect(toolNames(codeModeTools)).toEqual(["exec", "wait"]);
+  const completionTools = finalizeAgentToolAvailability([createLazyExecTool()]);
+  expect(completionTools[0]!.parameters).not.toHaveProperty(["properties", "background"]);
+  expect(completionTools[0]!.parameters).not.toHaveProperty(["properties", "yieldMs"]);
   const surfaces = {
     direct: directTools,
     codeMode: codeModeTools,
-    completion: [{ name: "exec", parameters: execCompletionSchema }],
+    completion: completionTools,
   };
   // Kimi confuses a top-level argument named required with JSON Schema's keyword.
   for (const [surface, tools] of Object.entries(surfaces)) {
@@ -423,6 +427,30 @@ describe("gateway client capability tool filtering", () => {
     expect(
       hasTool(createOpenClawTools({ githubPublicationAvailable: true }), "github_publish"),
     ).toBe(true);
+  });
+
+  it("negotiates GitHub reconnect guidance with the requesting Control UI", () => {
+    const olderTools = createOpenClawTools({
+      githubPublicationAvailable: false,
+      clientCaps: ["ui-commands"],
+    });
+    const capableTools = createOpenClawTools({
+      githubPublicationAvailable: false,
+      clientCaps: ["ui-commands", "ui-agent-github-settings"],
+    });
+
+    expect(JSON.stringify(expectToolNamed(olderTools, "screen").parameters)).not.toContain(
+      "github_identity_settings",
+    );
+    expect(JSON.stringify(expectToolNamed(capableTools, "screen").parameters)).toContain(
+      "github_identity_settings",
+    );
+    expect(expectToolNamed(olderTools, "github_identity_status").description).not.toContain(
+      "github_identity_settings",
+    );
+    expect(expectToolNamed(capableTools, "github_identity_status").description).toContain(
+      "github_identity_settings",
+    );
   });
 
   it("omits host UI runtime tools for sandboxed agents", () => {

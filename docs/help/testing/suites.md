@@ -89,6 +89,7 @@ Native dependency policy:
     - `pnpm test:changed` expands changed git paths into cheap scoped lanes by default: direct test edits, sibling `*.test.ts` files, explicit source mappings, and local import-graph dependents. Config/setup/package edits do not broad-run tests unless you explicitly use `OPENCLAW_TEST_CHANGED_BROAD=1 pnpm test:changed`.
     - `pnpm check:changed` is the normal smart local check gate for narrow work. It classifies the diff into core, core tests, extensions, extension tests, apps, docs, release metadata, live Docker tooling, and tooling, then runs the matching typecheck, lint, and guard commands. Selected paths also schedule targeted Vitest owner tests via `pnpm test:serial`; use `pnpm test:changed` or explicit `pnpm test <target>` for additional test proof matching the touched contract. Release metadata-only version bumps run targeted version/config/root-dependency checks, with a guard that rejects package changes outside the top-level version field.
     - In the default Git diff mode against `HEAD`, comment/whitespace-only TypeScript edits skip their typecheck lanes and core graph boundary check when tokens and line-break boundaries match the merge base. Files with TypeScript/JSX directives, triple-slash comments, parse errors, or path lifecycle changes retain typechecking, as do JavaScript files. Lint, formatting, ratchets, guards, and tests keep the full changed-path scope. Staged, explicit-path, and non-`HEAD` comparisons retain normal typecheck selection; `--dry-run` reports any skipped paths.
+    - Changed core test checks run the shards that own changed test roots before their other selected consumers. Both groups keep their canonical order, and CI stripe membership stays unchanged. Source-only changes keep the normal order. The boundary inventory is reused for selection and ordering.
     - Live Docker ACP harness edits run focused checks: shell syntax for the live Docker auth scripts and a live Docker scheduler dry-run. `package.json` changes are included only when the diff is limited to `scripts["test:docker:live-*"]`; dependency, export, version, and other package-surface edits still use the broader guards.
     - Import-light unit tests from agents, commands, plugins, auto-reply helpers, `plugin-sdk`, and similar pure utility areas route through the `unit-fast` lane, which skips `test/setup-openclaw-runtime.ts`; stateful/runtime-heavy files stay on the existing lanes.
     - Selected `plugin-sdk` and `commands` helper source files also map changed-mode runs to explicit sibling tests in those light lanes, so helper edits avoid rerunning the full heavy suite for that directory.
@@ -120,6 +121,10 @@ Native dependency policy:
       spawns can inherit another worker's temporary output pipe handles and
       prevent that worker's child cleanup from observing EOF. Worker counts
       and file parallelism remain unchanged.
+    - SQLite admission runs before test collection in each Vitest worker. Bun threads
+      inherit the config process's decision; OS forks initialize it locally.
+      Bun runs the existing native-close conformance probe before database pools
+      capture their policy; Node retains its runtime-provided capability.
     - The shared Vitest config fixes `isolate: false` and uses the
       non-isolated runner across the root projects, e2e, and live configs.
     - The root UI lane keeps its `jsdom` setup and optimizer, but runs on the
@@ -378,7 +383,7 @@ Use the ordinary local config, not the CI-only prebuilt config. The adapter uses
   - Live suites emit progress lines to stderr so long provider calls are visibly active even when Vitest console capture is quiet.
   - `test/vitest/vitest.live.config.ts` disables Vitest console interception so provider/gateway progress lines stream immediately during live runs.
   - Tune direct-model heartbeats with `OPENCLAW_LIVE_HEARTBEAT_MS`.
-  - Tune gateway/probe heartbeats with `OPENCLAW_LIVE_GATEWAY_HEARTBEAT_MS`.
+  - Tune gateway/check heartbeats with `OPENCLAW_LIVE_GATEWAY_HEARTBEAT_MS`.
 
 ### Advisory Bun release checks
 
@@ -403,9 +408,10 @@ gh workflow run openclaw-live-and-e2e-checks-reusable.yml --ref main \
 ```
 
 Bun jobs are labeled advisory and report failures normally in their separate
-run. They do not replace Node release evidence or add PR jobs. The existing
-`setup-test-bun` action owns the fork pin. The existing trusted admission job
-installs it once and shares its executable by artifact ID with the test jobs.
+run. They do not replace Node release evidence or add PR jobs. The trusted
+admission checkout includes `scripts/lib/openclaw-bun.json` and its staging
+helper from the workflow revision. The existing `setup-test-bun` action installs
+that pin once and shares its executable by artifact ID with the test jobs.
 Only test steps select Bun; dependency
 installation, build preparation, packaging, and workflow tooling keep their
 current toolchain.

@@ -108,7 +108,7 @@ function pauseRegistry() {
     .mockImplementationOnce((...args) => {
       const prepared = prepare(...args);
       return {
-        assertCurrent: prepared.assertCurrent,
+        ...prepared,
         read: async () => {
           entered.resolve();
           await resume.promise;
@@ -265,14 +265,14 @@ it.each([false, true])(
   },
 );
 
-it("captures config, environment, cwd and placement identity before discovery yields", async () => {
+it("captures config, state directory and placement identity before discovery yields", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const store = path.relative(process.cwd(), state.statePath("captured.sqlite"));
+    const store = "captured.sqlite";
     const cfg: OpenClawConfig = { session: { store } };
     setRuntimeConfigSnapshot(cfg, cfg);
     const subject = await placement();
     replaceSessionEntrySync(
-      { ...subject, storePath: store },
+      { ...subject, storePath: state.statePath(store) },
       { sessionId: subject.sessionId, updatedAt: 1 },
     );
     const gate = pauseRegistry();
@@ -404,12 +404,20 @@ it.each(["path", "root"] as const)(
             ? closeOpenClawAgentDatabaseByPathAsync(alias, "main")
             : closeOpenClawAgentDatabasesAsync(aliasDir);
         // An alias-only close must still find the failed physical reader's custody.
-        await expect(close()).rejects.toMatchObject({
+        const resourceFailure = {
           message: "Agent database resource drainage failed",
           errors: expect.arrayContaining([
             expect.objectContaining({ message: "synthetic retirement failure" }),
           ]),
-        });
+        };
+        await expect(close()).rejects.toMatchObject(
+          selection === "path"
+            ? resourceFailure
+            : {
+                message: "Agent database close failed",
+                errors: expect.arrayContaining([expect.objectContaining(resourceFailure)]),
+              },
+        );
         boundary.failRetirement = false;
         await close();
         expect(await (await createWorkerPlacementSessionEvidenceResolver([subject]))(subject)).toBe(

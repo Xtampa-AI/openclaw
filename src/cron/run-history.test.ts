@@ -2,6 +2,7 @@ import { expect, it, vi } from "vitest";
 import { trackSqliteStatementExecutions } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { ensureExecutionOwnerLifecycleBindingSchema } from "../audit/execution-owner-lifecycle-binding-store.js";
 import * as operationAdmission from "../infra/sqlite-worker-operation-admission.js";
+import { sqliteWorkerOwnerProbe as probe } from "../infra/sqlite-worker-owner-probe.test-support.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -51,6 +52,48 @@ function outcome(storeKey: string, receipt: string): CronRunHistoryWrite {
     ),
   };
 }
+
+it("projects only maintenance identities before loading selected reconciliation payloads", async () => {
+  await withOpenClawTestState(
+    { layout: "state-only", prefix: "cron-history-planning-projection-" },
+    async (state) => {
+      const storeKey = cronStoreKey(state.statePath("cron/jobs.json"));
+      runOpenClawStateWriteTransaction(({ db }) => {
+        recordCronRunInDatabase(db, {
+          ...outcome(storeKey, "large"),
+          summary: "summary-payload",
+          detail: {
+            kind: "cron-run",
+            storeKey,
+            retainedPayload: "payload-body",
+          },
+        });
+        const full = readCronRunRecordsInDatabase(db);
+        const planning = readCronRunRecordsInDatabase(db, undefined, undefined, {
+          planningOnly: true,
+        });
+        const fullRow = full[0];
+        expect(fullRow).toBeDefined();
+        if (!fullRow) {
+          throw new Error("Expected the recorded Cron history row");
+        }
+        expect(fullRow).toMatchObject({
+          summary: "summary-payload",
+          detail: { kind: "cron-run", storeKey, retainedPayload: "payload-body" },
+        });
+        expect(planning[0]).toMatchObject({
+          id: fullRow.id,
+          summary: undefined,
+          detail: { kind: "cron-run", storeKey },
+        });
+        expect(planning[0]?.detail).not.toHaveProperty("retainedPayload");
+        expect(
+          readCronRunRecordsInDatabase(db, undefined, undefined, { taskIds: [fullRow.id] }),
+        ).toEqual(full);
+      });
+    },
+  );
+});
 
 it.each(["asc", "desc"] as const)("orders history timestamps and ties %s", (sortDir) => {
   const run = (
@@ -232,18 +275,13 @@ it("admits actual worker writes and rolls back history pruning when commit is re
       const storeKey = cronStoreKey(state.statePath("cron/jobs.json"));
       const stages: string[] = [];
       let refuseCommit = false;
-      const createAdmission = operationAdmission.createSqliteWorkerOperationAdmission;
-      const admissionSpy = vi
-        .spyOn(operationAdmission, "createSqliteWorkerOperationAdmission")
-        .mockImplementation((admit, attachment) =>
-          createAdmission((request, grant) => {
-            stages.push(request.stage);
-            if (refuseCommit && request.stage === "commit") {
-              throw new Error("Cron history commit refused");
-            }
-            admit(request, grant);
-          }, attachment),
-        );
+      const admissionSpy = probe.admission(operationAdmission, (request, grant, admit) => {
+        stages.push(request.stage);
+        if (refuseCommit && request.stage === "commit") {
+          throw new Error("Cron history commit refused");
+        }
+        admit(request, grant);
+      });
       try {
         await recordCronRun(outcome(storeKey, "worker"));
         expect(stages).toEqual(["transaction", "commit"]);

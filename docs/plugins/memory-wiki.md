@@ -96,6 +96,10 @@ reads are off, those commands keep local/offline behavior.
 
 Managed content stays inside generated blocks; human note blocks are
 preserved across regeneration.
+Pruning also leaves a source page and its synchronization record intact when
+its bytes are not valid UTF-8, rather than salvaging replacement-decoded Notes
+and deleting the original. Keep a byte-for-byte backup, convert a copy to UTF-8
+using its original encoding, and retry the import.
 
 - `sources/`: imported raw material and bridge/unsafe-local-backed pages
 - `entities/`: durable things, people, systems, projects, objects
@@ -127,6 +131,13 @@ original OKF concept ID, source path, `type`, `resource`, `tags`, timestamp,
 and full producer frontmatter. Internal OKF links rewrite to the generated
 wiki concept pages and also emit structured `relationships` entries with
 `kind: okf-link`.
+
+Keep handwritten notes in the page's `## Notes` slot, between
+`<!-- openclaw:human:start -->` and `<!-- openclaw:human:end -->`. Re-import
+preserves that marked block exactly; text outside it is producer-owned and
+can be replaced. Legacy OKF pages without a marked block regenerate with an
+empty Notes slot. If a marker is missing from an existing block, restore it
+before retrying the import. Existing-page read failures leave that page unchanged.
 
 ## Structured claims and evidence
 
@@ -298,6 +309,10 @@ includes compact `Claim:` and `Evidence:` lines when available.
 | `wiki_get`    | read a wiki page by id/path, falling back to the shared memory corpus when shared search is enabled and the lookup misses                                     |
 | `wiki_apply`  | narrow synthesis/metadata mutations without freeform page surgery                                                                                             |
 | `wiki_lint`   | structural checks, provenance gaps, contradictions, open questions                                                                                            |
+
+`wiki_search` has a 30-second deadline and honors turn cancellation. A timeout
+or cancellation returns a tool error rather than an empty result, and stops
+the ongoing page scan. For a known page, use `wiki_get` with its id or path.
 
 The plugin also registers a non-exclusive memory corpus supplement, so shared
 `memory_search` and `memory_get` can reach the wiki when the active memory
@@ -559,7 +574,7 @@ subcommand set.
 
 When `vault.renderMode` is `obsidian`, the plugin writes Obsidian-friendly
 Markdown and can optionally use the official `obsidian` CLI for status
-probing, vault search, opening a page, invoking a command, and jumping to the
+checking, vault search, opening a page, invoking a command, and jumping to the
 daily note. This is optional; the wiki still works in native mode without
 Obsidian.
 

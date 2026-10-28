@@ -2,18 +2,23 @@ import fs from "node:fs";
 import { isBuiltin } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { JitiOptions } from "jiti";
 import { isPathInside } from "../infra/path-guards.js";
-import { createJiti } from "./jiti-factory.js";
+import { createPluginCaptureResolver } from "./plugin-capture-resolution.js";
 import {
   createPluginGenerationFileCapture,
   createPluginSourceLinkCapture,
+  linkPluginGenerationDependency,
 } from "./plugin-generation-file-capture.js";
 import { createPluginGenerationReceipt } from "./plugin-generation-receipt.js";
 import {
+  createPluginGenerationCapture,
   createPluginGenerationSourceLookup,
-  createPluginResolvedModuleCapture,
+  createPluginSourceFacts,
+  assertPluginSourceRootCurrent,
+  type PluginSourceCustodyFork,
+  createPluginGenerationModuleLookup,
 } from "./plugin-generation-source-lookup.js";
+import { PluginDependencyLinkError } from "./plugin-instance-error.js";
 import {
   createPluginNativeAdmission,
   type PluginNativeRecovery,
@@ -45,16 +50,24 @@ import {
 } from "./plugin-source-references.js";
 import { verifyPluginSourceInputs } from "./plugin-source-verification.js";
 
+export type PluginGenerationArtifact = ReturnType<typeof createPluginGenerationArtifact>;
+
 /** Capture selective entries and whole dependencies without replacing earlier file bytes. */
-export function capturePluginGenerationArtifact(
+export const capturePluginGenerationArtifact = createPluginGenerationCapture(
+  createPluginGenerationArtifact,
+);
+
+function createPluginGenerationArtifact(
   rootDir: string,
   entryFile?: string,
   execute?: <T>(run: () => T) => T,
   moduleSource?: (filename: string) => string,
   nativeRecovery?: PluginNativeRecovery,
   dependencyLookupBoundary?: Parameters<typeof createPluginDependencyResolver>[0],
+  retained?: PluginSourceCustodyFork,
+  captureForCustody = false,
 ) {
-  const sourceCapture = createPluginSourceCapture(execute);
+  const sourceCapture = retained?.source.sourceCapture ?? createPluginSourceCapture();
   const directory = sourceCapture.directory;
   const packages = new Map<string, PluginPackageCapture>();
   const capturedPaths = new Map<string, string>();
@@ -74,6 +87,12 @@ export function capturePluginGenerationArtifact(
     resolveSource: nativeAdmission.resolvePreparedSource,
   });
   const sourceAliases: Record<string, string> = {};
+  const sourceFacts = createPluginSourceFacts(
+    rootDir,
+    entryFile,
+    dependencyLookupBoundary,
+    captureForCustody,
+  );
   const receipt = createPluginGenerationReceipt(nativeAdmission.prepared);
   const {
     inputs,
@@ -83,12 +102,13 @@ export function capturePluginGenerationArtifact(
     assertModuleAvailable,
   } = sourceCapture;
   const captureAdmitted = <T>(run: () => T) => {
-    const acquired = acquireSources(run);
+    const acquired = execute ? execute(() => acquireSources(run)) : acquireSources(run);
     nativeAdmission.finish(receipt.finish());
     return acquired;
   };
   const moduleCaptures = new Map<string, PluginModuleCapture>();
-  const resolveDependency = createPluginDependencyResolver(dependencyLookupBoundary);
+  const resolution = createPluginCaptureResolver();
+  const resolveDependency = sourceFacts.resolveDependency;
   // Callers canonicalize roots; already-captured packages survive removal of their original files.
   const copyPackage = (
     root: string,
@@ -179,6 +199,8 @@ export function capturePluginGenerationArtifact(
       deferExternalLinks: Boolean(execute),
       nativeAdmission,
       receipt,
+      retained,
+      sourceFacts: sourceFacts.files,
       onPackageMetadata(source, target) {
         metadataCapture.record(target, (manifest) => {
           for (const alias of importTargetNames(manifest.imports)) {
@@ -207,11 +229,20 @@ export function capturePluginGenerationArtifact(
           ? path.dirname(moduleRoot)
           : destination;
       const link = path.join(lookupDirectory, "node_modules", name);
-      packages.get(dependency.root)!.links.add(link);
-      if (!fs.existsSync(link)) {
-        fs.mkdirSync(path.dirname(link), { recursive: true, mode: 0o700 });
-        fs.symlinkSync(path.relative(path.dirname(link), captured), link, "junction");
+      const dependencyPackage = packages.get(dependency.root)!;
+      dependencyPackage.links.add(link);
+      try {
+        if (linkPluginGenerationDependency(link, captured)) {
+          additions.add(link);
+        }
+      } catch (cause) {
+        const error = new PluginDependencyLinkError(
+          `Cannot prepare dependency ${name} for plugin ${rootDir}; check filesystem permissions and retry.`,
+          { cause },
+        );
+        dependencyPackage.state = { error };
         additions.add(link);
+        throw error;
       }
     };
     const scopes = metadataCapture.createScope({
@@ -220,6 +251,7 @@ export function capturePluginGenerationArtifact(
       boundary,
       copy,
       hasSource: (source) => capturedPaths.has(source),
+      recordMissingMetadata: sourceFacts.recordMissingFile,
     });
     const references = new Map<string, Set<string>>();
     const getNativeScope = createPluginNativeDependencyScopes(
@@ -227,7 +259,7 @@ export function capturePluginGenerationArtifact(
       (name, dependency) => linkDependency(name, dependency, true),
     );
     const scannedDirectories = new Set<string>();
-    const captureFile = (source: string, options?: JitiOptions): void => {
+    const captureFile = (source: string): void => {
       const existingSource = capturedPaths.get(path.resolve(source));
       if (existingSource) {
         assertModuleAvailable(existingSource);
@@ -252,13 +284,14 @@ export function capturePluginGenerationArtifact(
           return;
         }
         if (fs.statSync(real).isDirectory()) {
+          sourceFacts.recordDirectory(source);
           if (scannedDirectories.has(real)) {
             throw new Error("Standalone plugin input contains a directory cycle");
           }
           scannedDirectories.add(real);
           for (const name of fs.readdirSync(real).toSorted()) {
             if (isPluginSourceEntry(name)) {
-              captureFile(path.join(source, name), options);
+              captureFile(path.join(source, name));
             }
           }
           scannedDirectories.delete(real);
@@ -276,12 +309,7 @@ export function capturePluginGenerationArtifact(
         resolveDependency,
         linkDependency,
       );
-      const resolver = createJiti(source, {
-        ...options,
-        fsCache: false,
-        moduleCache: false,
-        tryNative: false,
-      });
+      const resolver = resolution.get(source);
       const captureReference = (
         reference: string,
         kind: "asset" | "import" | "require",
@@ -298,12 +326,11 @@ export function capturePluginGenerationArtifact(
             ? fileURLToPath(reference)
             : reference;
         const resolve = (specifier: string) => {
-          const resolved = resolver.esmResolve(specifier, {
-            try: true,
-            conditions: conditions
-              ? [...conditions]
-              : ["node", "module-sync", kind === "require" ? "require" : "import"],
-          });
+          const resolved = resolution.resolve(
+            source,
+            specifier,
+            conditions ?? ["node", "module-sync", kind === "require" ? "require" : "import"],
+          );
           if (!resolved?.startsWith("file:")) {
             return resolved;
           }
@@ -350,7 +377,7 @@ export function capturePluginGenerationArtifact(
               (capturedPaths.has(path.resolve(input)) ||
                 inPackage(boundary, fs.realpathSync(input)))
             ) {
-              captureFile(input, resolver.options);
+              captureFile(input);
               return input;
             }
             if (!isPathInside(resolveDependency(name, source)?.root ?? boundary, input)) {
@@ -383,7 +410,7 @@ export function capturePluginGenerationArtifact(
             }
           }
           if (!external) {
-            captureFile(input, resolver.options);
+            captureFile(input);
           }
           return input;
         }
@@ -441,11 +468,14 @@ export function capturePluginGenerationArtifact(
           ) {
             return conditions ? captureExecutableFile(input) : null;
           }
-          captureFile(input, resolver.options);
+          captureFile(input);
           if (module && path.isAbsolute(value)) {
             capturedPaths.set(requested, capturedPaths.get(path.resolve(input))!);
           }
           return input;
+        }
+        if (!module) {
+          sourceFacts.recordMissingFile(local);
         }
         return undefined;
       };
@@ -459,6 +489,14 @@ export function capturePluginGenerationArtifact(
         // Uninspected external references are distinct from observed absent local inputs.
         if (!observed.has(key) || (conditions && execute && observed.get(key) === null)) {
           observed.set(key, captureReference(reference, kind, conditions));
+          if (kind !== "asset" && observed.get(key) !== null) {
+            sourceFacts.recordModuleLookup(
+              source,
+              reference,
+              resolution,
+              conditions ?? ["node", "module-sync", kind],
+            );
+          }
         }
         return observed.get(key) ?? undefined;
       };
@@ -515,7 +553,7 @@ export function capturePluginGenerationArtifact(
               packageMap.recordMissingTarget(original);
               return undefined;
             }
-            captureFile(original, resolver.options);
+            captureFile(original);
           } else {
             packageForFile(filename)?.materialize();
           }
@@ -581,6 +619,7 @@ export function capturePluginGenerationArtifact(
         copy,
         nativeAdmission.isRetainedReference,
         nativeAdmission.resolvePreparedSource,
+        sourceFacts.recordFileProbe,
       );
       metadataCapture.setManifest(path.join(destination, "package.json"), manifest ?? null);
     } else {
@@ -608,12 +647,7 @@ export function capturePluginGenerationArtifact(
       capturedPaths.set(alias, capturedPaths.get(entry)!);
     }
     const assertSourceCurrent = () => {
-      if (
-        fs.realpathSync(rootDir) !== sourceRoot ||
-        (entryFile && fs.realpathSync(entryFile) !== entry)
-      ) {
-        throw new Error("Plugin source root changed after capture");
-      }
+      assertPluginSourceRootCurrent({ rootDir, sourceRoot, entryFile, entry });
       nativeAdmission.reconcileSourceInputs(inputs);
       verifyPluginSourceInputs(inputs, inputs.keys());
     };
@@ -622,8 +656,18 @@ export function capturePluginGenerationArtifact(
     nativeAdmission.finish(initialReceipt);
     pendingInputs.clear();
     additions.clear();
-    const captures = [moduleCaptures, hardlinkedSources, metadataCapture, packages];
+    const captures = [moduleCaptures, hardlinkedSources, metadataCapture, packages, resolution];
     const clearCaptures = () => captures.forEach((capture) => capture.clear());
+    const sourceLookup = createPluginGenerationSourceLookup({
+      rootDir,
+      sourceRoot,
+      capturedRoot: root,
+      boundaryRoot: directory,
+      capturedPaths,
+      hardlinkedSources,
+      assertModuleAvailable,
+      captureNativeRecovery: () => nativeAdmission.captureRecovery(initialReceipt, sourceAliases),
+    });
     return {
       sourceRoot,
       rootDir: root,
@@ -638,79 +682,37 @@ export function capturePluginGenerationArtifact(
         }
         nativeAdmission.reconcileSourceInputs(inputs);
       },
-      sourceForCaptured: (file: string) => originalSources.get(path.resolve(file)),
-      moduleFacts: (importer: string): Readonly<PluginModuleCapture> | undefined =>
-        moduleCaptures.get(importer),
-      boundaryRoot: directory,
       // The receipt attests the initial snapshot; first-demand inputs extend only its identity ledger.
       sourceDigest: initialReceipt.sourceDigest,
-      ...createPluginGenerationSourceLookup({
-        rootDir,
-        sourceRoot,
-        capturedRoot: root,
-        boundaryRoot: directory,
-        capturedPaths,
-        hardlinkedSources,
-        assertModuleAvailable,
-        captureNativeRecovery: () => nativeAdmission.captureRecovery(initialReceipt, sourceAliases),
-      }),
+      ...sourceLookup,
+      retainSourceCustody: () =>
+        sourceFacts.captureCustody({
+          sourceRoot,
+          entry,
+          sourceDigest: initialReceipt.sourceDigest,
+          capture: sourceLookup.captureRecoverySource,
+        }),
       assertSourceCurrent,
-      moduleRoot: (filename: string) =>
-        originalSources.has(filename) ? packageForFile(filename)?.capturedRoot : undefined,
-      assertModuleAvailable,
-      prepareModule: (filename: string) => {
-        const owner = packageForFile(filename);
-        const source = originalSources.get(filename);
-        const needsEntry =
-          execute && source && /\.[cm]?[jt]sx?$/.test(source) && !moduleCaptures.has(filename);
-        if (!owner || ((owner.state === "entry" || owner.state === "body") && !needsEntry)) {
-          return [];
-        }
-        return captureAdmitted(() => {
-          // Loading another selected module must not capture a standalone workspace.
-          owner.materialize(owner.state === "entry" ? source : undefined);
-          if (needsEntry && owner.state !== "entry") {
-            owner.materialize(source);
-          }
-        }).additions;
-      },
-      prepareDependency: (importer: string, specifier: string) =>
-        captureAdmitted(() => moduleCaptures.get(importer)?.prepareDependency(specifier)).additions,
-      prepareNativeScopes: (importer?: string) => {
-        const scope = importer ? moduleCaptures.get(importer)?.nativeScope : undefined;
-        return scope?.prepareDependencies || metadataCapture.pending
-          ? captureAdmitted(() => metadataCapture.prepare(scope))
-          : undefined;
-      },
-      prepareNativeModule: (importer: string, specifier: string) =>
-        captureAdmitted(() => {
-          const packageMap =
-            moduleCaptures.get(importer)?.prepareDependency(specifier) === "package-map";
-          metadataCapture.prepare();
-          return packageMap;
-        }).value,
-      captureModule: (importer: string, specifier: string, conditions: readonly string[]) => {
-        const result = captureAdmitted(() =>
-          moduleCaptures.get(importer)?.capture(specifier, conditions),
-        );
-        return result.value ? { ...result.value, additions: result.additions } : undefined;
-      },
-      captureResolvedModule: createPluginResolvedModuleCapture({
+      ...createPluginGenerationModuleLookup({
         capturedPaths,
+        originalSources,
+        moduleCaptures,
+        metadataCapture,
         assertModuleAvailable,
         captureAdmitted,
         captureExecutableFile,
+        executable: Boolean(execute),
         packages,
         directory,
       }),
       dispose: () => {
-        sourceCapture.dispose();
+        (retained?.source ?? sourceCapture).dispose();
         clearCaptures();
       },
-      disposeAsync: () => sourceCapture.disposeAsync().then(clearCaptures),
+      disposeAsync: () => (retained?.source ?? sourceCapture).disposeAsync().then(clearCaptures),
     };
   } catch (error) {
-    sourceCapture.dispose();
+    (retained?.source ?? sourceCapture).dispose();
     throw error;
   }
 }

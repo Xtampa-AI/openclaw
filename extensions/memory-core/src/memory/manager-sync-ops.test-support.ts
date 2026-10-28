@@ -14,7 +14,7 @@ export abstract class MemorySyncTestHarness extends MemoryManagerSyncOps {
 
   protected async indexFiles(items: MemoryIndexWorkItem[]): Promise<void> {
     for (const item of items) {
-      await this.indexFile(item.entry, { source: item.source });
+      await this.indexFile(item.entry, item.source);
     }
   }
 }

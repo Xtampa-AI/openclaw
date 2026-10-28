@@ -336,11 +336,12 @@ describe("sendGatewayHello update detail scope", () => {
     async (withdrawal) => {
       const gatewayMethods = ["health", "config.get"];
       const exited = createDeferredCore();
-      tailscaleClaim.mockResolvedValue({
+      tailscaleClaim.mockResolvedValueOnce({
         exited: exited.promise,
         isActive: () => true,
         stop: vi.fn(),
       });
+      tailscaleClaim.mockRejectedValue(new Error("Tailscale daemon unavailable"));
       const cleanup = await startGatewayTailscaleExposure({
         tailscaleMode: "serve",
         port: 18789,
@@ -508,6 +509,9 @@ describe("sendGatewayHello update detail scope", () => {
     expect(helloPayload(context)?.features.capabilities).toContain("session-scoped-chat-metadata");
     expect(helloPayload(context)?.features.capabilities).toContain("session-scoped-model-catalog");
     expect(helloPayload(context)?.features.capabilities).toContain("profile-binding-v1");
+    expect(helloPayload(context)?.features.capabilities).toContain(
+      "sender-restricted-hidden-helpers-v1",
+    );
   });
 
   it.each([

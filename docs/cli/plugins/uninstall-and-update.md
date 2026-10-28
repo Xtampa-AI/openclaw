@@ -31,6 +31,10 @@ openclaw plugins uninstall <ids...> --force
 
 `uninstall` removes plugin settings from `plugins.entries`, the persisted plugin index, plugin allow/deny list entries, and any `plugins.load.paths` entry that exactly resolves to the recorded install path. It leaves only an exact `enabled: false` entry for each removed plugin id. This marker records the explicit uninstall choice so remaining model, provider, or channel selections do not automatically reinstall the package during startup repair. Reinstalling does not silently re-enable it; enabling the plugin again replaces the marker. For a package with multiple child entries, any child id resolves to the package owner; uninstall removes every sibling's policy and slot/channel references, the one package install record, and the managed directory once. Linked path installs also remove an exact entry for their recorded source path. Parent directories, child paths, prefix matches, and unrelated load paths are preserved. Unless `--keep-files` is set, uninstall also removes the tracked managed install directory, but only when it resolves inside OpenClaw's plugin extensions root. If the plugin currently owns the `memory` or `contextEngine` slot, that slot resets to its default (`memory-core` for memory, `legacy` for context engine).
 
+Plugin entry and allow/deny cleanup uses case-insensitive policy IDs. A mixed-case
+manifest ID leaves one canonical lowercase disable marker, not conflicting entries
+with different spellings. Package install records retain their exact owner ID.
+
 Matching load-path references are removed before package files so symlink aliases cannot leave invalid config. With a running Gateway, runtime drain also precedes removal of the install record, including with `--keep-files` or a linked install. If runtime drain or file removal fails, the plugin stays disabled and tracked so you can retry uninstall.
 
 If a matching load-path reference is added again while the runtime drains, uninstall keeps the files and asks you to remove that reference before retrying. Config writes through OpenClaw wait until file cleanup settles, including writes to shared config includes. Cleanup rechecks its authority before each deletion and stops if the operation is revoked.
@@ -64,6 +68,12 @@ openclaw plugins update openclaw-codex-app-server --acknowledge-install-policy-w
 ```
 
 Updates apply to tracked plugin installs in the managed plugin index and tracked hook-pack installs in shared SQLite state. They reuse the source that the user already chose when installing the plugin, so they do not require a second source acknowledgement.
+
+Eligible official OpenClaw npm plugins follow the running host's release cohort
+when their recorded selector is bare, `latest`, or an older OpenClaw release.
+This applies to named updates and `--all`, so recovering a stale plugin uses the
+same target as `openclaw update` and `openclaw update repair`. An explicit version
+or tag supplied in the current command still takes precedence.
 
 Supply multiple IDs or npm specs to update a selection, or use `--all` without
 IDs. Repeated targets and sibling plugin IDs update their package once. An
@@ -179,7 +189,15 @@ Detailed readiness exposes the pending reload; an explicit wait has no drain
 deadline. Incoming messages retain their channel's existing queue and replay
 contract; this option does not add durable ingress to channels that lack it.
 Run this maintenance command outside a turn that itself holds the target plugin:
-waiting for that turn while it waits for reload cannot make progress.
+waiting for that turn while it waits for reload cannot make progress. Agents can
+use the `plugins` tool with `action: "reloadAndResume"` and `pluginId` instead.
+This explicit handoff ends the active turn (not the conversation), lets normal
+cleanup release its plugin leases, then runs the ordinary authorized reload and
+wakes the same session with the result, including failures and cleanup warnings.
+It requires a Gateway-hosted conversation with turn-yield support. Stop cancels
+a pending handoff; it never force-releases leases or rolls back a committed reload.
+The handoff is process-local: if the Gateway exits before delivery, inspect the
+plugin state before retrying. Plain CLI reloads are not intercepted or deferred.
 
 Replacement requires the previous registration's resource cleanup to finish
 before its successor acquires those resources. Failed cleanup can prevent
@@ -188,6 +206,8 @@ The receipt can also include cleanup warnings. Modules and native libraries may
 remain loaded after their registrations are removed.
 
 Bundled plugins can reload while preserving their enabled or disabled policy.
+Reload follows the selected bundled copy even when a dormant registry install
+record remains after a source update; that record stays unchanged.
 Bundled plugins, including TypeScript source entries, reuse their process-loaded
 code when their registrations reload. If the plugin's files changed while its
 original module remains loaded,

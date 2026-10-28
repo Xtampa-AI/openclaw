@@ -1,12 +1,19 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import {
   buildStatusUpdateRows,
   formatUpdateRestartStatusValue,
 } from "../../commands/status-update-restart.js";
+import {
+  packageActivationIdentity,
+  resolvePackageActivationAnchor,
+} from "../../infra/package-update-activation-journal.js";
+import { readPackageActivationReceipt } from "../../infra/package-update-activation.js";
 import * as sqliteWorkerStore from "../../infra/sqlite-worker-store.js";
 import { inspectUpdateRunDriver, readUpdateRunDriver } from "../../infra/update-run-driver.js";
 import {
@@ -46,7 +53,9 @@ const mocks = vi.hoisted(() => ({
     activatedPluginErrors: [] as { id: string; error: string }[],
     channelProbeErrors: [] as { id: string; error: string }[],
   })),
-  readiness: vi.fn(async () => ({ healthz: 200, readyz: 200 })),
+  readiness: vi.fn<
+    typeof import("../daemon-cli/restart-health-probe.js").waitForGatewayHttpReadiness
+  >(async () => ({ healthz: 200, readyz: 200 })),
   runtime: { log: vi.fn(), error: vi.fn(), writeJson: vi.fn(), exit: vi.fn() },
 }));
 
@@ -144,6 +153,51 @@ afterEach(async () => {
 });
 
 describe("update repair ledger recovery", () => {
+  it.each(["aborted", "publishing"])(
+    "exits nonzero while a released %s package record remains pending",
+    async (phase) => {
+      const installKey = await mocks.resolveRoot();
+      const anchor = resolvePackageActivationAnchor(installKey);
+      fs.mkdirSync(anchor, { mode: 0o700 });
+      const journal = path.join(anchor, "operation.sqlite");
+      const operationId = randomUUID();
+      const db = new DatabaseSync(journal);
+      fs.chmodSync(journal, 0o600);
+      try {
+        // Released in-anchor receipts belong to their original helper. The
+        // public command must report pending recovery before finalization.
+        db.exec("CREATE TABLE package_activation (slot INTEGER, phase TEXT, descriptor_json TEXT)");
+        db.prepare("INSERT INTO package_activation VALUES (1, ?, ?)").run(
+          phase,
+          JSON.stringify({
+            version: 1,
+            operationId,
+            authority: { installKey },
+            anchorIdentity: packageActivationIdentity(anchor, true),
+            journalIdentity: packageActivationIdentity(journal, false),
+            parentIdentity: packageActivationIdentity(path.dirname(anchor), "parent"),
+          }),
+        );
+      } finally {
+        db.close();
+      }
+      const before = fs.readFileSync(journal);
+
+      await runRegisteredCli({
+        register: registerUpdateCli,
+        argv: ["update", "repair", "--yes", "--json"],
+      });
+
+      expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+      expect(mocks.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining(path.join(anchor, "recovery.mjs")),
+      );
+      expect(mocks.finalize).not.toHaveBeenCalled();
+      expect(readPackageActivationReceipt(installKey)).toMatchObject({ phase, operationId });
+      expect(fs.readFileSync(journal)).toEqual(before);
+    },
+  );
+
   it.each([
     { legacy: true, target: "2026.9.3" },
     { legacy: false, target: "2026.9.2" },
@@ -722,10 +776,10 @@ describe("update repair ledger recovery", () => {
     "missing installed version",
     "config",
     "plugin",
-    "channel",
+    "channel-only outage",
     "readiness",
     "handshake",
-  ])("retains full repair when the serving generation is unverified: %s", async (problem) => {
+  ])("chooses repair from the serving generation's observed health: %s", async (problem) => {
     const run = seedRun();
     const root = await mocks.resolveRoot();
     if (problem === "missing installed build") {
@@ -737,6 +791,13 @@ describe("update repair ledger recovery", () => {
       mocks.readConfig.mockResolvedValue({ valid: false, config: {} });
     } else if (problem === "readiness") {
       mocks.readiness.mockResolvedValue({ healthz: 200, readyz: 503 });
+    } else if (problem === "channel-only outage") {
+      mocks.readiness.mockResolvedValue({
+        healthz: 200,
+        readyz: 503,
+        coreReady: true,
+        failingChannels: ["test"],
+      });
     }
     mocks.reachable.mockResolvedValue({
       reachable: true,
@@ -749,8 +810,23 @@ describe("update repair ledger recovery", () => {
             ? null
             : "installed-build",
       activatedPluginErrors: problem === "plugin" ? [{ id: "test", error: "failed" }] : [],
-      channelProbeErrors: problem === "channel" ? [{ id: "test", error: "failed" }] : [],
+      channelProbeErrors:
+        problem === "channel-only outage" ? [{ id: "test", error: "failed" }] : [],
     });
+    if (problem === "channel-only outage") {
+      await updateRepairCommand({});
+
+      expect(mocks.finalize).not.toHaveBeenCalled();
+      expect(getUpdateRun(run.runId)?.steps).toContainEqual(
+        expect.objectContaining({ step: "reconcile:acknowledged", status: "completed" }),
+      );
+      expect(mocks.runtime.log).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Channel health warnings: test. Run openclaw channels status --probe.",
+        ),
+      );
+      return;
+    }
     mocks.finalize.mockRejectedValueOnce(new Error("Stop the service through its owner"));
 
     await expect(updateRepairCommand({})).rejects.toThrow("Stop the service through its owner");

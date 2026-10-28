@@ -313,21 +313,11 @@ describe("OpenClaw performance workflow", () => {
     expect(verify.run).toContain('"$VITEST_PAIR_RESULT" != "success"');
   });
 
-  it("uses an optional dispatch identifier to name parent-owned runs", () => {
-    const workflow = readFileSync(WORKFLOW, "utf8");
-
-    expect(workflow).toContain(
-      "run-name: ${{ inputs.dispatch_id != '' && format('OpenClaw Performance {0}', inputs.dispatch_id) || 'OpenClaw Performance' }}",
-    );
-    expect(workflow).toContain("dispatch_id:");
-    expect(workflow).toContain("Optional parent workflow dispatch identifier");
-  });
-
   it("pins the Kova evaluator with release validation contracts", () => {
     const workflow = readFileSync(WORKFLOW, "utf8");
-    const canonicalKovaRef = "ae41f747d7e109851b27c236d78e192c5a77f478";
+    const canonicalKovaRef = "31e109b6f230180f086a539a0bd3a9d774f44566";
     const legacyKovaRef = "d69b2209905195bea06980721a92ad8b70808c5d";
-    const trustedLiveKovaRef = "ae41f747d7e109851b27c236d78e192c5a77f478";
+    const trustedLiveKovaRef = "31e109b6f230180f086a539a0bd3a9d774f44566";
     const install = findStep("Install OCM and Kova");
     const installRun = install.run ?? "";
     const targetCheckout = findStep("Checkout target metadata", "resolve_target");
@@ -525,7 +515,7 @@ describe("OpenClaw performance workflow", () => {
       expect(outputs).toMatchObject({
         checkout_ref: sha,
         tested_sha: sha,
-        kova_ref: "ae41f747d7e109851b27c236d78e192c5a77f478",
+        kova_ref: "31e109b6f230180f086a539a0bd3a9d774f44566",
         kova_config_contract: "canonical",
       });
     });

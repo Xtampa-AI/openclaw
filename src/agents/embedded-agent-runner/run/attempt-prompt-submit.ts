@@ -2,6 +2,7 @@ import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import type { ImageContent } from "../../../llm/types.js";
 import type { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
 import type { Agent, AgentMessage } from "../../runtime/index.js";
+import type { NextUserMessagePersistence } from "../../session-tool-result-guard.js";
 import { buildSessionsYieldContextMessage } from "../../sessions-yield-context.js";
 import { agentSessionQueuePromptContext } from "../../sessions/agent-session-prompting.js";
 import {
@@ -19,10 +20,12 @@ import { updateActiveEmbeddedRunSnapshot } from "../runs.js";
 import type { ToolResultPromptProjectionState } from "../session-prompt-state.js";
 import { truncateOversizedToolResultsInMessages } from "../tool-result-truncation.js";
 import { snapshotRecentMessages } from "./attempt-context-summary.js";
+import type { UserTranscriptContext } from "./attempt-history.js";
 import {
-  installModelPromptTransform,
+  installModelPromptProjection,
   installRuntimeContextMessageForPrompt,
   normalizeMessagesForLlmBoundary,
+  resolveModelPromptText,
 } from "./attempt-llm-boundary.js";
 import {
   isSessionsYieldAbortError,
@@ -59,7 +62,7 @@ type SteeringLease = {
   isCurrent: () => boolean;
 };
 
-type TrajectoryRecorder = ReturnType<typeof createTrajectoryRuntimeRecorder>;
+type TrajectoryRecorder = Awaited<ReturnType<typeof createTrajectoryRuntimeRecorder>>;
 
 export async function submitEmbeddedAttemptPrompt(input: {
   attempt: Pick<
@@ -80,6 +83,8 @@ export async function submitEmbeddedAttemptPrompt(input: {
   modelPrompt: string;
   onFinalPromptText: (prompt: string) => void;
   assertHostActive?: () => void;
+  getUserTranscriptContexts?: () => readonly UserTranscriptContext[] | undefined;
+  withTranscriptWrite?: <T>(write: () => Promise<T>) => Promise<T>;
   /** Returns work only when a stale optional restriction must be withdrawn. */
   preparePrimaryModelRequest?: () =>
     | Promise<
@@ -96,6 +101,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
   promptActiveSession: PromptActiveSession;
   runtimeContextMessage?: RuntimeContextCustomMessage;
   runtimeOnly: boolean;
+  setNextUserMessagePersistence?: (mode: NextUserMessagePersistence) => void;
   systemPrompt: string;
   toolResultAggregateMaxChars: number;
   toolResultMaxChars: number;
@@ -115,6 +121,10 @@ export async function submitEmbeddedAttemptPrompt(input: {
   };
   assertSteeringCurrent();
   const userTurnRecorder = attempt.userTurnTranscriptRecorder;
+  const projectionRecorder =
+    attempt.skipPreparedUserTurnMessage || input.runtimeOnly || userTurnRecorder?.isBlocked()
+      ? undefined
+      : userTurnRecorder;
   const persistedUserIdempotencyKey =
     attempt.skipPreparedUserTurnMessage !== true && userTurnRecorder?.hasPersisted() === true
       ? (userTurnRecorder.getPersistedMessage?.() ?? userTurnRecorder.message)?.idempotencyKey
@@ -165,23 +175,22 @@ export async function submitEmbeddedAttemptPrompt(input: {
     };
     activeSession.agent.prepareNextTurnWithContext = prepareNextTurn;
     const persistThenStream: StreamFn = async (model, context, options) => {
+      const assertRequestCurrent = () => {
+        options?.signal?.throwIfAborted();
+        assertSteeringCurrent();
+        input.assertHostActive?.();
+      };
       // Runtime admission queues behind the user append; join it outside that write lane.
       await userTurnRecorder?.waitForRuntimePersistence();
-      options?.signal?.throwIfAborted();
-      assertSteeringCurrent();
-      input.assertHostActive?.();
+      assertRequestCurrent();
       await input.persistToolResultProjections();
-      options?.signal?.throwIfAborted();
-      assertSteeringCurrent();
-      input.assertHostActive?.();
+      assertRequestCurrent();
       let requestContext = context;
       const foregroundRequest = captureCurrentPromptForModel && !activeSession.isCompacting;
       const preparation = foregroundRequest ? input.preparePrimaryModelRequest?.() : undefined;
       if (preparation) {
         const readRestoredContext = await preparation;
-        options?.signal?.throwIfAborted();
-        assertSteeringCurrent();
-        input.assertHostActive?.();
+        assertRequestCurrent();
         // Read the live permitted surface only after all awaited preparation.
         // Do not reuse the tools snapshot captured before the restoration.
         const projection = readRestoredContext().promptUpdate;
@@ -202,15 +211,11 @@ export async function submitEmbeddedAttemptPrompt(input: {
             ],
           };
         }
-        options?.signal?.throwIfAborted();
-        assertSteeringCurrent();
-        input.assertHostActive?.();
+        assertRequestCurrent();
         if (projection) {
           projection.commit();
           await input.persistToolResultProjections();
-          options?.signal?.throwIfAborted();
-          assertSteeringCurrent();
-          input.assertHostActive?.();
+          assertRequestCurrent();
         }
         const { tools, systemPrompt } = readRestoredContext();
         requestContext = { ...requestContext, tools, systemPrompt };
@@ -218,6 +223,10 @@ export async function submitEmbeddedAttemptPrompt(input: {
       if (foregroundRequest && !primaryRequestObserved) {
         primaryRequestObserved = true;
         input.onPrimaryModelRequest?.(requestContext.tools ?? []);
+      }
+      assertRequestCurrent();
+      if (foregroundRequest) {
+        projectionRecorder?.markSentToProvider?.();
       }
       const stream = await baseStreamFn(model, requestContext, options);
       // Pre-prompt compaction has not consumed the deferred answer.
@@ -242,22 +251,6 @@ export async function submitEmbeddedAttemptPrompt(input: {
         }
         if (providerPromptHistoryTruncation.aggregateTruncatedCount > 0) {
           recordAggregateTruncation(attempt);
-        }
-        // Mark the current turn sent at provider dispatch so late media appends
-        // instead of rewriting its prompt-cache slot (#99495).
-        const recorder = attempt.userTurnTranscriptRecorder;
-        const idempotencyKey = recorder?.message?.idempotencyKey;
-        if (
-          recorder &&
-          (!idempotencyKey ||
-            providerMessages.some(
-              (message) =>
-                message.role === "user" &&
-                "idempotencyKey" in message &&
-                message.idempotencyKey === idempotencyKey,
-            ))
-        ) {
-          recorder.markSentToProvider?.();
         }
         return providerMessages;
       },
@@ -286,19 +279,32 @@ export async function submitEmbeddedAttemptPrompt(input: {
     inFlightPrompt: input.transcriptPrompt,
   });
 
+  // An internal prompt has no transcript recorder to capture a model-facing projection,
+  // so it is submitted and persisted as the exact text the model receives.
+  const internalPrompt = attempt.skipPreparedUserTurnMessage === true;
+  const submittedPrompt = internalPrompt
+    ? resolveModelPromptText({ ...input, text: input.transcriptPrompt })
+    : input.transcriptPrompt;
   let captureCurrentPromptForModel = false;
-  const cleanupModelPromptTransform = installModelPromptTransform({
-    session: activeSession,
-    transcriptPrompt: input.transcriptPrompt,
-    modelPrompt: input.modelPrompt,
-    prependContext: input.prependContext,
-    appendContext: input.appendContext,
-    shouldCapturePrompt: () => captureCurrentPromptForModel,
-  });
+  const cleanupModelPromptTransform = internalPrompt
+    ? () => {}
+    : installModelPromptProjection({
+        session: activeSession,
+        transcriptPrompt: input.transcriptPrompt,
+        modelPrompt: input.modelPrompt,
+        prependContext: input.prependContext,
+        appendContext: input.appendContext,
+        shouldCapturePrompt: () => captureCurrentPromptForModel,
+        recorder: projectionRecorder,
+        withTranscriptWrite: input.withTranscriptWrite,
+        getUserTranscriptContexts: input.getUserTranscriptContexts,
+        assertCurrent: () => {
+          assertSteeringCurrent();
+          input.assertHostActive?.();
+        },
+      });
   const armModelPromptTransform = (submitted: boolean) => {
-    if (submitted) {
-      captureCurrentPromptForModel = true;
-    }
+    captureCurrentPromptForModel ||= submitted;
   };
   const promptOptions = {
     ...(!input.runtimeOnly && input.images.length > 0 ? { images: input.images } : {}),
@@ -307,6 +313,12 @@ export async function submitEmbeddedAttemptPrompt(input: {
   };
   attachPromptCompactionRequestBudget(promptOptions, input.compactionRequestBudget);
   const cleanupProviderPromptHistoryTransform = installProviderPromptHistoryTransform();
+  // Retain the model prefix without attributing a synthetic or internal prompt to a human;
+  // suppressing it would orphan the runtime context persisted after it.
+  const modelOnlyPrompt = input.runtimeOnly || internalPrompt;
+  if (modelOnlyPrompt) {
+    input.setNextUserMessagePersistence?.("runtime");
+  }
   try {
     // Persist after the user (or synthetic runtime prompt), retiring unconsumed
     // context when preflight handles or rejects the prompt before the loop starts.
@@ -319,7 +331,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
             persistedUserIdempotencyKey,
           });
     try {
-      await input.promptActiveSession(input.transcriptPrompt, promptOptions);
+      await input.promptActiveSession(submittedPrompt, promptOptions);
     } finally {
       cleanupRuntimeContextMessage();
     }
@@ -328,6 +340,10 @@ export async function submitEmbeddedAttemptPrompt(input: {
       input.onSteeringAcknowledged();
     }
   } finally {
+    if (modelOnlyPrompt) {
+      // Preflight can fail before consuming the one-shot persistence mode.
+      input.setNextUserMessagePersistence?.("normal");
+    }
     cleanupProviderPromptHistoryTransform();
     cleanupModelPromptTransform();
   }

@@ -9,6 +9,7 @@ import { formatErrorMessage } from "../../../infra/errors.js";
 import {
   hasAcceptedSessionSpawn,
   hasCompletionMessageSessionSpawn,
+  type AcceptedSessionSpawn,
 } from "../../accepted-session-spawn.js";
 import { projectAgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import type { AuthProfileFailureReason } from "../../auth-profiles.js";
@@ -104,20 +105,17 @@ export function resolveIncompleteTurnPayloadText(params: {
     params.attempt.clientToolCalls ||
     params.attempt.yieldDetected ||
     params.attempt.didSendDeterministicApprovalPrompt ||
+    params.attempt.heartbeatToolResponse ||
     params.attempt.lastToolError ||
-    params.hasIntentionalTerminalCompletion
-  ) {
-    return null;
-  }
-
-  if (
+    params.hasIntentionalTerminalCompletion ||
     params.attempt.hasToolMediaBlockReply ||
-    resolveSourceReplyDelivery(params.attempt) !== "missing"
+    resolveSourceReplyDelivery(params.attempt) !== "missing" ||
+    // A tool-authored final reply awaits host delivery, so its delivery state is still missing.
+    params.attempt.messagingToolSourceReplyPayloads?.some(
+      (payload) => payload.toolAuthored === true,
+    ) ||
+    hasCompletionMessageSessionSpawn(params.attempt.acceptedSessionSpawns)
   ) {
-    return null;
-  }
-
-  if (hasCompletionMessageSessionSpawn(params.attempt.acceptedSessionSpawns)) {
     return null;
   }
 
@@ -194,7 +192,12 @@ export function resolveIncompleteTurnPayloadText(params: {
       }),
     });
   }
-  return promptFailureText ?? "⚠️ Agent couldn't generate a response. Please try again.";
+  return (
+    promptFailureText ??
+    (stopReason === "length"
+      ? "⚠️ The model reached its output token limit before generating an answer. Please try again."
+      : "⚠️ Agent couldn't generate a response. Please try again.")
+  );
 }
 
 /**
@@ -234,7 +237,7 @@ interface YieldContinuationAttempt {
   clientToolCalls?: readonly unknown[];
   didSendDeterministicApprovalPrompt?: boolean;
   successfulCronAdds?: number;
-  acceptedSessionSpawns?: readonly { runId: string; childSessionKey: string }[];
+  acceptedSessionSpawns?: readonly AcceptedSessionSpawn[];
   runtimeContinuationStarted?: boolean;
   yieldMessageWaitRegistered?: boolean;
   messagingToolSentTexts?: readonly string[];
@@ -243,19 +246,27 @@ interface YieldContinuationAttempt {
   toolMetas?: readonly { asyncStarted?: boolean }[];
 }
 
-/** Continuation evidence for a yielded turn — sources that will produce future output. */
-export function hasYieldContinuationEvidence(attempt: YieldContinuationAttempt): boolean {
+/** Same-attempt work that can resume execution or deliver its completion. */
+export function hasRunContinuationEvidence(attempt: YieldContinuationAttempt): boolean {
   // Only same-attempt evidence is causal here. Session-wide active descendants may be
   // stale or unrelated and must not suppress the diagnostic for this yielded turn.
   return (
     (attempt.clientToolCalls?.length ?? 0) > 0 ||
     attempt.didSendDeterministicApprovalPrompt === true ||
-    hasCommittedMessagingToolDeliveryEvidence(attempt) ||
-    hasAcceptedSessionSpawn(attempt.acceptedSessionSpawns) ||
+    hasCompletionMessageSessionSpawn(attempt.acceptedSessionSpawns) ||
     attempt.runtimeContinuationStarted === true ||
     attempt.yieldMessageWaitRegistered === true ||
-    hasAsyncActivity(attempt.toolMetas) ||
-    (attempt.successfulCronAdds ?? 0) > 0
+    hasAsyncActivity(attempt.toolMetas)
+  );
+}
+
+/** A deliberate yield can also leave accepted work or already-sent output. */
+export function hasYieldContinuationEvidence(attempt: YieldContinuationAttempt): boolean {
+  return (
+    hasAcceptedSessionSpawn(attempt.acceptedSessionSpawns) ||
+    hasCommittedMessagingToolDeliveryEvidence(attempt) ||
+    (attempt.successfulCronAdds ?? 0) > 0 ||
+    hasRunContinuationEvidence(attempt)
   );
 }
 
@@ -364,7 +375,10 @@ export function resolveRunLivenessState(params: {
     return "abandoned";
   }
   const terminal = projectAgentRunAttemptTerminal(params.attempt.terminal);
-  if (terminal.promptErrorSource === "compaction" || terminal.timedOutDuringCompaction) {
+  if (
+    !terminal.timedOutDuringToolExecution &&
+    (terminal.promptErrorSource === "compaction" || terminal.timedOutDuringCompaction)
+  ) {
     return "paused";
   }
   if ((params.aborted || params.timedOut) && params.payloadCount === 0) {

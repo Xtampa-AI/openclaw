@@ -133,10 +133,9 @@ function wrapProvider(params: {
     dimensions: params.provider.dimensions,
     // Reserve BOS/EOS, a possible SentencePiece prefix, and the causal context boundary.
     maxInputTokens: params.provider.maxInputTokens ?? DEFAULT_LLAMA_CPP_EMBEDDING_CONTEXT_SIZE - 4,
-    embed: async (input, callOptions) =>
-      await withFacts(async () => await params.provider.embed(input, callOptions)),
-    embedBatch: async (inputs, callOptions) =>
-      await withFacts(async () => await params.provider.embedBatch(inputs, callOptions)),
+    embed: (input, callOptions) => withFacts(() => params.provider.embed(input, callOptions)),
+    embedBatch: (inputs, callOptions) =>
+      withFacts(() => params.provider.embedBatch(inputs, callOptions)),
     close: params.provider.close,
   };
   Object.defineProperty(wrapped, LOCAL_EMBEDDING_RUNTIME_FACTS, {

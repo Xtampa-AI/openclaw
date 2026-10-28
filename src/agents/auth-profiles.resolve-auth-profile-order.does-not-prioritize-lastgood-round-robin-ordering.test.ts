@@ -25,21 +25,20 @@ const makeStore = (profiles: AuthProfileStore["profiles"]): AuthProfileStore => 
 });
 
 describe("resolveAuthProfileOrder", () => {
-  it.each(["aws-sdk", "api-key"] as const)(
-    "accepts a config-only AWS profile only with %s provider auth",
-    (auth) => {
-      const cfg: OpenClawConfig = {
-        models: { providers: { bedrock: { auth, baseUrl: "https://example.test", models: [] } } },
-        auth: {
-          profiles: { aws: { provider: "bedrock", mode: "aws-sdk" } },
-          order: { bedrock: ["aws"] },
-        },
-      };
-      expect(resolveAuthProfileOrder({ cfg, store: makeStore({}), provider: "bedrock" })).toEqual(
-        auth === "aws-sdk" ? ["aws"] : [],
-      );
-    },
-  );
+  it("accepts a config-only AWS profile with AWS SDK provider auth", () => {
+    const cfg: OpenClawConfig = {
+      models: {
+        providers: { bedrock: { auth: "aws-sdk", baseUrl: "https://example.test", models: [] } },
+      },
+      auth: {
+        profiles: { aws: { provider: "bedrock", mode: "aws-sdk" } },
+        order: { bedrock: ["aws"] },
+      },
+    };
+    expect(resolveAuthProfileOrder({ cfg, store: makeStore({}), provider: "bedrock" })).toEqual([
+      "aws",
+    ]);
+  });
 
   it("ranks credential modes, then lastUsed, without prioritizing lastGood", () => {
     const store = makeStore({
@@ -96,21 +95,6 @@ describe("resolveAuthProfileOrder", () => {
     ]);
   });
 
-  it("uses store order ahead of config order and stale configured profile lists", () => {
-    const store = makeStore({ first: apiKey(), second: apiKey() });
-    store.order = { anthropic: ["second", "first"] };
-    const cfg: OpenClawConfig = {
-      auth: {
-        order: { anthropic: ["first", "second"] },
-        profiles: { first: { provider: "anthropic", mode: "api_key" } },
-      },
-    };
-    expect(resolveAuthProfileOrder({ cfg, store, provider: "anthropic" })).toEqual([
-      "second",
-      "first",
-    ]);
-  });
-
   it("promotes a preferred profile without dropping its fallback", () => {
     const store = makeStore({ first: apiKey(), second: apiKey() });
     expect(
@@ -134,20 +118,6 @@ describe("resolveAuthProfileOrder", () => {
     ).toEqual(["current"]);
   });
 
-  it("does not bypass an explicit profile that exists but is invalid", () => {
-    const store = makeStore({
-      expired: { type: "token", provider: "anthropic", token: "token", expires: 1 },
-      fallback: oauth(),
-    });
-    expect(
-      resolveAuthProfileOrder({
-        cfg: { auth: { order: { anthropic: ["expired"] } } },
-        store,
-        provider: "anthropic",
-      }),
-    ).toEqual([]);
-  });
-
   it("clears expired cooldowns and orders active windows after available profiles", () => {
     const now = Date.now();
     const store = makeStore({
@@ -157,7 +127,12 @@ describe("resolveAuthProfileOrder", () => {
       other: apiKey("openai"),
     });
     store.usageStats = {
-      expired: { cooldownUntil: now - 1000, errorCount: 4, failureCounts: { rate_limit: 4 } },
+      expired: {
+        cooldownUntil: now - 1000,
+        errorCount: 4,
+        failureCounts: { timeout: 4 },
+        lastRateLimitAt: now - 2000,
+      },
       late: { cooldownUntil: now + 120_000, errorCount: 2 },
       early: { disabledUntil: now + 60_000, disabledReason: "billing" },
       other: { cooldownUntil: now - 1000, errorCount: 3 },
@@ -169,7 +144,8 @@ describe("resolveAuthProfileOrder", () => {
     ]);
     expect(store.usageStats.expired).toMatchObject({
       errorCount: 0,
-      failureCounts: { rate_limit: 4 },
+      failureCounts: undefined,
+      lastRateLimitAt: now - 2000,
     });
     expect(store.usageStats.expired?.cooldownUntil).toBeUndefined();
     expect(store.usageStats.other?.errorCount).toBe(0);

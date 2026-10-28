@@ -91,7 +91,7 @@ rollback, and custom-bin behavior.
 
 Bun blocks dependency lifecycle scripts unless explicitly trusted. For this repo, the commonly blocked scripts are not required:
 
-- `baileys` `preinstall`: checks Node major >= 20 (OpenClaw requires Node 24.16+ or 26.1+, with Node 26 recommended)
+- `baileys` `preinstall`: checks Node major >= 20 (OpenClaw requires Node 24.22.1+ or 26.12.1+, with Node 26 recommended)
 - `protobufjs` `postinstall`: emits warnings about incompatible version schemes (no build artifacts)
 
 If you hit a runtime issue that needs these scripts, trust them explicitly:
@@ -105,6 +105,10 @@ bun pm trust baileys protobufjs
 On macOS, run `brew install sqlite` for native vector search. Bun 1.4.2 can retain SQLite handles and WAL/shared-memory files after close; use Node when prompt file release matters. See [Bun compatibility](/install/bun-compatibility) for library selection, requirements, and limitations.
 
 Some package scripts hardcode `pnpm` internally (for example `check:docs`, `ui:*`, `protocol:check`). Running them via `bun run` still shells out to `pnpm`, so just run those via `pnpm` directly.
+
+Repository npm packaging helpers run the packaged npm CLI directly under Bun,
+including on Windows. They do not require npm beside the Bun executable. An
+explicitly selected Node toolchain still uses its own adjacent npm installation.
 
 Gateway process inspection recognizes Bun's `--watch` and `--hot` flags. ACP bridge detection recognizes Bun and the current runtime executable, including custom filenames. Portable cloud worker archives target Node when built with either runtime, and worker inference errors omit runtime stack properties from their bounded diagnostic messages.
 

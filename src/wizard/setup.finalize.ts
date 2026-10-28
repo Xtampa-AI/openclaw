@@ -41,9 +41,7 @@ import {
 } from "../infra/gateway-supervision.js";
 import { formatWindowsGatewayFirewallGuidance } from "../infra/windows-gateway-firewall-diagnostics.js";
 import { ExitError, type RuntimeEnv } from "../runtime.js";
-import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import {
-  cancelProcessExitAfterTuiReturn,
   resolveTuiShutdownHardExitMs,
   runTui,
   scheduleProcessExitAfterTuiReturn,
@@ -123,8 +121,6 @@ async function closeSessionGatewayForOnboarding(params: {
     params.runtime.error(formatErrorMessage(error));
   });
 }
-
-const loadSearchSetupModule = createLazyRuntimeModule(() => import("../flows/search-setup.js"));
 
 export type GatewayServiceSetupOutcome =
   | {
@@ -335,14 +331,11 @@ export async function ensureGatewayServiceForOnboarding(params: {
         ],
       }));
     if (action === "restart") {
-      let restartDoneMessage = t("wizard.finalize.gatewayServiceRestarted");
+      let restartDoneMessage = t("wizard.finalize.gatewayService");
       const progress = prompter.progress(t("wizard.finalize.gatewayService"));
       try {
         progress.update(t("wizard.finalize.gatewayServiceRestarting"));
-        const restartResult = await service.restart({
-          env: process.env,
-          stdout: process.stdout,
-        });
+        const restartResult = await service.restart({ env: process.env, stdout: process.stdout });
         const restartStatus = describeGatewayServiceRestart("Gateway", restartResult);
         restartDoneMessage = restartStatus.scheduled
           ? t("wizard.finalize.gatewayServiceRestartScheduled")
@@ -351,6 +344,8 @@ export async function ensureGatewayServiceForOnboarding(params: {
           status: "ready",
           action: restartStatus.scheduled ? "restart-scheduled" : "restarted",
         };
+      } catch (error) {
+        gateway = { status: "failed", error: formatErrorMessage(error) };
       } finally {
         progress.stop(restartDoneMessage);
       }
@@ -812,7 +807,8 @@ export async function finalizeSetupWizard(
     const configuredSearchProviders = listConfiguredWebSearchProviders({ config: nextConfig });
     let webSearchLines: string[];
     if (webSearchProvider) {
-      const { resolveExistingKey, hasExistingKey, hasKeyInEnv } = await loadSearchSetupModule();
+      const { resolveExistingKey, hasExistingKey, hasKeyInEnv } =
+        await import("../flows/search-setup.js");
       const entry = configuredSearchProviders.find((e) => e.id === webSearchProvider);
       const label = entry?.label ?? webSearchProvider;
       const storedKey = entry ? resolveExistingKey(nextConfig, webSearchProvider) : undefined;
@@ -891,7 +887,7 @@ export async function finalizeSetupWizard(
     } else {
       // Legacy configs may have a working key (e.g. apiKey or BRAVE_API_KEY) without
       // an explicit provider. Runtime auto-detects these, so avoid saying "skipped".
-      const { hasExistingKey, hasKeyInEnv } = await loadSearchSetupModule();
+      const { hasExistingKey, hasKeyInEnv } = await import("../flows/search-setup.js");
       const legacyDetected = configuredSearchProviders.find(
         (e) => hasExistingKey(nextConfig, e.id) || hasKeyInEnv(e),
       );
@@ -1001,7 +997,7 @@ export async function finalizeSetupWizard(
             });
             sessionGateway = undefined;
           } finally {
-            cancelProcessExitAfterTuiReturn(cleanupExitTimer);
+            clearTimeout(cleanupExitTimer);
           }
         }
       }

@@ -2,12 +2,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProjectCloneFailureCause } from "../../packages/gateway-protocol/src/index.js";
+import { hasErrnoCode } from "../infra/errno.js";
 import {
   executeGitCommand,
   gitNullConfigPath,
   requireGitCommandOutput,
+  type GitCommandOptions,
 } from "../infra/git-exec.js";
 import { withGitNetworkRetry, type GitOperationStarter } from "../infra/git-network-retry.js";
+import { withGitRepositoryRepair } from "../infra/git-repository-repair.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { withGitProcessOperation } from "../process/spawn-diagnostics.js";
 
@@ -121,7 +124,15 @@ export async function cloneProjectCheckout(
   const env = options.env ?? process.env;
   const existed = await fs.lstat(input.target).then(
     () => true,
-    () => false,
+    (error: unknown) => {
+      if (hasErrnoCode(error, "ENOENT")) {
+        return false;
+      }
+      throw new ProjectCloneError(
+        "clone_failed",
+        "The managed checkout target could not be inspected. Check Gateway filesystem access and retry.",
+      );
+    },
   );
   if (existed) {
     throw new ProjectCloneError(
@@ -177,7 +188,7 @@ export async function refreshProjectCheckout(
   input: { target: string; url: string },
   options: ProjectCloneOptions = {},
 ): Promise<void> {
-  const [objectPath, objectFormatResult, currentRefs] = await Promise.all([
+  const [objectPath, objectFormatResult, initialRefs] = await Promise.all([
     runProjectCheckoutGit(input, options, [
       "rev-parse",
       "--path-format=absolute",
@@ -187,6 +198,7 @@ export async function refreshProjectCheckout(
     runProjectCheckoutGit(input, options, ["rev-parse", "--show-object-format"]),
     readProjectRemoteRefs(input, options),
   ]);
+  let currentRefs = initialRefs;
   if (objectPath.code !== 0 || objectPath.termination !== "exit") {
     throw new ProjectCloneError(
       "clone_failed",
@@ -219,17 +231,38 @@ export async function refreshProjectCheckout(
       );
     }
     const stagingOptions = { ...options, objectDirectory: objects };
+    let protectedRefs: ReadonlySet<string> | undefined;
     if (currentRefs.size > 0) {
       // Seed only refs already owned by the managed checkout. Besides enabling
       // incremental negotiation, this keeps transport isolated from local branches.
-      const seeded = await runProjectCheckoutGit(
-        { target: staging },
-        stagingOptions,
-        ["update-ref", "--stdin"],
-        {
-          input: `${Array.from(currentRefs, ([ref, commit]) => `update ${ref} ${commit}`).join("\n")}\n`,
+      const seed = () =>
+        runProjectCheckoutGit({ target: staging }, stagingOptions, ["update-ref", "--stdin"], {
+          input: Array.from(currentRefs, ([ref, commit]) => `update ${ref} ${commit}\n`).join(""),
+        });
+      const seeded = await withGitRepositoryRepair({
+        cwd: input.target,
+        result: await seed(),
+        remote: input.url,
+        canonicalTracking: true,
+        onRepaired: (refs) => {
+          protectedRefs = refs;
         },
-      );
+        signal: options.signal,
+        assertCurrent: options.assertCurrent,
+        run: (args, commandOptions) =>
+          args.includes("fetch") || args.includes("ls-remote")
+            ? runProjectCheckoutGit(
+                { target: staging, url: input.url },
+                stagingOptions,
+                args,
+                commandOptions,
+              )
+            : runProjectCheckoutGit(input, options, args, commandOptions),
+        retry: async () => {
+          currentRefs = await readProjectRemoteRefs(input, options);
+          return seed();
+        },
+      });
       if (seeded.code !== 0 || seeded.termination !== "exit") {
         throw new ProjectCloneError(
           "clone_failed",
@@ -262,13 +295,18 @@ export async function refreshProjectCheckout(
     const updates = [
       ...Array.from(fetchedRefs, ([ref, commit]) => `update ${ref} ${commit}`),
       ...Array.from(currentRefs.keys())
-        .filter((ref) => !fetchedRefs.has(ref))
+        .filter((ref) => !fetchedRefs.has(ref) && !protectedRefs?.has(ref))
         .map((ref) => `delete ${ref}`),
     ];
     if (updates.length > 0) {
-      const updated = await runProjectCheckoutGit(input, options, ["update-ref", "--stdin"], {
-        input: `${updates.join("\n")}\n`,
-      });
+      const updated = await runProjectCheckoutGit(
+        input,
+        options,
+        ["update-ref", "--no-deref", "--stdin"],
+        {
+          input: `${updates.join("\n")}\n`,
+        },
+      );
       if (updated.code !== 0 || updated.termination !== "exit") {
         throw new ProjectCloneError(
           "clone_failed",
@@ -328,17 +366,13 @@ function runProjectCheckoutGit(
   input: { target: string; url?: string },
   options: ProjectCloneOptions,
   args: string[],
-  commandOptions: { input?: string } = {},
+  commandOptions: GitCommandOptions = {},
 ) {
   return executeGitCommand(
     input.target,
     ["-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false", ...args],
     {
       operation: "project.clone",
-      env: {
-        ...cloneCommandEnv(input.url, options.token, options.env ?? process.env),
-        ...(options.objectDirectory ? { GIT_OBJECT_DIRECTORY: options.objectDirectory } : {}),
-      },
       timeoutMs: options.timeoutMs ?? PROJECT_CLONE_TIMEOUT_MS,
       signal: options.signal,
       killProcessTree: true,
@@ -346,6 +380,11 @@ function runProjectCheckoutGit(
       beforeRun: options.assertCurrent,
       startRun: options.startRun,
       ...commandOptions,
+      env: {
+        ...cloneCommandEnv(input.url, options.token, options.env ?? process.env),
+        ...commandOptions.env,
+        ...(options.objectDirectory ? { GIT_OBJECT_DIRECTORY: options.objectDirectory } : {}),
+      },
     },
   );
 }
@@ -363,14 +402,25 @@ export async function ensureProjectCheckoutCommit(
   if (present.code === 0 && present.termination === "exit") {
     return;
   }
-  const fetched = await command([
-    "fetch",
-    "--no-tags",
-    "--no-recurse-submodules",
-    "--",
-    input.url,
-    input.commit,
-  ]);
+  const fetch = () =>
+    command([
+      "fetch",
+      "--no-auto-maintenance",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--",
+      input.url,
+      input.commit,
+    ]);
+  const fetched = await withGitRepositoryRepair({
+    cwd: input.target,
+    result: await fetch(),
+    remote: input.url,
+    signal: options.signal,
+    assertCurrent: options.assertCurrent,
+    run: (args, commandOptions) => runProjectCheckoutGit(input, options, args, commandOptions),
+    retry: fetch,
+  });
   if (fetched.code !== 0 || fetched.termination !== "exit") {
     throw classifyProjectGitFailure(fetched, "fetch", Boolean(options.token));
   }

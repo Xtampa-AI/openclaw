@@ -13,6 +13,23 @@ const PROBE_TIMEOUT_MS = 2_000;
 const NATIVE_PROBE_TIMEOUT_MS = 10_000;
 declare const SEALED_RUNTIME_BUILD: boolean;
 
+export function resolveServiceProcessMembershipBlock(
+  membership: ServiceProcessMembership,
+  ancestryComplete: boolean,
+  platform: NodeJS.Platform = process.platform,
+) {
+  if (membership === "inside") {
+    return "inside-gateway-service";
+  }
+  if (membership === "unknown") {
+    return "service-membership-unverified";
+  }
+  // Darwin containment proves an external terminal even when a root-owned login is unreadable.
+  return !ancestryComplete && (platform !== "darwin" || membership !== "outside")
+    ? "service-ancestry-unverified"
+    : undefined;
+}
+
 // Koffi segfaults some Darwin hosts (x86_64 under Rosetta), so the query runs in a joined
 // child: a crash only loses the observation. Coalition IDs are kernel facts; the job name
 // comes from launchd and may be unavailable.

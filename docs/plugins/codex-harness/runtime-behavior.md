@@ -32,6 +32,8 @@ Codex tool search under the `openclaw` namespace, keeping the initial model
 context smaller. The restricted-turn shell fallback is the exception for
 `exec` and `process` when a finite allowlist disables native Code Mode;
 runtime allowlists and `codexDynamicToolsExclude` still apply.
+Strict [`agent exec`](/cli/agent#agent-exec) runs also use OpenClaw's tools so
+their process cleanup stays with the one-shot run owner.
 When native shell remains active and Gateway access is policy-eligible,
 OpenClaw instead publishes the distinct `gateway_exec` and `gateway_process`
 names so native shell and the OpenClaw-managed environment path cannot be
@@ -165,11 +167,25 @@ OpenClaw still bounds its own requests, dynamic tools, cancellation, and local
 settlement. See [Timeouts](/plugins/codex-harness-reference#timeouts) for those
 budgets, Stop and replay behavior, and Doctor migration of retired idle settings.
 
+If the app-server connection is lost before the turn completes, the conversation
+retains a visible failure outcome even when Codex already sent commentary or
+partial output. Reloading the Control UI or opening the conversation on another
+client preserves that outcome. The live error and saved notice both explain
+that the task may still be running and tell you to check the conversation before
+trying again. The original error remains in diagnostic details.
+Check any command's effects before retrying: a
+lost connection does not prove that its work stopped. A later turn can reconnect
+to the app-server normally.
+
 Failed app-server startup waits for child shutdown before returning its error.
 If startup times out or is canceled during process registration, cleanup joins
 that registration and closes any late child. Cleanup can extend beyond the
 startup deadline. A canceled caller leaves startup running when another caller
 still owns it.
+
+Temporary capability, native-hook, and tool-catalog probes wait for their isolated
+app-server to close before returning, including after a failed or timed-out read.
+Probes using a shared connection release their lease so other work can continue.
 
 OpenClaw preserves assistant text supplied with the initial native item and
 reasoning supplied with a completed item, even when Codex sends no text deltas.
@@ -246,7 +262,7 @@ Because entitlement belongs to the authenticated workspace and the target model
 rather than to any one conversation, an unauthorized target is remembered once
 for every session under that workspace and cannot be displaced by session churn.
 A separate workspace that is entitled keeps escalating normally, and the record
-releases on its own once `cooloffMs` elapses. Only one probe runs at a time for a
+releases on its own once `cooloffMs` elapses. Only one check runs at a time for a
 given workspace and target, so sibling sessions refused at the same moment do not
 each pay the reconnect ladder before the first result lands.
 
@@ -260,6 +276,23 @@ A closed, replaced, or retired client still cannot complete a stale handoff.
 When native interruption and subscription cleanup are confirmed, stopping one
 chat leaves other chats running on the shared client. A follow-up can resume the
 stopped thread without waiting for those chats to finish.
+
+Native child completion delivery stops permanently when its retry budget is
+exhausted or requester recovery blocks it. OpenClaw retires that child turn's
+pending assignment and follow-up receipt together, so later parent registrations
+and Gateway restarts do not restart delivery. A bounded system note in the parent
+transcript identifies the child, its status, and its result session key; a warning
+records retirement even if the transcript note cannot be written. Other pending
+turns of the same child remain independent. Parent subscription retention during
+ordinary completion retries is unchanged.
+
+If a chat's previous client was retired while other chats still use it, the
+next turn waits for its exact thread to close or for that client to exit before
+resuming. If a plugin reload missed the thread's closure notification, OpenClaw
+reads the exact old client's thread status once. A matching `notLoaded` status
+allows the handoff; a still-loaded thread or a failed read keeps waiting. Native
+resume retains its exclusive persistence writer lock. Stopping the waiting turn
+cancels its read and wait.
 
 Managed local connections share a bounded inference relay. Up to 16 request
 preparations and uploads run at once, with another 16 waiting in arrival order.

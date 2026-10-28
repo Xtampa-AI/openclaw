@@ -20,7 +20,7 @@ const REMOTE_QUIESCENCE_PS_JS = String.raw`function createProcessProbe() {
     for (;;) {
       const remaining = Math.ceil(deadline - performance.now());
       if (remaining <= 0) {
-        const message = "workspace quiescence process probe budget exhausted after 30000 ms; check host load and ps availability";
+        const message = "workspace quiescence process check budget exhausted after 30000 ms; check host load and ps availability";
         process.stderr.write(message + "\n");
         throw Object.assign(new Error(message), { code: "WORKSPACE_PROBE_BUDGET_EXHAUSTED" });
       }
@@ -32,7 +32,7 @@ const REMOTE_QUIESCENCE_PS_JS = String.raw`function createProcessProbe() {
       } catch (error) {
         if (!error || error.code !== "ETIMEDOUT") throw error;
         if (!warned) {
-          process.stderr.write("workspace quiescence: slow ps probe; retrying within the shared 30000 ms budget\n");
+          process.stderr.write("workspace quiescence: slow ps check; retrying within the shared 30000 ms budget\n");
           warned = true;
         }
         timeout *= 2;
@@ -81,7 +81,7 @@ function reportPendingProcesses(entries, exhausted = false) {
   // Match workspaceSyncError's single-line display in the retained diagnostic, while
   // preserving raw ps padding in lease identities used by signal guards and older watchdogs.
   const message = (exhausted
-    ? "workspace quiescence recovery exhausted after 4 probe passes (30000 ms each, 7000 ms total backoff); check host load and ps availability, then retry workspace recovery; unfinished workers (PID/start): "
+    ? "workspace quiescence recovery exhausted after 4 check passes (30000 ms each, 7000 ms total backoff); check host load and ps availability, then retry workspace recovery; unfinished workers (PID/start): "
     : "workspace quiescence recovery pending PIDs: " + pids.join(", ") + "; unfinished workers (PID/start): ") + JSON.stringify(entries).replace(/\s+/gu, " ");
   process.stderr.write(message + "\n");
   return message;
@@ -191,6 +191,31 @@ function withWindowsWorkspaceLease(databasePath, workspaceKey, run) {
   }
 }`;
 
+const REMOTE_WINDOWS_ACQUIRE_WORKSPACE_LEASE_JS = String.raw`function acquireWindowsWorkspaceLease(nonce, watchdogTimeoutMs) {
+  withWindowsWorkspaceLease(windowsLeaseDatabasePath, workspaceKey, (raw) => {
+    if (raw !== null) {
+      const parsed = JSON.parse(raw);
+      if (!/^[a-f0-9]{32}$/.test(parsed?.nonce || "")) {
+        throw new Error("invalid Windows shared-host workspace quiescence lease");
+      }
+      const candidate = parseWindowsLease(raw, parsed.nonce);
+      if (candidate.expiresAtMs > Date.now()) {
+        throw new Error("workspace quiescence lease is already active");
+      }
+    }
+    const lease = {
+      version: 1,
+      nonce,
+      sharedHost: true,
+      processes: [],
+      watchdog: null,
+      expiresAtMs: Date.now() + watchdogTimeoutMs,
+    };
+    return JSON.stringify(lease);
+  });
+  process.stderr.write("workspace quiescence: Windows shared host declared; using manifest fences without process freezing\n");
+}`;
+
 const REMOTE_QUIESCENCE_CONTROL_JS = String.raw`function freezeWorkspaceProcesses(input, frozen, refreshLease, initial = false) {
   let quietScans = 0;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -280,7 +305,7 @@ function refreshLease(processes) {
     if (current.nonce !== nonce || current.watchdog?.pid !== input.watchdog.pid || current.watchdog?.start !== input.watchdog.start) {
       throw new Error("workspace quiescence lease changed during renewal");
     }
-    if (current.expiresAtMs <= Date.now()) throw new Error("workspace quiescence lease expired during process probing");
+    if (current.expiresAtMs <= Date.now()) throw new Error("workspace quiescence lease expired during process checking");
   });
 }
 assertWatchdogActive();
@@ -373,35 +398,7 @@ const sharedHost = isolationMode === "shared-host";
 if (ownedWatchdog && !sharedHost) throw new Error("native quiescence requires a shared host");
 let leasePath = path.join(leaseDirectory, workspaceKey + "." + nonce + ".json");
 ${REMOTE_QUIESCENCE_LEASE_JS}
-if (process.platform === "win32" && sharedHost) {
-  withWindowsWorkspaceLease(windowsLeaseDatabasePath, workspaceKey, (raw) => {
-    if (raw !== null) {
-      const parsed = JSON.parse(raw);
-      if (!/^[a-f0-9]{32}$/.test(parsed?.nonce || "")) {
-        throw new Error("invalid Windows shared-host workspace quiescence lease");
-      }
-      const candidate = parseWindowsLease(raw, parsed.nonce);
-      if (candidate.expiresAtMs > Date.now()) {
-        throw new Error("workspace quiescence lease is already active");
-      }
-    }
-    const lease = {
-      version: 1,
-      nonce,
-      sharedHost: true,
-      processes: [],
-      watchdog: null,
-      expiresAtMs: Date.now() + watchdogTimeoutMs,
-    };
-    return JSON.stringify(lease);
-  });
-  process.stderr.write("workspace quiescence: Windows shared host declared; using manifest fences without process freezing\n");
-  process.stdout.write("quiesced " + nonce + "\n");
-  process.exit(0);
-}
-if (typeof process.getuid !== "function") throw new Error("workspace quiescence requires POSIX");
-const uid = process.getuid();
-if (uid === 0) throw new Error("workspace quiescence refuses root-owned worker sessions");
+${REMOTE_WINDOWS_ACQUIRE_WORKSPACE_LEASE_JS}
 ${REMOTE_QUIESCENCE_PS_JS}
 ${REMOTE_QUIESCENCE_CONTROL_JS}
 const frozen = new Map();
@@ -417,6 +414,13 @@ function writeLease(processes = [...frozen].map(([pid, start]) => ({ pid, start 
   });
 }
 function acquireWorkspaceLease() {
+if (process.platform === "win32" && sharedHost) {
+  acquireWindowsWorkspaceLease(nonce, watchdogTimeoutMs);
+  return;
+}
+if (typeof process.getuid !== "function") throw new Error("workspace quiescence requires POSIX");
+// Native custody only owns empty shared-host leases; detached recovery can signal host processes.
+if (process.getuid() === 0 && !ownedWatchdog) throw new Error("workspace quiescence refuses root-owned worker sessions");
 processProbe = createProcessProbe();
 const orphanNames = fs.readdirSync(leaseDirectory).filter((name) =>
   name.startsWith(workspaceKey + ".") && name.endsWith(".json"),
@@ -643,6 +647,20 @@ if (ownedWatchdog) {
 }
 `;
 
+const REMOTE_WINDOWS_WORKSPACE_QUIESCE_JS = String.raw`(() => {
+${REMOTE_QUIESCENCE_CONTEXT_JS}
+fs.mkdirSync(leaseDirectory, { recursive: true });
+const nonce = crypto.randomBytes(16).toString("hex");
+let watchdogTimeoutMs = Number(process.argv[2] || 12 * 60 * 1000);
+if (!Number.isSafeInteger(watchdogTimeoutMs) || watchdogTimeoutMs < 1) throw new Error("invalid watchdog timeout");
+if ((process.argv[3] || "dedicated") !== "shared-host") throw new Error("workspace quiescence requires POSIX");
+${REMOTE_QUIESCENCE_LEASE_JS}
+${REMOTE_WINDOWS_ACQUIRE_WORKSPACE_LEASE_JS}
+acquireWindowsWorkspaceLease(nonce, watchdogTimeoutMs);
+process.stdout.write("quiesced " + nonce + "\n");
+})();
+`;
+
 const REMOTE_QUIESCENCE_CONTROL_CONTEXT_JS = String.raw`${REMOTE_QUIESCENCE_CONTEXT_JS}
 const nonce = process.argv[2];
 const leasePath = path.join(leaseDirectory, workspaceKey + "." + nonce + ".json");
@@ -679,4 +697,20 @@ export function workspaceQuiescenceArgv(
     args.push(watchdogLifetime, ...(operation.action === "acquire" ? [operation.nonce] : []));
   }
   return ["node", "-e", scripts[operation.action], root, ...args];
+}
+
+export function legacyWindowsWorkspaceQuiescenceAcquireArgv(
+  root: string,
+  operation: Extract<NodeWorkerWorkspaceQuiescenceInput, { action: "acquire" }>,
+  hostMode: "shared-host" | "dedicated",
+): string[] {
+  // The full acquire program exceeds the Windows command-line limit through node -e.
+  return [
+    "node",
+    "-e",
+    REMOTE_WINDOWS_WORKSPACE_QUIESCE_JS,
+    root,
+    String(operation.timeoutMs),
+    hostMode,
+  ];
 }

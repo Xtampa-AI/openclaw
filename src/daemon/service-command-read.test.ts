@@ -119,6 +119,46 @@ describe("native service command inspection", () => {
     await fs.writeFile(filename, contents);
   }
 
+  it.each(["absent", "dangling", "empty"])(
+    "reinstall permits only absent plists while launchd retains a job (%s)",
+    async (condition) => {
+      const plist = resolveLaunchAgentPlistPath(env);
+      const result = (stdout: string, code = 0, stderr = "") => ({
+        code,
+        termination: "exit",
+        stdout,
+        stderr,
+      });
+      native.launchctl.mockImplementation(async (_command: string, args: string[]) =>
+        args[1]?.startsWith("system/")
+          ? result("", 113, "Could not find service")
+          : result(`${args[1]} = {\n\tstate = waiting\n}`),
+      );
+      if (condition === "dangling") {
+        await fs.mkdir(path.dirname(plist), { recursive: true });
+        await fs.symlink(path.join(root, "absent-definition"), plist);
+      } else if (condition === "empty") {
+        await writeFile(plist, renderPlist([]));
+      }
+      if (condition === "absent") {
+        await expect(
+          readLaunchAgentProgramArguments(env, { requireEffective: true }),
+        ).rejects.toThrow();
+      }
+      const command = readLaunchAgentProgramArguments(env, {
+        requireEffective: true,
+        allowMissingDefinition: true,
+      });
+      if (condition === "absent") {
+        await expect(command).resolves.toBeNull();
+      } else {
+        await expect(command).rejects.toThrow(
+          "Effective LaunchAgent service command could not be inspected",
+        );
+      }
+    },
+  );
+
   describe.each(readers)("$name", ({ name, read, resolvePath, render }) => {
     it.each(["dangling", "directory", "empty", "registered", "unavailable"])(
       "keeps a %s definition distinct from proven absence",
@@ -221,7 +261,7 @@ describe("native service command inspection", () => {
       { placement: "delegated serial", condition: "absent", explicit: true },
       { placement: "delegated serial", condition: "ready", explicit: false },
     ])(
-      "preserves $condition with fractional elapsed time ($placement, explicit=$explicit)",
+      "preserves native $condition state with fractional elapsed time ($placement, explicit=$explicit)",
       async ({ placement, condition, explicit }) => {
         mockProcessPlatform("win32");
         const windowsEnv = {
@@ -232,7 +272,7 @@ describe("native service command inspection", () => {
         const scriptPath = resolveTaskScriptPath(windowsEnv);
         const backingScriptPath = path.join(root, "gateway.cmd");
         if (condition !== "absent") {
-          // No port is recorded: retain Scheduler state without unrelated listener attribution.
+          // Native state remains useful even when the command cannot identify its process.
           await writeFile(backingScriptPath, buildTaskScript({ programArguments }));
         }
         let now = 0;
@@ -299,10 +339,10 @@ describe("native service command inspection", () => {
           expect(state).toMatchObject({
             command: { programArguments },
             installed: true,
-            running: condition === "running",
+            running: false,
             loadState: { status: "loaded" },
             runtime: {
-              status: condition === "running" ? "running" : "stopped",
+              status: "unknown",
               state: condition === "running" ? "Running" : "Ready",
             },
           });
@@ -436,13 +476,13 @@ describe("native service command inspection", () => {
       failure: "malformed HRESULT",
       response: { status: 1, stdout: "-2147024894 native-secret-canary" },
       diagnostic: { kind: "native", exitCode: 1 },
-      reported: "Task Scheduler probe failed (exit 1)",
+      reported: "Task Scheduler check failed (exit 1)",
     },
     {
       failure: "invalid response",
       response: { status: 0, stdout: "native-secret-canary" },
       diagnostic: { kind: "invalid-response" },
-      reported: "Task Scheduler probe returned an invalid response",
+      reported: "Task Scheduler check returned an invalid response",
     },
   ])(
     "preserves safe Windows $failure diagnostics through strict inspection",

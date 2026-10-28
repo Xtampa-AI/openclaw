@@ -38,24 +38,6 @@ import { createNodeWorkspaceTestTransport } from "./workspace-service.test-suppo
 
 vi.mock("./shared/audit.js", () => ({ appendFileTransferAudit: vi.fn() }));
 
-vi.mock("openclaw/plugin-sdk/agent-workspace-runtime", async (importOriginal) => {
-  const original =
-    await importOriginal<typeof import("openclaw/plugin-sdk/agent-workspace-runtime")>();
-  const { fileURLToPath } = await import("node:url");
-  // Source children run outside the checkout. Keep ESM dependencies native and
-  // resolve source aliases with the repository tsconfig, as other source fixtures do.
-  const register = `import { register } from ${JSON.stringify(import.meta.resolve("tsx/esm/api"))}; register({ tsconfig: ${JSON.stringify(fileURLToPath(new URL("../../../tsconfig.json", import.meta.url)))} });`;
-  return {
-    ...original,
-    resolveWorkspaceWorkerArgv(kind: "memory" | "skills") {
-      const argv = original.resolveWorkspaceWorkerArgv(kind);
-      return argv[0] === "--import"
-        ? ["--import", `data:text/javascript,${encodeURIComponent(register)}`, ...argv.slice(2)]
-        : argv;
-    },
-  };
-});
-
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let local: string;
 let remote: string;
@@ -122,6 +104,46 @@ function captureOutput() {
     output.push(bytes),
   );
   return output;
+}
+
+const pairingChanged = {
+  message: "node pairing changed while invocation was active",
+  code: "UNAVAILABLE",
+  retryable: true,
+  details: { code: "PAIRING_CHANGED" },
+};
+
+/** Mirrors node.invoke's GatewayClientRequestError after in-process dispatch. */
+function gatewayError({ message, ...fields }: typeof pairingChanged) {
+  return Object.assign(new Error(message), { name: "GatewayClientRequestError", ...fields });
+}
+
+/** Emulates node.invoke's generation fence; output frames advance the pairing generation. */
+function fenceSkillInvocations(changes: number, error: Error) {
+  let generation = 0;
+  let invocations = 0;
+  const transport = createNodeWorkspaceTestTransport(api, remote, undefined, () => {
+    if (generation < changes) {
+      generation += 1;
+    }
+  });
+  openDuplex = async (request) => {
+    if (request.command !== "workspace.skills") {
+      return transport(request);
+    }
+    invocations += 1;
+    const startedGeneration = generation;
+    const channel = await transport(request);
+    return {
+      ...channel,
+      closed: channel.closed.finally(() => {
+        if (generation !== startedGeneration) {
+          throw error;
+        }
+      }),
+    };
+  };
+  return () => invocations;
 }
 
 beforeEach(async () => {
@@ -212,6 +234,41 @@ afterEach(async () => {
 });
 
 describe("registered node workspace service", () => {
+  it("retries Skill discovery after an in-flight pairing change", async () => {
+    await writeSkill(remote, "local-tool");
+    const invocations = fenceSkillInvocations(1, gatewayError(pairingChanged));
+    const access = await startWorkspace();
+
+    const result = await access.loadSkills!(skillRequest());
+
+    expect(result.entries.map((entry) => entry.skill.name)).toContain("local-tool");
+    expect(invocations()).toBe(2);
+  });
+
+  it.each([
+    { kind: "pairing that keeps changing", error: pairingChanged, attempts: 3 },
+    {
+      kind: "non-retryable Gateway error",
+      error: {
+        message: "node command denied",
+        code: "INVALID_REQUEST",
+        retryable: false,
+        details: { code: "INVALID_REQUEST" },
+      },
+      attempts: 1,
+    },
+  ])("fails Skill discovery closed for a $kind", async ({ error, attempts }) => {
+    await writeSkill(remote, "local-tool");
+    const invocations = fenceSkillInvocations(Infinity, gatewayError(error));
+    const access = await startWorkspace();
+
+    await expect(access.loadSkills!(skillRequest())).rejects.toMatchObject({
+      message: "Remote workspace skill discovery failed",
+      cause: error,
+    });
+    expect(invocations()).toBe(attempts);
+  });
+
   it.each(["execution", "symlink", "skill card", "byte limit"])(
     "does not send denied Skill discovery metadata (%s)",
     async (kind) => {

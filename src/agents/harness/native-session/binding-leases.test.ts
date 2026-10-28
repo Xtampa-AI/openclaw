@@ -75,6 +75,50 @@ describe("native session binding leases", () => {
     },
   );
 
+  it.each([-70_000, 70_000])(
+    "keeps the lease wait deadline on the monotonic clock across a %d ms wall-clock jump",
+    async (jumpMs) => {
+      vi.useFakeTimers();
+      const { values, owner } = createLeaseFixture();
+      const key = "binding";
+      // A peer holds a live lease long enough that the owner must wait inside
+      // the acquisition loop while its 70s wait budget runs.
+      values.set(key, {
+        value: "peer",
+        lease: { token: "peer-owner", expiresAt: Date.now() + 120_000 },
+      });
+      const pending = owner.transact(key, (current) => ({ next: current, result: true }));
+      // Attach an early catch so a mid-advance rejection never surfaces as an
+      // unhandled rejection before the assertion below observes it.
+      const settled = pending.then(
+        (v) => ({ ok: true as const, v }),
+        (e: unknown) => ({ ok: false as const, e }),
+      );
+      // Let the first busy iteration (update + monotonic sleep) settle.
+      await vi.advanceTimersByTimeAsync(1_000);
+      // Adjust the wall clock (Date.now) only; the monotonic budget is untouched.
+      vi.setSystemTime(Date.now() + jumpMs);
+      if (jumpMs > 0) {
+        // A forward jump past the 70s deadline must not prematurely time out an
+        // acquisition that has waited nothing, so release the peer lease only
+        // after the deadline check has run.
+        await vi.advanceTimersByTimeAsync(1_000);
+        values.set(key, { value: "peer" });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await expect(settled).resolves.toEqual({ ok: true, v: true });
+      } else {
+        // A backward jump must not stretch the wait past its budget: with the
+        // peer never releasing, the acquisition times out at the waitMs budget
+        // (70s) instead of hanging beyond it. Advance just past 70s monotonic
+        // so the deadline fires; a wall-clock-based deadline would need ~140s.
+        await vi.advanceTimersByTimeAsync(71_000);
+        await expect(settled).resolves.toMatchObject({ ok: false });
+        await expect(pending).rejects.toThrow("Binding lease timed out: binding");
+        vi.clearAllTimers();
+      }
+    },
+  );
+
   it.each(["transaction", "heartbeat"])(
     "fences a replaced lease at %s without deleting its successor",
     async (check) => {
@@ -120,6 +164,65 @@ describe("native session binding leases", () => {
       }
     },
   );
+
+  it("preserves renewal failure after retained cleanup authority expires", async () => {
+    vi.useFakeTimers();
+    const { state } = createBindingTestState();
+    const bindingKey = "binding-failed-renewal";
+    const renewalCause = new Error("renewal observation failed");
+    const renewalFailure = new Error(`Lost binding lease: ${bindingKey}`, { cause: renewalCause });
+    const owner = createNativeSessionBindingLeases(state, {
+      ...bindingTestOptions,
+      errors: {
+        ...bindingTestOptions.errors,
+        lostLease: (key, cause) =>
+          cause === renewalCause ? renewalFailure : bindingTestOptions.errors.lostLease(key),
+      },
+    });
+    const withCurrent = state.withCurrent.bind(state);
+    let failNextObservation = false;
+    state.withCurrent = (authority) => {
+      const store = withCurrent(authority);
+      return {
+        ...store,
+        async observe(key) {
+          if (failNextObservation) {
+            failNextObservation = false;
+            throw renewalCause;
+          }
+          return await store.observe(key);
+        },
+      };
+    };
+    const { promise: ownerStarted, resolve: started } = createDeferred();
+    const { promise: finishRun, resolve: finish } = createDeferred();
+    let assertRetainedLease!: () => void;
+    const expiresAt = Date.now() + bindingTestOptions.lease.staleMs;
+    const run = owner
+      .withLease(
+        bindingKey,
+        async () => {
+          assertRetainedLease = owner.captureLeaseAssertion(bindingKey);
+          failNextObservation = true;
+          started();
+          await finishRun;
+          assertRetainedLease();
+        },
+        { prepareLease: prepareBindingTestLease },
+      )
+      .catch((error: unknown) => error);
+    await ownerStarted;
+    try {
+      await vi.advanceTimersByTimeAsync(bindingTestOptions.lease.renewIntervalMs);
+      vi.setSystemTime(expiresAt - 1);
+      expect(assertRetainedLease).not.toThrow();
+      vi.setSystemTime(expiresAt);
+    } finally {
+      finish();
+      await run;
+    }
+    expect(await run).toBe(renewalFailure);
+  });
 
   it.each(["comparison refusal", "uncertain outcome"])(
     "handles %s without replaying an applied mutation",

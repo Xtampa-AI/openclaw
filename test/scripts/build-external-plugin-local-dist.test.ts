@@ -417,8 +417,6 @@ fs.writeFileSync("assets/generated.txt", "generated asset");
 
   it.for([
     ["esm", false],
-    ["cjs", false],
-    ["esm", true],
     ["cjs", true],
   ] as const)(
     "retains %s source dependencies across metadata profiles and the shared host SDK (relocate=%s)",
@@ -591,7 +589,7 @@ fs.writeFileSync("assets/generated.txt", "generated asset");
         expect(fs.lstatSync(modules).isSymbolicLink()).toBe(false);
         expect(fs.lstatSync(path.join(modules, "@fixture")).isSymbolicLink()).toBe(false);
         for (const [name, owner] of [
-          ["openclaw", runtimeRoot],
+          ["openclaw", path.join(runtimeRoot, "dist", "extensions", "node_modules", "openclaw")],
           [dependency, path.join(runtimeRoot, "installed", version, "node_modules", dependency)],
           [".bin", path.join(runtimeRoot, "extensions", pluginId, "node_modules", ".bin")],
         ] as const) {

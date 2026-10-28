@@ -106,6 +106,10 @@ export async function captureUpdateDatabases(params: {
         stateDir: resolveStateDir(env),
         config: source.config,
         env,
+        // Under confirmed custody no writer can race a raw family copy. A native
+        // source open would rebuild an exited writer's WAL index, changing the
+        // recorded generation and disabling automatic restoration.
+        preserveSourceArtifacts: maintenance !== null && unavailable === undefined,
         timeoutMs: execution.updateStepTimeoutMs,
         nodeRunner: execution.packageUpdateNodeRunner,
       });
@@ -153,7 +157,7 @@ export async function captureUpdateDatabases(params: {
     durationMs: Date.now() - startedAt,
     exitCode: 0,
     diagnostics: [
-      `Databases snapshotted at ${backup.directory}. Verified successful activation removes these snapshots; otherwise retain them with the update's recovery artifacts.`,
+      `Databases snapshotted at ${backup.directory}. ${restorable ? "Verified successful activation removes these snapshots only if automatic restoration remains available; otherwise retain them with the update's recovery artifacts." : "These snapshots require manual recovery and remain available after successful activation."}`,
       ...backup.databases.map(
         (entry) =>
           `${entry.path} -> ${entry.snapshotPath}; schema ${entry.userVersion}; ${entry.sizeBytes} bytes; SHA-256 ${entry.sha256}`,

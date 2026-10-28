@@ -1,5 +1,5 @@
 import { scheduleAbsoluteDeadline } from "../../utils/absolute-deadline.js";
-import { PLATFORM_SEND_OWNER_LEASE_MS } from "../delivery-queue-sqlite-claim.js";
+import { PLATFORM_SEND_OWNER_LEASE_MS } from "../delivery-queue-sqlite-claim.kernel.js";
 
 const PLATFORM_SEND_OWNER_HEARTBEAT_MS = Math.floor(PLATFORM_SEND_OWNER_LEASE_MS / 3);
 
@@ -36,12 +36,11 @@ export async function startDeliveryProducerLease(params: {
   }
 
   const lost = new AbortController();
-  let stopped = false;
   let stopResult: Promise<void> | undefined;
   let pendingRenewal: Promise<void> | undefined;
   let cancelExpiry: (() => void) | undefined;
   const abortLost = (cause?: unknown): void => {
-    if (!stopped && !lost.signal.aborted) {
+    if (!stopResult && !lost.signal.aborted) {
       lost.abort(lostProducerLeaseError(params.id, cause));
     }
   };
@@ -52,12 +51,12 @@ export async function startDeliveryProducerLease(params: {
     });
   };
   const renew = async (): Promise<void> => {
-    if (stopped || lost.signal.aborted) {
+    if (stopResult || lost.signal.aborted) {
       return;
     }
     try {
       const expiresAt = await params.renew();
-      if (stopped) {
+      if (stopResult) {
         return;
       }
       if (expiresAt === undefined) {
@@ -69,7 +68,7 @@ export async function startDeliveryProducerLease(params: {
     } catch (error) {
       // A transient storage failure does not revoke the last confirmed lease.
       // Its expiry timer remains authoritative while later heartbeats retry.
-      if (!stopped && Date.now() >= confirmedExpiresAt) {
+      if (!stopResult && Date.now() >= confirmedExpiresAt) {
         abortLost(error);
       }
     }
@@ -89,10 +88,9 @@ export async function startDeliveryProducerLease(params: {
     signal: lost.signal,
     stop: () => {
       if (!stopResult) {
-        stopped = true;
+        stopResult = pendingRenewal ?? Promise.resolve();
         clearInterval(heartbeat);
         cancelExpiry?.();
-        stopResult = pendingRenewal ?? Promise.resolve();
       }
       return stopResult;
     },

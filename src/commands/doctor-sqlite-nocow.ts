@@ -14,6 +14,7 @@ import { isSqlitePathOnBtrfs, setSqliteDirectoryNoCow } from "../infra/sqlite-wa
 import type { MigrationMessages } from "../infra/state-migrations.types.js";
 import { DoctorMaintenanceRefusalError } from "../infra/update-doctor-result.js";
 import { assertDoctorSqliteMaintenancePathsNotAliased } from "./doctor-sqlite-maintenance-lock.js";
+import { reconcileNoCowRecoveryIdentities } from "./doctor-sqlite-nocow-recovery-identity.js";
 
 const TOOL_TIMEOUT_MS = 2_000;
 const FUSER_MAX_PATHS = 2_000;
@@ -34,10 +35,7 @@ function hasNoCow(pathname: string): boolean {
   return flags.includes("C");
 }
 
-export function inspectDoctorSqliteNoCow(paths: readonly string[]): {
-  paths: string[];
-  notes: string[];
-} {
+export function inspectDoctorSqliteNoCow(paths: readonly string[]) {
   const result: { paths: string[]; notes: string[] } = { paths: [], notes: [] };
   for (const pathname of new Set(paths)) {
     try {
@@ -94,6 +92,10 @@ function runAclTool(command: "getfacl" | "setfacl", args: string[], input?: stri
 
 function readAcl(pathname: string): string {
   return runAclTool("getfacl", ["-cEpn", "--", pathname]);
+}
+
+function sameDirectoryMetadata(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+  return (["dev", "ino", "mode", "uid", "gid"] as const).every((key) => left[key] === right[key]);
 }
 
 function preserveMetadata(target: string, original: fs.BigIntStats, acl: string) {
@@ -225,6 +227,7 @@ function readStoreEntries(directory: string): fs.Dirent[] {
 export async function repairDoctorSqliteNoCow(params: {
   paths: readonly string[];
   stateDir: string;
+  env: NodeJS.ProcessEnv;
   assertCurrent: () => void;
 }): Promise<MigrationMessages> {
   const help = spawnSync("mv", ["--help"], { encoding: "utf8", timeout: TOOL_TIMEOUT_MS });
@@ -421,11 +424,7 @@ export async function repairDoctorSqliteNoCow(params: {
           return true;
         });
       if (
-        currentIdentity.dev !== sourceIdentity.dev ||
-        currentIdentity.ino !== sourceIdentity.ino ||
-        currentIdentity.mode !== sourceIdentity.mode ||
-        currentIdentity.uid !== sourceIdentity.uid ||
-        currentIdentity.gid !== sourceIdentity.gid ||
+        !sameDirectoryMetadata(currentIdentity, sourceIdentity) ||
         readAcl(directory) !== sourceAcls.get(directory) ||
         currentFiles.length !== sourceFiles.size ||
         currentFiles.some((pathname) => {
@@ -435,11 +434,7 @@ export async function repairDoctorSqliteNoCow(params: {
             !expected ||
             (expected.isDirectory()
               ? !current.isDirectory() ||
-                expected.dev !== current.dev ||
-                expected.ino !== current.ino ||
-                expected.mode !== current.mode ||
-                expected.uid !== current.uid ||
-                expected.gid !== current.gid ||
+                !sameDirectoryMetadata(expected, current) ||
                 readAcl(pathname) !== sourceAcls.get(pathname)
               : !sameFileMutationFingerprint(expected, current) ||
                 (expected.isSymbolicLink() &&
@@ -487,6 +482,21 @@ export async function repairDoctorSqliteNoCow(params: {
         await syncDirectory(path.dirname(directory)),
         "SQLite NOCOW store parent",
       );
+      // Keep recovery-manifest identities truthful for the originals this rewrite relocated.
+      // Bookkeeping only: a failure leaves cleanup conservative and never unsettles the store.
+      try {
+        result.warnings.push(
+          ...reconcileNoCowRecoveryIdentities({
+            env: params.env,
+            previousIdentities: inventory,
+            assertCurrent: params.assertCurrent,
+          }),
+        );
+      } catch (error) {
+        result.warnings.push(
+          `NOCOW recovery-identity reconciliation failed for ${directory}: ${String(error)}`,
+        );
+      }
       result.changes.push(
         `Rewrote SQLite store directory with NOCOW: ${directory}. Original retained at ${backup}; verified WAL-aware snapshots at ${snapshotRoot}.`,
       );
@@ -497,27 +507,23 @@ export async function repairDoctorSqliteNoCow(params: {
           { kind: "data-at-risk", reason: "incomplete-migration" },
         );
       }
-      for (const candidate of [
+      for (const { pathname, identity } of [
         ...(backup && backupIdentity ? [{ pathname: backup, identity: backupIdentity }] : []),
         ...(snapshotRoot && snapshotIdentity && snapshotsCompleted === 0
           ? [{ pathname: snapshotRoot, identity: snapshotIdentity }]
           : []),
       ]) {
         try {
-          await removeUninstalledDirectory(
-            candidate.pathname,
-            candidate.identity,
-            params.assertCurrent,
-          );
-          if (candidate.pathname === backup) {
+          await removeUninstalledDirectory(pathname, identity, params.assertCurrent);
+          if (pathname === backup) {
             backup = undefined;
           }
-          if (candidate.pathname === snapshotRoot) {
+          if (pathname === snapshotRoot) {
             snapshotRoot = undefined;
           }
         } catch (cleanupError) {
           result.warnings.push(
-            `NOCOW staging cleanup failed; retained ${candidate.pathname}: ${String(cleanupError)}`,
+            `NOCOW staging cleanup failed; retained ${pathname}: ${String(cleanupError)}`,
           );
         }
       }

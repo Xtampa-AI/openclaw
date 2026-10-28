@@ -64,12 +64,6 @@ export async function prepareGatewayKernelState(params: {
   logPlugins: GatewayLogger;
   gatewayRuntime: ReturnType<typeof import("../logging/subsystem.js").runtimeForLogger>;
   resolveChannelRuntime: () => Promise<ChannelRuntime>;
-  loadWorkerEnvironmentStartupModule: () => Promise<
-    typeof import("./server-worker-environment-startup.js")
-  >;
-  loadWorkerPlacementStartupModule: () => Promise<
-    typeof import("./server-worker-placement-startup.js")
-  >;
 }) {
   const {
     bootstrap,
@@ -83,8 +77,6 @@ export async function prepareGatewayKernelState(params: {
     logPlugins,
     gatewayRuntime,
     resolveChannelRuntime: getChannelRuntime,
-    loadWorkerEnvironmentStartupModule,
-    loadWorkerPlacementStartupModule,
   } = params;
   const {
     pluginBootstrap,
@@ -133,7 +125,7 @@ export async function prepareGatewayKernelState(params: {
   });
   const workerEnvironmentRuntime = workerEnvironmentStartup
     ? await startupTrace.measure("worker-environments.runtime-imports", async () => {
-        const workerModule = await loadWorkerEnvironmentStartupModule();
+        const workerModule = await import("./server-worker-environment-startup.js");
         return await workerModule.createGatewayWorkerEnvironmentRuntime({
           scheduler,
           getPluginRegistry: () => pluginRuntime.registry,
@@ -168,7 +160,7 @@ export async function prepareGatewayKernelState(params: {
   const workerPlacementModule = workerEnvironmentStartup
     ? await startupTrace.measure(
         "worker-environments.placement-module",
-        loadWorkerPlacementStartupModule,
+        () => import("./server-worker-placement-startup.js"),
       )
     : undefined;
   const getCommittedRuntimeConfig = () => {
@@ -201,8 +193,9 @@ export async function prepareGatewayKernelState(params: {
             nodeWorkerBundleRetention,
             getSessionChangeContext: () => pluginGatewayContext.current,
             persistAbandonedPartial: async ({ sessionId, sessionKey, agentId, runId }) => {
-              // Placement runtime starts before chat state exists; moves invoke this only after startup.
-              const text = connectionState.chatRunState.resolveBuffer(runId, { final: true }).text;
+              // Placement runtime starts before chat state exists; callers run only after startup.
+              const partial = connectionState.chatRunState.resolveBuffer(runId, { final: true });
+              const text = partial.displayText ?? partial.text;
               if (!text.trim()) {
                 return;
               }
@@ -242,14 +235,16 @@ export async function prepareGatewayKernelState(params: {
     ? { ...workerPlacement, runtimeInstall }
     : undefined;
   if (workerPlacementRuntime && workerEnvironmentService) {
-    const { createDevicePlacementDemandReader } =
+    const { createDevicePlacementDemandReader, createDevicePlacementDemandReaderAsync } =
       await import("./worker-environments/device-placement-demand.js");
+    const demandSources = {
+      resolveGatewayContext: resolvePluginGatewayContext,
+      placements: workerPlacementRuntime.placements,
+      environments: workerEnvironmentService,
+    };
     Object.assign(workerPlacementRuntime.dispatchService, {
-      getAdmittedDeviceSessionCounts: createDevicePlacementDemandReader({
-        resolveGatewayContext: resolvePluginGatewayContext,
-        placements: workerPlacementRuntime.placements,
-        environments: workerEnvironmentService,
-      }),
+      getAdmittedDeviceSessionCounts: createDevicePlacementDemandReader(demandSources),
+      getAdmittedDeviceSessionCountsAsync: createDevicePlacementDemandReaderAsync(demandSources),
     });
     bindNodeWorkspaceBindingResolver?.(workerPlacementRuntime.resolveNodeWorkspaceBinding);
     workerEnvironmentRuntime.bindWorkerSessionDispatch?.(
@@ -426,6 +421,7 @@ export async function prepareGatewayKernelState(params: {
   const channelManager = createChannelManager({
     scheduler,
     getRuntimeConfig,
+    resolveGatewayContext: resolvePluginGatewayContext,
     channelLogs,
     channelRuntimeEnvs,
     resolveChannelRuntime: getChannelRuntime,

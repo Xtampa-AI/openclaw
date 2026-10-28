@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import type { Worker } from "node:worker_threads";
@@ -8,7 +9,9 @@ import {
   createDeferred,
   withinTest,
 } from "../../../test/helpers/promise.js";
+import { useSqliteWorkerFault } from "../../../test/helpers/sqlite-worker-fault.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
+import { runInDetachedAsyncContext } from "../../shared/detached-async-context.js";
 import * as readonlyDatabase from "../../state/openclaw-agent-db-readonly.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
@@ -26,6 +29,7 @@ import {
 } from "../../test-utils/openclaw-test-state.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
 import {
+  createSessionEntryWithTranscript,
   deleteSessionEntryLifecycle,
   loadSessionEntry,
   loadTranscriptEvents,
@@ -45,6 +49,16 @@ import * as reclamationWorker from "./session-accessor.sqlite-reclamation-worker
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import { waitForSessionTranscriptIndexReconcilesInStateDir } from "./session-transcript-reconcile.js";
+
+const fault = useSqliteWorkerFault([
+  {
+    name: "refuse_archive_result",
+    match: /^update session_transcript_archives\b/u,
+    sql: `CREATE TEMP TRIGGER refuse_archive_result BEFORE UPDATE OF published_at
+      ON main.session_transcript_archives
+      BEGIN SELECT RAISE(ABORT, 'synthetic archive result recording failure'); END;`,
+  },
+]);
 
 const archiveScopeHooks = vi.hoisted(() => ({
   afterMaterializeQueued: undefined as (() => void) | undefined,
@@ -123,7 +137,7 @@ describe("SQLite transcript archive sessions", () => {
     });
   }
 
-  it("reads pending archives without waiting for reclamation or writer admission", async ({
+  it("reads fresh pending archives without waiting for reclamation or writer admission", async ({
     signal,
   }) => {
     const database = openLifecycleTestDatabase(storePath);
@@ -131,6 +145,7 @@ describe("SQLite transcript archive sessions", () => {
     const archiveEntered = createDeferred();
     const writerEntered = createDeferred();
     const release = createDeferred();
+    const peer = new (requireNodeSqlite().DatabaseSync)(database.path);
     const archive = runExclusiveSqliteTranscriptArchiveWorker(async () => {
       archiveEntered.resolve();
       await release.promise;
@@ -141,21 +156,30 @@ describe("SQLite transcript archive sessions", () => {
     });
     try {
       await Promise.all([archiveEntered.promise, writerEntered.promise]);
-      await expect(
+      const readPending = () =>
         withSqliteTranscriptArchiveSession(options, () =>
           archiveWorker.readPendingSqliteTranscriptArchivesInWorker(
             { agentId: "main", databasePath: database.path, env: testState.env },
             signal,
           ),
-        ),
-      ).resolves.toBe(false);
+        );
+      await expect(readPending()).resolves.toBe(false);
+      peer
+        .prepare(
+          "INSERT INTO session_transcript_archives (session_id, generation, session_key, reason, encoding, archive_blob, archive_sha256, archive_name, created_at) VALUES ('deleted-session', 'generation', 'agent:main:deleted-session', 'deleted', 'identity', X'', ?, 'pending.jsonl', 1)",
+        )
+        .run("0".repeat(64));
+      await expect(readPending()).resolves.toBe(true);
+      peer.exec("UPDATE session_transcript_archives SET published_at = 2");
+      await expect(readPending()).resolves.toBe(false);
     } finally {
+      peer.close();
       release.resolve();
       await Promise.allSettled([archive, writer]);
     }
   });
 
-  it("reuses one archive worker across deletion generations and joins it before returning", async () => {
+  it("reuses one archive worker across deletion generations and joins it at database close", async () => {
     const sessionKey = "agent:main:durable-delete";
     const sessionIds = ["durable-delete-first", "durable-delete-second", "durable-delete-current"];
     const events = sessionIds.map((sessionId) =>
@@ -196,7 +220,7 @@ describe("SQLite transcript archive sessions", () => {
       "published",
     ]);
     expect(new Set(archiveWorkers.replies.map(({ worker }) => worker)).size).toBe(1);
-    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId > 0)).toBe(true);
     expect(archiveWorkers.replies.every(({ message }) => message.settled === true)).toBe(true);
     const operationIds = archiveWorkers.replies.flatMap(({ message }) =>
       typeof message.operationId === "number" ? [message.operationId] : [],
@@ -222,7 +246,103 @@ describe("SQLite transcript archive sessions", () => {
     ).toEqual(
       sessionIds.map(() => ({ published_at: expect.any(Number), session_key: sessionKey })),
     );
+    await closeOpenClawAgentDatabaseByPathAsync(database.path);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
   });
+
+  it("reuses one archive worker across sequential deletions of newly created sessions", async () => {
+    const database = openLifecycleTestDatabase(storePath);
+    const archiveWorkers = observeArchiveSessionWorkers();
+    try {
+      for (const sessionId of ["empty-first", "empty-second"]) {
+        const scope = { sessionKey: `agent:main:${sessionId}`, sessionId, storePath };
+        await createSessionEntryWithTranscript(scope, () => ({
+          ok: true,
+          entry: { sessionId, updatedAt: Date.now() },
+        }));
+        const events = await loadTranscriptEvents(scope);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ type: "session", id: sessionId });
+        const result = await deleteArchivedSession(scope.sessionKey);
+        expect(result.deleted).toBe(true);
+        expect(result.archivedTranscripts).toHaveLength(1);
+        expect(readArchiveLines(result.archivedTranscripts[0]?.archivedPath)).toEqual([
+          JSON.stringify(events[0]),
+        ]);
+      }
+    } finally {
+      archiveWorkers.stop();
+    }
+    expect(archiveWorkers.replies.map(({ message }) => message.type)).toEqual([
+      "done",
+      "published",
+      "done",
+      "published",
+    ]);
+    expect(new Set(archiveWorkers.replies.map(({ worker }) => worker)).size).toBe(1);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId > 0)).toBe(true);
+    await closeOpenClawAgentDatabaseByPathAsync(database.path);
+    expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+  });
+
+  it.each([false, true])(
+    "retires the idle archive worker after five idle minutes (open scope: %s)",
+    async (keepScopeOpen) => {
+      const first = await prepareSession("idle-first", "idle archive first");
+      const second = await prepareSession("idle-second", "idle archive second");
+      const options = { agentId: "main", path: first.database.path, env: testState.env };
+      const idleTimers: Array<() => void> = [];
+      const schedule = globalThis.setTimeout;
+      const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+        callback: (...callbackArgs: unknown[]) => void,
+        delay?: number,
+        ...args: unknown[]
+      ) => {
+        if (delay === 5 * 60_000) {
+          idleTimers.push(() => callback(...args));
+        }
+        return schedule(() => callback(...args), delay);
+      }) as typeof setTimeout);
+      const archiveWorkers = observeArchiveSessionWorkers();
+      const exercise = async () => {
+        const firstResult = await deleteArchivedSession(first.sessionKey);
+        expect(readArchiveLines(firstResult.archivedTranscripts[0]?.archivedPath)).toEqual([
+          JSON.stringify(first.event),
+        ]);
+        const carrier = archiveWorkers.replies[0]?.worker;
+        expect(carrier?.threadId).toBeGreaterThan(0);
+        // Each settled request re-arms the deadline; the latest one owns retirement.
+        expect(idleTimers.length).toBeGreaterThan(0);
+        const exited = once(carrier!, "exit");
+        idleTimers.at(-1)?.();
+        await exited;
+        expect(carrier?.threadId).toBe(-1);
+
+        const secondResult = await deleteArchivedSession(second.sessionKey);
+        expect(readArchiveLines(secondResult.archivedTranscripts[0]?.archivedPath)).toEqual([
+          JSON.stringify(second.event),
+        ]);
+        const replacement = archiveWorkers.replies.at(-1)?.worker;
+        expect(replacement).not.toBe(carrier);
+        expect(replacement?.threadId).toBeGreaterThan(0);
+      };
+      try {
+        if (keepScopeOpen) {
+          await withSqliteTranscriptArchiveSession(options, exercise);
+        } else {
+          await exercise();
+        }
+      } finally {
+        timers.mockRestore();
+        archiveWorkers.stop();
+      }
+      expect(new Set(archiveWorkers.replies.map(({ worker }) => worker)).size).toBe(2);
+      await closeOpenClawAgentDatabaseByPathAsync(first.database.path);
+      expect(archiveWorkers.replies.every(({ worker }) => worker.threadId === -1)).toBe(true);
+      expect(loadSessionEntry(first.scope)).toBeUndefined();
+      expect(loadSessionEntry(second.scope)).toBeUndefined();
+    },
+  );
 
   it("joins a failed publisher and recovers its committed archive after result recording fails", async () => {
     const sessionKey = "agent:main:scoped-publish-failure";
@@ -285,12 +405,7 @@ describe("SQLite transcript archive sessions", () => {
         )
         .get(sessionIds[0]);
     const pending = readPending();
-    database.db.exec(`
-        CREATE TRIGGER refuse_archive_result BEFORE UPDATE OF published_at
-        ON session_transcript_archives BEGIN
-          SELECT RAISE(ABORT, 'synthetic archive result recording failure');
-        END;
-      `);
+    fault.enable();
     try {
       await expect(deleteArchivedSession(sessionKey)).rejects.toThrow(
         "synthetic archive result recording failure",
@@ -301,7 +416,7 @@ describe("SQLite transcript archive sessions", () => {
         loadTranscriptEvents({ sessionKey, sessionId: sessionIds[0], storePath }),
       ).resolves.toEqual([]);
     } finally {
-      database.db.exec("DROP TRIGGER refuse_archive_result");
+      fault.disable();
     }
 
     await expect(deleteArchivedSession(sessionKey)).resolves.toMatchObject({
@@ -317,7 +432,7 @@ describe("SQLite transcript archive sessions", () => {
     ).toEqual({ published_at: expect.any(Number), last_publish_error: null });
   });
 
-  it("retires competing archive scopes and publishes with the originally captured environment", async () => {
+  it.each([false, true])("reuses idle workers across scopes (exited=%s)", async (exited) => {
     testState.envVars.OPENCLAW_SUPERVISOR_MODE = " ExTeRnAl ";
     testState.applyEnv();
     const first = {
@@ -384,9 +499,12 @@ describe("SQLite transcript archive sessions", () => {
       ]);
       const firstWorker = archiveWorkers.replies[0]?.worker;
       expect(firstWorker?.threadId).toBeGreaterThan(0);
+      if (exited) {
+        await firstWorker!.terminate();
+      }
       secondDeletion = deleteScope(second);
       const secondResult = await secondDeletion;
-      expect(firstWorker?.threadId).toBe(-1);
+      expect(firstWorker?.threadId === -1).toBe(exited);
       expect(readArchiveLines(secondResult.archivedTranscripts[0]?.archivedPath)).toEqual([
         JSON.stringify(events[1]),
       ]);
@@ -414,8 +532,9 @@ describe("SQLite transcript archive sessions", () => {
         ["published", second.sessionId],
         ["published", first.sessionId],
       ]);
-      expect(observedWorkers.size).toBe(3);
+      expect(observedWorkers.size).toBe(exited ? 2 : 1);
       expect(activeWorkersAtReply).toEqual([1, 1, 1, 1]);
+      await closeOpenClawAgentDatabasesAsync(tempDir);
       expect([...observedWorkers].every((worker) => worker.threadId === -1)).toBe(true);
     } finally {
       releasePublication.resolve();
@@ -499,7 +618,9 @@ describe("SQLite transcript archive sessions", () => {
       let nativeExitAtRetirement = false;
       const archiveWorkers = observeArchiveSessionWorkers((message, worker) => {
         if (message.type === boundary && !retirement) {
-          retirement = closeOpenClawAgentDatabaseByPathAsync(database.path).then((closed) => {
+          retirement = runInDetachedAsyncContext(() =>
+            closeOpenClawAgentDatabaseByPathAsync(database.path),
+          ).then((closed) => {
             nativeExitAtRetirement = worker.threadId === -1;
             return closed;
           });

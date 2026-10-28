@@ -4,6 +4,7 @@
  * history sanitization, tool IDs, thinking blocks, and turn validation align.
  */
 import { isDirectAnthropicModel } from "@openclaw/ai/internal/anthropic";
+import { supportsNativeOpenAIResponsesEndpoint } from "@openclaw/ai/internal/openai-responses-payload-policy";
 import { supportsClaudeInHistorySystemMessages } from "@openclaw/llm-core";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
@@ -120,6 +121,8 @@ const REASONING_CONTENT_REPLAY_MODEL_IDS = new Set([
   "kimi-k2.7-code",
   "kimi-k2.7-code-highspeed",
   "kimi-k3",
+  "kimi-k3.1-pro",
+  "kimi-k3.1-pro-highspeed",
   "kimi-k2-thinking",
   "kimi-k2-thinking-turbo",
   "mimo-v2-pro",
@@ -228,28 +231,28 @@ export function resolveTranscriptPolicy(params: {
     modelApi: params.modelApi,
     model: params.model,
     inHistorySystemUpdates:
-      params.directApiKey === true &&
-      params.modelApi === "anthropic-messages" &&
-      isDirectAnthropicModel({ provider, baseUrl: params.model?.baseUrl }, params.env) &&
-      supportsClaudeInHistorySystemMessages({
-        id: params.modelId ?? undefined,
-        params: params.model?.params,
-      }),
+      supportsNativeOpenAIResponsesEndpoint({
+        provider,
+        api: params.modelApi ?? "",
+        baseUrl: params.model?.baseUrl,
+      }) ||
+      (params.directApiKey === true &&
+        params.modelApi === "anthropic-messages" &&
+        isDirectAnthropicModel({ provider, baseUrl: params.model?.baseUrl }, params.env) &&
+        supportsClaudeInHistorySystemMessages({
+          id: params.modelId ?? undefined,
+          params: params.model?.params,
+        })),
   };
 
   // Once a provider adopts the replay-policy hook, replay policy should come
   // from the plugin, not from transport-family defaults in core.
   const buildReplayPolicy = runtimePlugin?.buildReplayPolicy;
-  const policy = buildReplayPolicy
-    ? mergeTranscriptPolicy(buildReplayPolicy(context) ?? undefined)
-    : mergeTranscriptPolicy(
-        buildUnownedProviderTransportReplayFallback({
-          modelApi: params.modelApi,
-          modelId: params.modelId,
-          model: params.model,
-          inHistorySystemUpdates: context.inHistorySystemUpdates,
-        }),
-      );
+  const policy = mergeTranscriptPolicy(
+    buildReplayPolicy
+      ? (buildReplayPolicy(context) ?? undefined)
+      : buildUnownedProviderTransportReplayFallback(context),
+  );
   if (policy.inHistorySystemUpdates) {
     policy.inHistorySystemUpdates = context.inHistorySystemUpdates;
     policy.appendOnlyRuntimeContext ||= context.inHistorySystemUpdates;

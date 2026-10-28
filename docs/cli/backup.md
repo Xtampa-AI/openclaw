@@ -512,7 +512,7 @@ attempt and success per backup kind, target, and offsite namespace from the whol
 configured backup schedules with their next run, and the configured storage
 locations. Local archives and SQLite snapshots without a named target use one
 status group per kind, displaying the newest attempt's archive path.
-Listing configuration does not probe storage. The Control UI's
+Listing configuration does not check storage. The Control UI's
 Backups section on the Systems landing and Gateway host views uses this status and provides a **Check** action per location
 through `storage.locations.probe`.
 Doctor uses the same retained history, so per-target health survives more than
@@ -716,6 +716,8 @@ processes before manually removing their reported scratch directories.
 Published archives and package rollback backups are outside this cleanup.
 Retired scratch is renamed to `openclaw-backup-retired-*` before deletion so a
 later pass can finish partial cleanup even after the lifetime token is gone.
+On Windows, the retirement destination is left absent until a guarded
+no-clobber move, so cleanup does not try to replace an existing directory.
 
 ## Related
 

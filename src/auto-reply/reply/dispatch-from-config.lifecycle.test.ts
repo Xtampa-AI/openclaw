@@ -67,6 +67,7 @@ describe("dispatchReplyFromConfig", () => {
       );
       expect(preparedLookup).toHaveBeenCalledWith({
         agentId: "main",
+        demand: "interactive",
         abortSignal: abort.signal,
         onRuntimeLease: expect.any(Function),
       });

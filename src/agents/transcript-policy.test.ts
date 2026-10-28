@@ -272,6 +272,8 @@ describe("resolveTranscriptPolicy", () => {
     "moonshot/kimi-k2.7-code",
     "moonshot/kimi-k2.7-code-highspeed",
     "moonshot/kimi-k3",
+    "moonshot/kimi-k3.1-pro",
+    "moonshot/kimi-k3.1-pro-highspeed",
     "kimi-k2-thinking",
     "hf:moonshotai/kimi-k2-thinking",
     "xiaomi/mimo-v2.6-flash",
@@ -420,6 +422,39 @@ describe("resolveTranscriptPolicy", () => {
         modelApi: "anthropic-messages",
         modelId: "claude-opus-5",
         env: { ANTHROPIC_BASE_URL: baseUrl },
+      });
+      expect(policy.inHistorySystemUpdates).toBe(expected);
+      expect(policy.appendOnlyRuntimeContext).toBe(expected);
+    }
+  });
+
+  it("limits OpenAI prompt updates to native Responses routes across cached policy reads", () => {
+    const config = {} as OpenClawConfig;
+    for (const [provider, api, baseUrl, expected] of [
+      ["openai", "openai-responses", "https://api.openai.com/v1", true],
+      ["openai", "openai-responses", "https://proxy.example.test/v1", false],
+      ["openai", "openai-chatgpt-responses", "https://chatgpt.com/backend-api/codex", false],
+      ["openai", "azure-openai-responses", "https://api.openai.com/v1", false],
+      ["openai", "openai-completions", "https://api.openai.com/v1", false],
+      ["custom-openai", "openai-responses", "https://api.openai.com/v1", false],
+      ["openai", "openai-responses", "https://api.openai.com/v1", true],
+    ] as const) {
+      const model = makeOpenAiCompatibleReasoningModel({ provider, api, baseUrl });
+      const policy = resolveTranscriptPolicy({
+        config,
+        provider,
+        modelApi: api,
+        modelId: model.id,
+        model,
+        runtimeHandle: {
+          provider,
+          plugin: {
+            id: provider,
+            label: provider,
+            auth: [],
+            buildReplayPolicy: () => ({ inHistorySystemUpdates: true }),
+          },
+        },
       });
       expect(policy.inHistorySystemUpdates).toBe(expected);
       expect(policy.appendOnlyRuntimeContext).toBe(expected);

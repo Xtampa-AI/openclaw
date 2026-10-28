@@ -511,7 +511,6 @@ it.each([
                   npm: { changed: false, outcomes: [] },
                   integrityDrifts: [],
                 },
-                freshDoctorRequired: false,
                 yes: true,
                 json: true,
                 timeoutMs: 1_000,

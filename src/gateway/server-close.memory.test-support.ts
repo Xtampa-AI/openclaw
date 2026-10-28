@@ -2,6 +2,11 @@
 import assert from "node:assert/strict";
 import { vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createPluginStateKeyedStore } from "../plugin-state/plugin-state-store.js";
+import type {
+  OpenKeyedStoreOptions,
+  PluginStateKeyedStore,
+} from "../plugin-state/plugin-state-store.types.js";
 import { createPluginRecord } from "../plugins/loader-records.js";
 import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import type { MemoryPluginRuntime } from "../plugins/registry-contribution-types.js";
@@ -10,10 +15,13 @@ import type { PluginRuntime } from "../plugins/runtime/types.js";
 import { resolveRelativeBundledPluginPublicModuleId } from "../test-utils/bundled-plugin-public-surface.js";
 
 export async function createGatewayMemoryCloseRegistryFactory(config: OpenClawConfig) {
-  const { createMemoryRuntime } = await vi.importActual<{
+  const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.importActual<{
     createMemoryRuntime: (host: {
       runInBackgroundContext: <T>(run: () => T) => T;
     }) => MemoryPluginRuntime;
+    configureMemoryCoreDreamingState: (
+      open: <T>(options: OpenKeyedStoreOptions) => PluginStateKeyedStore<T>,
+    ) => void;
   }>(
     resolveRelativeBundledPluginPublicModuleId({
       fromModuleUrl: import.meta.url,
@@ -21,7 +29,8 @@ export async function createGatewayMemoryCloseRegistryFactory(config: OpenClawCo
       artifactBasename: "runtime-api.js",
     }),
   );
-  const registry = (close: () => Promise<void>) => {
+  const env = { ...process.env };
+  const registry = (close: () => Promise<void>, beforeEmbedBatch?: () => Promise<void>) => {
     const builder = createPluginRegistry({
       logger: { info() {}, warn() {}, error() {}, debug() {} },
       runtime: {} as PluginRuntime,
@@ -39,6 +48,13 @@ export async function createGatewayMemoryCloseRegistryFactory(config: OpenClawCo
     builder.registry.plugins.push(memory);
     const api = builder.createApi(memory, { config });
     assert(api.lifecycle.runInBackgroundContext);
+    // Dreaming state is instance-owned (#167724): configure it where the memory
+    // registration runs, as Memory Core's own register() does.
+    api.lifecycle.runInBackgroundContext(() =>
+      configureMemoryCoreDreamingState(<T>(options: OpenKeyedStoreOptions) =>
+        createPluginStateKeyedStore<T>("memory-core", { ...options, env }),
+      ),
+    );
     api.registerMemoryCapability({
       runtime: createMemoryRuntime({
         runInBackgroundContext: api.lifecycle.runInBackgroundContext,
@@ -61,7 +77,10 @@ export async function createGatewayMemoryCloseRegistryFactory(config: OpenClawCo
           id: "fixture-embedding",
           model: "synthetic-embedding",
           embed: async () => [1, 0, 0],
-          embedBatch: async () => [[1, 0, 0]],
+          embedBatch: async (inputs) => {
+            await beforeEmbedBatch?.();
+            return inputs.map(() => [1, 0, 0]);
+          },
           close,
         },
       }),

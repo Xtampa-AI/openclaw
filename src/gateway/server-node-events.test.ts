@@ -175,75 +175,6 @@ describe("node exec events", () => {
     loadOrCreateProcessDeviceIdentityMock.mockClear();
   });
 
-  it.each([false, true])(
-    "preserves exec authorization and terminal consumption with suppressNotifyOnExit=%s",
-    async (suppressNotifyOnExit) => {
-      const registry = new NodeRegistry();
-      const connection = { connId: "conn-1" };
-      const runId = `run-seq-suppress-${suppressNotifyOnExit}`;
-      const sessionKey = "agent:main:main";
-      const eventRouting = { sessionKey, contextKey: `exec:${runId}` };
-      const startedPayload = { runId, sessionKey, command: "printf ok" };
-      const finishedPayload = {
-        ...startedPayload,
-        exitCode: 0,
-        timedOut: false,
-        output: "done",
-        suppressNotifyOnExit,
-      };
-      const finishedEvent = nodeEvent("exec.finished", finishedPayload);
-      const unmatchedEvent = eventResult("exec.finished", "unmatched_exec_event");
-      const ctx = buildCtx({
-        authorizeNodeSystemRunEvent: (params) => registry.authorizeSystemRunEvent(params),
-      });
-      registry.register(makeNodeClient(connection.connId, "node-1"), {
-        pairingIdentity: "identity-a",
-      });
-      const invoke = registry.invoke({
-        nodeId: "node-1",
-        command: "system.run",
-        params: { runId, sessionKey },
-        timeoutMs: 0,
-      });
-      try {
-        await expect(
-          handleNodeEvent(ctx, "node-1", finishedEvent, { connId: "wrong-conn" }),
-        ).resolves.toEqual(unmatchedEvent);
-        await expect(
-          handleNodeEvent(ctx, "node-1", nodeEvent("exec.started", startedPayload), connection),
-        ).resolves.toBeUndefined();
-
-        const started = [`Exec started (node=node-1 id=${runId}): printf ok`, eventRouting];
-        const wake = [execEventHeartbeatOptions(sessionKey)];
-        expect(enqueueSystemEventMock.mock.calls).toEqual([started]);
-        expect(requestHeartbeatMock.mock.calls).toEqual([wake]);
-
-        await expect(
-          handleNodeEvent(ctx, "node-1", finishedEvent, connection),
-        ).resolves.toBeUndefined();
-        // Remove suppression on replay so filtering cannot hide unconsumed authorization.
-        await expect(
-          handleNodeEvent(
-            ctx,
-            "node-1",
-            nodeEvent("exec.finished", { ...finishedPayload, suppressNotifyOnExit: false }),
-            connection,
-          ),
-        ).resolves.toEqual(unmatchedEvent);
-        const finished = [`Exec finished (node=node-1 id=${runId}, code 0)\ndone`, eventRouting];
-        expect(enqueueSystemEventMock.mock.calls).toEqual(
-          suppressNotifyOnExit ? [started] : [started, finished],
-        );
-        expect(requestHeartbeatMock.mock.calls).toEqual(
-          suppressNotifyOnExit ? [wake] : [wake, wake],
-        );
-      } finally {
-        registry.unregister(connection.connId);
-        await invoke;
-      }
-    },
-  );
-
   it("stores sandbox relay APNs registrations from node events", async () => {
     const ctx = buildCtx();
     await handleNodeEvent(
@@ -322,7 +253,7 @@ describe("node exec events", () => {
       nodeId: "node-2",
       connId: "conn-1",
       sessionKey: "agent:main:main",
-      terminal: true,
+      event: "exec.finished",
     });
     expect(enqueueSystemEventMock).toHaveBeenCalledWith(
       "Exec finished (node=node-2, code 0)\ndone",

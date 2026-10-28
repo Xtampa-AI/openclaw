@@ -127,8 +127,8 @@ describe("runCronIsolatedAgentTurn plugin generation carry", () => {
       makeIsolatedAgentParamsFixture({ cfg: config, agentId: "main" }),
     );
 
+    expect(result.status).toBe("ok");
     expect(acquirePreparedModelRuntimeMock.mock.calls[0]?.[0].config).toBe(config);
-    expect(result.status, result.error).toBe("ok");
     expect(runEmbeddedAgentMock).toHaveBeenCalledWith(
       expect.objectContaining({ ...selected, verboseLevel: "on" }),
     );

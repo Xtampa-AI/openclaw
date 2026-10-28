@@ -21,6 +21,8 @@ const repositoryScriptEntries = [
   "apps/linux/scripts/test-runtime-boundary.mjs!",
   "apps/linux/scripts/stage-runtime.mjs!",
   "apps/linux/scripts/test-stage-runtime.mjs!",
+  // The Python onboarding driver installs this synthetic CLI by path.
+  "apps/linux/tests/fixtures/onboarding-cli.mjs!",
   // apps/linux/README.md invokes this live Windows native-browser proof driver by path.
   "apps/linux/scripts/test-inline-browser.mjs!",
   // Linux App CI executes the injected native-auth bridge tests through Node.
@@ -39,6 +41,8 @@ const repositoryScriptEntries = [
   ".github/actions/frozen-node-test-compat/apply.mjs!",
   // The compiler below exposes this workflow's inline and generated-config imports.
   ".github/workflows/plugin-prerelease.yml!",
+  // Labeler steps import their shared helper through workspace file URLs.
+  ".github/workflows/labeler.yml!",
   // setup-node-env invokes this helper from composite-action YAML.
   ".github/actions/setup-node-env/dependency-fingerprint.mjs!",
   ".github/actions/setup-node-env/seed-bun-from-image.mjs!",
@@ -108,11 +112,6 @@ const repositoryScriptEntries = [
   "scripts/e2e/lib/fixtures/config.mjs!",
   "scripts/e2e/lib/fixtures/plugins.mjs!",
   "scripts/e2e/lib/fixtures/workspace.mjs!",
-  "scripts/e2e/lib/fleet-cache/assert-cell.mjs!",
-  "scripts/e2e/lib/fleet-cache/assert-podman-cell.mjs!",
-  "scripts/e2e/lib/fleet-cache/prepare-podman-storage.mjs!",
-  "scripts/e2e/lib/fleet-cache/probe-podman-cell.mjs!",
-  "scripts/e2e/lib/fleet-cache/runtime-preflight.mjs!",
   // test:e2e:node-auto-update runs the installed-package proof against a frozen tarball.
   "scripts/e2e/lib/node-auto-update/scenario.mjs!",
   // Installed-package authority proof runs by path and injects its worker preload via NODE_OPTIONS.
@@ -162,6 +161,8 @@ const repositoryScriptEntries = [
   "scripts/e2e/lib/upgrade-survivor/native-assignment-app-server.mjs!",
   // package-activation-recovery.sh preloads this observer into the released updater.
   "scripts/e2e/lib/upgrade-survivor/package-activation-fault.mjs!",
+  // run.sh preloads this fixture adapter through NODE_OPTIONS by path.
+  "scripts/e2e/lib/upgrade-survivor/plugin-registry-redirect.mjs!",
   "scripts/e2e/lib/upgrade-survivor/probe-gateway.mjs!",
   "scripts/e2e/lib/upgrade-survivor/probe-volume-gateway.mjs!",
   "scripts/e2e/lib/upgrade-survivor/projects-doctor.mjs!",
@@ -226,8 +227,6 @@ const repositoryScriptEntries = [
   // Generates the checked-in native protocol models from core descriptor metadata.
   "scripts/protocol-gen.ts!",
   "scripts/pr-lib/ci-dispatch.mjs!",
-  // merge.sh invokes this native review-authority parser by path.
-  "scripts/pr-lib/clawsweeper-review-gate.mjs!",
   // review.sh invokes the corrected-candidate review validator by path.
   "scripts/pr-lib/correction-review.mjs!",
   "scripts/pr-lib/gh-api-preflight.mjs!",
@@ -270,6 +269,8 @@ const repositoryScriptEntries = [
   "scripts/github/security-review.mjs!",
   "scripts/sync-labels.ts!",
   "scripts/test-built-bundled-channel-entry-smoke.mts!",
+  // CI launches the desktop resize proof through its bootstrap path.
+  "scripts/test-desktop-resize-real.mts!",
   // Native shell UI tests connect to this manually launched loopback Gateway fixture.
   "scripts/test-ios-shell-gateway.mjs!",
   "scripts/test-ios-sidebar-attention-gateway.mjs!",
@@ -305,7 +306,21 @@ function listScriptShimEntries(dir = "scripts"): string[] {
   });
 }
 
-function compileFrvWorkflowConsumers(source: string, filePath: string): string {
+function compileWorkflowConsumers(source: string, filePath: string): string {
+  if (path.resolve(filePath) === path.resolve(".github/workflows/labeler.yml")) {
+    return [
+      ...new Set(
+        [
+          ...source.matchAll(
+            /\bconst\s*\{([^}]+)\}\s*=\s*await\s+import\(\s*pathToFileURL\(`\$\{process\.env\.GITHUB_WORKSPACE\}\/(scripts\/[^`\r\n]+)`\)\.href\s*\)/gu,
+          ),
+        ].map(
+          ([, names, specifier]) =>
+            `import {${names}} from ${JSON.stringify(`../../${specifier}`)};`,
+        ),
+      ),
+    ].join("\n");
+  }
   if (path.resolve(filePath) !== path.resolve(".github/workflows/plugin-prerelease.yml")) {
     return "";
   }
@@ -394,6 +409,8 @@ const rootEntries = [
   "node-runtime-recovery.mjs!",
   "src/index.ts!",
   "src/entry.ts!",
+  // Startup metadata renders source help through a generated child module's file-URL import.
+  "src/cli/program/root-help.ts!",
   // Packaged postinstall imports this private compiled entry before stage activation.
   "src/commands/doctor-update-schema-guard.ts!",
   // Built as the official image's Docker HEALTHCHECK entrypoint.
@@ -403,6 +420,7 @@ const rootEntries = [
   "src/worker/worker-deploy-file-tool-planning.ts!",
   "src/worker/worker-deploy-image-processor.ts!",
   "src/worker/worker-deploy-sqlite-store.ts!",
+  "src/worker/worker-deploy-state-read.ts!",
   "src/worker/workspace-rsync-receiver.ts!",
   // v2026.9.1 Gateways lazy-import this stable dist entry after an in-place update.
   "src/gateway/plugin-channel-reload-targets.ts!",
@@ -415,7 +433,6 @@ const rootEntries = [
   "src/cli/daemon-cli.ts!",
   "src/agents/code-mode.worker.ts!",
   // Worker-thread and script entrypoints import contracts that production Knip cannot trace.
-  "src/agents/compaction-planning.worker.ts!",
   "src/config/sessions/disk-budget.worker.ts!",
   "scripts/print-cli-backend-live-metadata.ts!",
   // Workflow/package-script entrypoints are not imported from production modules.
@@ -430,13 +447,13 @@ const rootEntries = [
   "scripts/bench-agent-concurrency-worker.ts!",
   "scripts/bench-sqlite-reliability.ts!",
   "scripts/bench-cron-session-reaper.ts!",
-  "scripts/bench-codex-catalog-pages.ts!",
-  "scripts/bench-redaction-hot-paths.ts!",
-  // The manual heap-retention CLI launches its private IPC preload by path.
-  "scripts/bench-gateway-heap-retention.ts!",
-  "scripts/lib/gateway-heap-retention-preload.mjs!",
   // docs/reference/test/performance.md invokes this standalone comparison harness.
   "scripts/bench-workspace-computation.ts!",
+  // packages/worker-runtime/README.md invokes the benchmark; its worker is loaded by URL.
+  "scripts/bench-worker-runtime.ts!",
+  "scripts/bench-worker-runtime.worker.ts!",
+  // docs/help/testing/control-ui-load.md invokes this opt-in Linux process/protocol proof.
+  "scripts/bench-gateway-control-ui-proof.ts!",
   // Docker/manual E2E executables and their nested assertion/probe entrypoints.
   "scripts/e2e/*.{js,mjs,ts}!",
   "scripts/e2e/lib/**/{assertions,probe,mock-server}.{js,mjs,ts}!",
@@ -452,8 +469,7 @@ const rootEntries = [
   // Human plugin listing lazily loads its formatter to keep JSON startup lean.
   "src/cli/plugins-list-format.ts!",
   "src/infra/warning-filter.ts!",
-  // Jiti exposes this SDK barrel and its type-only declaration owner.
-  "src/agents/sessions/extension-sdk.ts!",
+  // The session extension SDK exposes this type-only declaration owner.
   "src/agents/sessions/extensions/types.ts!",
   // Plugin-SDK ACP facades expose the registry's runtime signatures.
   "src/acp/runtime/registry.ts!",
@@ -692,7 +708,7 @@ const ignoredTestSupportFiles = [
 
 const config = {
   compilers: {
-    yml: compileFrvWorkflowConsumers,
+    yml: compileWorkflowConsumers,
     sh: compileShellConsumers,
     mjs: compileNativeProtocolConsumer,
   },
@@ -708,6 +724,10 @@ const config = {
     // This worker-thread proof entry is loaded from its test with new URL(),
     // which Knip cannot discover as a static import.
     "src/worker/repro-worker-connection-closing-window.ts",
+    // Dormant host half of the durable cross-store source fence (#168018). Its real
+    // broker tests are the only importer until GitHub publication, session titles,
+    // or worktree finalization adopt it; drop this entry with that first caller.
+    "src/infra/sqlite-source-fence-admission.ts",
     "src/shared/text/assistant-visible-text.ts",
     bundledPluginFile("telegram", "src/draft-chunking.ts"),
   ],
@@ -731,6 +751,8 @@ const config = {
     // Focused outbox tests seed and recover rows through these kernels; production
     // reaches them only through the agent database worker's command dispatcher.
     "src/agents/harness/context-engine-turn-outbox.ts": ["exports"],
+    // Focused Crabbox tests inspect retained private diagnostics; production consumes them in-module.
+    "extensions/qa-lab/src/mantis/crabbox-runtime.ts": ["exports"],
     // Runtime reason values are exported now so protocol schemas can derive from one tuple later.
     "src/agents/failover/signal.ts": ["exports"],
     "src/context-engine/registry.ts": ["exports", "types"],

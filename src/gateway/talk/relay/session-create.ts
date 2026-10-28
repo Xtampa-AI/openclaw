@@ -30,13 +30,13 @@ import {
   adoptTalkRealtimeRelaySession,
   cancelTalkRealtimeRelayProviderToolCall,
   closeRelaySession,
-  pruneInactiveRelayAgentRuns,
   registerTalkRealtimeRelayAgentRun,
-  resetTalkRealtimeRelayContinuity,
   prepareTalkRealtimeRelayAgentControl,
 } from "./operations.js";
 import { submitFinalProviderToolResult, suppressedToolResultOptions } from "./provider-results.js";
 import {
+  pruneInactiveRelayAgentRuns,
+  resetTalkRealtimeRelayContinuity,
   RELAY_SESSION_TTL_MS,
   RELAY_TRANSCRIPT_ECHO_LOOKBACK_MS,
   adoptRelayProviderToolCallId,
@@ -152,6 +152,7 @@ export function createTalkRealtimeRelaySession(
         constructionTerminal.current ??= { kind: "error", error: new Error(message) };
       }
     },
+    () => bridgeRef.current?.bridge.outputAudioMode === "continuous",
   );
   const { agentId: relayAgentId, canonicalKey } = params.sessionTarget;
   const confirmationReadiness = createClientVoiceConfirmationReadiness({
@@ -171,18 +172,23 @@ export function createTalkRealtimeRelaySession(
     initialItems: params.initialItems ?? [],
     runIdPrefix: "talk-realtime-relay-consult",
     surface: "a gateway-relay Talk session",
-    registerRun: ({ runId }) => {
+    registerRun: async ({ runId, assertCurrent }) => {
       if (!getActiveRelay()) {
         throw new Error("Realtime gateway-relay session is closed");
       }
-      registerTalkRealtimeRelayAgentRun({
+      const registration = await registerTalkRealtimeRelayAgentRun({
         relaySessionId,
         connId: params.connId,
         sessionKey: canonicalKey,
         runId,
+        assertCurrent,
       });
+      if (!getActiveRelay() || !registration.isCurrent()) {
+        registration.release();
+        throw new Error("Realtime gateway-relay session is closed");
+      }
+      return registration;
     },
-    isRunCurrent: (runId) => getActiveRelay()?.activeAgentRuns.get(runId) === canonicalKey,
   });
   const runAgentConsult = bindTalkRealtimeRelayAgentConsult(
     consultRunner.runPrompt,
@@ -426,7 +432,13 @@ export function createTalkRealtimeRelaySession(
         confirmationReadiness.observeUserTranscript(text, false);
       }
       const previousTranscriptSeq = relay.voiceTranscriptSeq;
-      if (final && !enqueueRelayVoiceTranscript(relay, role, text)) {
+      const enqueueTranscript = () => enqueueRelayVoiceTranscript(relay, role, text);
+      if (
+        final &&
+        !(relay.closing?.runTranscript
+          ? relay.closing.runTranscript(enqueueTranscript)
+          : enqueueTranscript())
+      ) {
         return;
       }
       const transcriptIdentity =

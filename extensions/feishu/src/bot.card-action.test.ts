@@ -9,8 +9,8 @@ import {
   type FeishuCardInteractionEnvelope,
 } from "./card-interaction.js";
 import {
+  expectFeishuCardButtonRow,
   expectFirstSentCardUsesFillWidthOnly,
-  expectSentCardHasP2pAction,
 } from "./card-test-helpers.js";
 import {
   FEISHU_APPROVAL_CANCEL_ACTION,
@@ -100,56 +100,57 @@ describe("Feishu Card Action Handler", () => {
     });
   });
 
-  it("routes quick command actions with operator and conversation context", async () => {
-    await dispatch(cardEvent(quickAction(), { open_message_id: "om_card_message" }));
-    expect(vi.mocked(handleFeishuMessage).mock.calls[0]?.[0].event).toMatchObject({
-      sender: { sender_id: { open_id: "u123", user_id: "uid1", union_id: "un1" } },
-      message: {
-        chat_id: "chat1",
-        content: '{"text":"/help"}',
-        reply_target_message_id: "om_card_message",
-        typing_target_message_id: "om_card_message",
-      },
-    });
-  });
-
   it("opens approval cards with resolved DM type and preserved interaction context", async () => {
     getChat.mockResolvedValueOnce({ code: 0, data: { chat_mode: "p2p" } });
     await dispatch(cardEvent(approvalAction()), { accountId: "main" });
-    expect(sendCardFeishuMock.mock.calls[0]?.[0]).toMatchObject({
+    const expected = {
+      u: "u123",
+      h: "chat1",
+      t: "p2p",
+      s: "agent:codex:feishu:chat:chat1",
+      e: expect.any(Number),
+    };
+    const sent = sendCardFeishuMock.mock.calls[0]?.[0];
+    expect(sent).toMatchObject({
       to: "chat:chat1",
       accountId: "main",
-      card: {
-        config: { width_mode: "fill" },
-        header: { title: { content: "Confirm action" } },
-        body: {
-          elements: expect.arrayContaining([
-            {
-              tag: "action",
-              actions: [
-                expect.objectContaining({
-                  value: expect.objectContaining({
-                    c: {
-                      u: "u123",
-                      h: "chat1",
-                      t: "p2p",
-                      s: "agent:codex:feishu:chat:chat1",
-                      e: expect.any(Number),
-                    },
-                  }),
-                }),
-                expect.anything(),
-              ],
-            },
-          ]),
-        },
-      },
+      card: { header: { title: { content: "Confirm action" } } },
     });
+    const buttons = expectFeishuCardButtonRow(sent?.card);
+    expect(buttons.map((button) => button.value)).toEqual([
+      expect.objectContaining({ a: FEISHU_APPROVAL_CONFIRM_ACTION, q: "/new", c: expected }),
+      expect.objectContaining({ a: FEISHU_APPROVAL_CANCEL_ACTION, c: expected }),
+    ]);
     expectFirstSentCardUsesFillWidthOnly(sendCardFeishuMock);
-    expectSentCardHasP2pAction(sendCardFeishuMock);
     expect(createFeishuClientMock).toHaveBeenCalledTimes(1);
     expect(handleFeishuMessage).not.toHaveBeenCalled();
   });
+
+  it.each(["confirm", "cancel"] as const)(
+    "dispatches the emitted approval %s button",
+    async (action) => {
+      await dispatch(cardEvent(approvalAction()));
+      const buttons = expectFeishuCardButtonRow(sendCardFeishuMock.mock.calls[0]?.[0]?.card);
+      const button = buttons[action === "confirm" ? 0 : 1];
+      const event = cardEvent(button?.value as Record<string, unknown>, {
+        token: "approval-callback",
+      });
+      await dispatch(event, { botOpenId: "ou_bot" });
+      await dispatch(event, { botOpenId: "ou_bot" });
+      if (action === "confirm") {
+        expect(message()).toMatchObject({
+          chat_id: "chat1",
+          chat_type: "group",
+          content: '{"text":"/new"}',
+        });
+        expect(handleFeishuMessage).toHaveBeenCalledTimes(1);
+      } else {
+        expect(notice()).toMatchObject({ to: "chat:chat1", text: "Cancelled." });
+        expect(sendMessageFeishuMock).toHaveBeenCalledTimes(1);
+        expect(handleFeishuMessage).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it("does not open approval cards when the expiry would exceed a valid Date", async () => {
     vi.useFakeTimers();
@@ -163,12 +164,25 @@ describe("Feishu Card Action Handler", () => {
   });
 
   it("marks synthetic group card callbacks as mentioning the bot", async () => {
-    await dispatch(cardEvent(quickAction({ a: FEISHU_APPROVAL_CONFIRM_ACTION, q: "/new" })), {
-      botOpenId: "ou_bot",
-    });
+    await dispatch(
+      cardEvent(quickAction({ a: FEISHU_APPROVAL_CONFIRM_ACTION, q: "/new" }), {
+        open_message_id: "om_card_message",
+      }),
+      {
+        botOpenId: "ou_bot",
+      },
+    );
     expect(message()).toMatchObject({
+      chat_id: "chat1",
       chat_type: "group",
+      reply_target_message_id: "om_card_message",
+      typing_target_message_id: "om_card_message",
       content: '{"text":"/new"}',
+    });
+    expect(vi.mocked(handleFeishuMessage).mock.calls[0]?.[0].event.sender.sender_id).toEqual({
+      open_id: "u123",
+      user_id: "uid1",
+      union_id: "un1",
     });
     expect(message()?.mentions).toEqual([
       { key: "mention_bot", id: { open_id: "ou_bot" }, name: "bot" },

@@ -86,7 +86,7 @@ scripts/pr review-checkout-pr <pr>
 scripts/pr review-artifacts-init <pr>
 # Complete .local/review.json for this exact head.
 scripts/pr review-validate-artifacts <pr>
-# After local review and a completed ClawSweeper review, submit with enforced GitHub gates.
+# Local review complete → submit with enforced GitHub gates.
 env -u OPENCLAW_TESTBOX OPENCLAW_PR_GATES_REMOTE=github scripts/pr prepare-run <pr>
 scripts/pr merge-run <pr> --auto-merge
 ```
@@ -201,15 +201,50 @@ verifier rechecks live authority, enforced reviews, security, and exact CI evide
 after the final REST reread. Missing or changed evidence still refuses before
 intent. This adds no implicit admin route or mutation retry.
 
-#### Explicitly approved pre-existing failures
+#### Authorized pre-existing failures
 
-When the operator specifically authorizes ignoring independently attributed
-pre-existing CI failures, use the same flags and `github_pending` preparation.
+A scoped instruction to land a PR authorizes the inherited-failure exception
+when every remaining failure is independently attributed to the baseline. Do
+not ask for another confirmation just because CI is inherited red. Use the same
+`--admin-evidence` and `--confirmed-operator-admin` flags and `github_pending`
+preparation; the confirmation records the operator-authorized exception, not
+a claim that the executing bot is an administrator. A readiness question,
+uncertain attribution, or a PR-caused failure does not select this route.
 Keep `tests.result: "fail"` in the exact-head review and add `tests.preExistingCi`
 with `head`, numeric `runId` and `runAttempt`, and a nonempty `reason`. A READY
 review can retain that exception; ordinary merge admission still rejects it.
 The confirmed admin route must verify the same head and failed attempt. Product
 findings, enforced reviews, and security requirements are never waived.
+
+An executing account that is not an organization/repository admin may use this
+exception when it has repository write permission, active organization
+membership, and live GitHub bypass authority for every effective CI gate
+ruleset. The native verifier reads `current_user_can_bypass` with the actual
+writer: `always` and `pull_requests_only` qualify. Each qualifying ruleset must
+be an active, repository-owned branch ruleset containing only the
+`openclaw/ci-gate` required check from GitHub Actions (integration `15368`).
+Mixed review/security rulesets, missing or changed policy, and unavailable or
+revoked grants refuse admission. The verifier rereads policy and delegated
+authority after CI/security inspection and retains the writer, repository ID,
+ruleset IDs and bypass modes in the existing outcome. It does not accept a
+caller-supplied grant, change GitHub permissions, or grant the prior-success
+conflict-resolution exception to a delegated writer.
+
+GitHub administrators provision any missing grant through the repository
+ruleset owner, preferably with a dedicated CI-bypass team and pull-request-only
+mode. Inspect existing grants before changing them; never add the bot to an
+organization-admin role or broaden review/security bypass to enable this path.
+Task authorization remains the existing operator-invocation contract; a
+GitHub bypass grant is execution capability, not an authenticated human approval.
+
+Delegation does not remove the policy-reader requirement. The writer must still
+obtain authoritative classic-protection absence through the existing supported
+API. GitHub can return a generic `404 Not Found` to a non-admin even when the
+repository is readable. GraphQL `branchProtectionRule: null` and an empty
+`branchProtectionRules` connection can also hide real protection; they are not
+absence proofs. If policy is unavailable, stop before intent and report the
+missing policy-read capability. Do not upgrade the writer, substitute credentials,
+or introduce a caller-attested policy snapshot to get through this guard.
 
 Use the existing version-1 admin evidence with
 `changeKind: "pre-existing-failure"`. Here `priorHead` is the recorded main
@@ -237,102 +272,11 @@ Retain these additional fields:
   stay blocked.
 - `aggregate`: the CI gate's `jobId`, `causedBy` (all admitted failed-job IDs),
   `reason`, and `evidence` names establishing the downstream failure.
-- `cancellation`, only when sibling jobs were cancelled: their exhaustive
-  `jobIds`, the same `causedBy` root IDs, `reason`, and `evidence` names, plus the
-  successful `pr-fail-fast` job's `jobId` and cancellation-step number `step`.
-  This records inspected cancellation provenance, never passing coverage.
 
-A cancelled job that actually failed its Node test step can remain an independently
-attributed root. Add `failedStep: { number: 18, workflowJob:
-"checks-node-core-test-nondist-shard" }` to that job's existing `failures` entry,
-using its actual step number. Keep all observed cases, source paths, and independent
-baseline artifacts. The verifier requires the matching current GitHub Actions
-check-run/head/suite/timestamps, complete terminal steps, exactly one failed
-`Run Node test shard`, successful cleanup, and only successful or skipped other
-steps. The unchanged tested workflow must retain the audited Node shard entrypoint
-and matrix owner without `continue-on-error`. Matrix membership remains an inspected
-attestation, not an inference from the job name. The retained `failedStep` proof
-includes its cancelled job conclusion and actual step; exclude that root from
-collateral `cancellation.jobIds`, and include it in the aggregate's complete root
-list. Matrix cancellation names it only when it is an inspected causal member.
-Extra failed steps, absent or changed qualification, and mismatched sources refuse
-admission. This does not qualify the underlying test failure by itself.
+Read `pr-failure-report` or `openclaw/ci-gate`: **pre-existing** with matching signatures needs no further attribution; for job-name-only **pre-existing**, check the failing tests against main before attributing the failure.
 
-The same failure entry can bind a cancelled `check-prod-types` job with
-`failedStep: { number: 16, workflowJob: "check-shard" }`, using the actual step
-number. This route recognizes only the audited `Run check shard` command and its
-task/matrix bindings. Every declared workflow step must appear at its source
-position; all step timestamps must be ordered within the job and cleanup must
-succeed. The retained proof includes the full steps and cancelled conclusion.
-Matrix membership and the underlying type failure still require independent
-inspection. The same source, security, review, and exhaustive cancellation gates
-apply.
-
-An explicitly attributed Node job that exhausted its execution deadline may appear
-as `cancelled` in GitHub's job API. Keep it in `failures`, with the actual observed
-cases and incomplete coverage recorded. The verifier requires the matching live
-GitHub Actions check-run, complete deadline/cancellation annotations, consistent
-head, suite and timestamps, an elapsed deadline, one cancelled Node test step,
-no additional failed steps, and unchanged workflow source. It retains the cancelled
-status and deadline evidence; it does not classify this root as fail-fast collateral.
-Manual cancellation and missing or contradictory deadline evidence remain refused.
-
-The inspected historical `check-additional-extension-package-boundary` row also
-qualifies its 20-minute deadline. It must retain the audited additional-check
-command, matrix wiring and budget in the unchanged tested/baseline workflow.
-A successful shard requires only the deadline annotation; a cancelled shard
-requires both deadline and operation-cancelled annotations. Both require complete,
-ordered terminal steps, the expected shard ordinal, bounded timestamps reaching
-the deadline, successful cleanup, and no other failed or cancelled step. Preserve
-any unfinished receipt or canary coverage in its independent failure attribution.
-
-Current `openclaw/openclaw` PR reruns do not use native matrix fail-fast: every
-Node matrix leg can finish, preserving the remaining proof for inherited-red admin
-landing. This also applies to fork PRs targeting `openclaw/openclaw`; the workflow
-repository, not the head repository, owns this policy. The first-attempt monitor
-is unchanged. Native matrix fail-fast remains enabled only for PRs running in
-other repositories.
-
-Historical runs still use their tested workflow's policy, including the former
-expression that enabled native fail-fast on canonical PR reruns. For a run whose
-tested workflow and attempt/repository context enable native fail-fast, use
-`cancellation.kind: "matrix-fail-fast"` and
-`workflowJob: "checks-node-core-test-nondist-shard"` instead of monitor `jobId`/`step`.
-Its `causedBy` must name a nonempty, unique subset of independently admitted
-failed roots that actually caused this matrix cancellation. Add `members`, the
-exact `{ jobId, name }` bindings for those causal roots and every cancelled row.
-Other independently attributed failures remain in the aggregate's exhaustive
-`causedBy` list, without being misclassified as Node matrix members. Retain the tested workflow blob locally. The verifier requires
-that workflow to match the baseline, use the existing preflight matrix/name wiring,
-enable PR fail-fast, and have no `continue-on-error`. GitHub's job API omits matrix
-ownership; membership and cancellation cause remain explicitly inspected operator
-attestations supported by the named artifacts, not facts inferred from prefixes.
-Either mechanism refuses cancelled jobs with failed steps or missing step evidence;
-those cannot be hidden as collateral cancellation. The successful monitor route
-has one narrowly qualified historical exception: the Discord attachment uploader
-ran after cancellation skipped its entire built-artifact producer. This does not
-apply to matrix-only cancellation, test/cleanup failures, upload transport errors,
-or a producer that ran and failed or was cancelled.
-
-For that exact shape, add one `cancellation.secondaryFailures` entry with
-`kind: "missing-artifact-after-skipped-producer"`, numeric `jobId`, failed upload
-`step`, skipped `producerStep`, `log` (an existing artifact name), `reason`, and
-`evidence` names including that log. Keep this job in the exhaustive cancelled
-`jobIds`; do not add it to `failures` or either `causedBy` root list.
-
-The log must be the complete retained `gh run view --job --log` output with job,
-step, and timestamp columns, including multiline continuations and final cleanup.
-Its existing artifact SHA-256 is rechecked. The verifier binds the unique live
-build/producer/upload step names and numbers, successful monitor, cancelled build,
-skipped producer, and upload timing. It requires the tested workflow to equal the
-baseline, the reviewed historical producer body digest, and exact pinned uploader,
-selection, paths, and missing-file error policy. The log must identify the tested
-checkout/workflow and show only build cancellation followed by the absence of
-both declared JSON/log outputs. Other error annotations or failed steps block.
-The producer digest recognizes this inspected skipped-output contract; it grants
-no authority and does not evaluate arbitrary shell code. Source/log provenance
-and causal interpretation remain inspected attestations. This retains the
-secondary failure explicitly without turning cancellation into passing coverage.
+**New** and **unknown** failures retain the existing investigation and landing
+rules. The table does not change gate semantics or authorize an admin landing.
 
 The tool verifies live run/attempt/PR/head identities, complete job accounting,
 the current effective GitHub Actions gate check-run, and source/artifact hashes.
@@ -343,8 +287,10 @@ intent and landing-parent audit retain their original main anchor. Already-selec
 REST completes its final observation and main materialization before one final
 live authority verification. GraphQL retains its post-authority local-only reread,
 including late REST fallback; a newly unavailable main there is a pre-dispatch
-refusal. Neither path fetches after final authority verification. Crabbox admission
-and retained-outcome reconciliation keep their existing strict main binding.
+refusal. Neither path fetches after final authority verification. Crabbox admission also verifies forward main ancestry and the candidate tree. If its final proof observes newer main, it discards that authority decision before materializing or settling the new tip, then repeats full live verification within the same three-round admin limit. The tested proof base remains pinned while the live PR base is checked for forward ancestry; active organization membership is the final live authority read.
+
+`OPENCLAW_PR_STRICT_DRIFT=1` restores strict main stability on every landing
+route. Retained-outcome reconciliation keeps its existing strict main binding.
 A fork run with an empty GitHub PR association must match the current PR's exact
 head, branch, and source repository identity as well as that check-run; an
 explicit association with another PR is rejected. The retained result names
@@ -379,12 +325,8 @@ separate landing gate. Check live rules and review state before claiming a human
 approval is mandatory; bypass ability is not authorization to skip an enforced
 review.
 
-The native ClawSweeper completion gate currently enforces a 12-hour window,
-including on an unchanged head. Reusing local review or CI proof does not waive
-that independent gate. New admission needs an eligible completion; retain other
-still-valid review and CI proof. Do not rewrite timestamps, manufacture proof,
-or change freshness policy to resume a task. An accepted or uncertain merge
-intent still takes the recovery path below before fresh admission.
+ClawSweeper reviews advisory; no completion comment or freshness precondition.
+Accepted/uncertain merge intent → recovery below before fresh admission.
 
 For non-main targets, do not use `prepare-run` or `merge-run`: their base is main.
 Use review artifacts and exact base/head CI, revalidate the remote head, and
@@ -480,7 +422,7 @@ scripts/pr merge-recover <PR> <OUTCOME_OID> --confirmed-operator-recovery \
 
 Do not pass `--admin-evidence`. The replacement must differ, and the PR must stay
 OPEN and `MERGEABLE/BLOCKED` or `MERGEABLE/BEHIND`. Normal required-check,
-ClawSweeper, review, security, and owner gates still apply. The successor CAS
+review, security, and owner gates still apply. The successor CAS
 records route `auto` plus `recovery.staleHeadRetirement`, preserving ancestry
 and exact regular capture bytes without interpreting them; an empty capture is
 valid. Missing, symlink, extra, or admission-mutated captures, same-head or
@@ -495,8 +437,14 @@ replaying an accepted or uncertain request.
 A failed or timed-out merge response can still mean GitHub merged it. Reconcile
 remote state and ancestry before retrying. Verify the final merge commit is on
 current main; do not count a draft, pending check, or local summary as landing.
-After `merge-run` removes its worktree, switch command execution back to a
-persistent checkout. Once the requested outcome and required verification are
+Run closeout from a persistent checkout only after the owning session has exited
+or released its cwd. Changing a child command's cwd does not move its parent
+agent or shell; never remove a worktree containing a live process's cwd, including
+any subdirectory. Native cleanup refuses observed cwd holders. Preserve that
+refusal; do not bypass it with raw `git worktree remove`, `rm`, or a custom script.
+If your own session still holds the worktree, finish the report with its retained
+path and defer removal to a later closeout after the session ends.
+Once the requested outcome and required verification are
 complete, remove task-owned test logs, receipts, proof archives, and scratch.
 This includes `.crabbox` outputs and task-owned archives under `.local` or
 temporary directories. Existing published PR evidence needs no local duplicate.

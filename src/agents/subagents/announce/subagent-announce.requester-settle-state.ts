@@ -86,6 +86,12 @@ export function startRequesterSettleWakeAttempt(
   };
 }
 
+export function deferRequesterSettleWakePreparation(
+  state: RequesterSettleWakeBatchState,
+): RequesterSettleWakeBatchState {
+  return { ...state, nextAttemptAt: Date.now() + 30_000 };
+}
+
 export function readSharedBatchState(
   batch: readonly SubagentRunRecord[],
 ): RequesterSettleWakeBatchState {

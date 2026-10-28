@@ -1,5 +1,6 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createAbortError, racePromiseWithAbortSignal } from "../infra/abort-signal.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { resolvePublishedModelCatalogOwner } from "./prepared-model-catalog-owner.js";
 import { assertPreparedModelRuntimeAdmissionCanWait } from "./prepared-model-runtime-admission.js";
 import { readCapturedPreparedModelRuntimeCatalog } from "./prepared-model-runtime.capture.js";
@@ -59,6 +60,14 @@ function buildReplyDispatchPublication(
   return Object.freeze(runtimes);
 }
 
+type PreparedReplyDispatchLoadParams = {
+  agentId: string;
+  abortSignal?: AbortSignal;
+  demand?: "interactive" | "scheduled";
+  /** Transfers the captured generation to a request preparing execution from these facts. */
+  onRuntimeLease?: (lease: PreparedModelRuntimeLease) => void;
+};
+
 type PreparedReplyDispatchPublicationHost = Readonly<{
   retainOwner: (
     owner: PreparedModelRuntimeOwner,
@@ -67,28 +76,40 @@ type PreparedReplyDispatchPublicationHost = Readonly<{
   isGatewayLifecycleActive: () => boolean;
   getConfiguredOwner: (agentId: string) => PreparedModelRuntimeOwner | undefined;
   getPendingReplacement: () => Promise<void> | undefined;
+  isStartupPending: () => boolean;
+  ensureReady: (params: PreparedReplyDispatchLoadParams) => Promise<void>;
 }>;
 
-/** Reads one immutable configured Gateway dispatch generation without activating an owner. */
+/** Reads an immutable dispatch generation after the lifecycle's demand preparation. */
 export class PreparedReplyDispatchPublicationOwner {
   #publication = EMPTY_REPLY_DISPATCH_PUBLICATION;
+  #changed = createDeferredCore();
 
   constructor(private readonly host: PreparedReplyDispatchPublicationHost) {}
 
+  #publish(publication: readonly PreparedReplyDispatchRuntime[]): void {
+    this.#publication = publication;
+    const changed = this.#changed;
+    this.#changed = createDeferredCore();
+    changed.resolve();
+  }
+
   clear(): void {
-    this.#publication = EMPTY_REPLY_DISPATCH_PUBLICATION;
+    this.#publish(EMPTY_REPLY_DISPATCH_PUBLICATION);
   }
 
   advanceConfig(config: OpenClawConfig): void {
-    this.#publication = Object.freeze(
-      this.#publication.map((runtime) => Object.freeze({ ...runtime, config })),
+    this.#publish(
+      Object.freeze(this.#publication.map((runtime) => Object.freeze({ ...runtime, config }))),
     );
   }
 
   rebuild(owners: Iterable<PreparedModelRuntimeOwner>): void {
-    this.#publication = this.host.isGatewayLifecycleActive()
-      ? buildReplyDispatchPublication(owners)
-      : EMPTY_REPLY_DISPATCH_PUBLICATION;
+    this.#publish(
+      this.host.isGatewayLifecycleActive()
+        ? buildReplyDispatchPublication(owners)
+        : EMPTY_REPLY_DISPATCH_PUBLICATION,
+    );
   }
 
   stage(owners: Iterable<PreparedModelRuntimeOwner>): () => void {
@@ -96,14 +117,14 @@ export class PreparedReplyDispatchPublicationOwner {
       ? buildReplyDispatchPublication(owners)
       : EMPTY_REPLY_DISPATCH_PUBLICATION;
     return () => {
-      this.#publication = publication;
+      this.#publish(publication);
     };
   }
 
   remove(agentIds: ReadonlySet<string>): void {
     if (agentIds.size > 0) {
-      this.#publication = Object.freeze(
-        this.#publication.filter((runtime) => !agentIds.has(runtime.agentId)),
+      this.#publish(
+        Object.freeze(this.#publication.filter((runtime) => !agentIds.has(runtime.agentId))),
       );
     }
   }
@@ -111,24 +132,21 @@ export class PreparedReplyDispatchPublicationOwner {
   replace(owners: readonly PreparedModelRuntimeOwner[]): void {
     const replacements = buildReplyDispatchPublication(owners);
     const agentIds = new Set(replacements.map((runtime) => runtime.agentId));
-    this.#publication = Object.freeze(
-      [
-        ...this.#publication.filter((runtime) => !agentIds.has(runtime.agentId)),
-        ...replacements,
-      ].toSorted((left, right) => left.agentId.localeCompare(right.agentId)),
+    this.#publish(
+      Object.freeze(
+        [
+          ...this.#publication.filter((runtime) => !agentIds.has(runtime.agentId)),
+          ...replacements,
+        ].toSorted((left, right) => left.agentId.localeCompare(right.agentId)),
+      ),
     );
   }
 
-  readonly load = async ({
-    agentId,
-    abortSignal,
-    onRuntimeLease,
-  }: {
-    agentId: string;
-    abortSignal?: AbortSignal;
-    /** Transfers the captured generation to a request preparing execution from these facts. */
-    onRuntimeLease?: (lease: PreparedModelRuntimeLease) => void;
-  }): Promise<PreparedReplyDispatchRuntime | undefined> => {
+  readonly load = async (
+    params: PreparedReplyDispatchLoadParams,
+  ): Promise<PreparedReplyDispatchRuntime | undefined> => {
+    const { agentId, abortSignal, onRuntimeLease } = params;
+    let demandPrepared = false;
     for (;;) {
       if (abortSignal?.aborted) {
         throw createAbortError("Prepared reply dispatch admission aborted", {
@@ -139,19 +157,33 @@ export class PreparedReplyDispatchPublicationOwner {
         return undefined;
       }
       const replacement = this.host.getPendingReplacement();
+      const pendingOwner = replacement ? undefined : this.host.getConfiguredOwner(agentId);
       if (replacement) {
         assertPreparedModelRuntimeAdmissionCanWait();
+      } else if (pendingOwner?.pending) {
+        assertPreparedModelRuntimeAdmissionCanWait(pendingOwner);
+      }
+      if (!demandPrepared) {
+        // Demand can join recovery, so preserve admission before that first wait.
+        await this.host.ensureReady(params);
+        demandPrepared = true;
+        continue;
+      }
+      if (replacement) {
         await racePromiseWithAbortSignal(replacement, abortSignal);
         continue;
       }
-      const pendingOwner = this.host.getConfiguredOwner(agentId);
       if (pendingOwner?.pending) {
-        assertPreparedModelRuntimeAdmissionCanWait(pendingOwner);
         await racePromiseWithAbortSignal(pendingOwner.pending, abortSignal);
         continue;
       }
       const runtime = this.#publication.find((candidate) => candidate.agentId === agentId);
       if (!runtime) {
+        if (this.host.isStartupPending()) {
+          assertPreparedModelRuntimeAdmissionCanWait();
+          await racePromiseWithAbortSignal(this.#changed.promise, abortSignal);
+          continue;
+        }
         throw new PreparedModelRuntimeOwnerNotPublishedError(
           `prepared reply dispatch runtime owner was not published for ${agentId}`,
         );

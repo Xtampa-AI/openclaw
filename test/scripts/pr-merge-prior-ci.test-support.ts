@@ -47,6 +47,9 @@ export function createPriorCiFixtureState(head: string) {
     requireThreads: false,
     resolved: true,
     membership: "admin",
+    rulesetBypass: undefined as string | undefined,
+    rulesetReads: 0,
+    revokeRulesetAfterRead: false,
     revokeAdminOnMainFetch: false,
     unsupportedNoLazy: false,
     localOnlyFailureOid: "",
@@ -258,6 +261,7 @@ export function createPriorCiCandidateFactory(
         check_run_url: "https://api.github.com/repos/fixture/repo/check-runs/1",
       },
       {
+        // This fixture decodes retained receipts from before workflow cancellation was removed.
         ...job(603, "pr-fail-fast", "success"),
         steps: [
           {

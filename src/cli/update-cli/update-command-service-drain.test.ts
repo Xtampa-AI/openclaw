@@ -36,8 +36,12 @@ vi.mock("../../gateway/local-http-probe.js", () => ({
     resolveWebSocketTarget: async () => ({ url: "ws://127.0.0.1:18789" }),
   }),
 }));
+// mock-isolation: Drain policy uses explicit fixture credentials, independent of device storage.
 vi.mock("../daemon-cli/restart-health-probe.js", () => ({
-  resolveGatewayRestartProbeContext: async () => ({ config: {}, auth: {} }),
+  resolveGatewayRestartProbeContext: async () => ({
+    config: {},
+    auth: { token: "fixture-token" },
+  }),
 }));
 vi.mock("./update-command-service-plan.js", () => ({
   resolveUpdatedGatewayRestartPort: async () => 18789,
@@ -510,6 +514,25 @@ it.each([25_000, 325_000])(
     );
   },
 );
+
+it("warns when resume fails without replacing the native stop error", async () => {
+  const f = fixture();
+  const failure = new Error("native stop failed");
+  f.stop.mockRejectedValue(failure);
+  const call = mocks.call.getMockImplementation()!;
+  mocks.call.mockImplementation(async (request: CallGatewayCliOptions) => {
+    if (request.method === "gateway.suspend.resume") {
+      throw new Error("resume transport failed");
+    }
+    return await call(request);
+  });
+  await expect(withGatewayMaintenanceDrain(f.params, f.stop)).rejects.toBe(failure);
+  expect(f.warn).toHaveBeenCalledWith(
+    expect.stringMatching(
+      /resident-suspension.*resume transport failed.*the Gateway reopens admission automatically when the lease expires \(within 2 minutes\)/,
+    ),
+  );
+});
 
 it.each(["authority", "boot"] as const)(
   "refuses a changed %s while observing the resident",

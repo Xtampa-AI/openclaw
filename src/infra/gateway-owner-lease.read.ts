@@ -14,6 +14,8 @@ import {
 
 export const gatewayOwnerKey = { scope: "gateway-owner", key: "global" } as const;
 
+export type GatewayOwnerLeaseRow = NonNullable<ReturnType<typeof readOpenClawStateLease>>;
+
 function parseSupervisor(value: unknown): GatewayOwnerSupervisor | null {
   if (value === null) {
     return null;
@@ -39,7 +41,13 @@ export function readGatewayOwnerLeaseFromDatabase(
   if (!tableExists(db, "state_leases")) {
     return undefined;
   }
-  const row = readOpenClawStateLease(db, gatewayOwnerKey);
+  return decodeGatewayOwnerLease(readOpenClawStateLease(db, gatewayOwnerKey), port);
+}
+
+export function decodeGatewayOwnerLease(
+  row: GatewayOwnerLeaseRow | undefined,
+  port?: number,
+): GatewayOwnerLeaseIdentity | undefined {
   if (!row) {
     return undefined;
   }
@@ -70,6 +78,7 @@ export function readGatewayOwnerLeaseFromDatabase(
     port: payload.port,
     mode: payload.mode,
     supervisor,
+    ...(typeof payload.listeningAt === "number" ? { listeningAt: payload.listeningAt } : {}),
     // Expiry cannot revoke the separate physical Gateway coordinator.
     state: readStateLeaseProcessOwnerStatus(processOwner, row.heartbeatAt ?? row.createdAt),
     expired: row.expiresAt === null || row.expiresAt <= Date.now(),

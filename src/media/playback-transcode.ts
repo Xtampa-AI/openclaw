@@ -13,6 +13,7 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { copyFileHandle } from "../infra/file-descriptor.js";
 import { openLocalFileSafely } from "../infra/fs-safe.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { runBestEffortCleanup } from "../infra/non-fatal-cleanup.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { createPermitPool } from "../shared/permit-pool.js";
@@ -320,7 +321,6 @@ export async function resolvePlaybackMetadataForSource(
   return { playback: mode === "fallback" ? undefined : mode, durationMs, width, height };
 }
 
-/** Replaces the original container suffix for a transcoded response filename. */
 export function replacePlaybackFileExtension(fileName: string, extension: `.${string}`): string {
   const currentExtension = path.extname(fileName);
   const stem = currentExtension ? fileName.slice(0, -currentExtension.length) : fileName;
@@ -525,7 +525,10 @@ async function transcodePlaybackSource(params: {
       try {
         outputProbe = await probePlaybackMediaFileDescriptor(outputHandle.fd, params.kind);
       } finally {
-        await outputHandle.close().catch(() => {});
+        await runBestEffortCleanup({
+          cleanup: () => outputHandle.close(),
+          onError: (error) => log.warn("Failed to close playback probe output", { error }),
+        });
       }
       if (
         !outputProbe?.durationMs ||

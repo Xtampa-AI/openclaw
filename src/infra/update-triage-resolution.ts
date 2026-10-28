@@ -109,28 +109,6 @@ function validateTriagePendingRecovery(
   return warnings.length > 0 ? unresolved(warnings.join(" "), true, nextRepair) : undefined;
 }
 
-async function readGitHead(params: {
-  installRoot: string;
-  env: NodeJS.ProcessEnv;
-  signal: AbortSignal;
-}): Promise<string | undefined> {
-  const head = await runUtf8CommandWithTimeout(
-    ["git", "-C", params.installRoot, "rev-parse", "HEAD"],
-    {
-      signal: params.signal,
-      env: params.env,
-      input: "",
-      killProcessTree: true,
-      maxOutputBytes: 4096,
-      terminateOnOutputLimit: true,
-    },
-  );
-  params.signal.throwIfAborted();
-  return head.code === 0 && head.termination === "exit" && !head.outputLimitExceeded
-    ? head.stdout.trim() || undefined
-    : undefined;
-}
-
 /** Resolve the attributed blocker without rewriting the updater's historical outcome. */
 export async function validateTriageUpdateResolution(params: {
   failure?: TriageUpdateFailure;
@@ -157,15 +135,15 @@ export async function validateTriageUpdateResolution(params: {
   const original =
     (params.implicit ? history.failure : undefined) ??
     (runId ? getUpdateRun(runId, options) : undefined);
-  const ownerChanged = () =>
+  const validateCurrentOwner = () =>
     findActiveUpdateRun(options) ||
-    readUpdateRunResolutionHistory(options).outcome?.runId !== history.outcome?.runId;
+    readUpdateRunResolutionHistory(options).outcome?.runId !== history.outcome?.runId
+      ? unresolved("The update owner changed during verification.")
+      : validateTriagePendingRecovery(installRoot, env);
   const validateDoctor = async () => {
     const doctor = await params.validateDoctor();
     signal.throwIfAborted();
-    return ownerChanged()
-      ? unresolved("The update owner changed during verification.")
-      : (validateTriagePendingRecovery(installRoot, env) ?? doctor);
+    return validateCurrentOwner() ?? doctor;
   };
   if (findActiveUpdateRun(options)) {
     return unresolved("An update is still running; wait for its owner to finish.");
@@ -256,7 +234,19 @@ export async function validateTriageUpdateResolution(params: {
   }
   let errors: string[];
   if (target.kind === "git") {
-    const head = await readGitHead(params);
+    const probe = await runUtf8CommandWithTimeout(["git", "-C", installRoot, "rev-parse", "HEAD"], {
+      signal,
+      env,
+      input: "",
+      killProcessTree: true,
+      maxOutputBytes: 4096,
+      terminateOnOutputLimit: true,
+    });
+    signal.throwIfAborted();
+    const head =
+      probe.code === 0 && probe.termination === "exit" && !probe.outputLimitExceeded
+        ? probe.stdout.trim() || undefined
+        : undefined;
     if (!head || (expected.sha && head !== expected.sha)) {
       return unresolved("The checkout does not match the updater's recorded commit.");
     }
@@ -301,11 +291,8 @@ export async function validateTriageUpdateResolution(params: {
     return unresolved("The installed version changed during verification.");
   }
   signal.throwIfAborted();
-  if (ownerChanged()) {
-    return unresolved("The update owner changed during verification.");
-  }
   return (
-    validateTriagePendingRecovery(installRoot, env) ?? {
+    validateCurrentOwner() ?? {
       ok: true,
       score: 0,
       summary: `${rolledBack ? "Rollback" : "Update"} to ${expected.version ?? expected.sha}${expected.version && expected.sha ? ` (${expected.sha})` : ""} recorded by the updater; installed runtime and managed Gateway readiness verified.`,

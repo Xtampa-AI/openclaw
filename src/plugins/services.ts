@@ -6,6 +6,7 @@ import type { GatewayPluginEventBroadcastFn } from "../gateway/server-broadcast-
 import { waitForDiagnosticEventsDrained } from "../infra/diagnostic-events.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
+import { readOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -15,6 +16,7 @@ import {
 } from "./capability-lease.js";
 import { createPluginServiceGatewayEvents } from "./gateway-events.js";
 import { withPluginHttpRouteRegistry } from "./http-registry.js";
+import { pluginInstanceInvocation } from "./plugin-instance-invocation.js";
 import { getPluginInstance, runPluginCleanup } from "./plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "./plugin-instance.types.js";
 import { resolvePluginReturnPromise } from "./plugin-return-value.js";
@@ -23,6 +25,7 @@ import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import type { PluginServiceRegistration } from "./registry-types.js";
 import type { PluginRegistry } from "./registry.js";
 import { getGatewayContextResolver } from "./runtime/gateway-request-scope.js";
+import { runOutsidePluginRuntimeGenerationScope } from "./runtime/generation-scope.js";
 import { createPluginServiceCronGetter, type PluginServiceCronHost } from "./service-cron.js";
 import { createPluginServiceDiagnostics } from "./service-diagnostics.js";
 import { createPluginServiceHealthReporter } from "./service-health.js";
@@ -123,6 +126,7 @@ type StartPluginServicesParams = {
   getCronService?: () => PluginServiceCronHost | null | undefined;
   oneShotStopTimeouts?: { eventDrainMs: number; serviceStopMs: number };
   previous?: PluginServicesHandle | null;
+  deferStartForPluginIds?: ReadonlySet<string>;
 } & (
   | { throwOnStartError: true; onHandle: (handle: PluginServicesHandle) => void }
   | { throwOnStartError?: false; onHandle?: (handle: PluginServicesHandle) => void }
@@ -190,6 +194,7 @@ async function startPreparedPluginServices({
   broadcastPluginEvent,
   getCronService,
   oneShotStopTimeouts,
+  deferStartForPluginIds,
   throwOnStartError,
   owner,
   publication,
@@ -494,9 +499,15 @@ async function startPreparedPluginServices({
     const { service, id } = entry;
     const record = registry.plugins.find((plugin) => plugin.id === entry.pluginId);
     const instance = record && getPluginInstance(record);
+    // Standalone work keeps its host bindings, but never borrows a caller's reusable readers.
+    const runInServiceContext =
+      instance?.lifecycle.runInBackgroundContext ??
+      (<T>(run: () => T) => readOnlyWorkerScope.exit(run));
     // Native service receivers retain their brands; registration owns their invocation scope.
     const runServiceCleanup = <T>(run: () => T): T =>
-      instance ? instance.runCleanup(run) : runPluginCleanup(service, run);
+      instance
+        ? instance.runCleanup(() => runInServiceContext(run))
+        : runPluginCleanup(service, run);
     const traceName = `sidecars.plugin-services.${encodeStartupTraceSegment(entry.pluginId)}.${encodeStartupTraceSegment(entry.id)}`;
     const lease = createPluginRuntimeCapabilityLease("plugin service");
     const gatewayEvents = createPluginServiceGatewayEvents({
@@ -507,12 +518,14 @@ async function startPreparedPluginServices({
     const { health, revoke } = createPluginServiceHealthReporter(entry);
     lease.retain(revoke);
     const runtime = getPluginRegistryRuntime(registry);
-    const scheduling = createPluginServiceScheduler(
-      scheduler,
-      createPluginServiceSchedulerRunner({ registry, record, instance, lease }),
+    const scheduling = runInServiceContext(() =>
+      createPluginServiceScheduler(
+        scheduler,
+        createPluginServiceSchedulerRunner({ registry, record, instance, lease }),
+      ),
     );
-    const runServiceStart = createScheduledGatewayRunner(
-      runtime ? getGatewayContextResolver(runtime) : undefined,
+    const runServiceStart = runInServiceContext(() =>
+      createScheduledGatewayRunner(runtime ? getGatewayContextResolver(runtime) : undefined),
     );
     const getCron = getCronService
       ? createPluginServiceCronGetter({
@@ -629,14 +642,20 @@ async function startPreparedPluginServices({
           const start = () =>
             withPluginServiceScheduler(scheduling.scheduler, () => service.start(serviceContext));
           // Reload may originate in an RPC or tool; background work captures
-          // service-owned Gateway/worker context, never that caller's authority.
+          // service-owned Gateway/worker context, never that caller's authority or generation.
           await runOutsideOperatorToolGatewayAuthority(() =>
-            runServiceStart(async () =>
-              withPluginHttpRouteRegistry(
-                registry,
-                () =>
-                  ownedService.startupConsumer ? ownedService.startupConsumer.run(start) : start(),
-                lease,
+            runOutsidePluginRuntimeGenerationScope(() =>
+              pluginInstanceInvocation.exit(() =>
+                runServiceStart(async () =>
+                  withPluginHttpRouteRegistry(
+                    registry,
+                    () =>
+                      ownedService.startupConsumer
+                        ? ownedService.startupConsumer.run(start)
+                        : start(),
+                    lease,
+                  ),
+                ),
               ),
             ),
           );
@@ -688,6 +707,9 @@ async function startPreparedPluginServices({
     for (const entry of registry.services) {
       if (owner.closed) {
         break;
+      }
+      if (deferStartForPluginIds?.has(entry.pluginId)) {
+        continue;
       }
       if (!canStart(entry)) {
         if (throwOnStartError && owner.stopped.has(entry)) {

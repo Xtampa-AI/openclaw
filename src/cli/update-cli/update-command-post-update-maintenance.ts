@@ -16,6 +16,7 @@ import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-err
 import {
   markControlPlaneUpdateRestartSentinelFailureBestEffort,
   prepareUpdateServiceResult,
+  UpdateCommandFailure,
   UpdateCommandPendingRecoveryFailure,
 } from "./update-command-result.js";
 import type { PreManagedServiceStop } from "./update-command-service-context-types.js";
@@ -56,9 +57,7 @@ export async function preparePostUpdateService(
       );
       assertCurrent();
       params.preManagedServiceStop = stopped;
-      if (restartRequired) {
-        params.shouldRestart = true;
-      }
+      params.shouldRestart ||= restartRequired;
     }
   } catch (error) {
     if (
@@ -158,6 +157,7 @@ export async function completePostUpdateMaintenance(
   assertCurrent: () => void,
   context: {
     root: string;
+    activationVerified: boolean;
     sentinel: Omit<
       Parameters<typeof markControlPlaneUpdateRestartSentinelFailureBestEffort>[0],
       "reason"
@@ -180,6 +180,13 @@ export async function completePostUpdateMaintenance(
     return undefined;
   }
   defaultRuntime.error(retirement.error);
+  if (context.activationVerified) {
+    throw new UpdateCommandFailure(
+      { ...result, status: "error", reason: "wrapper-retirement-failed" },
+      1,
+      retirement.error,
+    );
+  }
   await markControlPlaneUpdateRestartSentinelFailureBestEffort({
     ...context.sentinel,
     reason: "wrapper-retirement-failed",

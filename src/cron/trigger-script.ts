@@ -16,9 +16,10 @@ import {
   type HookContext,
 } from "../agents/agent-tools.before-tool-call.js";
 import {
-  createOpenClawCodingTools,
+  createOpenClawCodingToolsInternalAsync,
   resolveToolLoopDetectionConfig,
 } from "../agents/agent-tools.js";
+import { hasAnyAuthProfileStoreSourceAsync } from "../agents/auth-profiles/source-check.js";
 import { createHeadlessDeadlineScope } from "../agents/code-mode-headless.js";
 import type {
   CodeModeNamespaceDescriptor,
@@ -64,7 +65,10 @@ import { formatErrorMessageWithCode } from "../infra/errors.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { logWarn } from "../logger.js";
 import { PluginInstanceUnavailableError } from "../plugins/plugin-instance-error.js";
-import { capturePluginLifecycleAuthority } from "../plugins/registry-lifecycle.js";
+import {
+  capturePluginLifecycleAuthority,
+  isPluginRegistryRecordSetAdmitting,
+} from "../plugins/registry-lifecycle.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
@@ -122,7 +126,7 @@ type PreparedTriggerRuntime = {
     admitted: AdmittedRunContext,
     signal: AbortSignal,
     messageActionTurnCapability: string | undefined,
-  ) => AnyAgentTool[];
+  ) => Promise<AnyAgentTool[]>;
   /** Starts this evaluation's own MCP runtime for servers its toolsAllow names by prefix. */
   acquireMcpTools?: (
     admitted: AdmittedRunContext,
@@ -231,6 +235,9 @@ async function prepareTriggerRuntime(
       toolsEnabled: true,
       toolsAllow: params.toolsAllow,
     });
+    const authProfileStoreSource =
+      toolPlan.constructTools && (await hasAnyAuthProfileStoreSourceAsync(agentDir));
+    preparationSignal?.throwIfAborted();
     const scheduledToolPolicy = resolveScheduledToolPolicyContext({
       toolsAllow: params.toolsAllow,
       scheduledToolPolicy: params.scheduledToolPolicy,
@@ -262,13 +269,13 @@ async function prepareTriggerRuntime(
       return profile;
     };
     // LSP runtimes are session-scoped and intentionally outside trigger v1.
-    const createTools: PreparedTriggerRuntime["createTools"] = (
+    const createTools: PreparedTriggerRuntime["createTools"] = async (
       admitted,
       signal,
       messageActionTurnCapability,
     ) => {
       const allTools = toolPlan.constructTools
-        ? createOpenClawCodingTools({
+        ? await createOpenClawCodingToolsInternalAsync({
             agentId,
             runId: admitted.operationalRunInstance.runId,
             operationalRunInstance: admitted.operationalRunInstance,
@@ -280,6 +287,7 @@ async function prepareTriggerRuntime(
             trigger: "cron",
             jobId: params.jobId,
             agentDir,
+            authProfileStoreSource,
             cwd: effectiveWorkspace,
             workspaceDir: effectiveWorkspace,
             spawnWorkspaceDir: workspaceDir,
@@ -394,19 +402,24 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
         throw error;
       }
     }
-    const promise = prepareRuntime({ ...request, signal: scope.signal }).then((runtime) => ({
-      ...runtime,
-      isCurrent: runtime.pluginRegistry
-        ? (capturePluginLifecycleAuthority(runtime.pluginRegistry, undefined, {
-            scopedRuntime: true,
-          }) ?? (() => false))
-        : () => true,
-      invalidate: () => {
-        if (runtimeCache.get(request.jobId) === entry) {
-          runtimeCache.delete(request.jobId);
-        }
-      },
-    }));
+    const promise = prepareRuntime({ ...request, signal: scope.signal }).then((runtime) => {
+      const registry = runtime.pluginRegistry;
+      const registryCurrent =
+        registry && capturePluginLifecycleAuthority(registry, undefined, { scopedRuntime: true });
+      return {
+        ...runtime,
+        // Per-plugin replacement disposes one instance without retiring this
+        // retained registry; its stale hooks would fail every later tool call.
+        isCurrent: () =>
+          !registry ||
+          (registryCurrent?.() === true && isPluginRegistryRecordSetAdmitting(registry)),
+        invalidate: () => {
+          if (runtimeCache.get(request.jobId) === entry) {
+            runtimeCache.delete(request.jobId);
+          }
+        },
+      };
+    });
     const entry: TriggerRuntimeCacheEntry = {
       promise,
       configEpoch: request.runtimeConfig,
@@ -510,13 +523,14 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
           }
           const selected = runtime;
           const authority = admitted;
-          tools = withPluginRuntimeRegistryScope(selected.pluginRegistry, () =>
+          tools = await withPluginRuntimeRegistryScope(selected.pluginRegistry, () =>
             selected.createTools(
               authority,
               evaluationScope.signal,
               admission?.messageActionTurnCapability,
             ),
           );
+          assertActive();
           if (!runtime.isCurrent()) {
             throw new PluginInstanceUnavailableError();
           }

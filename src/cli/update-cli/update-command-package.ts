@@ -9,13 +9,16 @@ import type {
 } from "../../infra/package-update-swap-contract.js";
 import { PackageUpdateActivationError } from "../../infra/package-update-swap-contract.js";
 import {
+  deferPackageStateVerification,
   failedPackageVerificationStep,
   markPackagePostInstallDoctorAdvisory,
 } from "../../infra/package-update-verification-step.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
+import type { UpdateDatabaseBackup } from "../../infra/update-database-backup.js";
 import {
   formatUpdateDoctorConfigWriteRefusal,
   getUpdateDoctorConfigFailureReason,
+  type UpdateDoctorConfigChange,
 } from "../../infra/update-doctor-config.js";
 import {
   consumeUpdatePostInstallDoctorResult,
@@ -35,6 +38,9 @@ import {
   verifyPackageUpdateRecovery,
   type ResolvedGlobalInstallTarget,
 } from "../../infra/update-global.js";
+import type { UpdateRecoveryBaselineRef } from "../../infra/update-recovery-baseline-capture.js";
+import type { UpdateRequester } from "../../infra/update-requester-authority.js";
+import type { UpdateRecoveryFence } from "../../infra/update-run-recovery.js";
 import {
   normalizeFallbackFailureReason,
   reportUpdateStepCompletion,
@@ -66,12 +72,25 @@ import {
 } from "./update-command-config-snapshot.js";
 import { recordUpdateDatabaseWrites } from "./update-command-database-receipts.js";
 import { withUpdateDoctorChild } from "./update-command-doctor-child.js";
-import type { PackageDoctorContext } from "./update-command-doctor-context.js";
 import { readPackageUpdateIdentity } from "./update-command-package-identity.js";
 import { resolveUpdateTargetEnv } from "./update-command-service-env.js";
 
+type PackageDoctorContext = {
+  runId: string;
+  executorFence: UpdateRecoveryFence;
+  requester?: Readonly<UpdateRequester>;
+  inputHash: string;
+  changes: UpdateDoctorConfigChange[];
+  databaseBackup?: UpdateDatabaseBackup;
+  originalRecoveryCapture?: UpdateRecoveryBaselineRef;
+  assertCurrent: () => void;
+  assertBoundChildCurrent: () => void;
+  onStateHandoff?: () => void;
+};
+
 type PackageDoctorOptions = {
   root: string;
+  restart?: boolean;
   timeoutMs?: number;
   /** Null leaves forward work unbounded; omission retains the caller's timeout. */
   workTimeoutMs?: number | null;
@@ -86,8 +105,12 @@ type PackageDoctorOptions = {
 };
 
 export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
-  const assertCurrent = params.assertCurrent;
+  const assertRequesterCurrent = params.assertCurrent;
   const context = params.getDoctorContext?.();
+  const assertCurrent = () => {
+    assertRequesterCurrent?.();
+    context?.assertCurrent();
+  };
   context?.assertCurrent();
   const entryPath = await resolveGatewayInstallEntrypoint(params.root);
   if (!entryPath) {
@@ -126,26 +149,29 @@ export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
     index: 0,
     total: 0,
   };
+  let configSnapshot: UpdateConfigSnapshot | undefined;
+  try {
+    configSnapshot = params.onConfigSnapshot
+      ? await captureUpdateConfigSnapshot(resolveConfigPath(doctorEnv), doctorEnv)
+      : undefined;
+  } catch (error) {
+    assertCurrent();
+    return await deferPackageStateVerification(
+      { ...params, assertCurrent, migrationRecorded: Boolean(context?.databaseBackup?.migration) },
+      error,
+    );
+  }
   await params.progress?.onStepStart?.(doctorProgressInfo);
-  assertCurrent?.();
-  context?.assertCurrent();
-  const configSnapshot = params.onConfigSnapshot
-    ? await captureUpdateConfigSnapshot(resolveConfigPath(doctorEnv), doctorEnv)
-    : undefined;
+  assertCurrent();
   const completeDoctorStep = async (
     doctorStep: UpdateStepResult,
     doctorResult: UpdatePostInstallDoctorResult | null,
     failure?: { error: unknown },
   ) => {
     let completionFailure = failure;
-    let databaseReceipt: UpdateStepResult | undefined;
-    if (context?.databaseBackup) {
-      databaseReceipt = recordUpdateDatabaseWrites(
-        context.databaseBackup,
-        doctorResult?.databaseWrites,
-        doctorStep,
-      );
-    }
+    const databaseReceipt = context?.databaseBackup
+      ? recordUpdateDatabaseWrites(context.databaseBackup, doctorResult?.databaseWrites, doctorStep)
+      : undefined;
     try {
       const refusal = doctorResult?.configWriteRefusal;
       const configWriteRefusal = refusal
@@ -283,8 +309,7 @@ export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
         index: 0,
         total: 0,
       });
-      assertCurrent?.();
-      context?.assertCurrent();
+      assertCurrent();
     }
     await reportCompletion({
       ...doctorProgressInfo,
@@ -304,8 +329,7 @@ export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
       configChanges: doctorStep.configChanges,
       configWriteRefusal: doctorStep.configWriteRefusal,
     });
-    assertCurrent?.();
-    context?.assertCurrent();
+    assertCurrent();
     if (completionFailure) {
       throw completionFailure.error;
     }
@@ -384,8 +408,7 @@ export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
     params.results?.push(...(processSettlement ? [processSettlement] : []), ...completedSteps);
     if (processSettlement) {
       await params.progress?.onStepComplete?.({ ...processSettlement, index: 0, total: 0 });
-      assertCurrent?.();
-      context?.assertCurrent();
+      assertCurrent();
     }
   } catch (error) {
     if ("error" in outcome) {
@@ -598,7 +621,6 @@ export async function runPackageInstallUpdate(
   params: PackageInstallUpdateParams,
   resolveDoctorOptions: () => PackageDoctorOptions = () => params,
 ): Promise<UpdateRunResult> {
-  const installEnv = params.installEnv ?? (await createGlobalInstallEnv());
   let installTarget = params.installTarget;
   if (!installTarget) {
     const manager = await resolveGlobalManager({
@@ -614,6 +636,7 @@ export async function runPackageInstallUpdate(
       honorPackageRoot: params.honorPackageRoot === true,
     });
   }
+  const installEnv = params.installEnv ?? (await createGlobalInstallEnv(undefined, installTarget));
   const pkgRoot = installTarget.packageRoot;
   const packageName = (await readPackageName(pkgRoot || params.root)) ?? DEFAULT_PACKAGE_NAME;
   const installSpec =

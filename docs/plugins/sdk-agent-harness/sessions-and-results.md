@@ -116,6 +116,22 @@ and resource cleanup remain with the backend; core owns host session lifecycle.
 
 ## Tool and media results
 
+### Same-turn retry context
+
+The optional `params.continuation` carries host-owned recovery context when a
+transient failure retries the same task. Its `prompt` is the original current
+request; its `messages` contains settled attempt snapshots in order, including
+completed assistant/tool messages and tool results. Keep the request visible
+outside bounded history projections and retain completed tool evidence when
+rendering the snapshots. These facts describe completed work; they do not grant
+execution authority or ask the harness to execute those tools again.
+
+Codex consumes this carrier even when the admission-fenced transcript ends
+before the current request, using its existing bounded context projection.
+The continuation instruction stays model-only and is not persisted as another
+user turn. Harnesses that ignore the optional field retain their existing
+transcript-based recovery behavior.
+
 `inferToolMetaFromArgs` from `openclaw/plugin-sdk/agent-harness-runtime` returns
 compact, lossy display metadata. Array values deeper than 64 levels are omitted;
 shallower siblings still contribute to the preview. The helper can return
@@ -262,7 +278,10 @@ not a substitute for removing the native capability surface.
 
 A projection-backed harness must capture the active branch after the settled
 turn is mirrored and prove that the current prompt and every current tool
-call/result are present through that boundary. Put the frozen evidence on
+call/result are present through that boundary. A turn whose prompt was never
+persisted (an internal system turn with `suppressNextUserMessagePersistence`
+and no `userTurnTranscriptRecorder`) has no prompt row to prove; its evidence
+starts at the turn's first mirrored row. Put the frozen evidence on
 `settledAttempt.settledTurnFinalizationContext` as one of:
 
 - `source: "openclaw-transcript"` with `messages`: the complete application

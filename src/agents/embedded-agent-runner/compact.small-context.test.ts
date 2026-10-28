@@ -9,14 +9,13 @@ import {
   streamMocks,
   testModel,
 } from "../sessions/agent-session-loop-correctness.test-support.js";
-import { createResourceLoader } from "../sessions/agent-session-loop-resource-loader.test-support.js";
 import { createCompactionRequestBudget } from "../sessions/compaction/request-budget.js";
 import { SessionManager } from "../sessions/session-manager.js";
 import { SettingsManager } from "../sessions/settings-manager.js";
 import { useCompactHooksSessionFixture } from "./compact.hooks.fixture.test-support.js";
 import {
   attemptServerEndpointCompactionMock,
-  buildEmbeddedSystemPromptMock,
+  buildConfiguredAgentSystemPromptMock,
   limitHistoryTurnsMock,
   loadCompactHooksHarness,
   resolveContextWindowInfoMock,
@@ -51,9 +50,65 @@ beforeEach(async () => {
   compactEndpoint.mockReset();
 });
 
+it("summarizes with the model window instead of a smaller session token budget", async () => {
+  const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
+  const { createAgentSession } = await import("../sessions/sdk.js");
+  const { resolveEmbeddedAgentStream } = await import("./stream-resolution.js");
+  const model = { ...testModel, contextWindow: 32_768, maxTokens: 1_024 };
+  const manager = SessionManager.inMemory(prepared.workspaceDir);
+  for (let turn = 0; turn < 8; turn++) {
+    manager.appendMessage({
+      role: "user",
+      content: `Remember code word copper. Document ${turn}. ${"older context ".repeat(200)}`,
+      timestamp: turn * 2 + 1,
+    });
+    manager.appendMessage(createAssistant(model, [{ type: "text", text: "ACK" }]));
+  }
+  const settingsManager = SettingsManager.inMemory({
+    compaction: { enabled: false, keepRecentTokens: 300, reserveTokens: 1_024 },
+    retry: { enabled: false },
+  });
+  resolveContextWindowInfoMock.mockReturnValue({ tokens: model.contextWindow });
+  resolveModelMock.mockImplementation(() => ({ ...createCompactHooksResolvedModel(), model }));
+  limitHistoryTurnsMock.mockImplementation((messages) => messages);
+  vi.mocked(guardSessionManager).mockReturnValue(manager);
+  vi.mocked(createAgentSession).mockImplementation((options) =>
+    createTestSession({ model: options.model, sessionManager: manager, settingsManager }),
+  );
+  const summary = "The code word is copper. Eight source documents were acknowledged.";
+  const summaryStream = vi.fn((activeModel: Model) =>
+    createAssistantResultStream(createAssistant(activeModel, [{ type: "text", text: summary }])),
+  );
+  vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
+    streamFn: summaryStream,
+    strategy: "session-custom",
+  });
+
+  const result = await compact({
+    agentId: "main",
+    sessionId: prepared.sessionId,
+    sessionKey,
+    sessionFile: sessionKey,
+    sessionTarget: { agentId: "main", sessionId: prepared.sessionId, sessionKey, storePath },
+    workspaceDir: prepared.workspaceDir,
+    config: {},
+    provider: model.provider,
+    model: model.id,
+    trigger: "manual",
+    force: true,
+    tokenBudget: 512,
+  });
+
+  expect(result, result.reason).toMatchObject({ ok: true, compacted: true });
+  expect(manager.buildSessionContext().messages[0]).toMatchObject({
+    role: "compactionSummary",
+    summary: expect.stringContaining(summary),
+  });
+});
+
 it("reclaims retained source turns when the endpoint cannot fit a small foreground window", async () => {
   const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
-  const { createAgentSessionForEmbeddedRunner } = await import("../sessions/sdk.js");
+  const { createAgentSession } = await import("../sessions/sdk.js");
   const { resolveEmbeddedAgentStream } = await import("./stream-resolution.js");
   const { attachCompactionAccountingRecorder } =
     await import("./run/compaction-accounting-bridge.js");
@@ -87,16 +142,11 @@ it("reclaims retained source turns when the endpoint cannot fit a small foregrou
   });
   resolveContextWindowInfoMock.mockReturnValue({ tokens: contextTokens });
   resolveModelMock.mockImplementation(() => ({ ...createCompactHooksResolvedModel(), model }));
-  buildEmbeddedSystemPromptMock.mockReturnValue(systemPrompt);
+  buildConfiguredAgentSystemPromptMock.mockReturnValue(systemPrompt);
   limitHistoryTurnsMock.mockImplementation((messages) => messages);
   vi.mocked(guardSessionManager).mockReturnValue(manager);
-  vi.mocked(createAgentSessionForEmbeddedRunner).mockImplementation(() =>
-    createTestSession({
-      model,
-      resourceLoader: { ...createResourceLoader(), getSystemPrompt: () => systemPrompt },
-      sessionManager: manager,
-      settingsManager,
-    }),
+  vi.mocked(createAgentSession).mockImplementation(() =>
+    createTestSession({ model, systemPrompt, sessionManager: manager, settingsManager }),
   );
   attemptServerEndpointCompactionMock.mockImplementation(attemptServerEndpointCompaction);
   compactEndpoint.mockImplementation(async (_stream, endpointModel: Model, context, options) => {
@@ -210,7 +260,7 @@ it("reclaims retained source turns when the endpoint cannot fit a small foregrou
   });
   const { session } = await createTestSession({
     model,
-    resourceLoader: { ...createResourceLoader(), getSystemPrompt: () => systemPrompt },
+    systemPrompt,
     sessionManager: manager,
     settingsManager,
   });

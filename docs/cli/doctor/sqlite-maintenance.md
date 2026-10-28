@@ -6,7 +6,10 @@ read_when:
   - You are importing, validating, or recovering legacy session history
 ---
 
-Explicit SQLite maintenance runs offline, with the Gateway stopped. This page covers
+SQLite repairs and compaction run offline, with the Gateway stopped. The session
+`inspect` and `validate` modes are read-only and can run while the Gateway is up;
+they do not take the exclusive maintenance lock. Validation may add load, and
+separate reads can observe new commits while the Gateway runs. This page covers
 shared-state compaction and the targeted session SQLite modes.
 
 SQLite keeps pages freed by deletes available for reuse inside the database file.
@@ -96,6 +99,8 @@ compatible backup or upgrade OpenClaw for a newer schema.
 Canonical session-key repair follows complete transcript-owner alias chains, including
 long chains in large databases. It preserves the terminal owner's session key and
 retained transcript history; shortening history is not required to bound the repair's stack.
+Archived registry discovery and recovery diagnostics also process complete
+inventories without expanding them into function arguments.
 
 Runtime session rows and transcripts live in SQLite, by default at
 `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite`. Gateway startup uses
@@ -170,6 +175,13 @@ conflicting source that cannot be verified stays in place. A conflicting identit
 or missing middle event is named in the finding. Compare those events with a
 verified backup, preserve the original, and restore a corrected JSONL at the named
 path before rerunning recovery. A healthy agent does not inherit another agent's failure.
+
+Transcript verification recognizes Doctor's legacy inbound-context heading
+normalization when comparing retained JSONL with SQLite. Heading-only rewrites
+do not report missing content or block migration completion. Different message
+bodies, event identities, and parent links still fail verification; the original
+JSONL bytes remain unchanged.
+
 When the legacy index and live transcript inputs are gone, verified historical
 archives keep their existing receipts. They do not require a new legacy-index
 receipt or block post-session plugin repair. The plugin's completion releases
@@ -268,12 +280,30 @@ are named in the warning; retained historical conflicts do not block update's
 post-session plugin repair. Preserve the originals and migration manifests while
 resolving those conflicts, then rerun `openclaw doctor --fix`.
 
+If you deleted a retained historical archive, Doctor keeps a warning and completes
+verified plugin session repair. History available only in that missing file cannot
+be recovered; Doctor does not recreate it or resurrect deleted sessions. Remaining
+originals and their recovery references stay protected.
+
+Duplicate settlement indexes retained artifact paths and manifest moves once per
+inventory instead of rescanning the full history for each duplicate. File-identity
+and source-byte checks still run before originals are retired.
+
 Normal Doctor output and `openclaw update status` show at most five
 `historical_transcript_deferred` examples per session store. Larger groups include
 the total and omitted counts; other warning types remain visible. For every
 finding, run `openclaw doctor --session-sqlite dry-run --session-sqlite-all-agents --json`.
 This summary does not retire recovery references or make missing archives eligible
 for cleanup. Preserve the remaining originals and migration manifests for recovery.
+
+`openclaw update status` rechecks recorded transcript findings against the current
+files and the read-only session store. It omits resolved findings, including JSONL
+originals that no longer exist and missing transcripts now present in SQLite or
+whose canonical session row was pruned. Unreadable stores, uncertain legacy keys,
+and unresolved originals keep their warnings. Replayed JSONL findings recommend
+inspection before choosing recovery; they do not ask you to stop the Gateway
+based only on a historical report. Migration manifests remain unchanged as proof
+for recovery and `openclaw update cleanup`.
 
 ### Changed archived registry
 
@@ -475,10 +505,19 @@ restore fail closed so restore cannot silently replace or hide recoverable data.
 Reimporting an unchanged, manifest-recorded restored index preserves current SQLite
 session metadata while reconciling its transcript history. It does not reset newer
 labels, activity timestamps, or the current session pointer to the restored values.
-A changed restore receipt refuses import without replacing that state. Unreadable
-recovery history permits an import only when the destination has no session rows;
-Doctor verifies that condition and imports the target in one transaction. This can
-use a larger transaction than normal batched imports. A newly created index with a
+A changed restore receipt leaves that target's originals in place with a warning,
+without stopping unrelated Doctor or post-session plugin repairs. Unreadable
+recovery history no longer requires an empty SQLite destination: Doctor reconciles
+each session, preserves its current metadata and generation, verifies existing
+transcript content, and imports new history through the normal staged importer.
+Verified originals move to the recovery archive with recorded receipts. Conflicting
+or malformed history with a verified SQLite owner moves to that archive as protected
+input, with a target warning; it is not certified as imported or eligible for cleanup.
+Unverified ownership or recovery evidence leaves originals in place. Preserve the
+originals and receipts, compare the named events with a verified backup, and use
+`--session-sqlite restore` before correcting an archived source and retrying Doctor.
+These rules also apply during
+updates and keep the existing archive/restore path for rollback. A newly created index with a
 different file identity remains an ordinary import when recovery history is readable.
 Keep recovery manifests with their original files so Doctor can distinguish the two.
 Shared indexes retain a receipt for each agent's SQLite target; another owner's

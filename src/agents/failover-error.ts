@@ -6,6 +6,8 @@ import {
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { containsAsciiControlCharacter } from "@openclaw/normalization-core/string-normalization";
 import { formatCliCommand } from "../cli/command-format.js";
+import { isSqliteTranscriptMutationConflict } from "../config/sessions/session-mutation-conflict-error.js";
+import { isSessionWorkStartInvalidatedError } from "../config/sessions/work-start-error.js";
 import { isAgentRunStaleLifecycleError } from "../infra/agent-lifecycle-error.js";
 import { copyErrorDiagnostic } from "../infra/error-diagnostics.js";
 import { collectErrorGraphCandidates, formatErrorMessage, readErrorName } from "../infra/errors.js";
@@ -60,6 +62,8 @@ const RUNTIME_COORDINATION_ERROR_NAMES = new Set([
   "WorkerRunnerCapacityError",
   "WorkerWorkspaceReconciliationError",
   "ActiveTurnClaimError",
+  "CliHistoryOwnerChangedError",
+  "SessionTranscriptReadFenceError",
   "SqliteWorkerError",
 ]);
 
@@ -322,6 +326,7 @@ function hasStaleAgentRunLifecycleFailure(err: unknown): boolean {
 function hasRuntimeCoordinationFailure(err: unknown): boolean {
   return collectErrorGraphCandidates(err, resolveNestedErrors).some(
     (candidate) =>
+      isSessionWorkStartInvalidatedError(candidate) ||
       RUNTIME_COORDINATION_ERROR_NAMES.has(readErrorName(candidate)) ||
       resolveExecutionApprovalFailureMessage(readDirectErrorMessage(candidate)) !== undefined,
   );
@@ -680,7 +685,10 @@ export function resolveModelFallbackError(
   err: unknown,
   context?: FailoverErrorContext,
 ): ModelFallbackErrorResolution {
-  if (err instanceof AgentHarnessSessionSupersededError) {
+  if (
+    err instanceof AgentHarnessSessionSupersededError ||
+    isSqliteTranscriptMutationConflict(err)
+  ) {
     return { kind: "coordination", error: err };
   }
   // Prepared-owner publication is an OpenClaw runtime fact, not a provider

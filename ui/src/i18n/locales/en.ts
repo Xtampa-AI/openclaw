@@ -4,6 +4,15 @@ import type { TranslationMap } from "../lib/types.ts";
 import * as agentEn from "./en-agents.ts";
 
 export const en: TranslationMap & {
+  logbook: TranslationMap;
+  gatewayLogs: TranslationMap;
+  standingGrants: TranslationMap;
+  approvalHistory: TranslationMap;
+  secretsStore: TranslationMap &
+    Record<
+      "allowedHosts" | "allowedHostsPlaceholder" | "protectedSecret" | "agentReadable" | "hint",
+      string
+    >;
   mcpApp: TranslationMap;
   linkReader: TranslationMap;
   agentTools: TranslationMap;
@@ -30,6 +39,7 @@ export const en: TranslationMap & {
         string
       >;
     pullRequests: TranslationMap;
+    processesPanel: TranslationMap;
   };
   configForm: TranslationMap & { sections: TranslationMap };
   configPage: TranslationMap;
@@ -91,6 +101,7 @@ export const en: TranslationMap & {
   sessionsView: TranslationMap;
   skillWorkshop: TranslationMap;
   systems: TranslationMap;
+  talkPage: TranslationMap;
   usage: TranslationMap & { overview: TranslationMap };
 } = {
   pluginUi: {
@@ -143,7 +154,7 @@ export const en: TranslationMap & {
     restore: "Restore",
     unarchive: "Unarchive",
     undo: "Undo",
-    probe: "Probe",
+    probe: "Check connection",
     call: "Call",
     confirm: "Confirm",
     dontAskAgain: "Don't ask me again",
@@ -189,15 +200,15 @@ export const en: TranslationMap & {
     dark: "Dark",
     baseUrl: "Base URL",
     lastStart: "Last start",
-    lastProbe: "Last probe",
+    lastProbe: "Last connection check",
     lastConnect: "Last connect",
     lastMessage: "Last message",
     authAge: "Auth age",
     credential: "Credential",
     audience: "Audience",
     publicKey: "Public Key",
-    probeOk: "Probe ok",
-    probeFailed: "Probe failed",
+    probeOk: "Connection check passed",
+    probeFailed: "Connection check failed",
     reloadConfig: "Reload Config",
     multiSelect: {
       addCustom: "Add “{value}”",
@@ -960,6 +971,7 @@ export const en: TranslationMap & {
     renameSession: "Rename session",
     renameSessionPrompt: "Rename session",
     renameSessionMenu: "Rename…",
+    sessionNameInUse: "A session with this name already exists.",
     setIconMenu: "Set icon",
     setColorMenu: "Color",
     setIconColorMenu: "Icon & color",
@@ -1224,6 +1236,7 @@ export const en: TranslationMap & {
       empty: "No skills found.",
       missing: "Missing: {items}",
       reason: "Reason: {items}",
+      learnedAlwaysOn: "Learned skill — archive in Workshop to hide",
       updateError: "Could not update the agent skill allowlist.",
     },
     channels: {
@@ -1395,6 +1408,8 @@ export const en: TranslationMap & {
       lobsterdexCardShinySeen: "✦ Shiny spotted {date}",
       lobsterdexCardCopyLink: "Copy link",
       lobsterdexOpen: "Open Lobsterdex",
+      lobsterdexThemeHidden:
+        "This theme hides Lobsterdex. Your collection and preferences are preserved.",
     },
     security: {
       intro: "Review gateway access, tool policy, device authentication, and approvals.",
@@ -1590,6 +1605,7 @@ export const en: TranslationMap & {
   agentTools: {},
   skillGroups: {
     workspace: "Workspace Skills",
+    learned: "Learned Skills",
     builtIn: "Built-in Skills",
     installed: "Installed Skills",
     extra: "Extra Skills",
@@ -1620,6 +1636,7 @@ export const en: TranslationMap & {
     forward: "Forward",
     settings: "Settings",
     askOpenClaw: "Ask OpenClaw",
+    askBrand: "Ask {brand}",
     settingsGroupDevice: "This Mac",
     settingsGroupThisComputer: "This computer",
     settingsGroupThisIPhone: "This iPhone",
@@ -1647,6 +1664,7 @@ export const en: TranslationMap & {
   },
   terminal: {
     title: "Terminal",
+    copiedToClipboard: "Copied to clipboard",
     toggle: "Toggle terminal",
     open: "Open terminal",
     openWindow: "Open terminal in new window",
@@ -1815,8 +1833,7 @@ export const en: TranslationMap & {
     cron: "Scheduled tasks and recurring agent runs.",
     skills: "Manage your agent skills",
     plugins: "Extend your Claw with tools",
-    skillWorkshop:
-      "The skills your agent uses now, suggestions waiting for review, and past decisions.",
+    skillWorkshop: "Skills your agent learned, recent changes, and undo.",
     devices: "Paired devices, pairing approvals, and exec bindings.",
     cloudWorkers: "Profiles and machine sizes for cloud sessions.",
     chat: "Gateway chat for quick interventions.",
@@ -1968,8 +1985,6 @@ export const en: TranslationMap & {
       prepareDialogLabel: "Local model setup",
       title: "Sign in with a provider",
       connected: "Account connected. Choose a model when you want to test a reply.",
-      failed: "Could not finish. Open Details to see what to do next.",
-      details: "Details",
       prepareTitle: "Set up a local model",
       starting: "Starting provider sign-in…",
       prepareStarting: "Starting local model setup…",
@@ -2103,47 +2118,7 @@ export const en: TranslationMap & {
   },
   mcpServers: {},
   mcpPage: {},
-  talkPage: {
-    intro: "Configure realtime voice providers, models, and speaker voices.",
-    voiceSection: {
-      title: "Realtime voice",
-      description:
-        "Continuous speech conversations with your agent. The pickers below write talk.realtime settings; the full form further down covers everything else.",
-    },
-    status: {
-      title: "Status",
-      ready: "Ready",
-      notReady: "Not configured",
-      unavailable: "Unavailable",
-      unavailableHint: "Connect to the Gateway to check realtime voice readiness.",
-      activeProvider: "Active provider: {provider}",
-      noProvider: "No realtime voice provider is configured yet.",
-    },
-    provider: {
-      title: "Provider",
-      description: "Auto picks the first provider with working credentials.",
-      auto: "Auto",
-    },
-    model: {
-      title: "Model",
-      description: "Realtime voice model for browser Talk sessions.",
-      default: "Provider default",
-      defaultNamed: "Default ({model})",
-    },
-    voice: {
-      title: "Speaker voice",
-      description: "Voice used for spoken replies. GPT-Live locks the voice once a call starts.",
-      default: "Provider default",
-      unsupported: "unsupported",
-      unsupportedDefault:
-        "This saved voice is unavailable for the selected route. Provider default will be used.",
-    },
-    gptLive: {
-      title: "GPT-Live",
-      hint: "Released browser/Gateway-owned WebRTC tries OAuth first and falls back to a Platform API key. Direct backend sockets and unlisted or private routes require Platform API-key access. Delegated work can be steered while running and requires exact spoken confirmation for high-impact actions.",
-      ready: "Ready",
-    },
-  },
+  talkPage: {},
   memoryPage: {},
   sessionsPage: {
     hubTablistLabel: "Session sections",
@@ -2261,7 +2236,7 @@ export const en: TranslationMap & {
       sessionUpdated: "Session updated",
       ago: "ago",
       viewActivity: "View activity",
-      web: "Web",
+      web: "Web app",
       cli: "Command line",
       terminal: "Terminal",
       app: "App",
@@ -2304,7 +2279,10 @@ export const en: TranslationMap & {
     online: "Online",
     idle: "Idle",
     offline: "Offline",
-    unknownDevice: "Unknown device",
+    unknownConnection: "Unknown client",
+    connectionDetails: "Connection details · {count}",
+    connectionOne: "1 connection",
+    connectionMany: "{count} connections",
     lastInput: "Last input {time} ago",
     viewingNow: "Viewing now",
     notViewing: "Not viewing a session right now.",
@@ -2324,6 +2302,12 @@ export const en: TranslationMap & {
     confirm: "Confirm original publication",
     check: "Check publication",
     refresh: "Refresh publication",
+    statusFailed: "Publication failed",
+    statusConfirm: "Confirmation needed",
+    statusRequested: "Publication queued",
+    statusPublishing: "Publication in progress",
+    statusUnavailable: "Publication status unavailable",
+    statusUnknown: "Outcome unknown",
     unknown:
       "The outcome is unknown. Retry keeps the original account and request; it does not switch accounts.",
     target: "Pull request: {repository} \u2192 {base}",
@@ -2416,77 +2400,13 @@ export const en: TranslationMap & {
       done: "Done",
     },
   },
-  gatewayLogs: {
-    title: "Logs",
-    subtitle: "Gateway file logs (JSONL).",
-    exportButton: "Export {label}",
-    exportLabels: {
-      filtered: "filtered",
-      visible: "visible",
-    },
-    filter: "Filter",
-    searchPlaceholder: "Search logs",
-    autoFollow: "Auto-follow",
-    file: "File: {file}",
-    truncated: "Log output truncated; showing latest chunk.",
-    empty: "No log entries.",
-  },
+  gatewayLogs: {},
   pluginTabs: {
     unavailableTitle: "Plugin panel unavailable",
     unavailableSubtitle:
       "The plugin that owns this tab is not active on the connected gateway, or it did not provide a panel.",
   },
-  logbook: {
-    nav: {
-      previousDay: "Previous day",
-      nextDay: "Next day",
-      today: "Today",
-    },
-    status: {
-      capturing: "Capturing every {seconds}s",
-      paused: "Capture paused",
-      disabled: "Capture off",
-      nodeHelp: "Device providing screen snapshots.",
-      pending: "{count} frames queued",
-      pendingHelp: "Snapshots waiting for the next analysis batch.",
-      analyzing: "Analyzing…",
-      captureError: "Capture error",
-      batchError: "Analysis error",
-      modelMissing: "No vision model",
-      modelMissingHelp:
-        "Set plugins.entries.logbook.config.visionModel or configure tools.media models.",
-    },
-    actions: {
-      pause: "Pause",
-      resume: "Resume",
-      analyzeNow: "Analyze now",
-    },
-    empty: {
-      title: "Nothing on the timeline yet.",
-      subtitle:
-        "Logbook is collecting snapshots; cards appear after the first analysis batch completes.",
-    },
-    card: {
-      keyframeAlt: "Screen snapshot from this activity",
-      distractions: "Distractions",
-    },
-    stats: {
-      title: "Day at a glance",
-      focus: "{pct}% focus",
-      tracked: "{duration} tracked",
-    },
-    standup: {
-      title: "Daily standup",
-      generate: "Generate",
-      refresh: "Regenerate",
-      empty: "Turn today's timeline into a ready-to-paste standup update.",
-    },
-    ask: {
-      title: "Ask your day",
-      placeholder: "When did I review the gateway PR?",
-      submit: "Ask",
-    },
-  },
+  logbook: {},
   board: {
     label: "Session dashboard",
     tabsLabel: "Dashboard tabs",
@@ -2623,72 +2543,8 @@ export const en: TranslationMap & {
   attention: {
     issues: "Inbox",
   },
-  standingGrants: {
-    title: "Standing grants",
-    description:
-      "Allow-always on an automation approval mints a standing grant for that exact command. Revoking one makes the next occurrence ask again.",
-    historyTitle: "Approval history",
-    empty: "No standing grants. Answer an automation approval with Always allow to mint one.",
-    stateUntilRevoked: "Until revoked",
-    stateExpiresIn: "Expires in {count}d",
-    stateExpired: "Expired",
-    stateRevoked: "Revoked",
-    revoke: "Revoke",
-    revoking: "Revoking…",
-    columns: {
-      automation: "Automation",
-      command: "Command",
-      uses: "Uses",
-      state: "State",
-    },
-  },
-  approvalHistory: {
-    description:
-      "Terminal exec, plugin, and system-agent approvals recorded by this gateway, newest first.",
-    loading: "Loading approval history…",
-    loadingMore: "Loading…",
-    loadMore: "Load more",
-    empty: "No resolved approvals in the rolling 30-day window.",
-    retention: "Approval history is a rolling 30-day window.",
-    offline: "Connect to the gateway to load approval history.",
-    invalidResponse: "The gateway returned an invalid approval history response.",
-    unknown: "Unknown",
-    notApplicable: "N/A",
-    columns: {
-      resolved: "Resolved",
-      kind: "Kind",
-      request: "Request",
-      decision: "Decision",
-      reason: "Resolution reason",
-      source: "Source agent / session",
-      resolver: "Resolver",
-    },
-    kinds: {
-      exec: "Exec",
-      plugin: "Plugin",
-      systemAgent: "System agent",
-    },
-    statuses: {
-      allowed: "Allowed",
-      denied: "Denied",
-      expired: "Expired",
-      cancelled: "Cancelled",
-    },
-    decisions: {
-      allowOnce: "Allow once",
-      allowAlways: "Always allow",
-      deny: "Deny",
-    },
-    reasons: {
-      user: "User decision",
-      timeout: "Timed out",
-      malformedVerdict: "Malformed verdict",
-      noRoute: "No route",
-      runAborted: "Run aborted",
-      gatewayRestart: "Gateway restart",
-      storageCorrupt: "Storage corrupt",
-    },
-  },
+  standingGrants: {},
+  approvalHistory: {},
   commandPalette: {},
   palette: {
     placeholder: "Search or start a task…",
@@ -2894,8 +2750,12 @@ export const en: TranslationMap & {
     },
     waitingForApproval: "Waiting for approval…",
     waitingOnSubagents: "Waiting on subagents",
-    yieldWaiting: "Handed off and waiting",
-    yieldResumed: "Resumed",
+    waitingOnSubagentsCount: "Waiting on {count} subagents",
+    waitingOnSubagent: "Waiting on {name}",
+    waitingOnSession: "Waiting on 1 session",
+    waitingOnSessionsCount: "Waiting on {count} sessions",
+    subagentsRunning: "{count} subagents running",
+    subagentsRunningOne: "1 subagent running",
     startupStatus: {
       retrying: "Retrying… {attempt}/{maxAttempts}",
       preparingWorkspace: "Preparing workspace…",
@@ -2910,8 +2770,24 @@ export const en: TranslationMap & {
     },
     archivedSessionDisabled: "This session is archived. Unarchive it to continue the conversation.",
     subagentViewOnly: "View-only subagent",
-    subagentSessionDisabled:
-      "This is a subagent of {parent}. Continue the conversation in its parent session.",
+    subagentSessionDisabled: "Continue in {parent}.",
+    processesPanel: { title: "Processes", refresh: "Refresh processes" },
+    subagentsPanel: {
+      title: "Subagents",
+      back: "Back to Subagents",
+      running: "Running ({count})",
+      finished: "Finished ({count})",
+      callsOne: "{count} call",
+      callsMany: "{count} calls",
+      empty: "No subagents in this conversation.",
+      noRunning: "No running subagents",
+      refresh: "Refresh subagents",
+      loadMore: "Show more subagents",
+      stop: "Stop {name}",
+      stopping: "Stopping…",
+      elapsed: "Elapsed time",
+      duration: "Run duration",
+    },
     parentSession: "the parent session",
     openParentSession: "Open parent session",
     parentSessionUnavailable: "Parent session information is unavailable.",
@@ -3202,6 +3078,7 @@ export const en: TranslationMap & {
       cloudPublicationGuidance:
         "Start a live agent turn and ask it to publish this cloud workspace after reconciliation.",
       dismiss: "Dismiss pull request #{number}",
+      dismissBranch: "Hide {branch} for this session",
       open: "Open",
       draft: "Draft",
       merged: "Merged",
@@ -3375,8 +3252,6 @@ export const en: TranslationMap & {
       },
       restartRecovery: {
         label: "System · restart recovery",
-        summary:
-          "Turn interrupted by a gateway restart — asked the agent to resume and finish the response.",
         interrupted:
           "The Gateway restarted. Automatic recovery was interrupted before the agent could resume. Send a message to continue.",
         cancelled:
@@ -3466,8 +3341,6 @@ export const en: TranslationMap & {
       activeFilterCount: "Active filters: {count}",
       sortSessions: "Filter & sort",
       sessionSources: "Session sources",
-      showOnlyPerson: "Show only {name}",
-      showEveryone: "Show everyone",
       showAllSessions: "Show all sessions",
       noActiveSessionsForFilter: "No active sessions match this filter",
       sortUpdated: "Last updated",
@@ -3590,6 +3463,7 @@ export const en: TranslationMap & {
       disconnected: "Not connected. Try again after reconnecting.",
     },
     imageLightbox: {
+      actions: "Image actions",
       previous: "Previous image",
       next: "Next image",
       position: "{current} / {total}",
@@ -3732,6 +3606,10 @@ export const en: TranslationMap & {
       filesEmpty: "Browse files, artifacts, and changes from this session.",
       companion: "Side chat",
       companionEmpty: "Ask a focused question about this session.",
+      processes: "Processes",
+      processesEmpty: "Inspect background commands and their output for this conversation.",
+      subagents: "Subagents",
+      subagentsEmpty: "Follow delegated work from this conversation.",
       desktop: "Desktop",
       desktopEmpty: "Connect to an available remote desktop.",
       portal: "Portal",
@@ -4033,6 +3911,8 @@ export const en: TranslationMap & {
         fetchesMany: "{count} fetches",
         otherOne: "1 other operation",
         otherMany: "{count} other operations",
+        subagentsOne: "1 subagent",
+        subagentsMany: "{count} subagents",
         failed: "{count} failed",
         blocked: "{count} blocked",
         unknown: "{count} unknown",
@@ -4062,6 +3942,9 @@ export const en: TranslationMap & {
       skipped: "Skipped",
       skippedCount: "{count} skipped",
       running: "Running",
+      subagentRunning: "running",
+      subagentStopped: "stopped",
+      openSubagent: "Open subagent session",
       completed: "Completed",
       blocked: "Blocked",
       outcomeUnknown: "Outcome unknown",
@@ -4228,47 +4111,13 @@ export const en: TranslationMap & {
     fa: "فارسی (Persian)",
     ru: "Русский (Russian)",
   },
+  // Navigation and in-chat secret requests render before the Secrets page loads.
   secretsStore: {
-    name: "Name",
-    access: "Access",
-    accessMode: "Access mode",
-    value: "Value",
     allowedHosts: "Allowed hosts",
     allowedHostsPlaceholder: "api.example.com",
-    allowedHostsHint:
-      "Exact hostnames only, one per line or comma-separated. No wildcards or ports.",
-    noAllowedHosts: "None",
-    updated: "Last updated",
-    by: "{time} by {name}",
-    actions: "Actions",
-    add: "Add",
-    edit: "Edit",
-    bulk: "Bulk Add",
     protectedSecret: "Protected secret",
-    protectedSecretHint:
-      "Hidden after save and inert unless referenced by a SecretRef or used through enabled destination-bound Gateway egress. It is never directly readable.",
     agentReadable: "Agent-readable environment",
-    agentReadableHint:
-      "High risk: visible to admins and plaintext to Gateway-hosted agent commands. The agent can print, transmit, or persist it. Applies from the next run.",
     hint: "Choose protected, write-only secrets or intentionally agent-readable Gateway environment values.",
-    required: "Enter a value.",
-    detect: "Protect credential-like names automatically",
-    detected: "{count} protected secrets detected",
-    detectedOne: "{count} protected secret detected",
-    unavail: "Gateway/admin required.",
-    badName: "Use SERVICE_API_KEY.",
-    tooLarge: "Max 64 KiB.",
-    savedProtected:
-      "Saved {name} as Protected secret. Add a SecretRef or enable destination-bound Gateway egress to use it.",
-    savedReadable:
-      "Saved {name} as Agent-readable environment. It is available to Gateway-hosted agent commands from the next run.",
-    savedMany:
-      "Saved {count} entries ({protected} protected, {readable} agent-readable). Protected secrets need a SecretRef or enabled destination-bound Gateway egress; agent-readable environment values reach Gateway-hosted agent commands from the next run.",
-    warnings: "{count} runtime warnings.",
-    partial: "{saved}/{total}: {error}",
-    confirmDelete: "Delete {name}?",
-    deleted: "Deleted {name}.",
-    deleteFailed: "The secret was not deleted. Reload the list and try again.",
   },
   cron: {
     adminRequired: "Browsing only. Automation changes require operator.admin access.",

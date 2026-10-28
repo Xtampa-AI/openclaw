@@ -87,30 +87,27 @@ function expectPersistedToolResultDetailsCapped(sm: SessionManager) {
 }
 
 describe("session persistence hooks", () => {
-  it.each(["tool_result_persist", "before_message_write"] as const)(
-    "caps text and details expanded by %s",
-    (hook) => {
-      installHook(hook, ({ message }) =>
-        message.role === "toolResult"
-          ? {
-              message: {
-                ...message,
-                content: [{ type: "text", text: "y".repeat(5000) }],
-                details: { status: "completed", aggregated: "x".repeat(150000) },
-              },
-            }
-          : undefined,
-      );
-      const sm = guardSessionManager(SessionManager.inMemory(), {
-        agentId: "main",
-        sessionKey: "main",
-        contextWindowTokens: 100,
-      });
-      appendToolResultDetails(sm, { big: "x".repeat(10_000) }, "ok", "read");
-      expectPersistedToolResultTextCapped(sm);
-      expectPersistedToolResultDetailsCapped(sm);
-    },
-  );
+  it("caps text and details expanded by before_message_write", () => {
+    installHook("before_message_write", ({ message }) =>
+      message.role === "toolResult"
+        ? {
+            message: {
+              ...message,
+              content: [{ type: "text", text: "y".repeat(5000) }],
+              details: { status: "completed", aggregated: "x".repeat(150000) },
+            },
+          }
+        : undefined,
+    );
+    const sm = guardSessionManager(SessionManager.inMemory(), {
+      agentId: "main",
+      sessionKey: "main",
+      contextWindowTokens: 100,
+    });
+    appendToolResultDetails(sm, { big: "x".repeat(10_000) }, "ok", "read");
+    expectPersistedToolResultTextCapped(sm);
+    expectPersistedToolResultDetailsCapped(sm);
+  });
 
   it("redacts small recursive details, including keys and depth-limited branches", () => {
     const tokenValue = "abcdefghijklmnopqrstuvwx1234567890";
@@ -360,6 +357,19 @@ describe("session persistence hooks", () => {
     appendToolResultDetails(sm, { big: "x".repeat(10_000) }, "ok", "read");
     expectPersistedToolResultDetailsCapped(sm);
   });
+
+  it("keeps the original tool result when a hook returns a non-message replacement", () => {
+    // A malformed plugin replacement must not fail the append or drop the admitted result.
+    installHook("tool_result_persist", () => ({
+      message: "not-a-message" as unknown as AgentMessage,
+    }));
+    const sm = createGuardedSession();
+    appendToolResultDetails(sm, { status: "ok" }, "ok", "read");
+    const toolResult = requirePersistedToolResult(sm);
+    expect(toolResult.role).toBe("toolResult");
+    expect(toolResultText(toolResult)).toBe("ok");
+  });
+
   it("refreshes skipped write hooks when reusing a session manager", () => {
     installHook("before_message_write", ({ message }) =>
       message.role === "user" ? { message: { ...message, content: "hooked" } } : undefined,
@@ -376,6 +386,21 @@ describe("session persistence hooks", () => {
           entry.type === "message" && entry.message.role === "user" ? [entry.message.content] : [],
         ),
     ).toEqual(["original", "hooked", "original"]);
+  });
+
+  it("keeps the original message when a hook returns a non-message replacement", () => {
+    // A malformed plugin replacement must not fail the append or drop the admitted message.
+    installHook("before_message_write", () => ({
+      message: "not-a-message" as unknown as AgentMessage,
+    }));
+    const sm = createGuardedSession();
+    sm.appendMessage(makeUserMessage("hello", 1));
+    const messages = sm
+      .getEntries()
+      .flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(messages.find((item) => item.role === "user")?.content).toBe("hello");
   });
 });
 

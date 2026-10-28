@@ -190,27 +190,26 @@ describe("modelsAliasesRemoveCommand", () => {
 
   it("recognizes a built-in alias regardless of requested letter casing", async () => {
     const cfg: OpenClawConfig = {
-      agents: { defaults: { models: { "google/gemini-3.1-pro-preview": {} } } },
+      agents: { defaults: { models: { "google/gemini-4-argon": {} } } },
     } as OpenClawConfig;
     mocks.readConfigFileSnapshot.mockResolvedValue(snapshot(cfg));
 
     await expect(modelsAliasesRemoveCommand("GEMINI", makeRuntime())).rejects.toThrow(
-      /built-in alias for "google\/gemini-3\.1-pro-preview"/,
+      /built-in alias for "google\/gemini-4-argon"/,
     );
     expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
   });
 
   it("rejects removal of a built-in alias whose target only matches after key normalization", async () => {
-    // Source config holds a retired Google preview key. applyModelDefaults normalizes
-    // `google/gemini-3-pro-preview` to `google/gemini-3.1-pro-preview` before materializing
-    // the `gemini` built-in alias (see src/config/model-alias-defaults.test.ts:135-144), so
-    // `list` shows `gemini`. `remove gemini` must compare against the normalized key and
-    // return the actionable built-in error, not the misleading generic "Alias not found".
+    // Source config holds the Gemini 4 shorthand key. applyModelDefaults normalizes
+    // `google/gemini-4` to `google/gemini-4-argon` before materializing the `gemini`
+    // built-in alias, so `list` shows `gemini`. `remove gemini` must compare against the
+    // normalized key and return the actionable built-in error, not "Alias not found".
     const cfg: OpenClawConfig = {
       agents: {
         defaults: {
           models: {
-            "google/gemini-3-pro-preview": {},
+            "google/gemini-4": {},
           },
         },
       },
@@ -218,7 +217,7 @@ describe("modelsAliasesRemoveCommand", () => {
     mocks.readConfigFileSnapshot.mockResolvedValue(snapshot(cfg));
 
     await expect(modelsAliasesRemoveCommand("gemini", makeRuntime())).rejects.toThrow(
-      /built-in alias for "google\/gemini-3\.1-pro-preview"/,
+      /built-in alias for "google\/gemini-4-argon"/,
     );
     expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
   });
@@ -232,7 +231,7 @@ describe("modelsAliasesRemoveCommand", () => {
       agents: {
         defaults: {
           models: {
-            "google/gemini-3.1-pro-preview": { alias: "" },
+            "google/gemini-4-argon": { alias: "" },
           },
         },
       },

@@ -230,8 +230,6 @@ describe("production lint suppressions", () => {
         "src/config/sessions/session-transcript-reconcile.sql-observer.test-support.ts|typescript/unbound-method|1",
         // Canonical entries must honor toJSON and omit non-JSON values exactly as persistence does.
         "src/config/sessions/transcript-json.ts|unicorn/prefer-structured-clone|1",
-        // Intl.Collator.compare is a getter returning a bound function.
-        "src/cron/service/list-page-sort.ts|typescript/unbound-method|1",
         "src/gateway/test-helpers.server.ts|typescript/no-unnecessary-type-parameters|1",
         "src/hooks/module-loader.ts|typescript/no-unnecessary-type-parameters|1",
         "src/infra/device-pairing-store.ts|typescript/no-unnecessary-type-parameters|1",
@@ -240,6 +238,8 @@ describe("production lint suppressions", () => {
         "src/infra/net/undici-dispatcher-options.ts|typescript/unbound-method|1",
         "src/infra/outbound/sanitize-text.ts|eslint/no-control-regex|1",
         "src/infra/outbound/send-deps.ts|typescript/no-unnecessary-type-parameters|1",
+        // Iterator wrappers capture native next/return and invoke them with the caller's receiver.
+        "src/infra/sqlite-native-observer.ts|typescript/unbound-method|2",
         "src/logging/redact.ts|unicorn/no-new-array|1",
         "src/node-host/invoke-payload.ts|typescript/no-unnecessary-type-parameters|1",
         "src/node-host/mcp.ts|unicorn/prefer-add-event-listener|1",
@@ -259,17 +259,17 @@ describe("production lint suppressions", () => {
         "src/plugins/plugin-return-value.ts|typescript/prefer-promise-reject-errors|1",
         "src/plugins/plugin-return-value.ts|typescript/unbound-method|1",
         "src/plugins/plugin-return-value.ts|unicorn/no-thenable|1",
-        "src/plugins/provider-auth-persistence.ts|preserve-caught-error|2",
         "src/plugins/public-surface-loader.ts|typescript/no-unnecessary-type-parameters|3",
-        // Admission records original factory identities; executable views bind their receivers.
-        "src/plugins/registry-registrars-memory.ts|typescript/unbound-method|1",
         "src/plugins/registry-registrars-providers.ts|typescript/unbound-method|1",
+        // Admission records original factory identities; executable views bind their receivers.
+        "src/plugins/registry-registrars.ts|typescript/unbound-method|1",
         "src/plugins/runtime/runtime-plugin-boundary.ts|typescript/no-unnecessary-type-parameters|1",
         "src/plugins/trusted-tool-policy.ts|typescript/no-unnecessary-type-parameters|1",
         "src/secrets/egress-proxy/proxy-server.ts|no-warning-comments|1",
         "src/secrets/private-plan-file.ts|preserve-caught-error|1",
+        // Synchronous acquisition failures reject with the acquiring owner's original value.
+        "src/shared/store-writer-acquisitions.ts|typescript/prefer-promise-reject-errors|1",
         "src/state/config-machine-state.ts|typescript/no-unnecessary-type-parameters|2",
-        "src/state/openclaw-agent-db-admission.ts|typescript/prefer-promise-reject-errors|1",
         // Node worker BroadcastChannel.postMessage accepts only a message, not a browser targetOrigin.
         "src/state/openclaw-agent-worker-store.test-support.ts|unicorn/require-post-message-target-origin|1",
         "src/system-agent/setup-inference-activate.ts|preserve-caught-error|1",

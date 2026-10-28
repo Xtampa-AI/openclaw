@@ -59,6 +59,7 @@ import {
   type CodeModeRunOwner,
 } from "./code-mode-state.js";
 import { recordCodeModeToolOutcome } from "./code-mode-tool-outcome.js";
+import { codeModeWaitRunUnavailableMessage } from "./code-mode-wait-errors.js";
 import type { AgentToolUpdateCallback } from "./runtime/index.js";
 import type { ToolResultBudget } from "./tool-result-limits.js";
 import { ToolSearchRuntime } from "./tool-search-runtime.js";
@@ -80,21 +81,22 @@ export async function runCodeModeExec(params: {
 }) {
   removeExpiredRuns();
   const { config } = params;
-  const runtime = new ToolSearchRuntime(params.ctx, toToolSearchConfig(config), {
-    prepareInput: true,
-    validateInput: true,
-  });
-  params.onRuntime?.(runtime);
-  const bridgeDispatch = { started: false };
-  const budget: CodeModeCallBudget = { deadlineMs: performance.now() + config.timeoutMs };
-  const namespaceCatalog = runtime.namespaceEntries();
-  const swarmEnabled = isCodeModeSwarmAvailable(params.ctx, namespaceCatalog);
   const codeModeReplayId = codeModeReplayIdForToolCall(
     params.ctx,
     params.toolCallId,
     params.code,
     params.assistantTurnId,
   );
+  const runtime = new ToolSearchRuntime(params.ctx, toToolSearchConfig(config), {
+    prepareInput: true,
+    validateInput: true,
+    callIdScope: codeModeReplayId.replace(/^cm_replay_/, ""),
+  });
+  params.onRuntime?.(runtime);
+  const bridgeDispatch = { started: false };
+  const budget: CodeModeCallBudget = { deadlineMs: performance.now() + config.timeoutMs };
+  const namespaceCatalog = runtime.namespaceEntries();
+  const swarmEnabled = isCodeModeSwarmAvailable(params.ctx, namespaceCatalog);
   const namespaceRuntime = createCodeModeNamespaceRuntime(namespaceCatalog);
   const catalogProjection = createCodeModeCatalogProjection(runtime.all({ includeMcp: false }), {
     reservedNames: namespaceRuntime.descriptors.map((descriptor) => descriptor.globalName),
@@ -584,11 +586,13 @@ export async function runWait(params: {
 }) {
   removeExpiredRuns();
   if (resumingRunIds.has(params.runId)) {
-    throw new ToolInputError("code mode run is already being resumed.");
+    throw new ToolInputError(
+      "code mode run is already being resumed by another wait. Use that wait’s result before deciding the next step; do not issue another concurrent wait or replay earlier actions.",
+    );
   }
   const state = activeRuns.get(params.runId);
   if (!state) {
-    throw new ToolInputError("code mode run is unavailable or expired.");
+    throw new ToolInputError(codeModeWaitRunUnavailableMessage(params.ctx));
   }
   if (state.ctx.runId && state.ctx.runId !== params.ctx.runId) {
     throw new ToolInputError("code mode run belongs to a different agent run.");

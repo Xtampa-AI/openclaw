@@ -210,6 +210,12 @@ async function fixture({
       return verification;
     },
     withOwnedManagedUpdateEnv: async (_env, action) => action(),
+    acquireWithWait: ({ acquire }) => acquire(),
+    // Backported 2026.10.5 update paths: no timeout flag, no maintenance contention,
+    // and no Doctor failure facts in this fixture.
+    parseUpdateTimeoutMs: (value) => (value == null ? undefined : Number(value)),
+    isStateDatabaseMaintenanceContention: () => false,
+    collectUpdateDoctorFailureFacts: () => [],
     readConfigFileSnapshot: async () => ({}),
     prepareUpdateRestart: async () => restartContext,
     convergeUpdatePlugins: async (params) => ({ resultWithPostUpdate: params.result }),
@@ -265,6 +271,7 @@ async function fixture({
     "update-command-mutable-signals",
     "update-command-execution-guards",
     "update-command-result",
+    "../../infra/acquire-with-wait",
     "../../infra/update-failure-result",
     "../../infra/update-failure-public-codes",
     "../../infra/update-run-step-key",
@@ -282,6 +289,7 @@ async function fixture({
     "update-command-terminal",
     "update-command-terminal-publication",
     "../daemon-cli/restart-health-deadline",
+    "../../../packages/retry/src/index",
     "../daemon-cli/restart-health-probe",
     "../../utils/absolute-deadline",
     "update-command-post-update-maintenance",

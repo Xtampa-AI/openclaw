@@ -1,4 +1,5 @@
 import { resolveResetPreservedSelection } from "../../config/sessions/reset-preserved-selection.js";
+import { preserveSessionInheritedToolPolicy } from "../../config/sessions/session-entry-lineage.js";
 import { preserveCreationStamp } from "../../config/sessions/session-entry-provenance.js";
 import { selectSessionModelOverride } from "../../config/sessions/session-entry-selection.js";
 import type { InternalSessionEntry, SessionEntry } from "../../config/sessions/types.js";
@@ -36,6 +37,10 @@ export function resolveReplySessionRolloverState(
     pendingDeliveryNotice: entry.pendingDeliveryNotice,
     ...(preserveSpawnLineage
       ? {
+          ...preserveSessionInheritedToolPolicy(entry),
+          ...(entry.inheritedToolPolicySource === "sender" && entry.sessionRoot
+            ? { sessionRoot: entry.sessionRoot }
+            : {}),
           spawnedBy: entry.spawnedBy,
           spawnedBySenderIsOwner: entry.spawnedBySenderIsOwner,
           spawnedBySessionId: entry.spawnedBySessionId,
@@ -44,6 +49,16 @@ export function resolveReplySessionRolloverState(
           spawnDepth: entry.spawnDepth,
           subagentRole: entry.subagentRole,
           subagentControlScope: entry.subagentControlScope,
+        }
+      : {}),
+    // Native worktrees belong to the logical session, not its conversation context.
+    // Plain New Chat detaches separately through clearSpawnedCwd and lifecycle cleanup.
+    ...(entry.worktree
+      ? {
+          worktree: entry.worktree,
+          projectId: entry.projectId,
+          spawnedCwd: entry.spawnedCwd,
+          sessionRoot: entry.sessionRoot,
         }
       : {}),
     parentSessionKey: entry.parentSessionKey,

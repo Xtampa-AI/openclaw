@@ -1,12 +1,18 @@
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
-import { usePreparedModelRuntimeHarness } from "./prepared-model-runtime.test-harness.js";
+import {
+  getPreparedModelRuntimeTestApi,
+  usePreparedModelRuntimeHarness,
+} from "./prepared-model-runtime.test-harness.js";
 import { isDeepStrictEqual } from "node:util";
-import { describe, expect, it } from "vitest";
-import { createDeferred } from "../../test/helpers/promise.js";
+import { describe, expect, it, vi } from "vitest";
+import { createDeferred, withinTest } from "../../test/helpers/promise.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { publishConfiguredModelRuntimeSnapshots } from "../gateway/server-startup-model-runtime.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { retireAgentDeleteRuntime } from "./agent-delete-databases.js";
 import { withAgentDeletion } from "./agent-lifecycle-registry.js";
+import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
 import {
   getPreparedModelRuntimeSnapshot,
   loadPublishedGatewayReplyDispatchRuntime,
@@ -16,6 +22,7 @@ import {
   retirePreparedModelRuntimeAgent,
 } from "./prepared-model-runtime.js";
 import { closePreparedModelRuntimeSnapshots } from "./prepared-model-runtime.lifecycle.js";
+import { getPreparedModelRuntimeStartupStatus } from "./prepared-model-runtime.startup-status.js";
 
 const fixture = usePreparedModelRuntimeHarness({ label: "prepared-model-runtime" });
 const { mocks } = fixture;
@@ -32,6 +39,115 @@ function holdNextCatalogWrite() {
 }
 
 describe("prepared model runtime owner selection", () => {
+  it.for(["success", "failure", "shutdown", "foreground grace"] as const)(
+    "follows active startup acquisition through a scoped replacement's %s",
+    async (outcome, { signal }) => {
+      mocks.configuredAgentIds = ["default", "deferred"];
+      const initial = { messages: { responsePrefix: "initial" } };
+      const latest = { messages: { responsePrefix: "latest" } };
+      const started = createDeferred();
+      const successorStarted = createDeferred();
+      const release = createDeferred();
+      const escape = createDeferred();
+      const successorError = new Error("replacement catalog acquisition failed");
+      if (outcome === "foreground grace") {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        getPreparedModelRuntimeTestApi().setModelRuntimeBuildTimeoutMsForTest(120_000);
+      }
+      let cancellation: unknown;
+      mocks.prepareStaticCatalog.mockImplementation(async (input) => {
+        const options = input as { config: OpenClawConfig; signal: AbortSignal };
+        if (options.config.messages?.responsePrefix === "initial") {
+          const aborted = createDeferred();
+          const onAbort = () => {
+            cancellation = options.signal.reason;
+            aborted.resolve();
+          };
+          options.signal.addEventListener("abort", onAbort, { once: true });
+          started.resolve();
+          try {
+            await Promise.race([aborted.promise, escape.promise]);
+            options.signal.throwIfAborted();
+          } finally {
+            options.signal.removeEventListener("abort", onAbort);
+          }
+        } else {
+          successorStarted.resolve();
+          await release.promise;
+          options.signal.throwIfAborted();
+          if (outcome === "failure") {
+            throw successorError;
+          }
+        }
+        return { entries: [] };
+      });
+      const startup = publishConfiguredModelRuntimeSnapshots({ cfg: initial });
+      let settled = false;
+      const observed = startup.then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      let successor: Promise<void> | undefined;
+      let closing: Promise<void> | undefined;
+      let reader: ReturnType<typeof loadPublishedGatewayReplyDispatchRuntime> | undefined;
+      try {
+        await withinTest(started.promise, signal);
+        expect(getPreparedModelRuntimeStartupStatus()?.pendingAgents.length).toBeGreaterThan(0);
+        if (outcome === "foreground grace") {
+          await vi.advanceTimersByTimeAsync(1_000);
+        }
+        successor = refreshPreparedModelRuntimeSnapshots(latest, {
+          gatewayLifecycle: true,
+          catalogMode: "static",
+          agentIds: new Set(["deferred"]),
+        });
+        void successor.catch(() => undefined);
+        expect(getPreparedModelRuntimeStartupStatus()).toBeUndefined();
+        await withinTest(successorStarted.promise, signal);
+        expect(cancellation).toBeInstanceOf(PreparedModelRuntimePublicationSupersededError);
+        const settledBeforeSuccessor = settled;
+        if (outcome === "shutdown") {
+          closing = closePreparedModelRuntimeSnapshots();
+        } else if (outcome === "foreground grace") {
+          await vi.advanceTimersByTimeAsync(119_000);
+          expect(settled).toBe(true);
+          expect(await withinTest(observed, signal)).toBeUndefined();
+          expect(getPreparedModelRuntimeStartupStatus()).toBeUndefined();
+        }
+        release.resolve();
+        const result = await withinTest(observed, signal);
+        if (outcome === "success" || outcome === "foreground grace") {
+          expect(result).toBeUndefined();
+          for (const agentId of mocks.configuredAgentIds) {
+            reader = loadPublishedGatewayReplyDispatchRuntime({ agentId });
+            await expect(withinTest(reader, signal)).resolves.toMatchObject({
+              agentId,
+              config: latest,
+            });
+          }
+        } else if (outcome === "failure") {
+          expect(result).toBe(successorError);
+        } else {
+          expect(result).toMatchObject({ message: expect.stringContaining("closed") });
+        }
+        expect(getPreparedModelRuntimeStartupStatus()).toBeUndefined();
+        expect(settledBeforeSuccessor).toBe(false);
+      } finally {
+        escape.resolve();
+        release.resolve();
+        closing ??= closePreparedModelRuntimeSnapshots();
+        await Promise.allSettled([startup, observed, successor, closing, reader]);
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("retires only the deleted agent's physical owners", async () => {
     mocks.configuredAgentIds = ["worker"];
     mocks.configuredAgentDirs.set("worker", fixture.state.agentDir("isolated-worker"));
@@ -45,7 +161,7 @@ describe("prepared model runtime owner selection", () => {
     await withAgentDeletion(
       input.agentId,
       async (begin) => {
-        const deletion = begin({
+        const deletion = await begin({
           agentId: input.agentId,
           agentDir: input.agentDir,
           workspaceDir: fixture.state.workspaceDir,
@@ -64,7 +180,7 @@ describe("prepared model runtime owner selection", () => {
         expect(sharing.isCurrent()).toBe(true);
 
         replaceJournal.run(deletion.entry.operationId, input.agentId);
-        deletion.rollback();
+        await deletion.rollback();
         await expect(
           retireAgentDeleteRuntime(input.config, deletion, [input.agentDir]),
         ).rejects.toThrow("no longer owns");
@@ -83,41 +199,56 @@ describe("prepared model runtime owner selection", () => {
     );
   });
 
-  it.each(["lost claim", "invalidation", "close"] as const)(
-    "does not accept a joined refresh after %s",
-    async (boundary) => {
-      mocks.configuredAgentIds = ["default"];
-      const { started, release } = holdNextCatalogWrite();
-      const first = refreshPreparedModelRuntimeSnapshots({}, { joinSupersedingPublication: true });
-      const rejected = expect(first).rejects.toThrow(/superseded|closed/);
-      let successor: Promise<void> | undefined;
-      let closing: Promise<void> | undefined;
-      try {
-        await started.promise;
-        if (boundary === "invalidation") {
-          markPreparedModelRuntimeSnapshotsStale("publication owner retired");
+  it.each([
+    "lost claim",
+    "invalidation",
+    "preserved invalidation",
+    "unpublished replacement invalidated",
+    "unpublished replacement close",
+    "close",
+  ] as const)("does not accept a joined refresh after %s", async (boundary) => {
+    mocks.configuredAgentIds = ["default"];
+    const { started, release } = holdNextCatalogWrite();
+    const first = refreshPreparedModelRuntimeSnapshots({}, { joinSupersedingPublication: true });
+    const rejected = expect(first).rejects.toThrow(/superseded|closed/);
+    let successor: Promise<void> | undefined;
+    let closing: Promise<void> | undefined;
+    try {
+      await started.promise;
+      if (boundary === "invalidation" || boundary === "preserved invalidation") {
+        markPreparedModelRuntimeSnapshotsStale("publication owner retired", {
+          preserveReplacementWait: boundary === "preserved invalidation",
+        });
+      } else if (boundary.startsWith("unpublished replacement")) {
+        markPreparedModelRuntimeSnapshotsStale("replacement preparing", {
+          waitForReplacement: true,
+        });
+        if (boundary === "unpublished replacement close") {
+          closing = closePreparedModelRuntimeSnapshots();
         } else {
-          let claimCurrent = true;
-          successor = refreshPreparedModelRuntimeSnapshots(
-            {},
-            {
-              isPublicationCurrent: () => claimCurrent,
-            },
-          );
-          if (boundary === "lost claim") {
-            claimCurrent = false;
-          } else {
-            closing = closePreparedModelRuntimeSnapshots();
-          }
+          markPreparedModelRuntimeSnapshotsStale("replacement cancelled");
         }
-        release.resolve();
-        await rejected;
-      } finally {
-        release.resolve();
-        await Promise.allSettled([first, successor, closing]);
+      } else {
+        let claimCurrent = true;
+        successor = refreshPreparedModelRuntimeSnapshots(
+          {},
+          {
+            isPublicationCurrent: () => claimCurrent,
+          },
+        );
+        if (boundary === "lost claim") {
+          claimCurrent = false;
+        } else {
+          closing = closePreparedModelRuntimeSnapshots();
+        }
       }
-    },
-  );
+      release.resolve();
+      await rejected;
+    } finally {
+      release.resolve();
+      await Promise.allSettled([first, successor, closing]);
+    }
+  });
 
   it("joins the latest of multiple replacements without rebuilding skipped config", async () => {
     mocks.configuredAgentIds = ["default"];

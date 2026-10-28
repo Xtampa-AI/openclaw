@@ -28,6 +28,7 @@ import {
 import {
   consumeRuntimeAuthorityMutationOptions,
   reconcileCronChannelRequesterAuthority,
+  reconcileCronOperatorSource,
   reconcileRuntimeAuthority,
 } from "./jobs-tool-policy.js";
 import {
@@ -166,6 +167,11 @@ export async function add(
         toolsAllowProvenance: opts?.toolsAllowProvenance,
         reauthorize: true,
       });
+      reconcileCronOperatorSource({
+        job: nextJob,
+        previousJob: existing,
+        captured: opts?.operatorSource,
+      });
       const includeEnabled = opts?.enabledExplicit === true;
       if (
         isDeepStrictEqual(
@@ -216,6 +222,9 @@ export async function add(
     if (opts?.createdActor) {
       job.createdActor = structuredClone(opts.createdActor);
     }
+    if (opts?.sourceConversation) {
+      job.sourceConversation = structuredClone(opts.sourceConversation);
+    }
     if (opts?.skillLibrarySelections) {
       job.skillLibrarySelections = structuredClone(opts.skillLibrarySelections);
     }
@@ -229,6 +238,7 @@ export async function add(
       job,
       toolsAllowProvenance: opts?.toolsAllowProvenance,
     });
+    reconcileCronOperatorSource({ job, captured: opts?.operatorSource });
     if (!snapshot.store) {
       throw new Error("Cron add has no loaded store");
     }
@@ -373,6 +383,7 @@ async function updateLoadedJob(params: {
     reauthorizeCallerOrigin:
       patch.payload !== undefined && Object.hasOwn(patch.payload, "toolsAllow"),
   });
+  reconcileCronOperatorSource({ job: nextJob, previousJob: job });
   const snapshot = snapshotStoreForRollback(state);
   return await persistUpdatedJob({
     state,

@@ -144,7 +144,8 @@ Claude CLI reuse (`claude -p`) is a sanctioned OpenClaw integration path. Anthro
 - Provider: `google`
 - Auth: `GEMINI_API_KEY`
 - Optional rotation: `GEMINI_API_KEYS`, `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GOOGLE_API_KEY` fallback, and `OPENCLAW_LIVE_GEMINI_KEY` (single override)
-- Example models: `google/gemini-3.1-pro-preview`, `google/gemini-3.5-flash`
+- Default model: `google/gemini-4-argon`
+- Other bundled models include `google/gemini-3.8-flash` and `google/gemini-3.5-flash-lite`
 - Compatibility: legacy OpenClaw config using `google/gemini-3.1-flash-preview` is normalized to `google/gemini-3-flash-preview`
 - Alias: `google/gemini-3.1-pro` is accepted and normalized to Google's live Gemini API id, `google/gemini-3.1-pro-preview`
 - CLI: `openclaw onboard --auth-choice gemini-api-key`
@@ -154,7 +155,14 @@ Claude CLI reuse (`claude -p`) is a sanctioned OpenClaw integration path. Anthro
 ### Google Vertex and Gemini CLI runtime
 
 - `google-vertex`: managed Google Cloud access through gcloud Application
-  Default Credentials.
+  Default Credentials. With a recognized ADC file plus
+  `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`) and `GOOGLE_CLOUD_LOCATION` in the gateway service
+  environment, OpenClaw discovers the provider automatically and no
+  credential needs to be stored. For metadata-only credentials or an explicit
+  override, the ADC path is selected by storing the literal sentinel value
+  `gcp-vertex-credentials`. Other stored values are sent as an API key, not
+  as ADC credentials; do not paste an OAuth access token. See
+  [Google provider setup](/providers/google).
 - `google-gemini-cli`: optional local runtime for an explicitly configured
   canonical `google/*` model.
 

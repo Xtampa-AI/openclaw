@@ -9,7 +9,7 @@ import { createToolCallOccurrenceQueue } from "../packages/agent-core/src/harnes
 import { inspectManagedProcessGroup } from "../scripts/lib/managed-child-process.mts";
 import { logLiveProgress } from "../src/agents/live-test-helpers.js";
 import { createExternalGates } from "../src/agents/subagents/announce/subagent-external-gate.test-support.js";
-import { loadSubagentRegistryFromSqlite } from "../src/agents/subagents/registry/subagent-registry.store.sqlite.js";
+import { loadSubagentRegistryFromSqlite } from "../src/agents/subagents/registry/subagent-registry-state.fixture.test-support.js";
 import type { SubagentRunRecord } from "../src/agents/subagents/registry/subagent-registry.types.js";
 import {
   prepareToolSearchDispatcherArguments,
@@ -705,7 +705,9 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
         evidence.providerBeforeOrphanRestart = providerBeforeOrphanRestart;
         orphanGate.release("ORPHAN_GATE_RELEASED");
         evidence.phase = "orphan-child-restart";
-        logLiveProgress("subagent restart: nonannouncing orphan interrupted; verifying no replay");
+        logLiveProgress(
+          "subagent restart: nonannouncing orphan interrupted; verifying parent handoff",
+        );
         await instance.startGateway();
         client = await connect();
         const settledOrphan = await vi.waitFor(
@@ -720,23 +722,37 @@ it.skipIf(!isLiveTestEnabled() || process.platform === "win32")(
                 interruptionReason: "gateway-restart",
               },
             });
-            expect(settled?.requesterSettleWake).toBeUndefined();
             return settled!;
           },
-          { timeout: 30_000 },
+          // This is the third unclean boot within the crash-loop window, so the
+          // breaker pauses restart settlement until that window drains.
+          { timeout: 360_000, interval: 1_000 },
         );
         const orphanProviderDispatches = workerRequests(
           provider.requests,
           providerBeforeOrphanRestart,
           (text) => text.includes("[Subagent Task]") && text.includes(orphanGate.url),
         ).length;
-        expect(orphanProviderDispatches).toBe(0);
-        expect(orphanGate.snapshot().requests).toBe(orphanGateRequests);
+        await vi.waitFor(
+          () =>
+            expect(
+              workerRequests(
+                provider!.requests,
+                providerBeforeOrphanRestart,
+                (text) =>
+                  text.includes("Reconcile every listed unfinished child") &&
+                  text.includes(orphan.childSessionKey),
+              ).length,
+            ).toBeGreaterThan(0),
+          { timeout: WAIT_MS },
+        );
         Object.assign(evidence, {
           phase: "passed",
           orphanRunId: orphan.runId,
           orphanCleanupCompletedAt: settledOrphan.cleanupCompletedAt,
           orphanProviderDispatches,
+          orphanGateRequestsBeforeRestart: orphanGateRequests,
+          orphanParentContinuationObserved: true,
         });
         logLiveProgress(`subagent cold restart proof passed; evidence=${artifactDir}`);
       },

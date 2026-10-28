@@ -56,7 +56,6 @@ type DiscoverLmstudioModelsParams = {
   headers?: Record<string, string>;
   quiet: boolean;
   discoveryMode?: "strict";
-  /** Injectable fetch implementation; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
 };
 
@@ -128,7 +127,6 @@ export async function fetchLmstudioModels(params: {
   ssrfPolicy?: SsrFPolicy;
   timeoutMs?: number;
   signal?: AbortSignal;
-  /** Injectable fetch implementation; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
 }): Promise<FetchLmstudioModelsResult> {
   const baseUrl = resolveLmstudioServerBase(params.baseUrl);
@@ -182,7 +180,6 @@ export async function fetchLmstudioModels(params: {
   }
 }
 
-/** Discovers LLM models from LM Studio and maps them to OpenClaw model definitions. */
 export async function discoverLmstudioModels(
   params: DiscoverLmstudioModelsParams,
 ): Promise<ModelDefinitionConfig[]> {
@@ -219,7 +216,6 @@ type LmstudioModelLoadParams = {
   requestedContextLength?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
-  /** Injectable fetch implementation; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
 };
 
@@ -241,7 +237,7 @@ export async function prepareLmstudioModelForInference(
     throw new Error("LM Studio model key is required");
   }
 
-  const timeoutMs = params.timeoutMs ?? 30_000;
+  const timeoutMs = params.timeoutMs ?? 120_000;
   const baseUrl = resolveLmstudioServerBase(params.baseUrl);
   const preflight = await fetchLmstudioModels({
     baseUrl,

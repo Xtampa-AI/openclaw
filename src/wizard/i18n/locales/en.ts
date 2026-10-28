@@ -33,7 +33,7 @@ export const en = {
       compatibilityOpenAiResponses: "OpenAI Responses-compatible",
       compatibilityOpenAiResponsesHint: "Uses /responses",
       compatibilityUnknown: "Unknown (detect automatically)",
-      compatibilityUnknownHint: "Probes OpenAI Chat, OpenAI Responses, then Anthropic endpoints",
+      compatibilityUnknownHint: "Checks OpenAI Chat, OpenAI Responses, then Anthropic endpoints",
       detectionFailed: "Could not detect endpoint type.",
       detectionFailedNote:
         "This endpoint did not respond to OpenAI Chat, OpenAI Responses, or Anthropic style requests.",
@@ -200,6 +200,8 @@ export const en = {
       installedPlugin: "Installed {plugin} plugin",
       installingPlugin: "Installing {plugin} plugin…",
       installTitle: "Plugin install",
+      invalidInteger: "Enter a JSON integer.",
+      invalidNumber: "Enter a valid JSON number.",
       noRemoteInstallSource:
         "No remote install source is available for {plugin}. Returning to selection.",
       officialInstall: "Install optional plugins",
@@ -466,7 +468,7 @@ export const en = {
       riskNotAccepted: "risk not accepted",
       searchTitle: "Search",
       setupMode: "Setup mode",
-      secretRefProbeFailed: "Could not resolve {field} SecretRef for setup probe.",
+      secretRefProbeFailed: "Could not resolve {field} SecretRef for setup check.",
       skillsTitle: "Skills",
       skipChannels: "Skipping channel setup.",
       skipSearch: "Skipping search setup.",
@@ -1255,7 +1257,7 @@ export const en = {
       securityReminder:
         "Running agents on your computer is risky — harden your setup: https://docs.openclaw.ai/security",
       secretRefAuthFailed: "Could not resolve {field} SecretRef for setup auth.",
-      skipHealthNextTime: "Or skip this probe next time: {command}",
+      skipHealthNextTime: "Or skip this check next time: {command}",
       skipControlUi: "Skipping Control UI/TUI prompts.",
       startGatewayNow: "Start now: {command}",
       systemdInstallSkipped:

@@ -16,7 +16,7 @@ the Xcode requirements below.
 
 - **Xcode 26.4+** (Swift 6.3 toolchain), on the latest macOS available in
   Software Update.
-- **Node.js 24.16+ or 26.1+ & pnpm** for the gateway, CLI, and packaging scripts.
+- **Node.js 24.22.1+ or 26.12.1+ & pnpm** for the gateway, CLI, and packaging scripts.
 
 macOS shell tooling uses the system `/bin/bash` (3.2); Homebrew Bash is not
 required. Run scripts directly or with `/bin/bash`. Bash 5.3+ can stall on a
@@ -141,7 +141,7 @@ retains its current runtime until a signed fork Windows build is published;
 unsigned dry-run artifacts are not shippable.
 
 Every repin requires both gates on the same published tag: CI's paired Bun-lane
-replay and Bun-only smoke, plus the macOS runtime probes and two-binary test set.
+replay and Bun-only smoke, plus the macOS runtime checks and two-binary test set.
 Neither app nor CI advances when either gate fails. A Linux-only regression
 also stops the shared repin. Preserve the last tag admitted by both gates while
 investigating; a published prerelease alone is not admission. Record the exact
@@ -231,6 +231,14 @@ state; named-profile preferences use a fresh domain and are also discarded with
 the runner.
 If process cleanup cannot be verified or Keychain deletion fails, the launcher
 fails and retains its files for inspection.
+The release-only bundled recovery app-host lane keeps the disposable account’s
+canonical home so the real CLI can manage its unique named-profile service. Its
+state and preferences use that profile. The app host and Security commands share
+the account’s user Keychain domain, selecting the launcher-owned empty-password
+Keychain file; temporary files also remain launcher-owned. Cleanup removes
+the profile state only after the service and its observed process group retire.
+Unverified retirement retains both the profile state and temporary resources.
+
 CI environment markers only catch accidental invocation; they do not enforce
 isolation or make an operator desktop safe.
 
@@ -302,6 +310,10 @@ the rest of the run.
 If packaging stops at `Freezing authenticated Peekaboo sources in a read-only snapshot`,
 check the `hdiutil` error on stderr. Routine image creation and attachment output stays
 quiet, but failures such as `hdiutil: attach failed - Permission denied` are preserved.
+A transient `Resource temporarily unavailable` attach failure is retried, up to three
+attempts in total. If attachment fails before mounting, cleanup detaches the snapshot image
+by device; if it stays attached, cleanup fails, retains the files, and prints the
+`hdiutil detach /dev/diskN` command to run.
 Snapshot images and build outputs stay in the checkout. Their read-only mount directories
 use macOS's per-user temporary location (`getconf DARWIN_USER_TEMP_DIR`), independently of
 `TMPDIR`, so an external checkout does not need to support nested mounts. If attachment

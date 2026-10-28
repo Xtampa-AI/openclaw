@@ -79,8 +79,6 @@ import {
 } from "./update-command-service-env.js";
 import { captureUpdateFinalizationDoctorOutput } from "./update-finalization-output.js";
 
-type UpdateDoctorPhase = "pre-plugin" | "post-plugin";
-
 export async function withPrePluginUpdateDoctorEnv<T>(run: () => Promise<T>): Promise<T> {
   return await withUpdateEnv(
     {
@@ -94,7 +92,7 @@ export async function withPrePluginUpdateDoctorEnv<T>(run: () => Promise<T>): Pr
 }
 
 export async function runUpdateFinalizationDoctorInFreshProcess(params: {
-  phase: UpdateDoctorPhase;
+  phase: "pre-plugin" | "post-plugin";
   root: string;
   runId?: string;
   opts?: UpdateCommandOptions;
@@ -149,9 +147,7 @@ export async function runUpdateFinalizationDoctorInFreshProcess(params: {
   try {
     const commandOptions: CommandOptions = {
       cwd: params.root,
-      // Normal updates also carry a default step allowance. Only operator opts
-      // may impose a Doctor deadline; standalone finalization supplies its own.
-      timeoutMs: params.opts ? parseUpdateTimeoutMs(params.opts.timeout) : params.timeoutMs,
+      timeoutMs: parseUpdateTimeoutMs(params.opts?.timeout) ?? params.timeoutMs,
       maxOutputBytes: 4 * 1024 * 1024,
       terminateOnOutputLimit: true,
       onOutputChunk: captureUpdateFinalizationDoctorOutput(params.phase),
@@ -192,10 +188,11 @@ export async function runUpdateFinalizationDoctorInFreshProcess(params: {
           assertCurrent,
         )));
     assertCurrent();
+    let child: Awaited<ReturnType<typeof runUpdateDoctorProcess>>;
     if (doctorConfigWrites && executorFence && runId) {
       const snapshot = await readUpdateConfigSnapshot(resolveConfigPath());
       assertCurrent();
-      const child = await withUpdateDoctorChild(
+      child = await withUpdateDoctorChild(
         {
           root: params.root,
           context: {
@@ -222,13 +219,10 @@ export async function runUpdateFinalizationDoctorInFreshProcess(params: {
         },
         (runCommand) => runCommand([...workerCommand, "--doctor"], commandOptions),
       );
-      result = child;
-      assertUpdateDoctorChildSucceeded(child);
-      assertCurrent();
     } else {
       // A valid legacy target contract retains its shipped CLI Doctor. This is
       // capability selection, never recovery from missing or refused authority.
-      const child = await runUpdateDoctorProcess(
+      child = await runUpdateDoctorProcess(
         {
           root: params.root,
           runId: runId ?? params.runId ?? "",
@@ -239,10 +233,10 @@ export async function runUpdateFinalizationDoctorInFreshProcess(params: {
         [params.nodeRunner ?? resolveNodeRunner(), ...args],
         commandOptions,
       );
-      result = child;
-      assertUpdateDoctorChildSucceeded(child);
-      assertCurrent();
     }
+    result = child;
+    assertUpdateDoctorChildSucceeded(child);
+    assertCurrent();
   } catch (error) {
     failure = { error };
   }
@@ -423,9 +417,7 @@ export async function runUpdateFinalizationDoctorInFreshProcess(params: {
   if (failure) {
     throw failure.error;
   }
-  if (warning) {
-    return warning;
-  }
+  return warning;
 }
 
 async function validatePostPluginConfigInFreshProcess(params: {
@@ -509,7 +501,6 @@ export async function completePostCorePluginUpdate(
     "phase" | "workspaceSuggestions" | "entryPath" | "onAuthorityRefused"
   > & {
     pluginUpdate: PostCorePluginUpdateResult;
-    freshDoctorRequired: boolean;
     beforeDoctor?: () => Promise<void>;
   },
 ): Promise<{
@@ -538,8 +529,11 @@ export async function completePostCorePluginUpdate(
         throw new Error("Updated OpenClaw entrypoint not found for post-plugin doctor");
       }
       const freshDoctorRequired =
-        params.freshDoctorRequired ||
-        hasDeferredUpdateModelRetirement() ||
+        pluginUpdate.changed ||
+        hasDeferredUpdateModelRetirement(
+          params.opts?.run?.env,
+          params.opts?.run?.runId ?? params.runId,
+        ) ||
         (await readDeferredPluginMigrationsAsync()).length > 0;
       assertCurrent();
       if (freshDoctorRequired) {

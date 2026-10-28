@@ -1,5 +1,5 @@
-/** Platform service registry and shared gateway service start/repair logic. */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { captureStalledGatewayStartup } from "../infra/gateway-startup-owner.js";
 import { assertGatewayServiceMutationAllowed } from "../infra/gateway-supervision.js";
 import { assertFutureConfigActionAllowed } from "./future-config-guard.js";
 import {
@@ -21,6 +21,7 @@ import {
   commitDaemonRuntimePin,
   readDaemonRuntimePinForInstall,
 } from "./runtime-pin-state.js";
+import { stopStalledGatewayStartup } from "./schtasks-process.js";
 import {
   installScheduledTask,
   isScheduledTaskEnabled,
@@ -33,6 +34,7 @@ import {
   stopScheduledTask,
   uninstallScheduledTask,
 } from "./schtasks.js";
+import { assertServiceInspectionFallbackAllowed } from "./service-inspection-error.js";
 import { withGatewayServiceOperationLock } from "./service-operation-lock.js";
 import { captureGatewayServiceRebind } from "./service-rebind.js";
 import { collectGatewayServiceStartRepairIssues } from "./service-start-repair.js";
@@ -75,11 +77,10 @@ export type {
   GatewayServiceState,
 } from "./service-types.js";
 
-// Platform service adapter used by CLI commands across launchd, systemd, and schtasks.
-function ignoreServiceWriteResult<TArgs extends GatewayServiceInstallArgs>(
-  write: (args: TArgs) => Promise<unknown>,
-): (args: TArgs) => Promise<void> {
-  return async (args: TArgs) => {
+function ignoreServiceWriteResult(
+  write: (args: GatewayServiceInstallArgs) => Promise<unknown>,
+): (args: GatewayServiceInstallArgs) => Promise<void> {
+  return async (args) => {
     await write(args);
   };
 }
@@ -122,6 +123,7 @@ export async function startGatewayService(
     await service.start({ ...args, env: state.env });
     nextState = await readGatewayServiceState(service, { env: state.env });
   } catch (err) {
+    assertServiceInspectionFallbackAllowed(err);
     const recoveryState = await readGatewayServiceState(service, { env: state.env });
     if (!recoveryState.installed) {
       return {
@@ -433,7 +435,13 @@ function withGatewayServiceMutationGuards(
       },
     ),
     start: guardGatewayServiceMutation("start the gateway service", service.start),
-    stop: guardGatewayServiceMutation("stop the gateway service", service.stop),
+    stop: guardGatewayServiceMutation("stop the gateway service", async (args) => {
+      const stalled = kind === "gateway" ? captureStalledGatewayStartup(args.env) : undefined;
+      await service.stop(args);
+      if (stalled) {
+        await stopStalledGatewayStartup(stalled, args.assertCurrent);
+      }
+    }),
     restart: guardGatewayServiceMutation("restart the gateway service", service.restart),
   };
 }

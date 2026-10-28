@@ -270,8 +270,9 @@ it("retires gateway admission before the next file", async () => {
 import { getAgentRunContext, registerAgentRunContext } from ${sourcePath("infra/agent-run-registry.ts")};
 import { emitAgentEvent, onAgentEvent } from ${sourcePath("infra/agent-events.ts")};
 import { listActiveSessionsForShutdown, noteActiveSessionForShutdown } from ${sourcePath("gateway/active-sessions-shutdown-tracker.ts")};
+import { createReplyOperation, replyRunRegistry } from ${sourcePath("auto-reply/reply/reply-run-registry.ts")};
 import { expect, it } from "vitest";
-it("seeds process-global run contexts", () => {
+it("seeds process-global run contexts", async () => {
   expect(tryBeginGatewayRootWorkAdmission()).not.toBeNull();
   expect(getActiveGatewayRootWorkCount()).toBe(1);
   markGatewayRestartDraining();
@@ -287,14 +288,32 @@ it("seeds process-global run contexts", () => {
   expect(getAgentRunContext("unrelated-run-a")).toBeDefined();
   expect(getAgentRunContext("unrelated-run-b")).toBeDefined();
   expect(sequence).toBe(1);
+  const operation = createReplyOperation({ sessionKey: "agent:main:runner-waiter", sessionId: "runner-waiter", resetTriggered: false });
+  operation.attachBackend({ kind: "embedded", cancel() {}, isAbortable: () => false });
+  operation.setPhase("running");
+  const outcomes: boolean[] = [];
+  void replyRunRegistry.waitForIdle(operation.key, null).then(ended => outcomes.push(ended));
+  Reflect.set(globalThis, Symbol.for("fixture.replyRunWaiter"), { operation, outcomes });
+  await Promise.resolve();
+  expect(outcomes).toEqual([]);
 });
 `,
     "05-b-agent-run.test.ts": `import { getActiveGatewayRootWorkCount, tryBeginGatewayRootWorkAdmission } from ${sourcePath("process/gateway-work-admission.ts")};
 import { clearAgentRunContext, getAgentRunContext, registerAgentRunContext, sweepStaleRunContexts } from ${sourcePath("infra/agent-run-registry.ts")};
 import { emitAgentEvent, onAgentEvent } from ${sourcePath("infra/agent-events.ts")};
 import { listActiveSessionsForShutdown } from ${sourcePath("gateway/active-sessions-shutdown-tracker.ts")};
+import { replyRunRegistry } from ${sourcePath("auto-reply/reply/reply-run-registry.ts")};
 import { expect, it } from "vitest";
 it("clears agent run registry state", () => {
+  const key = Symbol.for("fixture.replyRunWaiter");
+  const prior = Reflect.get(globalThis, key);
+  try {
+    expect(prior?.outcomes).toEqual([false]);
+    expect(replyRunRegistry.isActive("agent:main:runner-waiter")).toBe(false);
+  } finally {
+    prior?.operation.complete();
+    Reflect.deleteProperty(globalThis, key);
+  }
   expect(getActiveGatewayRootWorkCount()).toBe(0);
   const admission = tryBeginGatewayRootWorkAdmission();
   expect(admission).not.toBeNull();
@@ -574,7 +593,7 @@ async function verifyRunnerCleanup(signal: AbortSignal) {
       await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
       await fs.writeFile(path.join(root, name), content, "utf8");
     }
-    // This real source uses only type imports; Node can retain its native generation.
+    // The fixture primes Node's native generation before Vite imports this source.
     await fs.writeFile(
       path.join(root, "vitest.config.ts"),
       `import { sharedVitestConfig } from ${JSON.stringify(path.join(repoRoot, "test", "vitest", "vitest.shared.config.ts"))};
@@ -591,6 +610,7 @@ export default defineConfig({
   resolve: sharedVitestConfig.resolve,
   test: {
     name: "non-isolated-runner",
+    execArgv: ["--experimental-transform-types"],
     isolate: false,
     fileParallelism: false,
     maxWorkers: 1,

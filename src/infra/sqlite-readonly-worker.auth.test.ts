@@ -2,10 +2,9 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync, StatementSync } from "node:sqlite";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { prepareAgentAuthProfileRowsRead } from "../agents/auth-profiles/sqlite-read.js";
 import { resolveStateDir } from "../config/state-dir.js";
 import { createScheduledGatewayRunner } from "../gateway/scheduled-run-gateway-context.js";
 import { GatewayConnectionWork } from "../gateway/server-connection-work.js";
@@ -13,8 +12,8 @@ import { BrokerChild } from "../process/spawn-broker/child.js";
 import { runWithSpawnBroker } from "../process/spawn-broker/context.js";
 import { createSpawnBrokerHost } from "../process/spawn-broker/host.js";
 import { SpawnBrokerError } from "../process/spawn-broker/protocol.js";
-import { runInDetachedAsyncContext } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import { SQLITE_READONLY_CHILD_ARG } from "./runtime-process-entrypoints.js";
 import {
@@ -34,13 +33,20 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.mocked(spawn).mockReset();
 });
-const skipBroker = process.platform === "win32" || Boolean(process.versions.bun);
+const skipBroker = process.platform === "win32";
 
-function createAuthDatabase(key = "synthetic") {
+function createAuthDatabase(key = "synthetic", metadata?: Record<string, string>) {
   const source = path.join(tempDirs.make("openclaw-auth-transport-"), "source.sqlite");
   const store = {
     version: 1,
-    profiles: { "fixture:default": { type: "api_key", provider: "fixture", key } },
+    profiles: {
+      "fixture:default": {
+        type: "api_key",
+        provider: "fixture",
+        key,
+        ...(metadata ? { metadata } : {}),
+      },
+    },
   };
   const state = { lastGood: { fixture: "fixture:default" } };
   const database = new (requireNodeSqlite().DatabaseSync)(source);
@@ -92,52 +98,6 @@ function read(
     signal,
   });
 }
-
-it("keeps prepared auth source reads and cleanup off the host SQLite thread", async () => {
-  const { source, rows } = createAuthDatabase();
-  const before = fs.readFileSync(source);
-  const env = { ...process.env, OPENCLAW_STATE_DIR: path.dirname(source) };
-  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-  let childClosed = false;
-  vi.mocked(spawn).mockImplementationOnce((...args) => {
-    const child = actual.spawn(...args);
-    child.once("close", () => {
-      childClosed = true;
-    });
-    return child;
-  });
-  const sql = [
-    ...(["exec", "prepare", "close"] as const).map((method) =>
-      vi.spyOn(DatabaseSync.prototype, method),
-    ),
-    ...(["all", "get", "run", "iterate"] as const).map((method) =>
-      vi.spyOn(StatementSync.prototype, method),
-    ),
-  ];
-  const absentPath = path.join(path.dirname(source), "absent.sqlite");
-  const absent = prepareAgentAuthProfileRowsRead({
-    databasePath: absentPath,
-    agentId: "main",
-    env,
-  });
-  const reader = prepareAgentAuthProfileRowsRead({ databasePath: source, agentId: "main", env });
-  try {
-    await expect(absent.read()).resolves.toEqual({
-      store: { status: "missing", reason: "database" },
-      state: { status: "missing", reason: "database" },
-      cacheable: false,
-    });
-    expect(fs.existsSync(absentPath)).toBe(false);
-    await expect(reader.read()).resolves.toEqual(rows);
-    expect(childClosed).toBe(true);
-  } finally {
-    await Promise.all([absent.dispose(), reader.dispose()]);
-  }
-  for (const operation of sql) {
-    expect(operation).not.toHaveBeenCalled();
-  }
-  expect(fs.readFileSync(source)).toEqual(before);
-});
 
 describe.each([
   // Snapshots must bypass an active broker; also keep native proof where brokers are unsupported.
@@ -201,18 +161,30 @@ describe.each([
   );
 
   it.skipIf(transport.broker && skipBroker)(
-    "reads complete oversized auth rows and joins the child before returning",
+    "reads oversized auth fields in bounded records and joins the child before returning",
     async () => {
       const { source, rows: expectedRows } = createAuthDatabase(
         `${"synthetic".repeat(1_200_000)}🌊`,
+        { ["m".repeat(65_536)]: "synthetic-metadata" },
       );
       const sourceBefore = createHash("sha256").update(fs.readFileSync(source)).digest("hex");
       const broker = transport.broker ? createSpawnBrokerHost() : undefined;
       let child: ChildProcess | undefined;
       let closed = false;
       let stdoutBytes = 0;
+      let largestRecordBytes = 0;
       const observe = <T extends ChildProcess>(value: T): T => {
         child = value;
+        value.on("message", (message: unknown) => {
+          if (
+            isRecord(message) &&
+            isRecord(message.result) &&
+            isRecord(message.result.frame) &&
+            typeof message.result.frame.recordBytes === "number"
+          ) {
+            largestRecordBytes = Math.max(largestRecordBytes, message.result.frame.recordBytes);
+          }
+        });
         value.once("close", () => {
           closed = true;
         });
@@ -252,6 +224,8 @@ describe.each([
         expect(child?.exitCode).toBe(0);
         expect(child?.connected).toBe(false);
         expect(stdoutBytes).toBe(0);
+        expect(largestRecordBytes).toBeGreaterThan(0);
+        expect(largestRecordBytes).toBeLessThanOrEqual(64 * 1024);
         expect(createHash("sha256").update(fs.readFileSync(source)).digest("hex")).toBe(
           sourceBefore,
         );

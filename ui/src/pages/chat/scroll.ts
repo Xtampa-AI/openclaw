@@ -1,9 +1,9 @@
+import { pruneMapToMaxSize } from "../../../../src/infra/map-size.ts";
 import { resolveScrollBehavior } from "../../lib/scroll-behavior.ts";
 import { areUiSessionKeysEquivalent } from "../../lib/sessions/session-key.ts";
 import type { RenderLifecycle } from "./render-lifecycle.ts";
 import { getSessionCacheValue, setSessionCacheValue } from "./session-cache.ts";
 
-/** Distance (px) from the bottom within which we consider the user "near bottom". */
 const NEAR_BOTTOM_THRESHOLD = 450;
 /** Shared semantic boundary for treating the transcript as settled at its end. */
 export const CHAT_TRANSCRIPT_END_THRESHOLD_PX = 8;
@@ -18,21 +18,13 @@ export type ChatSessionScrollPosition = {
 const transcriptScrollTopByPane = new Map<string, Map<string, ChatSessionScrollPosition>>();
 
 function getPaneScrollTops(paneId: string): Map<string, ChatSessionScrollPosition> {
-  const existing = transcriptScrollTopByPane.get(paneId);
+  const existing = getSessionCacheValue(transcriptScrollTopByPane, paneId);
   if (existing) {
-    transcriptScrollTopByPane.delete(paneId);
-    transcriptScrollTopByPane.set(paneId, existing);
     return existing;
   }
   const created = new Map<string, ChatSessionScrollPosition>();
   transcriptScrollTopByPane.set(paneId, created);
-  while (transcriptScrollTopByPane.size > MAX_CACHED_TRANSCRIPT_SCROLL_PANES) {
-    const oldest = transcriptScrollTopByPane.keys().next().value;
-    if (typeof oldest !== "string") {
-      break;
-    }
-    transcriptScrollTopByPane.delete(oldest);
-  }
+  pruneMapToMaxSize(transcriptScrollTopByPane, MAX_CACHED_TRANSCRIPT_SCROLL_PANES);
   return created;
 }
 

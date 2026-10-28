@@ -5024,12 +5024,19 @@ function assertOpenAIUltraWireEffort(params: {
     `expected captured OpenAI requests for ${params.expectedModel}; captured=${params.observations.length}`,
   ).toBeGreaterThan(0);
   const ultraSessions = new Set(params.ultraRuns.values());
-  const expectedEffort = ({ dispatch }: OpenAIUltraWireObservation) =>
-    dispatch?.isHeartbeat === true &&
-    !params.ultraRuns.has(dispatch.runId) &&
-    !ultraSessions.has(dispatch.sessionKey ?? "")
-      ? OPENAI_ULTRA_NORMAL_EFFORT
-      : "max";
+  // Skill Workshop reviews run after the session idles, under their own run, and do not
+  // inherit the session's thinking level; like independent heartbeats they stay normal.
+  const isIndependentBackgroundRun = ({ dispatch }: OpenAIUltraWireObservation) => {
+    if (!dispatch || params.ultraRuns.has(dispatch.runId)) {
+      return false;
+    }
+    if (dispatch.runId.startsWith("skill-workshop-review:")) {
+      return true;
+    }
+    return dispatch.isHeartbeat === true && !ultraSessions.has(dispatch.sessionKey ?? "");
+  };
+  const expectedEffort = (entry: OpenAIUltraWireObservation) =>
+    isIndependentBackgroundRun(entry) ? OPENAI_ULTRA_NORMAL_EFFORT : "max";
   const heartbeats = matching.filter(
     (entry) => expectedEffort(entry) === OPENAI_ULTRA_NORMAL_EFFORT,
   );

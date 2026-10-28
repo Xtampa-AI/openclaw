@@ -53,7 +53,6 @@ export async function attemptServerEndpointCompaction(params: {
     return undefined;
   }
   params.assertActive?.();
-  let compacted: ServerEndpointCompactionResult;
   let compactionCommitted = false;
   try {
     const messages = params.context.messages.filter(
@@ -74,7 +73,7 @@ export async function attemptServerEndpointCompaction(params: {
     if (!owner || owner.type !== "message" || owner.message.role !== "assistant") {
       throw new Error("Responses compact endpoint requires a persisted assistant owner");
     }
-    compacted = await compactWithSafetyTimeout(
+    const compacted = await compactWithSafetyTimeout(
       (signal) =>
         requestPreparedOpenAIResponsesCompaction(
           params.streamFn,
@@ -143,6 +142,7 @@ export async function attemptServerEndpointCompaction(params: {
       compactionCommitted = true;
       params.onCompactionCommitted?.(compacted.usage.input_tokens);
     });
+    return compacted;
   } catch (err) {
     // Observer or handle-release failures after commit must not trigger a
     // second client compaction of the already replaced context.
@@ -155,5 +155,4 @@ export async function attemptServerEndpointCompaction(params: {
     );
     return undefined;
   }
-  return compacted;
 }

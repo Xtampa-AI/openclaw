@@ -8,7 +8,7 @@ import {
 } from "../../../packages/gateway-protocol/src/index.js";
 import { isExactSemverVersion } from "../../infra/npm-registry-spec.js";
 import { normalizeScpRemotePath } from "../../infra/scp-host.js";
-import type { WorkerSshEndpoint, WorkerSshIdentity } from "../../plugins/types.js";
+import type { WorkerSshEndpoint } from "../../plugins/types.js";
 import { runCommandWithTimeout, type SpawnResult } from "../../process/exec.js";
 import {
   WORKER_BUNDLE_ARTIFACT_PATHS,
@@ -30,6 +30,7 @@ import {
   runWorkerSshCandidates,
   workerSshCommandOptions,
   workerSshOptions,
+  type WorkerSshIdentityResolver,
 } from "./ssh.js";
 
 const BOOTSTRAP_ROOT = ".openclaw-worker";
@@ -440,10 +441,7 @@ type WorkerBootstrapRequest = {
 };
 
 type WorkerBootstrapDependencies = {
-  resolveIdentity: (
-    keyRef: WorkerSshEndpoint["keyRef"],
-    context: { assertCurrent: () => void },
-  ) => Promise<WorkerSshIdentity>;
+  resolveIdentity: WorkerSshIdentityResolver;
   runCommand?: WorkerBootstrapCommandRunner;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -582,7 +580,7 @@ function parsePreflight(
   }
   if (matchesCommandFailure(result, NODE_UNSUPPORTED_EXIT_CODE, NODE_UNSUPPORTED_MARKER)) {
     throw new Error(
-      "Worker bootstrap requires Node 24.16.0+ or 26.1.0+ with WAL-reset-safe SQLite on the leased host; install a supported Node runtime in the provider setup phase and retry",
+      "Worker bootstrap requires Node 24.22.1+ or 26.12.1+ with WAL-reset-safe SQLite on the leased host; install a supported Node runtime in the provider setup phase and retry",
     );
   }
   if (!isSuccess(result)) {

@@ -174,7 +174,7 @@ See [MCP](/cli/mcp#openclaw-as-an-mcp-client-registry) and
 - `entries.<skillKey>.enabled: false` disables a skill even if bundled/installed.
 - `entries.<skillKey>.apiKey`: convenience for skills declaring a primary env var (plaintext string or SecretRef object).
 - `limits.maxCandidatesPerRoot`, `limits.maxSkillsLoadedPerSource`, `limits.maxSkillsInPrompt`, `limits.maxSkillsPromptChars`, `limits.maxSkillFileBytes`: bound skill discovery and the model-facing skills prompt.
-- Skill Workshop autonomy/approval settings (`workshop.autonomous.mode`, `workshop.approvalPolicy`, `workshop.maxPending`, `workshop.maxSkillBytes`) are documented in [Skills configuration](/tools/skills-config).
+- Skill Workshop settings (`workshop.autonomous.mode`, `workshop.maxSkillBytes`) are documented in [Skills configuration](/tools/skills-config).
 
 ---
 
@@ -203,7 +203,7 @@ See [MCP](/cli/mcp#openclaw-as-an-mcp-client-registry) and
 ```
 
 - Loaded from package or bundle directories under `~/.openclaw/extensions` and `<workspace>/.openclaw/extensions`, plus files or directories listed in `plugins.load.paths`.
-- Put standalone plugin files in `plugins.load.paths`; auto-discovered extension roots ignore top-level `.js`, `.mjs`, and `.ts` files so helper scripts in those roots do not block startup.
+- Put standalone plugin files in `plugins.load.paths`; auto-discovered extension roots ignore top-level `.js`, `.mjs`, and `.ts` files so helper scripts in those roots do not block startup. A standalone file uses its file name as plugin id and starts with the Gateway once enabled through `allow` or `entries.<id>.enabled`.
 - Discovery accepts native OpenClaw plugins plus compatible Codex bundles and Claude bundles, including manifestless Claude default-layout bundles.
 - With the default hybrid reload mode, ordinary plugin policy, entry, and discovery-path changes hot-reload the plugin runtime. Entry config changes replace the affected instance. Use `openclaw plugins reload <id>` after source or manifest edits; active plugins can still declare restart-triggering config prefixes. See [Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
 - `allow`: optional allowlist (only listed plugins load). `deny` wins.

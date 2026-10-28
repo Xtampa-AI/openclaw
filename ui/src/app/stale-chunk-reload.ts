@@ -1,6 +1,6 @@
 // Stale hashed-chunk recovery for lazy routes and the entry stylesheet.
 //
-// A gateway update replaces `ui/dist` in place, so a document loaded before the
+// A gateway update replaces `dist/control-ui` in place, so a document loaded before the
 // update still references the old hashed chunk URLs; the first visit to a lazy
 // route after the update 404s and the dynamic import rejects ("Importing a
 // module script failed"). Secure-context browsers recover through the service
@@ -10,8 +10,10 @@
 // only recovery path there.
 import { raceWithTimeout, sleepWithAbort } from "@openclaw/retry";
 import { CONTROL_UI_BUILD_INFO } from "../build-info.ts";
+import { configuredUiDevGateway } from "../dev-gateway.ts";
 import { t } from "../i18n/index.ts";
 import { getSafeSessionStorage } from "../local-storage.ts";
+import { resolveControlUiPaths } from "./browser.ts";
 import { canReloadControlUiDocument } from "./document-reload-guard.ts";
 
 const RELOAD_GUARD_STORAGE_KEY = "openclaw.controlUi.staleChunkReloadBuildId";
@@ -61,7 +63,15 @@ function probeControlUiDocument(): Promise<boolean> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DOCUMENT_PROBE_TIMEOUT_MS);
     try {
-      const response = await fetch(window.location.href, {
+      // Session links reject HEAD; probe the serving document without session query data.
+      const url = new URL(window.location.href);
+      const [routeBasePath, resourceBasePath] = resolveControlUiPaths(url.pathname);
+      // Vite serves its own document while Gateway resources use the development proxy.
+      const documentBasePath = configuredUiDevGateway() ? routeBasePath : resourceBasePath;
+      url.pathname = `${documentBasePath}/index.html`;
+      url.search = "";
+      url.hash = "";
+      const response = await fetch(url.href, {
         method: "HEAD",
         cache: "no-store",
         signal: controller.signal,
@@ -234,9 +244,7 @@ async function waitForReachableControlUiDocument(
     if (remainingWait <= 0) {
       return false;
     }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, Math.min(REACHABLE_WAIT_INTERVAL_MS, remainingWait));
-    });
+    await sleepWithAbort(Math.min(REACHABLE_WAIT_INTERVAL_MS, remainingWait));
   }
 }
 
