@@ -1,0 +1,24 @@
+{
+  "name": "@kairos/kairos-wake-bridge",
+  "version": "2026.10.28",
+  "description": "Signed OpenClaw lifecycle events for Kairos-Wake governance and tracing.",
+  "type": "module",
+  "dependencies": {
+    "typebox": "1.3.34"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*",
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.10.1"
+    },
+    "build": {
+      "openclawVersion": "2026.10.1"
+    }
+  }
+}

@@ -4,7 +4,15 @@
     "onStartup": true
   },
   "name": "Kairos-Wake Bridge",
-  "description": "Delegate tasks to Kairos-Wake wakers. Create sessions, send messages, and receive responses from waker agents running on the Kairos-Wake daemon.",
+  "description": "Delegate tasks to Kairos-Wake wakers and optionally emit signed lifecycle events for Wake tracing.",
+  "configContracts": {
+    "secretInputs": {
+      "bundledDefaultEnabled": false,
+      "paths": [
+        { "path": "eventSecret", "expected": "string", "ownerKind": "route" }
+      ]
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -27,6 +35,23 @@
         "minimum": 5000,
         "maximum": 300000,
         "description": "Request timeout in milliseconds (default: 120000)"
+      },
+      "eventsEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable signed OpenClaw lifecycle events to Wake"
+      },
+      "eventSecret": {
+        "type": "string",
+        "description": "Shared secret used to sign event envelopes; inject through the secret manager"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Optional OpenClaw agent identity override for event envelopes"
+      },
+      "wakerId": {
+        "type": "string",
+        "description": "Optional Wake waker identity attached to event envelopes"
       }
     }
   },
@@ -45,6 +70,15 @@
     "defaultWaker": {
       "label": "Default Waker",
       "help": "Waker ID to use when the agent does not specify one explicitly."
+    },
+    "eventsEnabled": {
+      "label": "Enable Wake Event Tracing",
+      "help": "Emit bounded, signed OpenClaw lifecycle events to Kairos-Wake."
+    },
+    "eventSecret": {
+      "label": "Wake event signing secret",
+      "help": "Use a SecretRef or injected secret; never paste this into chat.",
+      "sensitive": true
     }
   }
 }
