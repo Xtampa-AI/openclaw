@@ -1,4 +1,3 @@
-import { createHmac, randomUUID } from "node:crypto";
 import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import {
   defineToolPlugin,
@@ -27,6 +26,7 @@ import {
  *  - wakerId:        optional Wake waker identity attached to events
  */
 import { Type } from "typebox";
+import { WakeEventDispatcher, wakeEventConfig } from "./event-transport.js";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:19900";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -41,7 +41,9 @@ interface KwBridgeConfig {
 
 function resolveConfig(config: Record<string, unknown> | undefined): KwBridgeConfig {
   return {
-    enabled: config?.enabled !== false,
+    // The plugin can be loaded for event tracing without exposing delegation
+    // tools. Require an explicit opt-in for the tool surface.
+    enabled: config?.enabled === true,
     daemonUrl: (config?.daemonUrl as string) || DEFAULT_DAEMON_URL,
     authToken: config?.authToken as string | undefined,
     defaultWaker: config?.defaultWaker as string | undefined,
@@ -337,256 +339,6 @@ const toolEntry = defineToolPlugin({
   ],
 });
 
-const EVENT_PROTOCOL = "kairos-wake.openclaw.v1";
-const EVENT_DEFAULT_TIMEOUT_MS = 5_000;
-const EVENT_MAX_STRING_LENGTH = 2_048;
-const EVENT_MAX_DEPTH = 4;
-const EVENT_MAX_ARRAY_ITEMS = 16;
-const EVENT_MAX_OBJECT_KEYS = 32;
-
-type WakeEventConfig = {
-  eventsEnabled?: boolean;
-  daemonUrl?: string;
-  eventSecret?: string;
-  agentId?: string;
-  wakerId?: string;
-  timeoutMs?: number;
-};
-
-type WakeHookContext = {
-  agentId?: string;
-  sessionKey?: string;
-  sessionId?: string;
-  runId?: string;
-  childSessionKey?: string;
-};
-
-const EVENT_SENSITIVE_KEY =
-  /(^|_)(authorization|api[_-]?key|password|passwd|secret|token|cookie|credential|private[_-]?key|access[_-]?key|prompt|system|messages?|history|transcript|environment|env)(_|$)/i;
-
-function eventRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function eventString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function boundedEventValue(value: unknown, depth = 0): unknown {
-  if (depth > EVENT_MAX_DEPTH) {
-    return "[TRUNCATED]";
-  }
-  if (value === null || typeof value === "boolean" || typeof value === "number") {
-    return value;
-  }
-  if (typeof value === "string") {
-    return value.length > EVENT_MAX_STRING_LENGTH
-      ? value.slice(0, EVENT_MAX_STRING_LENGTH) + "…[TRUNCATED]"
-      : value;
-  }
-  if (Array.isArray(value)) {
-    return value.slice(0, EVENT_MAX_ARRAY_ITEMS).map((item) => boundedEventValue(item, depth + 1));
-  }
-  const record = eventRecord(value);
-  if (!record) {
-    return String(value);
-  }
-  const result: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record).slice(0, EVENT_MAX_OBJECT_KEYS)) {
-    if (EVENT_SENSITIVE_KEY.test(key)) {
-      result[key] = "[REDACTED]";
-    } else {
-      result[key] = boundedEventValue(child, depth + 1);
-    }
-  }
-  return result;
-}
-
-function pickEventFields(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  const record = eventRecord(value);
-  if (!record) {
-    return {};
-  }
-  const result: Record<string, unknown> = {};
-  for (const key of keys) {
-    if (key in record) {
-      result[key] = boundedEventValue(record[key]);
-    }
-  }
-  return result;
-}
-
-function wakeEventConfig(api: OpenClawPluginApi): WakeEventConfig {
-  const raw = api.pluginConfig ?? {};
-  return {
-    eventsEnabled: raw.eventsEnabled === true,
-    daemonUrl: eventString(raw.daemonUrl),
-    eventSecret: eventString(raw.eventSecret) ?? eventString(process.env.OPENCLAW_EVENT_SECRET),
-    agentId: eventString(raw.agentId),
-    wakerId: eventString(raw.wakerId),
-    timeoutMs:
-      typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs)
-        ? Math.min(Math.max(Math.trunc(raw.timeoutMs), 500), 30_000)
-        : undefined,
-  };
-}
-
-function eventCorrelationId(event: unknown, context: WakeHookContext): string | undefined {
-  const record = eventRecord(event);
-  return (
-    eventString(record?.toolCallId) ??
-    eventString(record?.callId) ??
-    eventString(record?.childSessionKey) ??
-    eventString(context.childSessionKey) ??
-    eventString(context.runId)
-  );
-}
-
-function wakeEventPayload(hookName: string, event: unknown): Record<string, unknown> {
-  switch (hookName) {
-    case "before_tool_call": {
-      const record = eventRecord(event);
-      return {
-        toolName: eventString(record?.toolName),
-        toolCallId: eventString(record?.toolCallId),
-        params: boundedEventValue(record?.params),
-      };
-    }
-    case "after_tool_call": {
-      const record = eventRecord(event);
-      return {
-        toolName: eventString(record?.toolName),
-        toolCallId: eventString(record?.toolCallId),
-        durationMs: record?.durationMs,
-        error: eventString(record?.error),
-        result: boundedEventValue(record?.result),
-      };
-    }
-    case "model_call_started":
-      return pickEventFields(event, ["callId", "provider", "model", "api", "transport"]);
-    case "model_call_ended":
-      return pickEventFields(event, [
-        "callId",
-        "provider",
-        "model",
-        "api",
-        "transport",
-        "durationMs",
-        "outcome",
-        "errorCategory",
-        "failureKind",
-        "requestPayloadBytes",
-        "responseStreamBytes",
-        "timeToFirstByteMs",
-        "upstreamRequestIdHash",
-      ]);
-    case "session_start":
-      return pickEventFields(event, ["sessionId", "sessionKey", "resumedFrom"]);
-    case "session_end":
-      return pickEventFields(event, [
-        "sessionId",
-        "sessionKey",
-        "messageCount",
-        "durationMs",
-        "reason",
-        "transcriptArchived",
-        "nextSessionId",
-        "nextSessionKey",
-      ]);
-    case "before_compaction":
-    case "after_compaction":
-      return pickEventFields(event, [
-        "messageCount",
-        "compactingCount",
-        "tokenCount",
-        "compactedCount",
-        "previousSessionId",
-      ]);
-    case "subagent_spawned":
-      return pickEventFields(event, [
-        "childSessionKey",
-        "agentId",
-        "label",
-        "mode",
-        "threadRequested",
-        "resolvedModel",
-        "resolvedProvider",
-      ]);
-    case "subagent_progress":
-      return pickEventFields(event, ["phase", "runId", "childSessionKey", "outcome"]);
-    case "subagent_ended":
-      return pickEventFields(event, [
-        "targetSessionKey",
-        "targetKind",
-        "reason",
-        "sendFarewell",
-        "runId",
-        "endedAt",
-        "outcome",
-        "error",
-      ]);
-    case "agent_end":
-      return pickEventFields(event, ["runId", "success", "error", "durationMs"]);
-    default:
-      return pickEventFields(event, ["runId", "sessionId", "sessionKey"]);
-  }
-}
-
-async function emitWakeEvent(
-  api: OpenClawPluginApi,
-  config: WakeEventConfig,
-  hookName: string,
-  event: unknown,
-  context: WakeHookContext,
-): Promise<void> {
-  if (!config.eventsEnabled || !config.daemonUrl || !config.eventSecret) {
-    return;
-  }
-
-  const record = eventRecord(event);
-  const sessionKey = eventString(context.sessionKey) ?? eventString(record?.sessionKey);
-  const runId = eventString(context.runId) ?? eventString(record?.runId);
-  const body = JSON.stringify({
-    protocol: EVENT_PROTOCOL,
-    eventId: randomUUID(),
-    eventType: "openclaw." + hookName,
-    occurredAt: new Date().toISOString(),
-    // The configured alias is the Wake governance identity for this
-    // container. Keep OpenClaw's internal agent id only as a fallback.
-    agentId: config.agentId ?? context.agentId ?? "unknown",
-    sessionKey,
-    runId,
-    correlationId: eventCorrelationId(event, context),
-    wakerId: config.wakerId,
-    payload: wakeEventPayload(hookName, event),
-  });
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signature = createHmac("sha256", config.eventSecret)
-    .update(timestamp + "." + body)
-    .digest("hex");
-  const endpoint = config.daemonUrl.replace(/\/$/, "") + "/api/public/openclaw/events";
-
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-kairos-wake-timestamp": timestamp,
-        "x-kairos-wake-signature": signature,
-      },
-      body,
-      signal: AbortSignal.timeout(config.timeoutMs ?? EVENT_DEFAULT_TIMEOUT_MS),
-    });
-    if (!response.ok) {
-      api.logger.warn("Kairos-Wake event rejected (" + response.status + ") for " + hookName);
-    }
-  } catch (error) {
-    api.logger.debug?.("Kairos-Wake event delivery failed for " + hookName + ": " + String(error));
-  }
-}
-
 function registerWakeEvents(api: OpenClawPluginApi): void {
   const config = wakeEventConfig(api);
   if (!config.eventsEnabled) {
@@ -598,42 +350,37 @@ function registerWakeEvents(api: OpenClawPluginApi): void {
     return;
   }
 
-  api.on("session_start", (event, context) => {
-    void emitWakeEvent(api, config, "session_start", event, context);
-  });
-  api.on("session_end", (event, context) => {
-    void emitWakeEvent(api, config, "session_end", event, context);
-  });
-  api.on("model_call_started", (event, context) => {
-    void emitWakeEvent(api, config, "model_call_started", event, context);
-  });
-  api.on("model_call_ended", (event, context) => {
-    void emitWakeEvent(api, config, "model_call_ended", event, context);
-  });
-  api.on("before_tool_call", (event, context) => {
-    void emitWakeEvent(api, config, "before_tool_call", event, context);
-  });
-  api.on("after_tool_call", (event, context) => {
-    void emitWakeEvent(api, config, "after_tool_call", event, context);
-  });
-  api.on("before_compaction", (event, context) => {
-    void emitWakeEvent(api, config, "before_compaction", event, context);
-  });
-  api.on("after_compaction", (event, context) => {
-    void emitWakeEvent(api, config, "after_compaction", event, context);
-  });
-  api.on("subagent_spawned", (event, context) => {
-    void emitWakeEvent(api, config, "subagent_spawned", event, context);
-  });
-  api.on("subagent_progress", (event, context) => {
-    void emitWakeEvent(api, config, "subagent_progress", event, context);
-  });
-  api.on("subagent_ended", (event, context) => {
-    void emitWakeEvent(api, config, "subagent_ended", event, context);
-  });
-  api.on("agent_end", (event, context) => {
-    void emitWakeEvent(api, config, "agent_end", event, context);
-  });
+  const dispatcher = new WakeEventDispatcher(api.logger, config);
+  api.on("session_start", (event, context) => dispatcher.enqueue("session_start", event, context));
+  api.on("session_end", (event, context) => dispatcher.enqueue("session_end", event, context));
+  api.on("model_call_started", (event, context) =>
+    dispatcher.enqueue("model_call_started", event, context),
+  );
+  api.on("model_call_ended", (event, context) =>
+    dispatcher.enqueue("model_call_ended", event, context),
+  );
+  api.on("before_tool_call", (event, context) =>
+    dispatcher.enqueue("before_tool_call", event, context),
+  );
+  api.on("after_tool_call", (event, context) =>
+    dispatcher.enqueue("after_tool_call", event, context),
+  );
+  api.on("before_compaction", (event, context) =>
+    dispatcher.enqueue("before_compaction", event, context),
+  );
+  api.on("after_compaction", (event, context) =>
+    dispatcher.enqueue("after_compaction", event, context),
+  );
+  api.on("subagent_spawned", (event, context) =>
+    dispatcher.enqueue("subagent_spawned", event, context),
+  );
+  api.on("subagent_progress", (event, context) =>
+    dispatcher.enqueue("subagent_progress", event, context),
+  );
+  api.on("subagent_ended", (event, context) =>
+    dispatcher.enqueue("subagent_ended", event, context),
+  );
+  api.on("agent_end", (event, context) => dispatcher.enqueue("agent_end", event, context));
   api.logger.info("Kairos-Wake event bridge enabled for 12 lifecycle hooks");
 }
 

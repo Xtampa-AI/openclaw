@@ -2,7 +2,10 @@
 
 This OpenClaw plugin emits bounded, HMAC-signed lifecycle events to Kairos-Wake. Wake stores the events, deduplicates them, links them to an `oc_session_key`, and adds tool/model/subagent spans to the Wake trace.
 
-The plugin is disabled by default. Enable it only after configuring a private route to Wake and a shared secret in the OpenClaw secret manager:
+The plugin is loaded by OpenClaw but both the delegation tools and lifecycle
+events are disabled by default. Enable each surface explicitly only after
+configuring a private route to Wake and a shared secret in the OpenClaw secret
+manager:
 
 ```json
 {
@@ -11,6 +14,7 @@ The plugin is disabled by default. Enable it only after configuring a private ro
       "kairos-wake-bridge": {
         "enabled": true,
         "config": {
+          "enabled": true,
           "eventsEnabled": true,
           "daemonUrl": "http://kairos-wake-proxy:19900",
           "eventSecret": "<injected-secret>",
@@ -27,6 +31,12 @@ The plugin's event surface is observability-only: it does not alter prompts, too
 
 Payloads exclude prompts/transcripts/system messages and are bounded before transport. Delivery is best-effort and at-least-once; Wake deduplicates by `eventId` and remains authoritative for events it has accepted. The configured `agentId` is the stable governance alias (`kai`, `cangrejo`, or `hermes`); OpenClaw's internal context identity is only the fallback.
 
+The event transport is deliberately isolated from the agent loop: it keeps at
+most four HTTP deliveries in flight and 256 queued events per gateway. After
+five consecutive delivery failures it opens a 30-second circuit and drops
+queued lifecycle events until Wake is reachable again. These limits prevent a
+slow or unavailable Wake daemon from becoming an OpenClaw resource leak.
+
 For a proxy session to appear in Wake's trace, the OpenClaw gateway must receive the durable key through the official `x-openclaw-session-key` request header. A JSON `session_key` field is not a valid substitute and is ignored by the OpenAI-compatible gateway. Wake deliberately keeps older events without an exact session-key match unlinked.
 
 Wake-side session stopping is exposed separately through its governed `/api/openclaw/sessions/:sessionId/abort` endpoint and `openclaw_abort_session` tool; this plugin does not invoke control methods. Session option changes and compaction are Wake approval-gated operations and never edit `openclaw.json`.
@@ -37,3 +47,8 @@ Operational checklist:
 2. Inject the same secret as Wake's `OPENCLAW_EVENT_SECRET`; do not commit it.
 3. Verify a new proxy turn produces a matching `sessionKey`, accepted events, and a linked trace in Wake.
 4. If the event endpoint is unavailable, OpenClaw continues operating and Wake does not infer activity from the missing delivery; the gap remains visible as incomplete observability.
+
+The Docker healthcheck uses an eight-minute startup window by default because
+the OpenClaw entrypoint runs Doctor, schema migrations, and plugin recovery
+before the gateway binds its port. Override it with
+`OPENCLAW_HEALTH_START_PERIOD` when a persistent state needs more or less time.

@@ -91,7 +91,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      # Doctor, schema migrations, and plugin recovery run before the gateway
+      # binds its port. Persistent OpenClaw states can take several minutes.
+      start_period: ${OPENCLAW_HEALTH_START_PERIOD:-8m}
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
