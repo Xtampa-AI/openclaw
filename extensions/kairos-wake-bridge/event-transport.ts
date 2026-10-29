@@ -346,10 +346,18 @@ export class WakeEventDispatcher {
 
 export function wakeEventConfig(api: OpenClawPluginApi): WakeEventConfig {
   const raw = api.pluginConfig ?? {};
+  const configuredEventSecret = eventString(raw.eventSecret);
   return {
     eventsEnabled: raw.eventsEnabled === true,
     daemonUrl: eventString(raw.daemonUrl),
-    eventSecret: eventString(raw.eventSecret) ?? eventString(process.env.OPENCLAW_EVENT_SECRET),
+    // An omitted secret may use the documented environment fallback. An
+    // explicit but unresolved SecretRef must fail closed rather than silently
+    // selecting an unrelated ambient credential.
+    eventSecret:
+      configuredEventSecret ||
+      (!Object.prototype.hasOwnProperty.call(raw, "eventSecret")
+        ? eventString(process.env.OPENCLAW_EVENT_SECRET)
+        : undefined),
     agentId: eventString(raw.agentId),
     wakerId: eventString(raw.wakerId),
     timeoutMs:

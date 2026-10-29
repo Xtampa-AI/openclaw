@@ -27,6 +27,14 @@ manager:
 }
 ```
 
+Delegation additionally requires a Wake-issued OpenClaw service token. Keep
+the clear value outside `openclaw.json`: inject it as the
+`KAIROS_WAKE_BRIDGE_TOKEN` environment variable, or provide `authToken` via
+OpenClaw's SecretRef mechanism. Wake stores only a hash, limits the token to
+the bridge operations, and returns the clear value only when an administrator
+creates it. Use one credential per gateway so a single revocation does not
+disable the other agents.
+
 The plugin's event surface is observability-only: it does not alter prompts, tools, model routing, or session execution. It emits twelve lifecycle hooks using the envelope `kairos-wake.openclaw.v1`, signs `<unix-seconds>.<raw-body>` with HMAC-SHA256, and sends the signature in `X-Kairos-Wake-Signature` together with `X-Kairos-Wake-Timestamp`.
 
 Payloads exclude prompts/transcripts/system messages and are bounded before transport. Delivery is best-effort and at-least-once; Wake deduplicates by `eventId` and remains authoritative for events it has accepted. The configured `agentId` is the stable governance alias (`kai`, `cangrejo`, or `hermes`); OpenClaw's internal context identity is only the fallback.
@@ -45,8 +53,9 @@ Operational checklist:
 
 1. Configure `eventsEnabled: true`, a private `daemonUrl`, and the correct alias.
 2. Inject the same secret as Wake's `OPENCLAW_EVENT_SECRET`; do not commit it.
-3. Verify a new proxy turn produces a matching `sessionKey`, accepted events, and a linked trace in Wake.
-4. If the event endpoint is unavailable, OpenClaw continues operating and Wake does not infer activity from the missing delivery; the gap remains visible as incomplete observability.
+3. For delegation, inject the corresponding `KAIROS_WAKE_BRIDGE_TOKEN`; do not commit it or print it in diagnostics.
+4. Verify a new proxy turn produces a matching `sessionKey`, accepted events, and a linked trace in Wake.
+5. If the event endpoint is unavailable, OpenClaw continues operating and Wake does not infer activity from the missing delivery; the gap remains visible as incomplete observability.
 
 The Docker healthcheck uses an eight-minute startup window by default because
 the OpenClaw entrypoint runs Doctor, schema migrations, and plugin recovery

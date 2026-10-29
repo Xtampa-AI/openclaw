@@ -17,7 +17,7 @@ import {
  *
  * Configuration via openclaw.json plugins.entries["kairos-wake-bridge"].config:
  *  - daemonUrl:   KW daemon URL (default: http://127.0.0.1:19900)
- *  - authToken:   Bearer token for KW API
+ *  - authToken:   Bearer token for KW API; falls back to KAIROS_WAKE_BRIDGE_TOKEN
  *  - defaultWaker: default waker ID
  *  - timeoutMs:   request timeout (default: 120000)
  *  - eventsEnabled: signed lifecycle events to Wake (default: false)
@@ -39,13 +39,32 @@ interface KwBridgeConfig {
   timeoutMs?: number;
 }
 
-function resolveConfig(config: Record<string, unknown> | undefined): KwBridgeConfig {
+const SecretRefSchema = Type.Object({
+  source: Type.Union([
+    Type.Literal("env"),
+    Type.Literal("file"),
+    Type.Literal("exec"),
+    Type.Literal("store"),
+  ]),
+  provider: Type.String({ minLength: 1 }),
+  id: Type.String({ minLength: 1 }),
+});
+const SecretInputSchema = Type.Union([Type.String(), SecretRefSchema]);
+
+export function resolveConfig(config: Record<string, unknown> | undefined): KwBridgeConfig {
+  const hasExplicitAuthToken = config && Object.prototype.hasOwnProperty.call(config, "authToken");
+  const configuredAuthToken = typeof config?.authToken === "string" ? config.authToken : undefined;
   return {
     // The plugin can be loaded for event tracing without exposing delegation
     // tools. Require an explicit opt-in for the tool surface.
     enabled: config?.enabled === true,
     daemonUrl: (config?.daemonUrl as string) || DEFAULT_DAEMON_URL,
-    authToken: config?.authToken as string | undefined,
+    // Prefer an explicit SecretRef-resolved value. Only an omitted field may
+    // use the ambient env fallback; an unresolved explicit SecretRef fails
+    // closed instead of silently selecting another credential.
+    authToken:
+      configuredAuthToken ||
+      (!hasExplicitAuthToken ? process.env.KAIROS_WAKE_BRIDGE_TOKEN : undefined),
     defaultWaker: config?.defaultWaker as string | undefined,
     timeoutMs: (config?.timeoutMs as number) || DEFAULT_TIMEOUT_MS,
   };
@@ -87,11 +106,11 @@ const toolEntry = defineToolPlugin({
   configSchema: Type.Object({
     enabled: Type.Optional(Type.Boolean()),
     daemonUrl: Type.Optional(Type.String()),
-    authToken: Type.Optional(Type.String()),
+    authToken: Type.Optional(SecretInputSchema),
     defaultWaker: Type.Optional(Type.String()),
     timeoutMs: Type.Optional(Type.Integer()),
     eventsEnabled: Type.Optional(Type.Boolean()),
-    eventSecret: Type.Optional(Type.String()),
+    eventSecret: Type.Optional(SecretInputSchema),
     agentId: Type.Optional(Type.String()),
     wakerId: Type.Optional(Type.String()),
   }),

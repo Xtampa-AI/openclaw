@@ -9,6 +9,7 @@
     "secretInputs": {
       "bundledDefaultEnabled": false,
       "paths": [
+        { "path": "authToken", "expected": "string", "ownerKind": "route" },
         { "path": "eventSecret", "expected": "string", "ownerKind": "route" }
       ]
     }
@@ -16,6 +17,21 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
+    "$defs": {
+      "secretRef": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": { "type": "string", "enum": ["env", "file", "exec", "store"] },
+          "provider": { "type": "string", "minLength": 1 },
+          "id": { "type": "string", "minLength": 1 }
+        },
+        "required": ["source", "provider", "id"]
+      },
+      "secretInput": {
+        "anyOf": [{ "type": "string" }, { "$ref": "#/$defs/secretRef" }]
+      }
+    },
     "properties": {
       "enabled": { "type": "boolean" },
       "daemonUrl": {
@@ -23,8 +39,8 @@
         "description": "Kairos-Wake daemon URL (default: http://127.0.0.1:19900)"
       },
       "authToken": {
-        "type": "string",
-        "description": "Bearer token for Kairos-Wake API authentication"
+        "$ref": "#/$defs/secretInput",
+        "description": "Bearer token for Kairos-Wake API authentication; prefer SecretRef or KAIROS_WAKE_BRIDGE_TOKEN"
       },
       "defaultWaker": {
         "type": "string",
@@ -42,7 +58,7 @@
         "description": "Enable signed OpenClaw lifecycle events to Wake"
       },
       "eventSecret": {
-        "type": "string",
+        "$ref": "#/$defs/secretInput",
         "description": "Shared secret used to sign event envelopes; inject through the secret manager"
       },
       "agentId": {
@@ -66,6 +82,11 @@
     "daemonUrl": {
       "label": "Daemon URL",
       "help": "URL of the Kairos-Wake daemon. Defaults to http://127.0.0.1:19900."
+    },
+    "authToken": {
+      "label": "Wake bridge service token",
+      "help": "Prefer a SecretRef or the KAIROS_WAKE_BRIDGE_TOKEN environment variable; never paste a clear token into openclaw.json.",
+      "sensitive": true
     },
     "defaultWaker": {
       "label": "Default Waker",
