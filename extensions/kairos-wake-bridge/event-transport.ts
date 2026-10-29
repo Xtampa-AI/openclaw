@@ -90,7 +90,7 @@ function pickEventFields(value: unknown, keys: readonly string[]): Record<string
   }
   const result: Record<string, unknown> = {};
   for (const key of keys) {
-    if (key in record) {
+    if (key in record && record[key] !== undefined) {
       result[key] = boundedEventValue(record[key]);
     }
   }

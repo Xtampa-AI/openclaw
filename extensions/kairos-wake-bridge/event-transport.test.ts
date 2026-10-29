@@ -138,6 +138,27 @@ describe("WakeEventDispatcher", () => {
     expect(body.payload).toEqual({});
   });
 
+  it("does not serialize undefined lifecycle fields", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { logger } = makeLogger();
+    const dispatcher = new WakeEventDispatcher(logger, config);
+    dispatcher.enqueue(
+      "agent_end",
+      { runId: "run-undefined", success: true, error: undefined, durationMs: undefined },
+      { runId: "run-undefined", sessionKey: "agent:kai:main" },
+    );
+    await tick();
+
+    const [, init] = fetchMock.mock.calls[0] ?? [];
+    const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    expect(body.payload).toEqual({ runId: "run-undefined", success: true });
+  });
+
   it("anchors subagent lifecycle events to the requester and preserves child correlation", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
     vi.stubGlobal("fetch", fetchMock);
