@@ -26,6 +26,12 @@ import {
  *  - wakerId:        optional Wake waker identity attached to events
  */
 import { Type } from "typebox";
+import {
+  WakeArtifactParameters,
+  WakeAttachmentParameters,
+  createWakeArtifactTool,
+  createWakeAttachmentTool,
+} from "./attachment-tools.js";
 import { WakeEventDispatcher, wakeEventConfig } from "./event-transport.js";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:19900";
@@ -355,6 +361,32 @@ const toolEntry = defineToolPlugin({
         return parts.join("\n");
       },
     }),
+    tool({
+      name: "kw_wake_attachment",
+      label: "Wake Attachment",
+      description:
+        "Upload or download a file in the current governed Kairos-Wake proxy session. The scoped Wake service token is kept inside the bridge and is never exposed to the model.",
+      parameters: WakeAttachmentParameters,
+      factory({ toolContext, config }) {
+        return createWakeAttachmentTool(
+          toolContext,
+          resolveConfig(config as Record<string, unknown>),
+        );
+      },
+    }),
+    tool({
+      name: "kw_wake_artifact",
+      label: "Wake Room Artifact",
+      description:
+        "List or register a governed artifact in a Kairos-Wake room without exposing a Wake token in the prompt.",
+      parameters: WakeArtifactParameters,
+      factory({ toolContext, config }) {
+        return createWakeArtifactTool(
+          toolContext,
+          resolveConfig(config as Record<string, unknown>),
+        );
+      },
+    }),
   ],
 });
 
@@ -400,7 +432,12 @@ function registerWakeEvents(api: OpenClawPluginApi): void {
     dispatcher.enqueue("subagent_ended", event, context),
   );
   api.on("agent_end", (event, context) => dispatcher.enqueue("agent_end", event, context));
-  api.logger.info("Kairos-Wake event bridge enabled for 12 lifecycle hooks");
+  // Emit a bounded, payload-free transport probe at gateway startup. It has
+  // no session identity and therefore cannot create a Wake shadow; it only
+  // proves that this configured bridge can reach Wake without requiring an
+  // LLM turn or leaking user content.
+  dispatcher.enqueue("bridge_ready", {}, {});
+  api.logger.info("Kairos-Wake event bridge enabled for 12 lifecycle hooks + startup probe");
 }
 
 const eventEntry = definePluginEntry({

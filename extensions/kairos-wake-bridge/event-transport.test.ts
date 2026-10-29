@@ -1,6 +1,11 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EVENT_MAX_IN_FLIGHT, EVENT_MAX_QUEUE, WakeEventDispatcher } from "./event-transport.js";
+import {
+  EVENT_MAX_IN_FLIGHT,
+  EVENT_MAX_QUEUE,
+  EVENT_STARTUP_PROBE_RETRY_DELAYS_MS,
+  WakeEventDispatcher,
+} from "./event-transport.js";
 
 const config = {
   eventsEnabled: true,
@@ -25,6 +30,7 @@ async function tick(): Promise<void> {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("WakeEventDispatcher", () => {
@@ -109,5 +115,107 @@ describe("WakeEventDispatcher", () => {
 
     expect(callsWhenOpen).toBeLessThan(32);
     expect(fetchMock).toHaveBeenCalledTimes(callsWhenOpen);
+  });
+
+  it("emits a payload-free startup probe without a session identity", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { logger } = makeLogger();
+    const dispatcher = new WakeEventDispatcher(logger, config);
+    dispatcher.enqueue("bridge_ready", {}, {});
+    await tick();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] ?? [];
+    const body = JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    expect(body.eventType).toBe("openclaw.bridge_ready");
+    expect(body.sessionKey).toBeUndefined();
+    expect(body.runId).toBeUndefined();
+    expect(body.payload).toEqual({});
+  });
+
+  it("anchors subagent lifecycle events to the requester and preserves child correlation", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { logger } = makeLogger();
+    const dispatcher = new WakeEventDispatcher(logger, config);
+    const childSessionKey = "agent:kai:subagent:run-1";
+    const context = {
+      runId: "run-1",
+      requesterSessionKey: "agent:kai:parent",
+    };
+    dispatcher.enqueue("subagent_spawned", { runId: "run-1", childSessionKey }, context);
+    dispatcher.enqueue(
+      "subagent_ended",
+      { runId: "run-1", targetSessionKey: childSessionKey },
+      context,
+    );
+    await tick();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const bodies = fetchMock.mock.calls.map(
+      ([, init]) =>
+        JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")) as Record<
+          string,
+          unknown
+        >,
+    );
+    expect(bodies).toEqual([
+      expect.objectContaining({
+        eventType: "openclaw.subagent_spawned",
+        sessionKey: "agent:kai:parent",
+        correlationId: childSessionKey,
+      }),
+      expect.objectContaining({
+        eventType: "openclaw.subagent_ended",
+        sessionKey: "agent:kai:parent",
+        correlationId: childSessionKey,
+      }),
+    ]);
+  });
+
+  it("retries a startup probe with the same bounded event after Wake recovers", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Wake unavailable"))
+      .mockResolvedValue(new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { logger } = makeLogger();
+    const dispatcher = new WakeEventDispatcher(logger, config);
+    dispatcher.enqueue("bridge_ready", {}, {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(EVENT_STARTUP_PROBE_RETRY_DELAYS_MS[0]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const firstBody = (fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body;
+    const secondBody = (fetchMock.mock.calls[1]?.[1] as RequestInit | undefined)?.body;
+    expect(JSON.parse(String(secondBody)).eventId).toBe(JSON.parse(String(firstBody)).eventId);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("bridge_ready"));
+  });
+
+  it("bounds startup probe retries", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("Wake unavailable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { logger } = makeLogger();
+    const dispatcher = new WakeEventDispatcher(logger, config);
+    dispatcher.enqueue("bridge_ready", {}, {});
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(EVENT_STARTUP_PROBE_RETRY_DELAYS_MS[0]);
+    await vi.advanceTimersByTimeAsync(EVENT_STARTUP_PROBE_RETRY_DELAYS_MS[1]);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(logger.warn).toHaveBeenCalled();
   });
 });

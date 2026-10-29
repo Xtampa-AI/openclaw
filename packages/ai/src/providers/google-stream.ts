@@ -1,4 +1,3 @@
-import type { FinishReason } from "@google/genai";
 import { appendAssistantThinking } from "@openclaw/llm-core/event-stream";
 import { calculateCost } from "../model-utils.js";
 import {
@@ -63,29 +62,30 @@ function retainThoughtSignature(
   return existing;
 }
 
-const stopReasons = new Map<string, StopReason>(
-  Object.entries({
-    STOP: "stop",
-    MAX_TOKENS: "length",
-    CONTINUATION: "length",
-    BLOCKLIST: "error",
-    PROHIBITED_CONTENT: "error",
-    SPII: "error",
-    SAFETY: "error",
-    IMAGE_SAFETY: "error",
-    IMAGE_PROHIBITED_CONTENT: "error",
-    IMAGE_RECITATION: "error",
-    IMAGE_OTHER: "error",
-    RECITATION: "error",
-    FINISH_REASON_UNSPECIFIED: "error",
-    OTHER: "error",
-    LANGUAGE: "error",
-    MALFORMED_FUNCTION_CALL: "error",
-    TOO_MANY_TOOL_CALLS: "error",
-    UNEXPECTED_TOOL_CALL: "error",
-    NO_IMAGE: "error",
-  } satisfies Record<FinishReason, StopReason>),
-);
+// Keep the wire spelling table open to provider additions and historical values
+// such as CONTINUATION. The SDK's FinishReason enum is not a stable wire
+// contract, and newer TypeScript versions reject extra keys in a Record enum.
+const stopReasons = new Map<string, StopReason>([
+  ["STOP", "stop"],
+  ["MAX_TOKENS", "length"],
+  ["CONTINUATION", "length"],
+  ["BLOCKLIST", "error"],
+  ["PROHIBITED_CONTENT", "error"],
+  ["SPII", "error"],
+  ["SAFETY", "error"],
+  ["IMAGE_SAFETY", "error"],
+  ["IMAGE_PROHIBITED_CONTENT", "error"],
+  ["IMAGE_RECITATION", "error"],
+  ["IMAGE_OTHER", "error"],
+  ["RECITATION", "error"],
+  ["FINISH_REASON_UNSPECIFIED", "error"],
+  ["OTHER", "error"],
+  ["LANGUAGE", "error"],
+  ["MALFORMED_FUNCTION_CALL", "error"],
+  ["TOO_MANY_TOOL_CALLS", "error"],
+  ["UNEXPECTED_TOOL_CALL", "error"],
+  ["NO_IMAGE", "error"],
+]);
 
 function mapStopReason(reason: string): StopReason {
   const mapped = stopReasons.get(reason);

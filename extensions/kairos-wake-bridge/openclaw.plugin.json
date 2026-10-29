@@ -72,7 +72,13 @@
     }
   },
   "contracts": {
-    "tools": ["kw_list_wakers", "kw_send_message", "kw_get_response"]
+    "tools": [
+      "kw_list_wakers",
+      "kw_send_message",
+      "kw_get_response",
+      "kw_wake_attachment",
+      "kw_wake_artifact"
+    ]
   },
   "uiHints": {
     "enabled": {

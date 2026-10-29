@@ -12,6 +12,7 @@ export const EVENT_MAX_IN_FLIGHT = 4;
 export const EVENT_MAX_QUEUE = 256;
 export const EVENT_FAILURE_THRESHOLD = 5;
 export const EVENT_CIRCUIT_COOLDOWN_MS = 30_000;
+export const EVENT_STARTUP_PROBE_RETRY_DELAYS_MS = [1_000, 5_000] as const;
 
 export type WakeEventConfig = {
   eventsEnabled?: boolean;
@@ -28,6 +29,7 @@ export type WakeHookContext = {
   sessionId?: string;
   runId?: string;
   childSessionKey?: string;
+  requesterSessionKey?: string;
 };
 
 type WakeEventRequest = {
@@ -35,6 +37,7 @@ type WakeEventRequest = {
   body: string;
   headers: Record<string, string>;
   hookName: string;
+  attempt?: number;
 };
 
 const EVENT_SENSITIVE_KEY =
@@ -100,7 +103,9 @@ function eventCorrelationId(event: unknown, context: WakeHookContext): string | 
     eventString(record?.toolCallId) ??
     eventString(record?.callId) ??
     eventString(record?.childSessionKey) ??
+    eventString(record?.targetSessionKey) ??
     eventString(context.childSessionKey) ??
+    eventString(record?.runId) ??
     eventString(context.runId)
   );
 }
@@ -206,7 +211,13 @@ function buildEventRequest(
   }
 
   const record = eventRecord(event);
-  const sessionKey = eventString(context.sessionKey) ?? eventString(record?.sessionKey);
+  // Subagent lifecycle hooks identify the parent through requesterSessionKey;
+  // without this fallback, those events are accepted by Wake but remain
+  // unlinked and cannot contribute to the parent's trace.
+  const sessionKey =
+    eventString(context.sessionKey) ??
+    eventString(context.requesterSessionKey) ??
+    eventString(record?.sessionKey);
   const runId = eventString(context.runId) ?? eventString(record?.runId);
   const body = JSON.stringify({
     protocol: EVENT_PROTOCOL,
@@ -309,6 +320,9 @@ export class WakeEventDispatcher {
               this.notice(
                 `Kairos-Wake event delivery failed for ${request.hookName}: ${String(error)}`,
               );
+              if (request.hookName === "bridge_ready") {
+                this.scheduleStartupProbeRetry(request);
+              }
             }
           })
           .finally(() => {
@@ -319,6 +333,28 @@ export class WakeEventDispatcher {
     } finally {
       this.draining = false;
     }
+  }
+
+  /**
+   * A gateway can start while Wake is restarting. Keep the startup probe
+   * observable without retrying the whole lifecycle queue or blocking the
+   * OpenClaw agent loop. The same signed event id is reused, so Wake's
+   * idempotency makes an ambiguous HTTP outcome safe to repeat.
+   */
+  private scheduleStartupProbeRetry(request: WakeEventRequest): void {
+    const attempt = request.attempt ?? 0;
+    const delayMs = EVENT_STARTUP_PROBE_RETRY_DELAYS_MS[attempt];
+    if (delayMs === undefined) return;
+
+    setTimeout(() => {
+      if (this.circuitOpenUntil > Date.now()) return;
+      if (this.queue.length >= EVENT_MAX_QUEUE) {
+        this.notice("Kairos-Wake startup probe retry dropped because the event queue is full");
+        return;
+      }
+      this.queue.push({ ...request, attempt: attempt + 1 });
+      this.drain();
+    }, delayMs);
   }
 
   private async deliver(request: WakeEventRequest): Promise<void> {

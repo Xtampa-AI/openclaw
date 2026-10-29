@@ -302,7 +302,11 @@ describe("Google stream projection", () => {
     expect(output.usage).toMatchObject({ input: 6, cacheRead: 40 });
   });
 
-  it.each([FinishReason.MAX_TOKENS, FinishReason.CONTINUATION])(
+  // CONTINUATION remains a historical wire value handled by the stream mapper,
+  // even though the current SDK no longer exports it in FinishReason.
+  const legacyContinuationFinishReason = "CONTINUATION" as unknown as FinishReason;
+
+  it.each([FinishReason.MAX_TOKENS, legacyContinuationFinishReason])(
     "preserves %s when the partial response contains a function call",
     async (finishReason) => {
       const { output, events } = await runFixture([
