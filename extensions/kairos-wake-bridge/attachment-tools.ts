@@ -211,7 +211,7 @@ export function createWakeAttachmentTool(
 }
 
 export function createWakeArtifactTool(
-  toolContext: OpenClawPluginToolContext,
+  _toolContext: OpenClawPluginToolContext,
   config: WakeAttachmentConfig,
 ): AnyAgentTool {
   return {

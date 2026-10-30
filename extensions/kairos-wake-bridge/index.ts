@@ -33,16 +33,26 @@ import {
   createWakeAttachmentTool,
 } from "./attachment-tools.js";
 import { WakeEventDispatcher, wakeEventConfig } from "./event-transport.js";
+import {
+  WakeToolDocsParameters,
+  WakeToolExecuteParameters,
+  WakeToolDiscoveryParameters,
+  createWakeToolDocsTool,
+  createWakeToolExecuteTool,
+  createWakeToolDiscoveryTool,
+} from "./tool-surface.js";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:19900";
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 interface KwBridgeConfig {
   enabled?: boolean;
+  toolSurfaceEnabled?: boolean;
   daemonUrl?: string;
   authToken?: string;
   defaultWaker?: string;
   timeoutMs?: number;
+  agentId?: string;
 }
 
 const SecretRefSchema = Type.Object({
@@ -64,6 +74,7 @@ export function resolveConfig(config: Record<string, unknown> | undefined): KwBr
     // The plugin can be loaded for event tracing without exposing delegation
     // tools. Require an explicit opt-in for the tool surface.
     enabled: config?.enabled === true,
+    toolSurfaceEnabled: config?.toolSurfaceEnabled === true,
     daemonUrl: (config?.daemonUrl as string) || DEFAULT_DAEMON_URL,
     // Prefer an explicit SecretRef-resolved value. Only an omitted field may
     // use the ambient env fallback; an unresolved explicit SecretRef fails
@@ -73,6 +84,7 @@ export function resolveConfig(config: Record<string, unknown> | undefined): KwBr
       (!hasExplicitAuthToken ? process.env.KAIROS_WAKE_BRIDGE_TOKEN : undefined),
     defaultWaker: config?.defaultWaker as string | undefined,
     timeoutMs: (config?.timeoutMs as number) || DEFAULT_TIMEOUT_MS,
+    agentId: typeof config?.agentId === "string" ? config.agentId : undefined,
   };
 }
 
@@ -108,9 +120,10 @@ const toolEntry = defineToolPlugin({
   id: "kairos-wake-bridge",
   name: "Kairos-Wake Bridge",
   description:
-    "Delegate tasks to Kairos-Wake wakers. Create sessions, send messages, and receive responses from waker agents running on the Kairos-Wake daemon.",
+    "Delegate tasks to Kairos-Wake wakers and, when explicitly enabled, use a governed read-only native Wake tool surface from an OpenClaw session.",
   configSchema: Type.Object({
     enabled: Type.Optional(Type.Boolean()),
+    toolSurfaceEnabled: Type.Optional(Type.Boolean()),
     daemonUrl: Type.Optional(Type.String()),
     authToken: Type.Optional(SecretInputSchema),
     defaultWaker: Type.Optional(Type.String()),
@@ -382,6 +395,44 @@ const toolEntry = defineToolPlugin({
       parameters: WakeArtifactParameters,
       factory({ toolContext, config }) {
         return createWakeArtifactTool(
+          toolContext,
+          resolveConfig(config as Record<string, unknown>),
+        );
+      },
+    }),
+    tool({
+      name: "kw_wake_discover_tools",
+      label: "Wake Discover Tools",
+      description:
+        "List the effective read-only Kairos-Wake native tools for this exact governed OpenClaw session.",
+      parameters: WakeToolDiscoveryParameters,
+      factory({ toolContext, config }) {
+        return createWakeToolDiscoveryTool(
+          toolContext,
+          resolveConfig(config as Record<string, unknown>),
+        );
+      },
+    }),
+    tool({
+      name: "kw_wake_get_tool_docs",
+      label: "Wake Tool Docs",
+      description: "Return the exact schema for one effective read-only Kairos-Wake native tool.",
+      parameters: WakeToolDocsParameters,
+      factory({ toolContext, config }) {
+        return createWakeToolDocsTool(
+          toolContext,
+          resolveConfig(config as Record<string, unknown>),
+        );
+      },
+    }),
+    tool({
+      name: "kw_wake_execute_tool",
+      label: "Wake Execute Read-only Tool",
+      description:
+        "Execute one effective read-only Kairos-Wake native tool in the current governed session. Mutating tools are rejected by Wake.",
+      parameters: WakeToolExecuteParameters,
+      factory({ toolContext, config }) {
+        return createWakeToolExecuteTool(
           toolContext,
           resolveConfig(config as Record<string, unknown>),
         );

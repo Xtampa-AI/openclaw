@@ -34,6 +34,11 @@
     },
     "properties": {
       "enabled": { "type": "boolean" },
+      "toolSurfaceEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Explicitly expose the governed read-only Kairos-Wake native tool surface to linked OpenClaw sessions"
+      },
       "daemonUrl": {
         "type": "string",
         "description": "Kairos-Wake daemon URL (default: http://127.0.0.1:19900)"
@@ -77,13 +82,21 @@
       "kw_send_message",
       "kw_get_response",
       "kw_wake_attachment",
-      "kw_wake_artifact"
+      "kw_wake_artifact",
+      "kw_wake_discover_tools",
+      "kw_wake_get_tool_docs",
+      "kw_wake_execute_tool"
     ]
   },
   "uiHints": {
     "enabled": {
       "label": "Enable Kairos-Wake Bridge",
       "help": "Globally enable or disable the Kairos-Wake bridge tools."
+    },
+    "toolSurfaceEnabled": {
+      "label": "Enable governed Wake tools",
+      "help": "Expose only the effective read-only Wake tools to linked OpenClaw sessions; requires an explicit scoped Wake service token permission.",
+      "advanced": true
     },
     "daemonUrl": {
       "label": "Daemon URL",
