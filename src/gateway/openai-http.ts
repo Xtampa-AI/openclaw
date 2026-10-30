@@ -635,6 +635,10 @@ export async function handleOpenAiHttpRequest(
     sendInvalidRequest(res, `Invalid tools/tool_choice: ${formatErrorMessage(err).trim()}`);
     return true;
   }
+  // Chat Completions `tool_choice=none` must also disable OpenClaw's native
+  // tools. Without this runtime allowlist, the endpoint only suppresses
+  // caller-provided client tools while retaining shell/filesystem/API tools.
+  const disableAgentTools = payload.tool_choice === "none";
   let images: ImageContent[];
   try {
     assertGatewayHttpRequestCurrent(handled.requestAuth);
@@ -686,6 +690,7 @@ export async function handleOpenAiHttpRequest(
       extraSystemPrompt: mergedExtraSystemPrompt,
       images,
       clientTools: toolChoice.tools,
+      ...(disableAgentTools ? { toolsAllow: [] } : {}),
       modelOverride,
       sessionKey,
       runId,

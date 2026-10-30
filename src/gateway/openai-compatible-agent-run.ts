@@ -97,6 +97,8 @@ export async function runOpenAiCompatibleAgentCommand(params: {
   message: string;
   images?: ImageContent[];
   clientTools?: ClientToolDefinition[];
+  /** Explicit runtime tool allowlist; [] is a deny-all list. */
+  toolsAllow?: string[];
   extraSystemPrompt?: string;
   modelOverride?: string;
   streamParams?: AgentStreamParams;
@@ -157,6 +159,7 @@ export async function runOpenAiCompatibleAgentCommand(params: {
         message: params.message,
         images: params.images?.length ? params.images : undefined,
         clientTools: params.clientTools?.length ? params.clientTools : undefined,
+        ...(params.toolsAllow !== undefined ? { toolsAllow: params.toolsAllow } : {}),
         extraSystemPrompt: params.extraSystemPrompt || undefined,
         model: params.modelOverride,
         streamParams: params.streamParams,

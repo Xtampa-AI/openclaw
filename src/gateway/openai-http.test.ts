@@ -180,6 +180,7 @@ type FirstAgentCommandOptions = {
   onAdmittedRunContext?: (context: object) => void | Promise<void>;
   senderIsOwner?: boolean;
   sessionKey?: string;
+  toolsAllow?: string[];
   streamParams?: {
     frequencyPenalty?: number;
     maxTokens?: number;
@@ -939,6 +940,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         expect(res.status).toBe(200);
         const firstCall = getFirstAgentCall();
         expect(firstCall?.clientTools).toBeUndefined();
+        expect(firstCall?.toolsAllow).toEqual([]);
         await res.text();
       }
 

@@ -110,6 +110,19 @@ describe("OpenAI-compatible operator run authority", () => {
     vi.mocked(agentCommandFromGatewayIngress).mockReset();
   });
 
+  it("forwards an explicit empty toolsAllow as a deny-all runtime policy", async () => {
+    await withOpenClawTestState({ label: "compat-run-deny-tools" }, async () => {
+      const fixture = createOperatorRunFixture();
+      fixture.params.toolsAllow = [];
+      vi.mocked(agentCommandFromGatewayIngress).mockResolvedValue(completedResult);
+
+      await expect(runOpenAiCompatibleAgentCommand(fixture.params)).resolves.toBe(completedResult);
+      expect(agentCommandFromGatewayIngress.mock.calls[0]?.[0]).toEqual(
+        expect.objectContaining({ toolsAllow: [] }),
+      );
+    });
+  });
+
   it.each([false, true])(
     "retains the original source through command settlement and detached work (reject=%s)",
     async (reject) => {
