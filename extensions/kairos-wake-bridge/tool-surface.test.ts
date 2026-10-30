@@ -113,4 +113,20 @@ describe("Kairos-Wake governed native tool surface", () => {
     expect(JSON.stringify(sessionless)).toContain("session");
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("can be enabled without enabling legacy delegation tools", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>) =>
+      jsonResponse({ data: { tools: [] } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = createWakeToolDiscoveryTool(context as never, {
+      ...config,
+      enabled: false,
+      toolSurfaceEnabled: true,
+    });
+    await tool.execute("native-only", {}, undefined);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
 });

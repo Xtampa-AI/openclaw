@@ -97,9 +97,7 @@ function errorText(body: Record<string, unknown>, status: number): string {
 }
 
 function disabled(config: WakeToolSurfaceConfig): string | null {
-  if (!config.enabled || !config.toolSurfaceEnabled) {
-    return "Kairos-Wake native tool surface is disabled.";
-  }
+  if (!config.toolSurfaceEnabled) return "Kairos-Wake native tool surface is disabled.";
   if (!config.authToken) {
     return "Kairos-Wake native tool surface requires a scoped service token.";
   }

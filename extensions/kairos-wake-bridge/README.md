@@ -14,7 +14,8 @@ manager:
       "kairos-wake-bridge": {
         "enabled": true,
         "config": {
-          "enabled": true,
+          "enabled": false,
+          "toolSurfaceEnabled": true,
           "eventsEnabled": true,
           "daemonUrl": "http://kairos-wake-proxy:19900",
           "eventSecret": "<injected-secret>",
@@ -35,7 +36,12 @@ the bridge operations, and returns the clear value only when an administrator
 creates it. Use one credential per gateway so a single revocation does not
 disable the other agents.
 
-When `config.enabled` is true, the plugin also registers two governed tools:
+When `config.enabled` is true, the plugin also enables the legacy delegation,
+attachment and artifact tools. The native read-only surface is independent:
+set `toolSurfaceEnabled: true` with a scoped Wake service token while keeping
+`enabled: false` when a canary must not expose legacy delegation.
+
+When legacy `config.enabled` is true, the plugin also registers two governed tools:
 
 - `kw_wake_attachment` uploads a local workspace/agent `/tmp` file to the exact
   Wake proxy session or downloads an authorized attachment to an allowed local
