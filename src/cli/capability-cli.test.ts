@@ -1348,7 +1348,7 @@ describe("capability cli", () => {
 
   it("passes image output format, quality, and OpenAI hints through to edit runtime", async () => {
     const png = Buffer.from(PNG_1X1_BASE64, "base64");
-    primeGeneratedImage("gpt-image-1.5", "transparent-edit.png", png);
+    primeGeneratedImage("gpt-image-2.6-sunburst", "transparent-edit.png", png);
     const directory = tempDirs.make("capability-image-edit-");
     const inputPath = path.join(directory, "input.png");
     const outputPath = path.join(directory, "output.png");
@@ -1376,7 +1376,7 @@ describe("capability cli", () => {
       "--prompt",
       "make background transparent",
       "--model",
-      "openai/gpt-image-1.5",
+      "openai/gpt-image-2.6-sunburst",
       "--output-format",
       "png",
       "--openai-background",
@@ -1393,7 +1393,7 @@ describe("capability cli", () => {
     const generationCall = firstImageGenerationCall();
     const inputImages = generationCall?.inputImages as Array<Record<string, unknown>>;
     expect(generationCall?.prompt).toBe("make background transparent");
-    expect(generationCall?.modelOverride).toBe("openai/gpt-image-1.5");
+    expect(generationCall?.modelOverride).toBe("openai/gpt-image-2.6-sunburst");
     expect(generationCall?.outputFormat).toBe("png");
     expect(generationCall?.quality).toBe("high");
     expect(generationCall).toMatchObject({

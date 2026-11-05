@@ -496,8 +496,8 @@ describe("createImageGenerateTool", () => {
     expect(tool.description).toContain("outputFormat png|webp");
     expect(tool.description).toContain('background="transparent"');
     expect(tool.description).toContain("openai.background");
-    expect(tool.description).toContain("gpt-image-1.5");
-    expect(JSON.stringify(tool.parameters)).toContain("openai/gpt-image-1.5");
+    expect(tool.description).toContain("gpt-image-2.6-sunburst");
+    expect(JSON.stringify(tool.parameters)).toContain("openai/gpt-image-2.6-sunburst");
   });
 
   it("does not load runtime providers while registering an explicitly configured tool", () => {
@@ -1771,7 +1771,7 @@ describe("createImageGenerateTool", () => {
     const generateImage = vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue(
       createSingleImageResult({
         provider: "openai",
-        model: "gpt-image-1.5",
+        model: "gpt-image-2.6-sunburst",
         bytes: "png-out",
         mimeType: "image/png",
         fileName: "transparent.png",
@@ -1784,7 +1784,7 @@ describe("createImageGenerateTool", () => {
       contentType: "image/png",
     });
 
-    const tool = createToolWithPrimaryImageModel("openai/gpt-image-1.5");
+    const tool = createToolWithPrimaryImageModel("openai/gpt-image-2.6-sunburst");
     const result = await tool.execute("call-openai-transparent", {
       prompt: "A transparent badge",
       outputFormat: "png",
@@ -1798,7 +1798,7 @@ describe("createImageGenerateTool", () => {
     const agents = requireRecord(cfg.agents, "generateImage agents config");
     const defaults = requireRecord(agents.defaults, "generateImage defaults config");
     expect(requireRecord(defaults.mediaModels, "mediaModels").image).toEqual({
-      primary: "openai/gpt-image-1.5",
+      primary: "openai/gpt-image-2.6-sunburst",
     });
     expect(generateArgs.outputFormat).toBe("png");
     expect(generateArgs.providerOptions).toEqual({
@@ -1808,7 +1808,7 @@ describe("createImageGenerateTool", () => {
     });
     const details = resultDetails(result);
     expect(details.provider).toBe("openai");
-    expect(details.model).toBe("gpt-image-1.5");
+    expect(details.model).toBe("gpt-image-2.6-sunburst");
     expect(details.outputFormat).toBe("png");
   });
 

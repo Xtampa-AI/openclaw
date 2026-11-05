@@ -23,7 +23,7 @@ sidebarTitle: "Models"
 | Direct API-key billing, explicit OpenClaw runtime | `openai/gpt-5.6` plus provider/model `agentRuntime.id: "openclaw"` | Select a normal `openai` API-key profile.                           |
 | Latest ChatGPT Instant model alias                | `openai/chat-latest`                                               | Direct API-key only; moving alias, not the stable default.          |
 | Image generation or editing                       | `openai/gpt-image-2`                                               | Works with `OPENAI_API_KEY` or Codex OAuth.                         |
-| Transparent-background images                     | `openai/gpt-image-1.5`                                             | Set `outputFormat` to `png` or `webp` and `background=transparent`. |
+| Transparent-background images                     | `openai/gpt-image-2.6-sunburst`                                    | Set `outputFormat` to `png` or `webp` and `background=transparent`. |
 
 ### Retired subscription model references
 

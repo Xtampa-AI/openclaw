@@ -87,9 +87,9 @@ internal image endpoints remain blocked by default.
 | Goal                                             | Model ref                                                                                           | Auth                                           |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
 | OpenAI image generation with API billing         | `openai/gpt-image-2`                                                                                | `OPENAI_API_KEY`                               |
-| OpenAI GPT Image 2.5                             | `openai/gpt-image-2.5-flare` or `openai/gpt-image-2.5-sunburst`                                     | Explicit OpenAI API-key route                  |
+| OpenAI GPT Image 2.6 / 2.5                       | `openai/gpt-image-2.6-flare` or `openai/gpt-image-2.6-sunburst`                                     | Explicit OpenAI API-key route                  |
 | OpenAI image generation with ChatGPT/Codex OAuth | `openai/gpt-image-2`                                                                                | OpenAI ChatGPT/Codex OAuth                     |
-| OpenAI transparent-background PNG/WebP           | `openai/gpt-image-1.5`                                                                              | `OPENAI_API_KEY` or OpenAI ChatGPT/Codex OAuth |
+| OpenAI transparent-background PNG/WebP           | `openai/gpt-image-2.6-sunburst`                                                                     | `OPENAI_API_KEY` or OpenAI ChatGPT/Codex OAuth |
 | DeepInfra image generation                       | `deepinfra/black-forest-labs/FLUX-1-schnell`                                                        | `DEEPINFRA_API_KEY`                            |
 | fal Krea 2 expressive/style-directed generation  | `fal/krea/v2/medium/text-to-image`                                                                  | `FAL_KEY`                                      |
 | fal GPT Image 2.5                                | `fal/openai/gpt-image-2.5/flare/text-to-image` or `fal/openai/gpt-image-2.5/sunburst/text-to-image` | `FAL_KEY`                                      |
@@ -166,7 +166,7 @@ the peer who requested the image.
 </ParamField>
 <ParamField path="model" type="string">
   Provider/model override (e.g. `openai/gpt-image-2`). Use
-  `openai/gpt-image-1.5` for transparent OpenAI backgrounds.
+  `openai/gpt-image-2.6-sunburst` for transparent OpenAI backgrounds.
 </ParamField>
 <ParamField path="image" type="string">
   Single reference image path or URL for edit mode.
@@ -333,7 +333,7 @@ and ComfyUI support 1.
     `resolution` overrides for these models or infer resolution from edit inputs.
 
   </Accordion>
-  <Accordion title="OpenAI gpt-image-2 (and gpt-image-1.5)">
+  <Accordion title="OpenAI gpt-image-2 (and gpt-image-2.6)">
     OpenAI image generation defaults to `openai/gpt-image-2`. If an
     `openai` OAuth profile is configured, OpenClaw reuses the same
     OAuth profile used by Codex subscription chat models and sends the
@@ -345,10 +345,11 @@ and ComfyUI support 1.
     `models.providers.openai` explicitly with an API key, custom base URL,
     or Azure endpoint.
 
-    The `openai/gpt-image-1.5`, `openai/gpt-image-1`, and
-    `openai/gpt-image-1-mini` models can still be selected explicitly. Use
-    `gpt-image-1.5` for transparent-background PNG/WebP output. The current
-    `gpt-image-2` API rejects `background: "transparent"`.
+    `openai/gpt-image-2.6-flare`, `openai/gpt-image-2.6-sunburst`, and
+    `openai/gpt-image-1` can still be selected explicitly. Use
+    `gpt-image-2.6-sunburst` for transparent-background PNG/WebP output.
+    (`gpt-image-1.5`, `gpt-image-1-mini`, and `chatgpt-image-latest` were
+    retired by OpenAI on 2026-12-01.)
 
     `gpt-image-2` supports both text-to-image generation and
     reference-image editing through the same `image_generate` tool.
@@ -385,7 +386,7 @@ and ComfyUI support 1.
     `openai.background` accepts `transparent`, `opaque`, or `auto`.
     Transparent outputs require `outputFormat` `png` or `webp` and a
     transparency-capable OpenAI image model. OpenClaw routes default
-    `gpt-image-2` transparent-background requests to `gpt-image-1.5`.
+    `gpt-image-2` transparent-background requests to `gpt-image-2.6-sunburst`.
     `openai.outputCompression` applies to JPEG/WebP outputs and is ignored
     for PNG outputs.
 
@@ -550,14 +551,14 @@ and ComfyUI support 1.
   </Tab>
   <Tab title="Generate (transparent PNG)">
 ```text
-/tool image_generate action=generate model=openai/gpt-image-1.5 prompt="A simple red circle sticker on a transparent background" outputFormat=png background=transparent
+/tool image_generate action=generate model=openai/gpt-image-2.6-sunburst prompt="A simple red circle sticker on a transparent background" outputFormat=png background=transparent
 ```
 
 Equivalent CLI:
 
 ```bash
 openclaw infer image generate \
-  --model openai/gpt-image-1.5 \
+  --model openai/gpt-image-2.6-sunburst \
   --output-format png \
   --background transparent \
   --prompt "A simple red circle sticker on a transparent background" \

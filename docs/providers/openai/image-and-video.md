@@ -43,15 +43,16 @@ provider selection, and failover behavior.
 </Note>
 
 `gpt-image-2` is the default for OpenAI text-to-image generation and image
-editing. `gpt-image-1.5`, `gpt-image-1`, and `gpt-image-1-mini` remain usable
-as explicit model overrides. Use `openai/gpt-image-1.5` for
-transparent-background PNG/WebP output; the current `gpt-image-2` API rejects
-`background: "transparent"`.
+editing. `gpt-image-1` remains usable as an explicit model override
+(`gpt-image-1.5`, `gpt-image-1-mini`, and `chatgpt-image-latest` were retired
+by OpenAI on 2026-12-01). Use `openai/gpt-image-2.6-sunburst` for
+transparent-background PNG/WebP output.
 
-### GPT Image 2.5
+### GPT Image 2.6 and 2.5
 
-Select `openai/gpt-image-2.5-flare` or `openai/gpt-image-2.5-sunburst` explicitly.
-Both support generation and edits through the direct Images API.
+Select `openai/gpt-image-2.6-flare`, `openai/gpt-image-2.6-sunburst`,
+`openai/gpt-image-2.5-flare`, or `openai/gpt-image-2.5-sunburst` explicitly.
+All support generation and edits through the direct Images API.
 The default remains `openai/gpt-image-2`.
 
 Export `OPENAI_API_KEY` and select API-key authentication:
@@ -98,18 +99,18 @@ The aspect ratio must be between 1:3 and 3:1.
 ### Other Image Models
 
 For a transparent-background request, call `image_generate` with
-`model: "openai/gpt-image-1.5"`, `outputFormat: "png"` or `"webp"`, and
+`model: "openai/gpt-image-2.6-sunburst"`, `outputFormat: "png"` or `"webp"`, and
 `background: "transparent"`; the older `openai.background` provider option is
 still accepted. OpenClaw also protects the public OpenAI and OpenAI Codex OAuth
 routes by rewriting default `openai/gpt-image-2` transparent requests to
-`gpt-image-1.5`; Azure and custom OpenAI-compatible endpoints keep their
+`gpt-image-2.6-sunburst`; Azure and custom OpenAI-compatible endpoints keep their
 configured deployment/model names.
 
 The same setting is exposed for headless CLI runs:
 
 ```bash
 openclaw infer image generate \
-  --model openai/gpt-image-1.5 \
+  --model openai/gpt-image-2.6-sunburst \
   --output-format png \
   --background transparent \
   --prompt "A simple red circle sticker on a transparent background" \
@@ -148,7 +149,7 @@ Generate:
 Generate a transparent PNG:
 
 ```
-/tool image_generate model=openai/gpt-image-1.5 prompt="A simple red circle sticker on a transparent background" outputFormat=png background=transparent
+/tool image_generate model=openai/gpt-image-2.6-sunburst prompt="A simple red circle sticker on a transparent background" outputFormat=png background=transparent
 ```
 
 Edit:

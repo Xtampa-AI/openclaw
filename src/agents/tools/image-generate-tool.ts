@@ -99,7 +99,7 @@ const ImageGenerateToolSchema = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Provider/model override, e.g. openai/gpt-image-2; transparent OpenAI: openai/gpt-image-1.5.",
+        "Provider/model override, e.g. openai/gpt-image-2; transparent OpenAI: openai/gpt-image-2.6-sunburst.",
     }),
   ),
   filename: Type.Optional(Type.String({ description: MEDIA_GENERATE_DESCRIPTIONS.filename })),
@@ -132,7 +132,7 @@ const ImageGenerateToolSchema = Type.Object({
     Type.Object({
       background: optionalStringEnum(SUPPORTED_BACKGROUNDS, {
         description:
-          "OpenAI background: transparent, opaque, auto. Transparent needs png/webp; default model routes to gpt-image-1.5.",
+          "OpenAI background: transparent, opaque, auto. Transparent needs png/webp; default model routes to gpt-image-2.6-sunburst.",
       }),
       moderation: optionalStringEnum(SUPPORTED_OPENAI_MODERATIONS, {
         description: "OpenAI moderation: low, auto.",
@@ -255,7 +255,7 @@ export function createImageGenerateTool(options?: MediaGenerateToolOptions): Any
     label: "Image Generation",
     name: "image_generate",
     description:
-      'Create/edit images. Batch via count; aspectRatio and resolution up to 4K. Session chat runs in background: call once/request; the result returns as a later turn that sends the media. This turn: short ack at most, then end; no poll/yield. Transparent: outputFormat png|webp + background="transparent"; OpenAI also openai.background, default gpt-image-1.5. action=list providers/models/readiness/auth; status active task.',
+      'Create/edit images. Batch via count; aspectRatio and resolution up to 4K. Session chat runs in background: call once/request; the result returns as a later turn that sends the media. This turn: short ack at most, then end; no poll/yield. Transparent: outputFormat png|webp + background="transparent"; OpenAI also openai.background, default gpt-image-2.6-sunburst. action=list providers/models/readiness/auth; status active task.',
     parameters: ImageGenerateToolSchema,
     execute: createMediaGenerateExecute({
       options,
