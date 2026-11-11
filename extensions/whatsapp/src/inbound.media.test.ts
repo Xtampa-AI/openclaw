@@ -266,10 +266,6 @@ let resetWebInboundDedupe: typeof import("./inbound.js").resetWebInboundDedupe;
 let createWaSocket: typeof import("./session.js").createWaSocket;
 let resetLogger: typeof import("openclaw/plugin-sdk/runtime-env").resetLogger;
 let setLoggerOverride: typeof import("openclaw/plugin-sdk/runtime-env").setLoggerOverride;
-type MediaOnMessage = NonNullable<Parameters<typeof monitorWebInbox>[0]["onMessage"]>;
-type MediaMessage = Parameters<MediaOnMessage>[0];
-let deliveredMessages: MediaMessage[] = [];
-let messageWaiters: Array<(message: MediaMessage) => void> = [];
 
 const LOG_PATH = path.join(os.tmpdir(), `openclaw-inbound-media-${crypto.randomUUID()}.log`);
 const DIRECT_SYNTHETIC_BEARER = "synthetic-direct-bearer-never-real";
@@ -277,13 +273,13 @@ const QUOTED_SYNTHETIC_API_KEY = "synthetic-quoted-api-key-never-real";
 const DEPLOYMENT_REDACTION_SENTINEL = "deployment-secret-never-real";
 
 async function waitForMessage(onMessage: ReturnType<typeof vi.fn>) {
-  const delivered =
-    deliveredMessages.shift() ??
-    (await new Promise<MediaMessage>((resolve) => {
-      messageWaiters.push(resolve);
-    }));
-  expect(onMessage).toHaveBeenCalledTimes(1);
-  return delivered;
+  // Saturated no-isolate suite runs can stall the worker (sync module fetches
+  // against the shared transform queue) well past a 2s delivery budget.
+  await vi.waitFor(() => expect(onMessage).toHaveBeenCalledTimes(1), {
+    interval: 1,
+    timeout: 5_000,
+  });
+  return onMessage.mock.calls[0]?.[0];
 }
 
 function latestSaveMediaStreamCall() {
@@ -363,22 +359,14 @@ describe("web inbound media saves with extension", () => {
     };
   }
 
-  function startMediaMonitor(onMessage: MediaOnMessage, mediaMaxMb?: number) {
-    const observeMessage: MediaOnMessage = (...args) => {
-      const result = onMessage(...args);
-      const delivered = args[0];
-      const waiter = messageWaiters.shift();
-      if (waiter) {
-        waiter(delivered);
-      } else {
-        deliveredMessages.push(delivered);
-      }
-      return result;
-    };
+  function startMediaMonitor(
+    onMessage: Parameters<typeof monitorWebInbox>[0]["onMessage"],
+    mediaMaxMb?: number,
+  ) {
     return monitorWebInbox({
       cfg: { channels: { whatsapp: { allowFrom: ["*"] } } },
       verbose: false,
-      onMessage: observeMessage,
+      onMessage,
       accountId: "default",
       authDir: path.join(HOME, "wa-auth"),
       ...(mediaMaxMb === undefined ? {} : { mediaMaxMb }),
@@ -391,8 +379,6 @@ describe("web inbound media saves with extension", () => {
     downloadMediaMessageMock.mockClear();
     observedConsoleWarnings.mockClear();
     saveMediaStreamSpy.mockClear();
-    deliveredMessages = [];
-    messageWaiters = [];
     resetWebInboundDedupe();
   });
 

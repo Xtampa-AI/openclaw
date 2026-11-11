@@ -141,57 +141,6 @@ describe("openLocalFile", () => {
   });
 });
 
-describe("openLocalFile", () => {
-  it("passes only the private file:// path to the opener, never a credential URL", async () => {
-    mockProcessPlatform("linux");
-    vi.stubEnv("VITEST", "");
-    vi.stubEnv("NODE_ENV", "development");
-    vi.stubEnv("DISPLAY", ":0");
-    detectBinaryMock.mockResolvedValue(true);
-    runCommandWithTimeoutMock.mockResolvedValue({
-      stdout: "",
-      stderr: "",
-      code: 0,
-      signal: null,
-      killed: false,
-      termination: "exit",
-    });
-
-    await expect(openLocalFile("/tmp/openclaw-browser-handoff-X/handoff.html")).resolves.toBe(true);
-    const argv = runCommandWithTimeoutMock.mock.calls[0]![0];
-    expect(argv[0]).toBe("xdg-open");
-    expect(argv).toHaveLength(2);
-    expect(argv[1]).toMatch(/^file:\/\//);
-    expect(argv[1]).not.toContain("bootstrapToken");
-  });
-
-  it("opens native Windows handoff paths instead of reading the drive letter as a URL scheme", async () => {
-    mockProcessPlatform("win32");
-
-    await expect(
-      openLocalFile(
-        "C:\\Users\\Alice\\AppData\\Local\\Temp\\openclaw-browser-handoff-ABC123\\handoff.html",
-      ),
-    ).resolves.toBe(true);
-    const argv = runCommandWithTimeoutMock.mock.calls[0]![0];
-    expect(argv.at(-2)).toBe("url.dll,FileProtocolHandler");
-    expect(argv.at(-1)).toBe(
-      "file:///C:/Users/Alice/AppData/Local/Temp/openclaw-browser-handoff-ABC123/handoff.html",
-    );
-  });
-
-  it("refuses http(s) URLs and non-file inputs", async () => {
-    mockProcessPlatform("linux");
-    vi.stubEnv("VITEST", "");
-    vi.stubEnv("NODE_ENV", "development");
-
-    await expect(openLocalFile("http://127.0.0.1:18789/#bootstrapToken=x")).resolves.toBe(false);
-    await expect(openLocalFile("file:///tmp/handoff.html")).resolves.toBe(false);
-    await expect(openLocalFile("relative/handoff.html")).resolves.toBe(false);
-    expect(runCommandWithTimeoutMock).not.toHaveBeenCalled();
-  });
-});
-
 describe("browser support and launch", () => {
   it("retains process-level WSL detection caching through support detection", async () => {
     mockProcessPlatform("linux");

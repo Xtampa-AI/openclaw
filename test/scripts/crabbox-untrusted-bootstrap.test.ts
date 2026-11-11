@@ -144,7 +144,7 @@ fi
   // Only the trusted fixture's anchors change; candidate/image state never supplies them.
   script = script
     .replace(productionSpec, spec)
-    .replaceAll("6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6", hashes.node)
+    .replaceAll("fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6", hashes.node)
     .replaceAll(
       "c9cf9095947ef7e9ebdbd2787d1ce13286a98314c10e776affea5eca8ab55d4b9f9d01677db5d4305b9d0c82b31e2e78e658a71aa98e9977e7d0da2e7cd81c3a",
       hashes.native,

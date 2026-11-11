@@ -668,11 +668,7 @@ describe.skipIf(process.platform === "win32")("QA gateway lifetime ownership", (
           }),
         }),
       );
-      expect(gateway.cliCommand).toEqual({
-        executablePath: params.command.executablePath,
-        argsPrefix: [...(params.command.argsPrefix ?? [])],
-        cwd: gateway.tempRoot,
-      });
+      expect(gateway.cliCommand).toBeUndefined();
       pids();
       const denied = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
         if (target === gateway.tempRoot) {

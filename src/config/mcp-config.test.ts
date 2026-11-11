@@ -3,11 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it, vi } from "vitest";
-import {
-  listConfiguredMcpServers,
-  mcpConfigInternal,
-  redactMcpServersForDisplay,
-} from "./mcp-config.js";
+import { listConfiguredMcpServers, mcpConfigInternal } from "./mcp-config.js";
 import { REDACTED_SENTINEL } from "./redact-snapshot.js";
 
 const { set: setConfiguredMcpServer, unset: unsetConfiguredMcpServer } = mcpConfigInternal;
@@ -206,7 +202,7 @@ describe("config mcp config", () => {
     });
   });
 
-  it("redacts MCP secrets for display and restores them on set", async () => {
+  it("restores redacted MCP secrets on set instead of writing the sentinel", async () => {
     await withMcpConfigHome(
       {
         mcp: {
@@ -233,32 +229,26 @@ describe("config mcp config", () => {
         },
       },
       async () => {
-        const original = await readValidMcpConfig();
-        const redacted = redactMcpServersForDisplay(original.mcpServers).billing;
-        expect(redacted).toEqual({
-          command: "uvx",
-          args: [
-            "billing-mcp",
-            "--api-key",
-            REDACTED_SENTINEL,
-            `--token=${REDACTED_SENTINEL}`,
-            REDACTED_SENTINEL,
-            "--region",
-            "us-east-1",
-          ],
-          headers: {
-            Authorization: REDACTED_SENTINEL,
-          },
-          env: {
-            BILLING_TOKEN: REDACTED_SENTINEL,
-          },
-        });
-        expect(original.mcpServers.billing?.headers).toEqual({
-          Authorization: "Bearer real-token",
-        });
         const setResult = await setConfiguredMcpServer({
           name: "billing",
-          server: redacted,
+          server: {
+            command: "uvx",
+            args: [
+              "billing-mcp",
+              "--api-key",
+              REDACTED_SENTINEL,
+              `--token=${REDACTED_SENTINEL}`,
+              REDACTED_SENTINEL,
+              "--region",
+              "us-east-1",
+            ],
+            headers: {
+              Authorization: REDACTED_SENTINEL,
+            },
+            env: {
+              BILLING_TOKEN: REDACTED_SENTINEL,
+            },
+          },
         });
 
         expect(setResult.ok).toBe(true);

@@ -363,18 +363,6 @@ async function runDoctorConfigPreflightOperation(
       ),
     );
   }
-  if (stateDirMigrations && options.doctorOnlyStateMigrations === true) {
-    const { repairRelativeSessionStores } = await import("./doctor-relative-session-store.js");
-    noteDoctorStateMigrationResult(
-      await measurePreflightStep("relative-session-store", () =>
-        repairRelativeSessionStores({
-          cfg: automaticConfigRepair?.config ?? baseConfig,
-          env: process.env,
-          registeredDatabases: options.agentDatabaseMigrationDiscovery?.registeredAgentDatabases,
-        }),
-      ),
-    );
-  }
   if (automaticConfigRepair && !skipLegacyParentConfigWrite) {
     modelBillingRouteMigrationSource ??=
       snapshot.sourceConfigBeforeMigrations ?? snapshot.sourceConfig;

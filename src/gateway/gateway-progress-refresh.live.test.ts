@@ -43,8 +43,7 @@ type History = {
 };
 
 describeLive("progress refresh through the live embedded runtime", () => {
-  // Waived for 2026.9.7 by Peter's release decision; see #161083.
-  it.skip(
+  it(
     "steers the active parent and refreshes an idle card without resuming work or adding chat",
     async ({ signal: testSignal, onTestFinished }) => {
       const stopping = new AbortController();

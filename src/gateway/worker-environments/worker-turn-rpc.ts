@@ -323,16 +323,7 @@ export function createWorkerTurnRpc(options: WorkerTurnRpcOptions) {
         if (!binding.ok) {
           throw new WorkerTranscriptAuthorityError(binding);
         }
-        try {
-          source.receiptAuthority();
-        } catch (error) {
-          throw validateWorkerPlacement(identity) === "durable"
-            ? error
-            : new WorkerTranscriptAuthorityError({
-                ok: false,
-                closeReason: "placement-mismatch",
-              });
-        }
+        source.receiptAuthority();
       };
       try {
         assertCurrent();
@@ -345,7 +336,8 @@ export function createWorkerTurnRpc(options: WorkerTurnRpcOptions) {
           sessionTarget: source.sessionTarget,
           assertCurrent,
         });
-        // Persistence and post-commit ACKs both require this owner to remain current.
+        // Persistence checks this owner after its queues and before commit; ACKs
+        // also require the claim to remain live after post-commit publication.
         assertCurrent();
         // Stale base consumes a sequence just like success, including on replay.
         if (result.ok || result.reason === "stale-base-leaf") {

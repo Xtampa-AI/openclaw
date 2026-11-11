@@ -60,8 +60,6 @@ Two additional guards run outside these paths:
 
   Messages steered into the active run after a tool result are included in this check. If that added context exceeds the budget, a settled tool batch can compact and continue without replaying the tool.
 
-  Messages steered into the active run after a tool result are included in this check. If that added context exceeds the budget, a settled tool batch can compact and continue without replaying the tool.
-
 ## Compaction settings
 
 Checkpoint replay prechecks distinguish predicted pressure from a provider-confirmed overflow. A matching measured Responses request supplies the covered context count; only appended content is estimated. If the current checkpoint or covered input changes, that measurement is no longer used. Predicted pressure can use native budget compaction, including the public OpenAI compact endpoint by default, while actual provider overflow retains client-side recovery. Both paths preserve the unresolved user request when client summarization is required.

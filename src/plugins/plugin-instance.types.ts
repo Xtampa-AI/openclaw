@@ -18,12 +18,6 @@ export type PluginInstanceAdmission = {
 };
 
 /** Known disposal faults are reported outcomes, never new-call admission failures. */
-/** Reload observers get the bounded report; final resource owners join physical settlement. */
-export type PluginInstanceDisposal = {
-  observed: Promise<PluginInstanceDisposalResult>;
-  settled: Promise<PluginInstanceDisposalResult>;
-};
-
 export type PluginInstanceDisposalResult = {
   errors: readonly unknown[];
   /** Errors seen only in host cleanup, eligible for its named-hook reporting. */

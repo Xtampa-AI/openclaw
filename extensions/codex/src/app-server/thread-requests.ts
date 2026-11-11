@@ -375,6 +375,7 @@ export function buildCodexRuntimeThreadConfigForRun(
     restrictedToolSurfaceInheritedMcpServerNames?: readonly string[];
     shellEnvironment?: Readonly<Record<string, string>>;
     shellPathPrepend?: readonly string[];
+    shellGitConfigParameters?: string;
     disableLoginShell?: boolean;
   } = {},
 ): JsonObject {
@@ -465,6 +466,7 @@ export function buildCodexRuntimeThreadConfigForRun(
     options.shellEnvironment,
     options.disableLoginShell,
     options.shellPathPrepend,
+    options.shellGitConfigParameters,
   );
 }
 

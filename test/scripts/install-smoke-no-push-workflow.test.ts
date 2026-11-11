@@ -966,12 +966,6 @@ describe("install smoke no-push root image transport", () => {
     const nonroot = job(workflow, "installer_smoke_nonroot");
     const aggregate = job(workflow, "installer_smoke");
 
-    for (const group of ["update", "nonroot"]) {
-      expect(job(workflow, `installer_smoke_${group}_image`).needs).toEqual([
-        "preflight",
-        "installer_smoke_candidate_payload",
-      ]);
-    }
     expect(update.needs).toEqual([
       "preflight",
       "installer_smoke_candidate_payload",

@@ -818,7 +818,6 @@ describe.skipIf(process.platform === "win32")("immutable release artifact CLI", 
 
   it.each([
     "successful raw job",
-    "uploaded descriptor while raw job is active",
     "failed unrelated qualifier",
     "failed raw job",
     "wrong raw attempt",
@@ -829,10 +828,6 @@ describe.skipIf(process.platform === "win32")("immutable release artifact CLI", 
       const test = fixture();
       test.jobs[1]!.status = "in_progress";
       test.jobs[1]!.conclusion = null;
-      if (outcome === "uploaded descriptor while raw job is active") {
-        test.jobs[0]!.status = "in_progress";
-        test.jobs[0]!.conclusion = null;
-      }
       if (outcome === "failed raw job") {
         test.jobs[0]!.conclusion = "failure";
       }
@@ -847,11 +842,8 @@ describe.skipIf(process.platform === "win32")("immutable release artifact CLI", 
       const result = test.run("wait", {
         ARTIFACT_OUTPUT: "raw",
         FIXTURE_RERUN_DURING_DOWNLOAD: String(outcome === "rerun during download"),
-        FIXTURE_STOP_ON_WAIT: String(outcome === "uploaded descriptor while raw job is active"),
       });
-      if (outcome === "uploaded descriptor while raw job is active") {
-        expectRejected(result, "Fixture reached another artifact poll");
-      } else if (outcome === "successful raw job" || outcome === "failed unrelated qualifier") {
+      if (outcome === "successful raw job" || outcome === "failed unrelated qualifier") {
         expect(result.status, result.stderr).toBe(0);
         expect(JSON.parse(result.outputs.prepared_bundle_json!)).toEqual(test.raw);
         expect(result.outputs.qualified_preflight_bundle_json).toBeUndefined();

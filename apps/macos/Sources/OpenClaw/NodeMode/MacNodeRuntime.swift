@@ -881,22 +881,6 @@ extension MacNodeRuntime {
         self.errorResponse(req, code: .unavailable, message: "UNAVAILABLE: \(req.command) payload too large; \(hint)")
     }
 
-    /// Stats before reading so oversized recordings never allocate file data plus base64.
-    private static func readInlineMedia(atPath path: String) throws -> Data? {
-        let size = try FileManager().attributesOfItem(atPath: path)[.size] as? Int ?? 0
-        return size > self.maxInlineMediaRawBytes ? nil : try Data(contentsOf: URL(fileURLWithPath: path))
-    }
-
-    /// The Gateway closes the node socket on frames above its limit, losing the result.
-    private static func fitsGatewayFrame(_ payloadJSON: String, for req: BridgeInvokeRequest) throws -> Bool {
-        try self.projectedOuterFrameBytes(forPayloadJSON: payloadJSON, requestId: req.id, nodeId: req.nodeId) <=
-            self.maxGatewayPayloadBytes
-    }
-
-    private static func recordingPayloadTooLarge(_ req: BridgeInvokeRequest, hint: String) -> BridgeInvokeResponse {
-        self.errorResponse(req, code: .unavailable, message: "UNAVAILABLE: \(req.command) payload too large; \(hint)")
-    }
-
     private static func screenSnapshotPayloadTooLarge(_ req: BridgeInvokeRequest) -> BridgeInvokeResponse {
         self.errorResponse(
             req,

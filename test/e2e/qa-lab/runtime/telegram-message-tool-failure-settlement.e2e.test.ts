@@ -200,4 +200,4 @@ test("visibly settles a message-tool-only Telegram turn after a provider failure
         }
       }),
   );
-}, 180_000);
+}, 120_000);

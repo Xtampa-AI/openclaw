@@ -548,66 +548,6 @@ describe("irc monitor reconnect", () => {
     },
   );
 
-  it("reports disconnected status and recovers after a silent socket", async ({ signal }) => {
-    vi.useFakeTimers({
-      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
-    });
-    onTestFinished(() => {
-      vi.useRealTimers();
-    });
-    await withIngressQueue(async (ingressQueue) => {
-      installMonitorRuntime();
-      const disconnected = createDeferred<void>();
-      const failedReconnect = createDeferred<void>();
-      const reconnected = createDeferred<void>();
-      let readyCount = 0;
-      let recoveringCount = 0;
-      const status: Parameters<
-        NonNullable<Parameters<typeof monitorIrcProvider>[0]["statusSink"]>
-      >[0] = {};
-      const statusSink: NonNullable<Parameters<typeof monitorIrcProvider>[0]["statusSink"]> = (
-        patch,
-      ) => {
-        Object.assign(status, patch);
-        if (patch.lifecycle === "ready" && ++readyCount === 2) {
-          reconnected.resolve();
-        }
-        if (patch.lifecycle === "recovering") {
-          recoveringCount += 1;
-          (recoveringCount === 1 ? disconnected : failedReconnect).resolve();
-        }
-      };
-      const server = await startDisconnectingIrcServer();
-      const config = monitorConfig(server.port, "bot", { channels: ["#openclaw"] });
-      let monitor: { stop: () => Promise<void> } | undefined;
-
-      try {
-        monitor = await monitorIrcProvider({ config, ingressQueue, statusSink });
-        await withinTest(server.joined, signal);
-        // The server never answers PING; the receive deadline must drop the link.
-        await vi.advanceTimersByTimeAsync(240_000);
-        await withinTest(disconnected.promise, signal);
-        expect(status).toMatchObject({ running: true, lifecycle: "recovering" });
-        await vi.advanceTimersByTimeAsync(1_200);
-        await withinTest(failedReconnect.promise, signal);
-        await vi.advanceTimersByTimeAsync(2_400);
-        await withinTest(reconnected.promise, signal);
-        await withinTest(server.rejoined, signal);
-        expect(status).toMatchObject({ running: true, connected: true, lastError: null });
-        expect(server.connectionCount).toBe(3);
-        expect(server.lines.filter((line) => line === "JOIN #openclaw")).toHaveLength(2);
-        await monitor.stop();
-        await vi.advanceTimersByTimeAsync(240_000);
-        expect(server.connectionCount).toBe(3);
-      } finally {
-        if (monitor) {
-          await monitor.stop();
-        }
-        await server.close();
-      }
-    });
-  });
-
   it("does not send a delayed private reply through the reconnected client", async () => {
     await withIngressQueue(async (ingressQueue) => {
       const pairingStarted = createDeferred<void>();

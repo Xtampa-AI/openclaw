@@ -412,7 +412,7 @@ export async function readUpdateChannelConfig(
     });
   }
   let legacyConfigPlan: LegacyConfigUpdatePlan | undefined;
-  if (channelRequested || options?.tolerateReadFailure) {
+  if (channelRequested) {
     ({ configSnapshot, legacyConfigPlan } = await planUpdateChannelLegacyConfig(configSnapshot));
   }
   const plannedConfig =

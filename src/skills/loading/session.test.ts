@@ -14,13 +14,6 @@ async function writeRawSkill(dir: string, raw: string, filename = "SKILL.md") {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-async function writeRawSkill(dir: string, raw: string, filename = "SKILL.md") {
-  await fs.mkdir(dir, { recursive: true });
-  const filePath = path.join(dir, filename);
-  await fs.writeFile(filePath, raw, "utf-8");
-  return filePath;
-}
-
 function loadSkillsFromPath(dir: string) {
   return loadSkills({ cwd: dir, agentDir: dir, skillPaths: [dir], includeDefaults: false });
 }

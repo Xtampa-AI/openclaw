@@ -315,10 +315,6 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
     result.didSendDeterministicApprovalPrompt === true
       ? (true as const)
       : undefined;
-  const meta: RestartRecoveryTerminalDeliveryEvidenceResult["meta"] = {
-    ...(result.meta?.aborted ? { aborted: true as const } : {}),
-    ...(result.meta?.error ? { error: true as const } : {}),
-  };
   return {
     captured: true,
     ...(Object.keys(meta).length ? { meta } : {}),
@@ -326,7 +322,6 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
       ? { requesterContinuationSettled: true as const }
       : {}),
     ...(payloads?.length ? { payloads } : {}),
-    ...(Object.keys(meta).length ? { meta } : {}),
     ...(payloadsTruncated ? { payloadsTruncated } : {}),
     ...(deliveryStatus ? { deliveryStatus } : {}),
     ...(messagingToolSentTargets?.length ? { messagingToolSentTargets } : {}),

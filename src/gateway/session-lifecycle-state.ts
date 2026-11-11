@@ -520,23 +520,6 @@ async function persistPreparedGatewaySessionLifecycleEvent(
               };
         }
       }
-      if (isAgentRunResumableToolTimeout(resolveSettledLifecycleTerminalOutcome(params.event))) {
-        const recovery = entry.mainRestartRecovery;
-        if (!recovery) {
-          patch.mainRestartRecovery = {
-            cycleId: randomUUID(),
-            revision: 1,
-            chargedAttempts: 0,
-            safeToolsRequired: true,
-          };
-        } else if (!recovery.tombstone && recovery.safeToolsRequired !== true) {
-          patch.mainRestartRecovery = {
-            ...recovery,
-            revision: recovery.revision + 1,
-            safeToolsRequired: true,
-          };
-        }
-      }
       if (providerReview && Object.keys(patch).length > 0) {
         patch.providerReview = providerReview.review;
       }

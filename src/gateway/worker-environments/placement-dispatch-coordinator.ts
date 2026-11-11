@@ -486,7 +486,6 @@ export function coordinateWorkerPlacementDispatch(
     readEnvironmentSessionIds: (environmentId) => service.readEnvironmentSessionIds(environmentId),
     isInterruptedTurn: service.isInterruptedTurn,
     reconcile: (mode) => runReconciliation(() => service.reconcile(mode, tryRecovery)),
-    isInterruptedTurn: service.isInterruptedTurn,
     reconcileActive: (environmentId) =>
       environmentId === undefined
         ? runReconciliation(() => service.reconcileActive(undefined, tryRecovery))

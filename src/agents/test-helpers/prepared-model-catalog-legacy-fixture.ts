@@ -13,10 +13,7 @@ import {
   createCatalogFixture,
 } from "../prepared-model-catalog-worker.test-support.js";
 import { startSerializedSnapshotBuildBatch } from "../prepared-model-runtime.build.js";
-import {
-  discardPreparedPluginGeneration,
-  retainPreparedPluginGeneration,
-} from "../prepared-model-runtime.plugin-lifetime.js";
+import { retainPreparedPluginGeneration } from "../prepared-model-runtime.plugin-lifetime.js";
 
 export async function expectLegacyWorkerCatalogRetention(params: {
   makeTempDir: (prefix: string) => string;
@@ -105,7 +102,6 @@ export async function expectLegacyWorkerCatalogRetention(params: {
   await using _ = {
     [Symbol.asyncDispose]: retainPreparedPluginGeneration(build.pluginGeneration),
   };
-  await discardPreparedPluginGeneration(build.pluginGeneration);
   const snapshot = build.snapshot;
   const learnedIds = (catalog: ModelCatalogSnapshot) =>
     catalog.entries

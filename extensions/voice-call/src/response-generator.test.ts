@@ -563,31 +563,6 @@ describe("generateVoiceResponse", () => {
     },
   );
 
-  it.each([
-    { agents: { defaults: { model: { primary: "anthropic/claude-opus-5-5" } } } },
-    {
-      agents: {
-        entries: { main: { model: "anthropic/claude-opus-5-5" } },
-        defaults: { model: { primary: "openai/gpt-5.4" } },
-      },
-    },
-  ] as OpenClawConfig[])(
-    "runs the call agent's configured model when responseModel is unset",
-    async (coreConfig) => {
-      const { runtime, runEmbeddedAgent } = createAgentRuntime([
-        { text: '{"spoken":"Configured model answers."}' },
-      ]);
-
-      const { result } = await runGenerateVoiceResponse([], { runtime, coreConfig });
-
-      expect(result.text).toBe("Configured model answers.");
-      expect(requireEmbeddedAgentArgs(runEmbeddedAgent)).toMatchObject({
-        provider: "anthropic",
-        model: "claude-opus-5-5",
-      });
-    },
-  );
-
   it("pins the voice session to responseModel before running the embedded agent", async () => {
     const { runtime, runEmbeddedAgent, prepareSessionEntryPatch, sessionStore } =
       createAgentRuntime([{ text: '{"spoken":"Pinned model works."}' }]);

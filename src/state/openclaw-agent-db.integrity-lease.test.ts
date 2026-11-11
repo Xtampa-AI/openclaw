@@ -22,8 +22,8 @@ import { registerOpenClawAgentDatabaseIdentity } from "./openclaw-agent-db-ident
 import {
   claimOpenClawAgentDatabaseLease,
   releaseOpenClawAgentDatabaseLease,
+  type OpenClawAgentDatabaseWorkerLeaseReceipt,
 } from "./openclaw-agent-db-lease.js";
-import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "./openclaw-agent-db-lease.types.js";
 import { openOpenClawAgentDatabaseReadOnly } from "./openclaw-agent-db-readonly.js";
 import {
   listOpenClawRegisteredAgentDatabases,

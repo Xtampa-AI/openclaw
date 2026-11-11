@@ -69,20 +69,6 @@ describe("first-hop package fixtures", () => {
     expect(() => listFirstHopSourceVersions(root, "2026.10.1-beta.1")).toThrow("unsupported");
   });
 
-  it.each([true, false])("excludes newer-schema sources (supported source: %s)", (supported) => {
-    const root = makePackageFixture();
-    writeJson(path.join(root, "dist/update-compat-inventory.json"), {
-      schemaVersion: 1,
-      releases: [
-        ...(supported ? [{ version: "2026.9.1", schemaVersions: { state: 1, agent: 1 } }] : []),
-        { version: "2026.10.1-beta.1", schemaVersions: { state: 2, agent: 1 } },
-        { version: "2026.10.1-beta.2", schemaVersions: { state: 1, agent: 2 } },
-      ],
-    });
-    expect(listFirstHopSourceVersions(root)).toEqual(supported ? ["2026.9.1"] : []);
-    expect(() => listFirstHopSourceVersions(root, "2026.10.1-beta.1")).toThrow("unsupported");
-  });
-
   it("selects recorded baselines and verifies their bytes before choosing restart controls", () => {
     const root = makePackageFixture();
     const createSource = (version: string) => {

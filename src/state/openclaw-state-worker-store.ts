@@ -21,7 +21,7 @@ import {
   runWithCapturedWorkerContext,
   runWithOpenClawStateWorkerStore,
 } from "./openclaw-state-worker-operation.js";
-import { getOpenClawStateWorkerOwner as owner } from "./openclaw-state-worker-owner-get.js";
+import { getOpenClawStateWorkerOwner as owner } from "./openclaw-state-worker-owner.js";
 import type { DomainScope } from "./openclaw-state-worker-store.types.js";
 
 export type { OpenClawStateWorkerLease } from "./openclaw-state-worker-lease.js";

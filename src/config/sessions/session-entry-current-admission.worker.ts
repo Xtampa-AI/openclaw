@@ -1,6 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import { runSqlitePinnedReadSnapshotSync } from "../../infra/sqlite-pinned-read-snapshot.js";
 import { assertExistingDatabaseIdentity } from "../../infra/sqlite-worker-identity.js";
 import {
   requestSqliteWorkerOperationAdmission,
@@ -127,11 +126,7 @@ function readSessionEntryCurrentFactsInDatabase(
     };
     currentEntryReads.set(database.db, cached);
   }
-  const { read } = cached;
-  // Acquire facts and their revision in one snapshot; grants and their rereads stay unpinned.
-  return readWithCanonicalSessionAdmission(database, () =>
-    runSqlitePinnedReadSnapshotSync(database.db, read),
-  );
+  return readWithCanonicalSessionAdmission(database, cached.read);
 }
 
 function assertSessionEntryCurrentNativeSource(

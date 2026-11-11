@@ -54,7 +54,6 @@ describe("runCodexAppServerAttempt question refresh", () => {
     });
 
     const params = createSteeringParams();
-    params.timeoutMs = 60_000;
     let pendingRefresh = false;
     params.runtimePlan = createCodexRuntimePlanFixture();
     setCodexTestModelSupportsTools(params, true);

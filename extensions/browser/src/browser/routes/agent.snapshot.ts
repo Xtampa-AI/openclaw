@@ -140,9 +140,10 @@ export function registerBrowserAgentSnapshotRoutes(
     let timeoutMs: number | undefined;
     try {
       const requestedTimeoutMs = readRouteTimerTimeoutMs(body.timeoutMs);
-      if (requestedTimeoutMs !== undefined) {
-        timeoutMs = resolveBrowserNavigationTimeoutMs(requestedTimeoutMs);
-      }
+      timeoutMs =
+        requestedTimeoutMs === undefined
+          ? undefined
+          : resolveBrowserNavigationTimeoutMs(requestedTimeoutMs);
     } catch (err) {
       return jsonError(res, 400, String(err instanceof Error ? err.message : err));
     }

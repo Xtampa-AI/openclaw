@@ -27,7 +27,6 @@ describe("github_identity_status tool", () => {
     }));
     const tool = createGitHubIdentityStatusTool({
       callGateway: callGatewayMock as InProcessGatewayCaller,
-      githubIdentitySettingsAvailable: true,
     });
 
     const result = await withGatewayToolCallerIdentity(
@@ -39,17 +38,7 @@ describe("github_identity_status tool", () => {
       agentId: "main",
       selectedScope: "agent",
     });
-    expect(JSON.stringify(result)).toContain("github_identity_settings");
-
-    const legacyTool = createGitHubIdentityStatusTool({
-      callGateway: callGatewayMock as InProcessGatewayCaller,
-    });
-    const legacyResult = await withGatewayToolCallerIdentity(
-      { agentId: "main", sessionKey: "agent:main:status" },
-      async () => await legacyTool.execute("status-2", {}),
-    );
-    expect(JSON.stringify(legacyResult)).toContain("Settings → Agents → Tools");
-    expect(JSON.stringify(legacyResult)).not.toContain("github_identity_settings");
+    expect(JSON.stringify(result)).toContain("Ask the operator");
   });
 
   it("directs capable sessions to the masked reconnect action", async () => {

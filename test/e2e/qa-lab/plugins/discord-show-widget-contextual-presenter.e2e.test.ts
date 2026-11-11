@@ -718,8 +718,7 @@ describe("Discord show_widget contextual presenter process proof", () => {
     },
   );
 
-  // Waived for 2026.9.7 by the release lead under Peter's 00:40 PT live/e2e waiver decision; see FRV 36534008742 job 109299879005.
-  it.skip(
+  it(
     "routes one core tool through Discord and keeps mismatched and inline paths honest",
     { timeout: 180_000 },
     async () => {

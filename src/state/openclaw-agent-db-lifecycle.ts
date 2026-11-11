@@ -36,8 +36,8 @@ import {
   hasAgentDatabaseMaintenanceAuthority,
   readOpenClawAgentDatabaseWorkerLeaseReceiptFromClaim,
   releaseOpenClawAgentDatabaseLease,
+  type OpenClawAgentDatabaseWorkerLeaseReceipt,
 } from "./openclaw-agent-db-lease.js";
-import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "./openclaw-agent-db-lease.types.js";
 import {
   drainAgentDatabaseResources,
   matchesAgentDatabaseClose,

@@ -16,7 +16,6 @@ import {
   resetSubagentRegistryForTests,
 } from "../../agents/subagents/registry/subagent-registry.test-helpers.js";
 import { recordAgentRunTerminalOutcome } from "../../channels/turn/agent-run-terminal-outcome.js";
-import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { attachErrorDiagnostic } from "../../infra/error-diagnostics.js";
 import { withTestDir } from "../../test-helpers/temp-dir.js";
 import { createCanonicalAgentConfigFixture } from "../../test-utils/config-roster.js";
@@ -43,7 +42,6 @@ import {
   mockGlobalSessionAgentRoster,
   mockSpawnedChildSessionEntry,
   nativeSubagentClient,
-  observeAgentSubagentCleanup,
   seedPersistedSubagentRunForAgentTest,
   withPluginSubagentTestState,
 } from "./agent.spawned-child.test-support.js";

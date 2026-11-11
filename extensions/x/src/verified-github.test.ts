@@ -314,31 +314,6 @@ describe("X GitHub verification sync", () => {
   });
 });
 
-async function withService(
-  test: ReturnType<typeof githubFixture>,
-  cfg: OpenClawConfig,
-  run: (clock: ReturnType<typeof createGatewaySchedulerClock>) => Promise<void>,
-): Promise<void> {
-  const clock = createGatewaySchedulerClock(Date.now());
-  const gateway = createTestGatewayScheduler(clock.clock);
-  const scheduler = createTestPluginServiceScheduler(gateway);
-  const service = createXGitHubService({ runtime: test.runtime });
-  const context: OpenClawPluginServiceContextV2 = {
-    config: cfg,
-    stateDir: test.runtime.state.resolveStateDir(),
-    logger: test.logger,
-    scheduler,
-  };
-  try {
-    await service.start(context);
-    await run(clock);
-  } finally {
-    await scheduler.stop();
-    await service.stop?.(context);
-    await gateway.stop();
-  }
-}
-
 describe("X GitHub verification service", () => {
   it("names reauthorization when the X refresh token is rejected", async () => {
     const test = githubFixture(1, true);

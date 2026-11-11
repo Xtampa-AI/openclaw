@@ -1912,7 +1912,6 @@ export const PR_PROTECTED_RUNTIME_TEST_FILES: readonly string[] = [
   "src/cli/update-cli/update-command-terminal-outcome.test.ts",
   "src/cli/update-cli/update-command-terminal-triage.test.ts",
   "src/cli/update-cli/update-command-timeouts.test.ts",
-  "src/cli/update-cli/update-command-verification-package-replacement.test.ts",
   "src/cli/update-cli/update-command-verification.test.ts",
   "src/cli/update-cli/update-config-provenance.integration.test.ts",
   "src/cli/update-cli/update-execution.runtime.test.ts",

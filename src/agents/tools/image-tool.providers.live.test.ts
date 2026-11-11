@@ -207,9 +207,6 @@ afterEach(() => {
 async function runLiveDownscaleCase(testCase: LiveProviderCase) {
   let observedDimensions: { width: number; height: number } | undefined;
   testing.setProviderDepsForTest({
-    // This probe calls the model-backed provider below; plugin discovery is unused
-    // and its cold runtime imports can exhaust the live request's test budget.
-    buildProviderRegistry: () => new Map(),
     getMediaUnderstandingProvider: (
       _id: string,
       _registry: Map<string, MediaUnderstandingProvider>,

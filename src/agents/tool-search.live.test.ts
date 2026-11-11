@@ -1,5 +1,4 @@
 // Real provider discovery through the admitted OpenClaw runner; no response or tool-choice mocks.
-import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
@@ -21,12 +20,6 @@ import {
   useLiveTestRuntimeConfig,
 } from "./live-test-helpers.js";
 import { SessionManager } from "./sessions/session-manager.js";
-import {
-  nonceTextMetrics,
-  observeNonceDispatch,
-  type NonceDispatch,
-  summarizeNonceRun,
-} from "./tool-search.live-diagnostics.js";
 
 const liveOpenAiKey = collectProviderApiKeys("openai")[0];
 const describeLive = isLiveTestEnabled() && liveOpenAiKey ? describe : describe.skip;
@@ -232,34 +225,6 @@ module.exports = {
           let firstRequestToTargetMs: number | undefined;
           let wireFailure: Error | undefined;
           let completed = false;
-          let diagnosticNonce: string | undefined;
-          let boundaryLogged = false;
-          const acceptedResults: Array<{
-            target: boolean;
-            isError: boolean;
-            bytes: number;
-            nonceCount: number | null;
-          }> = [];
-          const dispatchBoundaries: NonceDispatch[] = [];
-          const logBoundaries = (result?: Awaited<ReturnType<typeof runEmbeddedAgent>>) => {
-            boundaryLogged = true;
-            const messages = sessionManager
-              .getBranch()
-              .flatMap((entry) => (entry.type === "message" ? [entry.message] : []))
-              .filter((message) => message.role === "assistant" || message.role === "toolResult");
-            logLiveProgress(
-              JSON.stringify({
-                suite: "tool-search-nonce-boundary",
-                lane,
-                distractorCount,
-                nonceAvailable: diagnosticNonce !== undefined,
-                acceptedResults,
-                dispatchBoundaries,
-                ...summarizeNonceRun(messages, result, diagnosticNonce),
-                wireFailure: wireFailure !== undefined,
-              }),
-            );
-          };
           configureAiTransportHost({
             ...host,
             buildModelFetch: (...args) => {
@@ -313,12 +278,7 @@ module.exports = {
                 }
                 // Observe the genuine wire request, forwarding its bytes and stream unchanged.
                 // Log only aggregate metrics, never request bodies, headers or credentials.
-                return await observeNonceDispatch(
-                  dispatchBoundaries,
-                  request,
-                  () => diagnosticNonce,
-                  () => fetchModel(input, init),
-                );
+                return fetchModel(input, init);
               };
             },
           });
@@ -356,24 +316,7 @@ module.exports = {
               timeoutMs: 180_000,
               runId: sessionId,
               cleanupBundleMcpOnRunEnd: true,
-              onAgentToolResult: ({ toolName, result: toolResult, isError }) => {
-                if (toolName === TARGET) {
-                  const receipts = readFileSync(receiptPath, "utf8")
-                    .trim()
-                    .split("\n")
-                    .filter(Boolean)
-                    .map((line) => JSON.parse(line) as Receipt);
-                  diagnosticNonce = receipts.findLast((receipt) => receipt.tool === TARGET)?.nonce;
-                }
-                acceptedResults.push({
-                  target: toolName === TARGET,
-                  isError,
-                  ...nonceTextMetrics(JSON.stringify(toolResult), diagnosticNonce),
-                });
-              },
             });
-            // Independent diagnostics must survive every assertion below, including nonce loss.
-            logBoundaries(result);
             if (wireFailure) {
               throw wireFailure;
             }
@@ -452,9 +395,6 @@ module.exports = {
             }
             return firstRequest;
           } finally {
-            if (!boundaryLogged) {
-              logBoundaries();
-            }
             // Exclude fixture creation and teardown; include run admission/lease setup.
             const wallElapsedMs = Math.round(performance.now() - runStartedAtMs);
             configureAiTransportHost(host);

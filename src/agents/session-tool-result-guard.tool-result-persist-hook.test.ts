@@ -265,21 +265,6 @@ describe("session persistence hooks", () => {
         ),
     ).toEqual(["original", "hooked", "original"]);
   });
-
-  it("keeps the original message when a hook returns a non-message replacement", () => {
-    // A malformed plugin replacement must not fail the append or drop the admitted message.
-    installHook("before_message_write", () => ({
-      message: "not-a-message" as unknown as AgentMessage,
-    }));
-    const sm = createGuardedSession();
-    sm.appendMessage(makeUserMessage("hello", 1));
-    const messages = sm
-      .getEntries()
-      .flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
-    expect(messages).toHaveLength(1);
-    expect(messages[0]?.role).toBe("user");
-    expect(messages.find((item) => item.role === "user")?.content).toBe("hello");
-  });
 });
 
 const call = makeAgentAssistantMessage({

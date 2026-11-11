@@ -381,8 +381,7 @@ describe("Gateway timeout recovery subagent delivery", () => {
     }
   });
 
-  // Waived for 2026.9.7 by the release lead under Peter's 2026-09-29 waiver decision; see #161139.
-  it.skip("delivers a child completion once while parent timeout recovery is active", async () => {
+  it("delivers a child completion once while parent timeout recovery is active", async () => {
     const provider = await startProofProvider();
     cleanups.push(() => provider.stop());
     const state = createQaBusState();

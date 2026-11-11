@@ -676,7 +676,6 @@ export async function snapshotUpdateCandidateState(
       // The rehearsal is private and disposable; compaction would create another
       // full image and alter implicit row IDs before candidate migrations run.
       preserveRowIds: true,
-      ftsSchemas: AGENT_FTS_SCHEMAS,
       onProgress: progress.onProgress,
       ...(file === shared
         ? {

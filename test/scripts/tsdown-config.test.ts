@@ -64,11 +64,6 @@ const workerBuildTargets = [
     "src/infra/gateway-state-owner-heartbeat.worker.ts",
   ],
   [
-    "gateway-state-owner-heartbeat",
-    "worker/gateway-state-owner-heartbeat.worker",
-    "src/infra/gateway-state-owner-heartbeat.worker.ts",
-  ],
-  [
     "image-processor",
     "worker/image-processor.worker",
     "src/worker/worker-deploy-image-processor.ts",

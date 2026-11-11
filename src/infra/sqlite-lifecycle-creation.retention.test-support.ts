@@ -9,7 +9,7 @@ import {
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
-import { getOpenClawStateWorkerOwner } from "../state/openclaw-state-worker-owner-get.js";
+import { getOpenClawStateWorkerOwner } from "../state/openclaw-state-worker-owner.js";
 import { runOpenClawStateWorkerOperation } from "../state/openclaw-state-worker-store.js";
 import { collectForRetentionCheck } from "../test-utils/retention.js";
 import { removeTempDirectoryAsync } from "./sqlite-readonly-location-cleanup.js";

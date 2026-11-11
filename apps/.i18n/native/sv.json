@@ -2269,7 +2269,6 @@
     "native.apple.1ef2c9a8cf3055e1": "Konfigurationskoden har tillämpats. Ansluter...",
     "native.apple.1f000764a8ae9309": "Kopiera ID",
     "native.apple.1f3f8e5255782fe9": "Behöver granskas",
-    "native.apple.1f44f4373efc4524": "Klockan tar emot en parkopplingskod för engångsbruk och lagrar sin egen enhetstoken. Fristående röståtkomst ger även läs- och Talk-behörighet, utan administratörsåtkomst. En nåbar och säker Gateway-URL krävs när klockan inte är i närheten av iPhone.",
     "native.apple.1f4a8faabc9fc4ed": "\\(label) kunde inte slutföra testet. Visa detaljer för att granska eller kopiera felet.",
     "native.apple.1f4bae4397263967": "Tillåt alltid här sparar godkännandet för framtida matchande förfrågningar.",
     "native.apple.1f57a516f0eeb364": "Sessionslager",

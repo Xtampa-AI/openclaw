@@ -51,18 +51,3 @@ export const PluginInstanceDrainTimeoutError = resolveGlobalSingleton(
 );
 
 export type PluginInstanceDrainTimeoutError = InstanceType<typeof PluginInstanceDrainTimeoutError>;
-
-/** Forced retirement leaves resource cleanup pending; `settled` reports its eventual outcome. */
-export function forcedRetirementError(
-  pluginId: string,
-  timeoutMs: number,
-  fact: { activeCallCount: number; retainedConsumerCount: number },
-  settled: Promise<void>,
-): PluginInstanceDrainTimeoutError {
-  return new PluginInstanceDrainTimeoutError(
-    `Plugin ${pluginId} forced retirement after ${timeoutMs}ms: ${fact.activeCallCount} still-running call(s), ${fact.retainedConsumerCount} retained consumer(s); resource cleanup remains pending.`,
-    settled,
-    {},
-    fact,
-  );
-}

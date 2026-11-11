@@ -171,7 +171,6 @@ describe("candidate service capability startup", () => {
         expect(JSON.parse(result.stdout)).toEqual({
           updateExecutor: "root-spawner-v1",
           targetRootBinding: true,
-          currentCoreRecoveryRiskGuard: true,
           definitionBackup: true,
           retainedOwnerBinding: true,
           originalDefinitionBinding: true,

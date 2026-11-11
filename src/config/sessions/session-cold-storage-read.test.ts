@@ -26,8 +26,6 @@ describe("readRestoredSessionTranscript", () => {
         scope,
         undefined,
         coldRead,
-        undefined,
-        undefined,
       );
     } else {
       expect(restoreSessionColdTranscript).not.toHaveBeenCalled();

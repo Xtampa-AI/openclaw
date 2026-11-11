@@ -46,8 +46,7 @@
             "compat": {
               "supportsReasoningEffort": true,
               "supportedReasoningEfforts": ["none", "low", "high", "max"],
-              "reasoningEffortMap": { "off": "none", "none": "none", "adaptive": "max" },
-              "codeMode": "capable"
+              "reasoningEffortMap": { "off": "none", "none": "none", "adaptive": "max" }
             }
           },
           {

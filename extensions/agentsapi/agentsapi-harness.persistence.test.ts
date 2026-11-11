@@ -28,7 +28,7 @@ import {
   reopenState,
   requireExecutorHarness,
 } from "./agentsapi-harness.persistence.test-helpers.js";
-import { createTurn } from "./agentsapi.test-support.js";
+import { createHostedSession, createTurn } from "./agentsapi.test-support.js";
 
 const { createSession, fetchWithSsrFGuardMock, resolveProviderAuth } = vi.hoisted(() => ({
   createSession: vi.fn<typeof import("./agentsapi-session.js").createAgentsApiSession>(),

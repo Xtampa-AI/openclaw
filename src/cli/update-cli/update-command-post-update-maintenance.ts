@@ -17,7 +17,6 @@ import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-err
 import {
   markControlPlaneUpdateRestartSentinelFailureBestEffort,
   prepareUpdateServiceResult,
-  UpdateCommandFailure,
   UpdateCommandPendingRecoveryFailure,
   UpdateCommandFailure,
 } from "./update-command-result.js";

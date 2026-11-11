@@ -49,25 +49,6 @@ function readPreservedCliEnv(env: NodeJS.ProcessEnv): ReadonlySet<string> {
   return new Set(raw.split(/[,\s]+/).filter(Boolean));
 }
 
-// Mirrors the CLI runner's child-env contract (src/agents/cli-runner/execute.ts): keys listed
-// here survive the Claude clear list for native-login runs, so readiness must probe them too.
-const CLI_BACKEND_PRESERVE_ENV = "OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV";
-
-function readPreservedCliEnv(env: NodeJS.ProcessEnv): ReadonlySet<string> {
-  const raw = env[CLI_BACKEND_PRESERVE_ENV]?.trim();
-  if (!raw) {
-    return new Set();
-  }
-  if (raw.startsWith("[")) {
-    try {
-      return new Set(filterStringEntries(JSON.parse(raw)));
-    } catch {
-      return new Set();
-    }
-  }
-  return new Set(raw.split(/[,\s]+/).filter(Boolean));
-}
-
 /** Ask Claude CLI whether its own login is usable without reading token material. */
 export async function probeClaudeCliAuthStatus(params?: {
   command?: string;

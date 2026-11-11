@@ -157,16 +157,7 @@ describe("refreshQueuedFollowupSession", () => {
     const queuedRun: FollowupRun = {
       prompt: "queued message",
       enqueuedAt: Date.now(),
-      run: {
-        ...makeRun(),
-        hasAutoFallbackProvenance: true,
-        autoFallbackPrimaryProbe: {
-          provider: "anthropic",
-          model: "primary",
-          fallbackProvider: "anthropic",
-          fallbackModel: "claude-opus-4-6",
-        },
-      },
+      run: { ...makeRun(), hasAutoFallbackProvenance: true },
     };
     queue.items.push(queuedRun);
 

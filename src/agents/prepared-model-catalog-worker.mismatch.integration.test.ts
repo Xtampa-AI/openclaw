@@ -20,7 +20,6 @@ import {
 } from "./prepared-model-catalog-worker.test-support.js";
 import { startSerializedSnapshotBuildBatch } from "./prepared-model-runtime.build.js";
 import type { PreparedModelRuntimeAgentFacts } from "./prepared-model-runtime.catalog-contract.js";
-import { discardPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
 import { AuthStorage } from "./sessions/auth-storage.js";
 import { usePreparedCatalogWorkerFixtures } from "./test-helpers/prepared-model-catalog-worker-fixture.js";
 
@@ -129,7 +128,6 @@ async function createMismatchFixture() {
       undefined,
     ).pending
   )[0]!;
-  retireAfterTest(() => discardPreparedPluginGeneration(build.pluginGeneration));
   const workerParams = {
     retirementSignal: retirement.signal,
     agentFacts: {

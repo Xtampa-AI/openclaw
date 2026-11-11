@@ -41,8 +41,6 @@ import { createSqliteReadOnlyWorkerSession } from "./sqlite-readonly-worker-sess
 
 export { createSqliteReadOnlyWorkerScope } from "./sqlite-readonly-worker-context.js";
 
-export { createSqliteReadOnlyWorkerScope } from "./sqlite-readonly-worker-context.js";
-
 const SLOW_HARDWARE_HEADROOM = 10;
 const SQLITE_INSPECTION_TIMEOUT_MS = 30_000 * SLOW_HARDWARE_HEADROOM;
 const SQLITE_INSPECTION_BYTES_PER_SECOND = 32 * 1024 * 1024;

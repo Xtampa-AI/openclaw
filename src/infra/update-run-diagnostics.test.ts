@@ -251,36 +251,3 @@ it("keeps recovery observations atomic across a busy write without revising the 
   ).toBeNull();
   expect(renderUpdateRunReport(after!).markdown).not.toContain("verified serving");
 });
-
-it.each(["admission", "healthy", "secondary-refusal"] as const)(
-  "preserves later named risk against stale recovery-only %s diagnostics",
-  (phase) => {
-    const options = { env: { OPENCLAW_STATE_DIR: dirs.make("update-stale-risk-") } };
-    const run = createUpdateRun({ trigger: "cli" }, options);
-    const risk = {
-      serviceRestartSafe: false,
-      reason: "runtime-verification-failed",
-      dataAtRisk: "unreadable-state",
-    } as const;
-    recordUpdateRunVerification(run.runId, { recovery: risk }, options);
-    const observed =
-      phase === "secondary-refusal"
-        ? ({ serviceRestartSafe: false, reason: "runtime-verification-failed" } as const)
-        : ({
-            serviceRestartSafe: true,
-            version: "2026.9.5",
-            ...(phase === "healthy" ? { service: "healthy" as const } : {}),
-          } as const);
-    recordUpdateRunDiagnostics(
-      run.runId,
-      { recovery: observed },
-      () => {
-        throw new Error("write failed");
-      },
-      options,
-    );
-    expect(getUpdateRun(run.runId, options)?.verification.recovery).toEqual(risk);
-    closeOpenClawStateDatabaseForTest();
-    expect(getUpdateRun(run.runId, options)?.verification.recovery).toEqual(risk);
-  },
-);

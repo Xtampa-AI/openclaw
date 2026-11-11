@@ -13,8 +13,10 @@ import {
   readOpenClawAgentDatabaseIdentity,
   type OpenClawAgentDatabaseClaim,
 } from "../../state/openclaw-agent-db-identity.js";
-import { assertOpenClawAgentDatabaseLease } from "../../state/openclaw-agent-db-lease.js";
-import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lease.types.js";
+import {
+  assertOpenClawAgentDatabaseLease,
+  type OpenClawAgentDatabaseWorkerLeaseReceipt,
+} from "../../state/openclaw-agent-db-lease.js";
 import { readOpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lifecycle.js";
 import { withFreshOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly-open.js";
 import {

@@ -54,7 +54,6 @@ describe("runCodexAppServerAttempt dynamic tools", () => {
     const command = createRequiredExecRuntimeContract();
     const harness = createStartedThreadHarness();
     const params = createTestParams();
-    params.timeoutMs = 60_000;
     setCodexTestToolFactory(params, () => [{ ...command.tool, name: "sandbox_exec" }]);
     params.runtimePlan = createCodexRuntimePlanFixture();
     setCodexTestModelSupportsTools(params, true);

@@ -145,7 +145,8 @@ export async function disposeMcpClient(
     if (closed) {
       return failed ? "uncertain" : "closed";
     }
-    // Stdio owns a process group; force it dead before reporting completion.
+    // Closing an HTTP transport aborts a hung DELETE. Stdio owns a process
+    // group, so force it dead before disposal can report completion.
     const { transport } = session;
     const closeTransport =
       session.transportType === "stdio" && transport instanceof OpenClawStdioClientTransport

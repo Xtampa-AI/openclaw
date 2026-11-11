@@ -145,8 +145,6 @@ import {
 } from "./gateway-models.profiles.live.test-helpers.js";
 import { restoreLiveEnv, snapshotLiveEnv } from "./live-env-test-helpers.js";
 import {
-  buildToolOnlyFollowupPrompt,
-  buildToolReadProbePrompt,
   hasExpectedSingleNonce,
   hasExpectedToolNonce,
   isLikelyToolNonceRefusal,
@@ -5066,19 +5064,12 @@ function assertOpenAIUltraWireEffort(params: {
     `expected captured OpenAI requests for ${params.expectedModel}; captured=${params.observations.length}`,
   ).toBeGreaterThan(0);
   const ultraSessions = new Set(params.ultraRuns.values());
-  // Skill Workshop reviews run after the session idles, under their own run, and do not
-  // inherit the session's thinking level; like independent heartbeats they stay normal.
-  const isIndependentBackgroundRun = ({ dispatch }: OpenAIUltraWireObservation) => {
-    if (!dispatch || params.ultraRuns.has(dispatch.runId)) {
-      return false;
-    }
-    if (dispatch.runId.startsWith("skill-workshop-review:")) {
-      return true;
-    }
-    return dispatch.isHeartbeat === true && !ultraSessions.has(dispatch.sessionKey ?? "");
-  };
-  const expectedEffort = (entry: OpenAIUltraWireObservation) =>
-    isIndependentBackgroundRun(entry) ? OPENAI_ULTRA_NORMAL_EFFORT : "max";
+  const expectedEffort = ({ dispatch }: OpenAIUltraWireObservation) =>
+    dispatch?.isHeartbeat === true &&
+    !params.ultraRuns.has(dispatch.runId) &&
+    !ultraSessions.has(dispatch.sessionKey ?? "")
+      ? OPENAI_ULTRA_NORMAL_EFFORT
+      : "max";
   const heartbeats = matching.filter(
     (entry) => expectedEffort(entry) === OPENAI_ULTRA_NORMAL_EFFORT,
   );
@@ -5906,7 +5897,15 @@ async function runGatewayModelSuite(params: GatewayModelSuiteParams) {
                     sessionKey,
                     idempotencyKey: `idem-${runIdTool}-tool-${toolReadAttempt + 1}`,
                     modelKey,
-                    message: buildToolReadProbePrompt(toolProbePath, strictReply),
+                    message: strictReply
+                      ? "OpenClaw live tool probe (local, safe): " +
+                        "Follow the advertised tool interface; if tools are behind Code Mode, invoke them through Code Mode. " +
+                        `read the local file ${JSON.stringify(toolProbePath)} using the available file-reading tool. ` +
+                        "Then reply with exactly the two test marker values from that file, separated by one space. No extra text."
+                      : "OpenClaw live tool probe (local, safe): " +
+                        "Follow the advertised tool interface; if tools are behind Code Mode, invoke them through Code Mode. " +
+                        `read the local file ${JSON.stringify(toolProbePath)} using the available file-reading tool. ` +
+                        "Then reply with the two test marker values you read (include both).",
                     thinkingLevel,
                     context: `${progressLabel}: tool-read`,
                   });
@@ -6144,7 +6143,7 @@ async function runGatewayModelSuite(params: GatewayModelSuiteParams) {
                   sessionKey,
                   idempotencyKey: `idem-${runId2}-2`,
                   modelKey,
-                  message: buildToolOnlyFollowupPrompt(toolProbePath, nonceA, nonceB),
+                  message: `Now answer: what are the values of testMarkerA and testMarkerB in "${toolProbePath}"? Reply with exactly: ${nonceA} ${nonceB}.`,
                   thinkingLevel,
                   context: `${progressLabel}: tool-only-regression-second`,
                 });
@@ -6155,9 +6154,7 @@ async function runGatewayModelSuite(params: GatewayModelSuiteParams) {
                   label: params.label,
                 });
                 if (!reply.includes(nonceA) || !reply.includes(nonceB)) {
-                  throw new Error(
-                    `tool-only followup marker mismatch: expected ${JSON.stringify(`${nonceA} ${nonceB}`)}, observed ${JSON.stringify(reply)}`,
-                  );
+                  throw new Error(`unexpected reply: ${reply}`);
                 }
               }
 

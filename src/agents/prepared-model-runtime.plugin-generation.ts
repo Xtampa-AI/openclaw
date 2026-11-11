@@ -132,7 +132,7 @@ export function createPreparedPluginGeneration(params: {
     if (params.pluginMetadataSnapshot === reusable.pluginMetadataSnapshot) {
       derivedGenerationBases.set(derived, reusable);
     }
-    ownPreparedPluginGeneration(derived, { unpublished: true });
+    ownPreparedPluginGeneration(derived);
     return derived;
   }
   const generation = Object.freeze({
@@ -159,6 +159,6 @@ export function createPreparedPluginGeneration(params: {
       ? { providerStaticModels: Object.freeze([...(params.providerStaticModels ?? [])]) }
       : {}),
   });
-  ownPreparedPluginGeneration(generation, { unpublished: true });
+  ownPreparedPluginGeneration(generation);
   return generation;
 }

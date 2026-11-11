@@ -188,15 +188,6 @@ async function runRepairEnvelope(
   }
 }
 
-// Exercise the built runtime through Node's loader; Vitest's source-module graph
-// stalls inside agent command execution before the synthetic provider is called.
-vi.mock("./update-repair-agent.runtime.js", async () => {
-  const { createRequire } = await import("node:module");
-  return createRequire(import.meta.url)(
-    "../../dist/update-repair-agent.runtime.js",
-  ) as typeof import("./update-repair-agent.runtime.js");
-});
-
 type ModelRequest = {
   model?: string;
   tools?: Array<{ name?: string }>;

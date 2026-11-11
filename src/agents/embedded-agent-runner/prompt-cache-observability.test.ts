@@ -24,21 +24,6 @@ function scopedKey(value: string): string {
   return `${value}:${testScope}`;
 }
 
-function beginAnthropicObservation(
-  params: Pick<ObservationParams, "sessionId"> & Partial<ObservationParams>,
-) {
-  return beginPromptCacheObservation({
-    messages: [],
-    provider: "anthropic",
-    modelId: "claude-sonnet-4-6",
-    modelApi: "anthropic-messages",
-    streamStrategy: "boundary-aware:anthropic-messages",
-    systemPrompt: "stable system",
-    tools: [{ name: "read" }],
-    ...params,
-  });
-}
-
 describe("prompt cache observability", () => {
   afterEach(() => vi.restoreAllMocks());
 
