@@ -7,8 +7,9 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runCommandBuffered } from "../process/exec.js";
 import { getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import { withAgentDatabaseMaintenanceLease } from "../state/openclaw-agent-db-maintenance-lease.js";
-import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
+import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db-cache.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
@@ -34,6 +35,7 @@ beforeEach(async () => {
   await materializeUpdateCandidateStateWorker(root);
 });
 afterEach(async () => {
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
   await fs.rm(root, { recursive: true, force: true });
 });
@@ -101,7 +103,7 @@ it.each(["DELETE"])(
         now,
         now,
       );
-    closeOpenClawStateDatabaseByPath(shared);
+    await closeOpenClawStateDatabaseByPathAsync(shared);
     const sources = [shared, canonical, external];
     for (const file of sources) {
       const database = openNodeSqliteDatabase(file);
@@ -357,7 +359,7 @@ it.each([
         1,
       );
     const shared = path.join(source, "state", "openclaw.sqlite");
-    closeOpenClawStateDatabaseByPath(shared);
+    await closeOpenClawStateDatabaseByPathAsync(shared);
     const before = await fs.readFile(shared);
     await runSnapshotWorker({ stateDir: source, targetStateDir: target, config: {} });
     expect((await fs.readFile(shared)).equals(before)).toBe(true);
@@ -457,7 +459,7 @@ it.each([
         JSON.stringify({ revision: 1, index: { installRecords: {} } }),
         1,
       );
-    closeOpenClawStateDatabaseByPath(path.join(source, "state", "openclaw.sqlite"));
+    await closeOpenClawStateDatabaseByPathAsync(path.join(source, "state", "openclaw.sqlite"));
     const config: OpenClawConfig = {
       plugins: {
         load: { paths: [entry] },
@@ -652,6 +654,9 @@ it.each(["external-store", "cycle"] as const)(
 it.skipIf(process.platform === "win32")(
   "copies an external file link without traversing unrelated siblings",
   async () => {
+    // A surrounding Node package scope must not turn a single file edge into
+    // a recursive copy of its unrelated siblings or the private snapshot.
+    await fs.writeFile(path.join(root, "package.json"), "{}");
     const plugin = path.join(root, "plugin");
     const assets = path.join(root, "assets");
     await fs.mkdir(plugin);
@@ -670,12 +675,44 @@ it.skipIf(process.platform === "win32")(
       const config: OpenClawConfig = JSON.parse(await fs.readFile(rehearsal.configPath, "utf8"));
       const copied = path.join(config.plugins!.load!.paths![0]!, "config.txt");
       expect(await fs.readFile(copied, "utf8")).toBe("preserved");
+      expect((await fs.realpath(copied)).startsWith(rehearsal.stateDir + path.sep)).toBe(true);
+      expect(
+        (await fs.readdir(rehearsal.stateDir, { recursive: true })).some(
+          (entry) => path.basename(entry) === "unrelated",
+        ),
+      ).toBe(false);
       await fs.writeFile(copied, "private");
       expect(await fs.readFile(source, "utf8")).toBe("preserved");
       expect(await fs.readlink(path.join(plugin, "config.txt"))).toBe(source);
     } finally {
       await rehearsal.cleanup();
     }
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "still refuses an external file link into private snapshot state",
+  async () => {
+    const plugin = path.join(root, "plugin");
+    const targetStateDir = path.join(root, "snapshot");
+    await fs.mkdir(plugin);
+    await fs.mkdir(targetStateDir);
+    await fs.writeFile(path.join(root, "package.json"), "{}");
+    await fs.writeFile(path.join(plugin, "package.json"), '{"name":"plugin"}');
+    const source = path.join(targetStateDir, "private.txt");
+    await fs.writeFile(source, "private snapshot bytes");
+    const link = path.join(plugin, "config.txt");
+    await fs.symlink(source, link);
+    await expect(
+      prepareUpdateCandidatePlugins({
+        config: { plugins: { load: { paths: [plugin] } } },
+        stateDir: path.join(root, "source-state"),
+        targetStateDir,
+        candidateRoot: root,
+      }),
+    ).rejects.toThrow("Plugin copy source overlaps update state");
+    expect(await fs.readFile(source, "utf8")).toBe("private snapshot bytes");
+    expect(await fs.readlink(link)).toBe(source);
   },
 );
 

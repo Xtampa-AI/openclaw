@@ -11,7 +11,11 @@ import {
   type WorkerComputeCapacity,
 } from "./worker-task-capacity.js";
 import { captureWorkerTaskContext } from "./worker-task-context.js";
-import { WorkerTaskError, workerTaskTimeoutError } from "./worker-task-error.js";
+import {
+  WorkerTaskError,
+  workerTaskTimeoutError,
+  workerTaskUnavailableError,
+} from "./worker-task-error.js";
 import { serviceNativeWorkerPass, type WorkerTaskHost } from "./worker-task-host.js";
 import { createWorkerNativeSectionState } from "./worker-task-native-sections.js";
 import { createWorkerTaskPoolBootstrap } from "./worker-task-pool-bootstrap.js";
@@ -285,6 +289,7 @@ export class WorkerTaskPoolCore<Input, Output> {
       (slot) => this.ownedSettlement.retire(slot),
       key,
       this.ownerOptions,
+      this.host.observeResourceReply,
     );
   }
 
@@ -405,6 +410,7 @@ export class WorkerTaskPoolCore<Input, Output> {
           task,
           (input) =>
             sendWorkerTaskInput({
+              workerUrl: this.options.workerUrl,
               slot,
               task,
               input,
@@ -412,7 +418,11 @@ export class WorkerTaskPoolCore<Input, Output> {
               bootstrapError: this.bootstrap.error,
               createWorker: () => this.createWorker(slot),
               fail: (error, nativeFailure) =>
-                this.fail(slot, new WorkerTaskError(String(error), "unavailable"), nativeFailure),
+                this.fail(
+                  slot,
+                  workerTaskUnavailableError(slot, String(error), error),
+                  nativeFailure,
+                ),
               refuse: (error) => this.finish(task, error, undefined, true),
             }),
           (error) => this.finish(task, toErrorObject(error, "worker task preparation failed")),
@@ -437,7 +447,7 @@ export class WorkerTaskPoolCore<Input, Output> {
       host: this.host,
       bootstrapError: this.bootstrap.error,
       runInContext: runInWorkerPoolContext,
-      unavailableError: (message) => new WorkerTaskError(message, "unavailable"),
+      unavailableError: (message, cause) => workerTaskUnavailableError(slot, message, cause),
       onStarted: (worker) => {
         this.workers++;
         this.workersCreated++;
@@ -449,8 +459,7 @@ export class WorkerTaskPoolCore<Input, Output> {
         if (counted) {
           this.workers--;
         }
-        const error = new WorkerTaskError(`worker exited with code ${code}`, "unavailable");
-        this.fail(slot, error, true);
+        this.fail(slot, workerTaskUnavailableError(slot, `worker exited with code ${code}`), true);
       },
     });
   }

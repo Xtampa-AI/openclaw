@@ -180,7 +180,8 @@ describe("update-cli", () => {
 
       await updateCommand({ dryRun: true });
       if (command !== "gateway") {
-        expect(getLogOutput()).toContain("Restart the Gateway you launched manually");
+        expect(getLogOutput()).toContain("Gateway service inspection is unavailable");
+        expect(getLogOutput()).toContain("openclaw gateway status --deep");
       }
 
       expect(serviceReadCommand).toHaveBeenCalledTimes(2);
@@ -339,9 +340,11 @@ describe("update-cli", () => {
           run: { status: "failed" },
         });
         expect(inferenceRepair).not.toHaveBeenCalled();
-        expect(freshRestartCalls()).toHaveLength(0);
+        expect(freshRestartCalls()).toHaveLength(1);
         expect(serviceRestart).not.toHaveBeenCalled();
         expect((await serviceReadCommand(process.env))?.programArguments[0]).toBe(serviceNode);
+        expect(getErrorOutput()).toContain("openclaw update repair");
+        expect(getLogOutput() + getErrorOutput()).not.toMatch(/keep the gateway stopped/i);
       }
       expect(packageInstallCommandCall()).toBeUndefined();
     },

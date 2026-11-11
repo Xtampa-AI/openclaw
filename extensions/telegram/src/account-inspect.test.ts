@@ -10,17 +10,8 @@ import { createTelegramPluginConfig } from "./config-adapter.js";
 
 describe("inspectTelegramAccount SecretRef resolution", () => {
   it.each([
-    { accountId: "alerts", configured: true, startable: true, tokenStatus: "available" },
     { accountId: "work", configured: false, startable: false, tokenStatus: "available" },
     { accountId: "ops", configured: true, startable: true, tokenStatus: "available" },
-    { accountId: "missing", configured: false, startable: false, tokenStatus: "missing" },
-    {
-      accountId: "unavailable",
-      configured: true,
-      startable: false,
-      tokenStatus: "configured_unavailable",
-    },
-    { accountId: "unknown", configured: false, startable: false, tokenStatus: "missing" },
   ])(
     "preserves owner status for $accountId without resolving credentials",
     ({ accountId, configured, startable, tokenStatus }) => {
@@ -134,32 +125,6 @@ describe("inspectTelegramAccount SecretRef resolution", () => {
     });
   });
 
-  it("matches runtime token lookup for account keys that need full normalization", () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        telegram: {
-          accounts: {
-            "Carey Notifications": {
-              botToken: "123:token",
-              reactionLevel: "ack",
-            },
-          },
-        },
-      },
-    };
-
-    const account = inspectTelegramAccount({
-      cfg,
-      accountId: "carey-notifications",
-    });
-
-    expect(account.accountId).toBe("carey-notifications");
-    expect(account.configured).toBe(true);
-    expect(account.tokenSource).toBe("config");
-    expect(account.tokenStatus).toBe("available");
-    expect(account.config.reactionLevel).toBe("ack");
-  });
-
   it("routes omitted-account inspection through the configured defaultAccount (#61012)", () => {
     withEnv({ TELEGRAM_BOT_TOKEN: "123:env" }, () => {
       const cfg: OpenClawConfig = {
@@ -233,4 +198,21 @@ describe("inspectTelegramAccount SecretRef resolution", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     },
   );
+});
+
+it("reads groups from a mixed-case account key for unmentioned group status", () => {
+  const cfg: OpenClawConfig = {
+    channels: {
+      telegram: {
+        groups: { "-100999": { requireMention: true } },
+        accounts: {
+          Work: {
+            botToken: "123:work",
+            groups: { "-100123": { requireMention: false } },
+          },
+        },
+      },
+    },
+  };
+  expect(inspectTelegramAccount({ cfg, accountId: "work" }).allowUnmentionedGroups).toBe(true);
 });

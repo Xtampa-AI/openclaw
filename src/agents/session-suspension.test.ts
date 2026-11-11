@@ -15,7 +15,7 @@ const sessionAccessorMocks = vi.hoisted(() => ({
 vi.mock("../config/sessions/session-accessor.js", () => sessionAccessorMocks);
 
 const sessionKeyResolverMocks = vi.hoisted(() => ({
-  resolveStoredSessionKeyForSessionId: vi.fn(() => ({
+  resolveStoredSessionKeyForSessionId: vi.fn(async () => ({
     sessionKey: "session-key",
     storePath: "/tmp/openclaw-session-suspension-test/sessions.json",
   })),

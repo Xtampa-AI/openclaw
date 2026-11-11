@@ -110,7 +110,7 @@ describe("Synthetic live catalog", () => {
     expect(result.provider.models.find((model) => model.id === "syn:small:vision")).toMatchObject({
       reasoning: false,
       input: ["text", "image"],
-      maxTokens: 8192,
+      maxTokens: 32768,
     });
     const request = fetchGuard.mock.calls[0]?.[0];
     expect(request.url).toBe(endpoint);
@@ -134,7 +134,13 @@ describe("Synthetic live catalog", () => {
           }
         : {
             provider: { ...buildSyntheticProvider(), apiKey: "SYNTHETIC_API_KEY", models: [] },
-            outcomes: [{ provider: "synthetic", status: "ready" }],
+            outcomes: [
+              {
+                provider: "synthetic",
+                status: "ready",
+                modelIdCatalog: { baseUrl: SYNTHETIC_BASE_URL, modelIds: ["missing-metadata"] },
+              },
+            ],
           },
     );
   });

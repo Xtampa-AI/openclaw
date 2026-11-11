@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "@openclaw/ai/internal/shared";
 // System prompt report tests cover prompt accounting, bootstrap injection
 // matching, and hash output used to compare prompt/tool parity.
 import { describe, expect, it } from "vitest";
@@ -46,7 +47,7 @@ describe("buildSystemPromptReport", () => {
   });
 
   it("accounts for project context with LF markers and UTF-16 content", () => {
-    const systemPrompt = "lead\n# Project Context\n汉🦞\n## Silent Replies\ntail";
+    const systemPrompt = `lead\n# Project Context\n汉🦞${SYSTEM_PROMPT_CACHE_BOUNDARY}\n## Skills\nRun-scoped catalog\n## Silent Replies\ntail`;
     const report = makeReport({ systemPrompt });
     expect(report.systemPrompt).toMatchObject({
       chars: systemPrompt.length,
@@ -65,6 +66,24 @@ describe("buildSystemPromptReport", () => {
     expect(report.skills.entries).toEqual([
       { name: "(unknown)", blockChars: "<skill></skill>".length },
       { name: "(unknown)", blockChars: "<skill><name> </name></skill>".length },
+    ]);
+  });
+
+  it.each(["long-synthetic-skill-name", "技能🦞-long-skill-name", "lone-\ud800-surrogate-name"])(
+    "preserves the UTF-16 skill name %j while trimming whitespace",
+    (name) => {
+      const skillsPrompt = `<skill><name>  ${name}\n</name></skill>`;
+      const report = makeReport({ systemPrompt: `## Skills\n${skillsPrompt}`, skillsPrompt });
+      expect(report.skills.entries).toEqual([{ name, blockChars: skillsPrompt.length }]);
+    },
+  );
+
+  it("uses the first complete plain-text name, including mixed-case tags", () => {
+    const skillsPrompt =
+      "<skill><name><invalid/></name><NAME> valid-skill-name-after-markup </NAME><name>later</name></skill>";
+    const report = makeReport({ systemPrompt: `## Skills\n${skillsPrompt}`, skillsPrompt });
+    expect(report.skills.entries).toEqual([
+      { name: "valid-skill-name-after-markup", blockChars: skillsPrompt.length },
     ]);
   });
 

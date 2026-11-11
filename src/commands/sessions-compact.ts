@@ -1,5 +1,6 @@
 // Failed compaction must exit nonzero so automation cannot mistake a silent no-op for success.
-import { rethrowExpectedCliError } from "../cli/failure-output.js";
+import { createCompactionNoticePayload } from "../auto-reply/reply/compaction-notice.js";
+import { formatCliJsonFailure, rethrowExpectedCliError } from "../cli/failure-output.js";
 import { callGatewayFromCliWithTransport } from "../cli/gateway-rpc.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
@@ -33,6 +34,7 @@ type SessionsCompactResult = {
       signal?: string;
       pending?: boolean;
       completed?: boolean;
+      qualityDegraded?: true;
     };
   };
 };
@@ -57,7 +59,11 @@ function describeCompaction(result: SessionsCompactResult, fallbackKey: string):
   } else if (typeof result.kept === "number") {
     detail = ` (kept ${result.kept} lines)`;
   }
-  return `Compacted session ${sessionKey}${detail}.`;
+  const notice =
+    result.result?.details?.qualityDegraded === true
+      ? `\n${createCompactionNoticePayload({ phase: "degraded" }).text}`
+      : "";
+  return `Compacted session ${sessionKey}${detail}.${notice}`;
 }
 
 export async function sessionsCompactCommand(
@@ -92,7 +98,7 @@ export async function sessionsCompactCommand(
     rethrowExpectedCliError(err);
     const message = formatErrorMessage(err);
     if (opts.json) {
-      writeRuntimeJson(runtime, { ok: false, key: opts.key, error: message });
+      writeRuntimeJson(runtime, { ...formatCliJsonFailure(message), key: opts.key });
     } else {
       runtime.error(`Compaction failed: ${message}`);
     }

@@ -379,6 +379,7 @@ module.exports = {
           const { inspection: _inspection, ...failure } = await request(true);
           expect(failure).toEqual({
             status: "failed",
+            authCredentials: [],
             error: "synthetic catalog construction failure",
           });
         }

@@ -152,7 +152,7 @@ export async function resolveMatrixInboundContext(config: {
   const sharedDmContextNotice = isDirectMessage
     ? hasExplicitSessionBinding
       ? null
-      : resolveMatrixSharedDmContextNotice({
+      : await resolveMatrixSharedDmContextNotice({
           storePath,
           sessionKey: sharedDmNoticeSessionKey,
           roomId,
@@ -260,6 +260,7 @@ export async function resolveMatrixInboundContext(config: {
     },
     sessionTranscript: { historyLimit: isRoom ? historyLimit : 0 },
     access: {
+      toolPolicy: isRoom ? (roomConfig?.tools ?? {}) : undefined,
       ...(isRoom
         ? {
             mentions: {
@@ -275,6 +276,7 @@ export async function resolveMatrixInboundContext(config: {
     },
     extra: {
       GroupSubject: isRoom ? (roomName ?? roomId) : undefined,
+      GroupChannel: isRoom ? roomId : undefined,
       GroupId: isRoom ? roomId : undefined,
       ...locationPayload?.context,
       CommandSource: isControlCommand ? ("text" as const) : undefined,

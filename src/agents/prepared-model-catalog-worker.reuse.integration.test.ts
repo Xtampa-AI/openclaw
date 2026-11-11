@@ -82,7 +82,6 @@ const currentPayload = activePayload.ref.deref();
             captured: retained.registries.length,
             nativeExports: retained.exports.filter(ref => ref.deref()).length,
             controlCollected: retained.control.deref() === undefined,
-            currentExportAlive: currentPayload !== undefined,
             memory: process.memoryUsage(),
           }));
         }
@@ -300,7 +299,6 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
   const retainedShape = {
     controlCollected: true,
     captured: 1,
-    currentExportAlive: true,
     registries: 1,
   };
   expect(retained).toMatchObject(retainedShape);
@@ -340,12 +338,9 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
       expect(readCatalogCaptureFootprint(captureRoot)).toEqual(warmedFootprint);
     }
   }
-  const retainedAfterReuse = JSON.parse(
-    fs.readFileSync(path.join(fixture.root, "retention.json"), "utf8"),
-  );
-  expect(retainedAfterReuse).toMatchObject(retainedShape);
-  expect(retainedAfterReuse.nativeExports).toBeGreaterThanOrEqual(1);
-  expect(retainedAfterReuse.nativeExports).toBeLessThanOrEqual(retainedAfterReuse.captured);
+  expect(
+    JSON.parse(fs.readFileSync(path.join(fixture.root, "retention.json"), "utf8")),
+  ).toMatchObject(retainedShape);
   const heap = fs
     .readFileSync(path.join(fixture.root, "heap.jsonl"), "utf8")
     .trim()

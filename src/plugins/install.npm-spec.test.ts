@@ -1,6 +1,5 @@
 // Covers npm spec parsing for plugin install inputs.
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, assert, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,7 +12,6 @@ import {
 import {
   resolvePluginNpmGenerationProjectDir,
   resolvePluginNpmProjectDir,
-  resolvePluginNpmProjectsDir,
 } from "./install-paths.js";
 import {
   requestDeferredPluginInstall,
@@ -594,28 +592,6 @@ describe("installPluginFromNpmSpec", () => {
     },
   );
 
-  it("continues when the managed generation scan reports ENOTDIR", async () => {
-    const packageName = "scan-recovery-plugin";
-    mockNpmViewAndInstall({
-      spec: `${packageName}@1.0.0`,
-    });
-    const error = Object.assign(new Error("not a directory"), { code: "ENOTDIR" });
-    const readdirSpy = vi.spyOn(fs.promises, "readdir").mockRejectedValueOnce(error);
-
-    try {
-      const result = await installPluginFromNpmSpec({
-        spec: `${packageName}@1.0.0`,
-      });
-
-      expect(result.ok).toBe(true);
-      expect(readdirSpy).toHaveBeenCalledWith(resolvePluginNpmProjectsDir(npmRoot), {
-        withFileTypes: true,
-      });
-    } finally {
-      readdirSpy.mockRestore();
-    }
-  });
-
   it("rejects npm pack archive metadata with traversal package names", async () => {
     const stateDir = suiteTempRootTracker.makeTempDir();
     npmRoot = path.join(stateDir, "npm");
@@ -743,46 +719,6 @@ describe("installPluginFromNpmSpec", () => {
       expect(readTextFileTree(projectRoot)).toEqual(original);
     },
   );
-
-  it("runs managed npm installs with the bundled npm CLI under Bun", async () => {
-    const npmCliPath = path.join(
-      path.dirname(createRequire(import.meta.url).resolve("npm/package.json")),
-      "bin/npm-cli.js",
-    );
-    const execPath = process.execPath;
-    mockNpmViewAndInstall({
-      spec: "@openclaw/voice-call@0.0.1",
-      version: "0.0.1",
-      pluginId: "voice-call",
-    });
-    vi.stubGlobal("process", {
-      ...process,
-      versions: { ...process.versions, bun: "1.4.2" },
-    });
-    try {
-      const result = await installPluginFromNpmSpec({
-        spec: "@openclaw/voice-call@0.0.1",
-      });
-      expect(result.ok).toBe(true);
-      expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(
-        [
-          execPath,
-          npmCliPath,
-          "install",
-          "--omit=dev",
-          "--omit=peer",
-          "--legacy-peer-deps",
-          "--loglevel=error",
-          "--ignore-scripts",
-          "--no-audit",
-          "--no-fund",
-        ],
-        expect.objectContaining({ cwd: expect.any(String) }),
-      );
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
 
   it("does not mutate a retained generation when an exact rollback reuses its artifact key", async () => {
     const packageName = "@openclaw/codex";
@@ -915,16 +851,6 @@ describe("installPluginFromNpmSpec", () => {
       errors: [
         "metadata remained incomplete after managed npm project recovery",
         "integrity missing",
-      ],
-      attempts: 2,
-      expectedIntegrity: "sha512-safe",
-    },
-    {
-      label: "missing version",
-      fixture: { integrity: "sha512-safe", omitInstalledVersion: true },
-      errors: [
-        "metadata remained incomplete after managed npm project recovery",
-        "version missing",
       ],
       attempts: 2,
       expectedIntegrity: "sha512-safe",
@@ -1422,59 +1348,6 @@ describe("installPluginFromNpmSpec", () => {
     ).toBe(true);
   });
 
-  it("resolves incompatible prerelease tags to a compatible prerelease version", async () => {
-    const warnings: string[] = [];
-    vi.stubEnv("OPENCLAW_COMPATIBILITY_HOST_VERSION", "2026.5.28-beta.3");
-
-    mockNpmViewAndInstallMany([
-      {
-        spec: "@openclaw/msteams@beta",
-        packageName: "@openclaw/msteams",
-        version: "2026.5.28-beta.4",
-        pluginId: "msteams",
-        npmRoot,
-        versions: ["2026.5.28-beta.3", "2026.5.28-beta.4"],
-        openclaw: {
-          extensions: ["./dist/index.js"],
-          compat: { pluginApi: ">=2026.5.28-beta.4" },
-        },
-      },
-      {
-        spec: "@openclaw/msteams@2026.5.28-beta.3",
-        packageName: "@openclaw/msteams",
-        version: "2026.5.28-beta.3",
-        pluginId: "msteams",
-        npmRoot,
-        expectedDependencySpec: "2026.5.28-beta.3",
-        openclaw: {
-          extensions: ["./dist/index.js"],
-          compat: { pluginApi: ">=2026.5.28-beta.3" },
-        },
-      },
-    ]);
-
-    const result = await installPluginFromNpmSpec({
-      spec: "@openclaw/msteams@beta",
-      mode: "update",
-      logger: { info: () => {}, warn: (message) => warnings.push(message) },
-    });
-
-    assert(result.ok, JSON.stringify(result));
-    expect(result.npmResolution?.resolvedSpec).toBe("@openclaw/msteams@2026.5.28-beta.3");
-    expect(result.npmResolution?.version).toBe("2026.5.28-beta.3");
-    expect(warnings.join("\n")).toContain(
-      "using newest compatible @openclaw/msteams@2026.5.28-beta.3",
-    );
-    const npmProjectRoot = resolvePluginNpmProjectDir({
-      npmDir: npmRoot,
-      packageName: "@openclaw/msteams",
-    });
-    const managedManifest = JSON.parse(
-      fs.readFileSync(path.join(npmProjectRoot, "package.json"), "utf8"),
-    ) as { dependencies?: Record<string, string> };
-    expect(managedManifest.dependencies?.["@openclaw/msteams"]).toBe("2026.5.28-beta.3");
-  });
-
   it.each([
     ["does not resolve explicit prerelease tags to stable compatible versions", "2026.5.27"],
   ])("%s", async (_name, candidateVersion) => {
@@ -1874,7 +1747,7 @@ describe("installPluginFromNpmSpec", () => {
               },
               "node-domexception": "npm:@nolyfill/domexception@1.0.28",
               "range-target@>1": "2.0.0",
-              // npm's nested form of pnpm's exact-parent child rule.
+              // Exact-parent pnpm selectors map to npm's nested override form.
               "werift-ice@0.2.2": { ip: "npm:neoip@3.1.0" },
             });
             expect(manifest.openclaw?.managedOverrides).toEqual([

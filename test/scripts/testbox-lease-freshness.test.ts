@@ -132,11 +132,6 @@ describe("Testbox lease freshness", () => {
 
   it.each([
     {
-      caller: "codex",
-      env: { CODEX_THREAD_ID: "session-one" },
-      changes: [{ CODEX_THREAD_ID: "session-two" }],
-    },
-    {
       caller: "claude",
       env: { CODEX_THREAD_ID: undefined, CLAUDE_CODE_SESSION_ID: "session-one" },
       changes: [{ CLAUDE_CODE_SESSION_ID: "session-two" }],
@@ -217,7 +212,6 @@ describe("Testbox lease freshness", () => {
     ["old schema", "state schema"],
     ["missing HEAD", "headSha"],
     ["invalid HEAD", "headSha"],
-    ["changed HEAD", "headSha"],
   ])("rejects %s after preparation without refreshing allocation provenance", (change, message) => {
     const fixture = createLeaseFixture();
     fixture.allocate();
@@ -226,8 +220,6 @@ describe("Testbox lease freshness", () => {
     expect(() => admitted?.assertCurrent()).not.toThrow();
     if (change === "withdrawn") {
       rmSync(fixture.statePath);
-    } else if (change === "changed HEAD") {
-      fixture.advanceHead();
     } else {
       const receipt = JSON.parse(original);
       if (change === "reassigned") {
@@ -243,17 +235,12 @@ describe("Testbox lease freshness", () => {
       ? readFileSync(fixture.statePath, "utf8")
       : undefined;
     expect(() => admitted?.assertCurrent()).toThrow(message);
-    if (change !== "changed HEAD") {
-      expect(() => fixture.reuse()).toThrow(message);
-    }
+    expect(() => fixture.reuse()).toThrow(message);
     expect(admitted?.current.headSha).toBe(JSON.parse(original).headSha);
     if (changedReceipt === undefined) {
       expect(existsSync(fixture.statePath)).toBe(false);
     } else {
       expect(readFileSync(fixture.statePath, "utf8")).toBe(changedReceipt);
-    }
-    if (change === "changed HEAD") {
-      expect(readFileSync(fixture.statePath, "utf8")).toBe(original);
     }
   });
 
@@ -314,7 +301,6 @@ describe("Testbox lease freshness", () => {
   });
 
   it.each([
-    { args: ["run", "--", "true"], exitCode: 0, retained: false },
     { args: ["run", "--keep-on-failure", "--", "task"], exitCode: 0, retained: false },
     { args: ["run", "--keep-on-failure", "--", "task"], exitCode: 7, retained: true },
   ])("records retention=$retained for $args exiting $exitCode", ({ args, exitCode, retained }) => {

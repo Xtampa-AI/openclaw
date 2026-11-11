@@ -15,6 +15,7 @@ import {
   recoverNodeRuntime,
 } from "../../node-runtime-recovery.mjs";
 import { SQLITE_CAPABILITY_PROBE } from "../../node-sqlite.mjs";
+import { awaitGateBeforeSettlement, createDeferred } from "../../test/helpers/promise.js";
 import { buildTaskScript } from "../daemon/schtasks-layout.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
@@ -82,9 +83,10 @@ const windowsPath = {
   dirname: path.win32.dirname.bind(path.win32),
   relative: (from: string, to: string) => path.win32.relative(from, to).replaceAll("\\", path.sep),
 };
-const exitSentinel = new Error("replacement exited");
 let child: ChildProcess;
-let exitSpy: MockInstance<typeof process.exit>;
+let originalExitCode: typeof process.exitCode;
+let spawned: ReturnType<typeof createDeferred<void>>;
+const recoveries: Array<ReturnType<typeof recoverNodeRuntime>> = [];
 let stderrSpy: MockInstance<typeof process.stderr.write>;
 
 beforeEach(() => {
@@ -118,9 +120,12 @@ beforeEach(() => {
     stderr: "",
   }));
   child = new ChildProcess();
-  mocks.spawn.mockReturnValue(child);
-  exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
-    throw exitSentinel;
+  originalExitCode = process.exitCode;
+  process.exitCode = undefined;
+  spawned = createDeferred();
+  mocks.spawn.mockImplementation(() => {
+    spawned.resolve();
+    return child;
   });
   stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
   process.argv = [
@@ -143,10 +148,10 @@ beforeEach(() => {
   }
 });
 
-afterEach(() => {
-  if (child.listenerCount("exit")) {
-    expect(() => child.emit("exit", 0, null)).toThrow(exitSentinel);
-  }
+afterEach(async () => {
+  child.emit("close", 0, null);
+  await Promise.allSettled(recoveries.splice(0));
+  process.exitCode = originalExitCode;
   process.argv = originalArgv;
   process.execArgv = originalExecArgv;
   for (const [stream, descriptor] of [
@@ -186,12 +191,60 @@ async function withRecoveryHome(run: (home: string) => Promise<void>) {
   });
 }
 
-async function expectRecoveryStarted(home: string) {
-  void recoverNodeRuntime({ homeDir: home });
-  await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+async function expectRecoveryStarted(options: Parameters<typeof recoverNodeRuntime>[0] = {}) {
+  const completion = recoverNodeRuntime(options);
+  recoveries.push(completion);
+  await awaitGateBeforeSettlement(
+    spawned.promise,
+    completion,
+    "recovery did not spawn a replacement",
+  );
+  expect(mocks.spawn).toHaveBeenCalledOnce();
+  return { completion };
 }
 
 describe("runtime recovery discovery", () => {
+  it.each([
+    { platform: "win32", quote: '"', relative: false, selected: true },
+    { platform: "win32", quote: "", relative: false, selected: true },
+    { platform: "win32", quote: '"', relative: true, selected: false },
+    { platform: "linux", quote: '"', relative: false, selected: false },
+  ] as const)(
+    "recovers from $platform PATH (quote=$quote, relative=$relative)",
+    async ({ platform, quote, relative, selected }) => {
+      await withRecoveryHome(async (home) => {
+        const candidate = await writeFixture(
+          path.join(home, "Node Runtime", platform === "win32" ? "node.exe" : "node"),
+        );
+        mockProcessPlatform(platform);
+        mocks.admissible.add(candidate);
+        // A simulated POSIX PATH must not contain a native Windows drive colon.
+        const directory = relative
+          ? "Node Runtime"
+          : platform === "linux" && hostPlatform === "win32"
+            ? "/fixture/Node Runtime"
+            : path.dirname(candidate);
+        if (platform === "linux" && hostPlatform === "win32") {
+          vi.spyOn(path, "isAbsolute").mockImplementation(path.posix.isAbsolute);
+          vi.spyOn(path, "join").mockImplementation(path.posix.join);
+          mocks.virtualPaths.set(path.posix.join(directory, "node"), candidate);
+        }
+        const env = {
+          HOME: home,
+          PATH: `${quote}${directory}${quote}${platform === "win32" ? ";" : ":"}`,
+        };
+
+        if (selected) {
+          await expectRecoveryStarted({ homeDir: home, env });
+          expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
+        } else {
+          expect(await recoverNodeRuntime({ homeDir: home, env })).toBe(false);
+          expect(mocks.spawn).not.toHaveBeenCalled();
+        }
+      });
+    },
+  );
+
   it.each(["HOME", "OPENCLAW_HOME"])(
     "reuses a private runtime when cwd equals %s",
     async (homeVariable) => {
@@ -207,8 +260,7 @@ describe("runtime recovery discovery", () => {
         vi.spyOn(process, "cwd").mockReturnValue(home);
         mocks.admissible.add(candidate);
 
-        void recoverNodeRuntime();
-        await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+        await expectRecoveryStarted();
         expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
         expect(mocks.probe.mock.calls.map(([file]) => file)).toEqual([candidate]);
       });
@@ -337,13 +389,13 @@ describe("runtime recovery discovery", () => {
           result.selected = command;
           const child = new EventEmitter();
           child.kill = () => true;
-          setImmediate(() => child.emit("exit", 23, null));
+          setImmediate(() => { child.emit("exit", 23, null); child.emit("close", 23, null); });
           return child;
         };
-        process.on("exit", () => fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify(result)));
         syncBuiltinESMExports();
         const { recoverNodeRuntime } = await import(${JSON.stringify(new URL("../../node-runtime-recovery.mjs", import.meta.url).href)});
-        await recoverNodeRuntime();
+        result.handled = await recoverNodeRuntime();
+        fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
       `,
       );
       const { spawnSync } =
@@ -376,9 +428,11 @@ describe("runtime recovery discovery", () => {
         expect(result.status, result.stderr).toBe(23);
         expect(observed.reads).toContain(homeScript);
         expect(observed.selected).toBe(installedNode);
+        expect(observed.handled).toBe(true);
       } else {
         expect(result.status, result.stderr).toBe(0);
         expect(observed.selected).toBeUndefined();
+        expect(observed.handled).toBe(false);
       }
     });
   });
@@ -411,14 +465,7 @@ describe("runtime recovery discovery", () => {
         vi.stubEnv("USERPROFILE", undefined);
       }
       mocks.admissible.add(candidate);
-      await expect(
-        Promise.race([
-          recoverNodeRuntime({ homeDir: home }),
-          vi.waitFor(() => {
-            expect(mocks.spawn).toHaveBeenCalledOnce();
-          }),
-        ]),
-      ).resolves.toBeUndefined();
+      await expectRecoveryStarted({ homeDir: home });
       expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
       expect(account).toHaveBeenCalledTimes(hasHome ? 0 : 1);
     });
@@ -444,7 +491,7 @@ describe("runtime recovery discovery", () => {
         vi.stubEnv("VOLTA_HOME", "~/custom-manager");
       }
       mocks.admissible.add(candidate);
-      await expectRecoveryStarted(home);
+      await expectRecoveryStarted({ homeDir: home });
       expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
     });
   });
@@ -471,8 +518,7 @@ describe("runtime recovery discovery", () => {
         vi.stubEnv(key, "~/custom-home");
         mocks.admissible.add(candidate);
 
-        void recoverNodeRuntime();
-        await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+        await expectRecoveryStarted();
         expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
       });
     },
@@ -495,8 +541,7 @@ describe("runtime recovery discovery", () => {
       mocks.admissible.add(inheritedNode);
       mocks.admissible.add(workspaceNode);
 
-      void recoverNodeRuntime({ homeDir: home, env });
-      await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+      await expectRecoveryStarted({ homeDir: home, env });
 
       expect(mocks.probe.mock.calls.map(([file]) => file)).toEqual([systemNode, inheritedNode]);
       expect(mocks.probe.mock.calls[0]?.[2].env).toMatchObject({ TEMP: home });
@@ -562,11 +607,11 @@ describe("runtime recovery discovery", () => {
           const fallback = await writeFixture(path.join(home, "fallback/bin/node.exe"));
           vi.stubEnv("PATH", path.dirname(fallback));
           mocks.admissible.add(fallback);
-          await expectRecoveryStarted(home);
+          await expectRecoveryStarted({ homeDir: home });
           expect(mocks.probe.mock.calls.map(([file]) => file)).toEqual([fallback]);
           expect(mocks.spawn.mock.calls[0]?.[0]).toBe(fallback);
         } else {
-          await expectRecoveryStarted(home);
+          await expectRecoveryStarted({ homeDir: home });
           expect(mocks.probe.mock.calls.map(([file]) => file)).toEqual([candidate]);
           expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
         }
@@ -621,7 +666,7 @@ describe("runtime recovery discovery", () => {
         `[Service]\nExecStart="${candidate.replaceAll("\\", "\\\\")}" /fixture/dist/index.js gateway\n`,
       );
 
-      await expectRecoveryStarted(home);
+      await expectRecoveryStarted({ homeDir: home });
 
       expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
       expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("(PATH;"));
@@ -644,7 +689,7 @@ describe("runtime recovery discovery", () => {
       vi.stubEnv("PATH", path.dirname(candidate));
       mocks.admissible.add(candidate);
 
-      await expectRecoveryStarted(home);
+      await expectRecoveryStarted({ homeDir: home });
       expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
       expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("(PATH;"));
     });
@@ -728,7 +773,7 @@ describe("runtime recovery discovery", () => {
         mocks.admissible.add(candidate);
       }
 
-      await expectRecoveryStarted(home);
+      await expectRecoveryStarted({ homeDir: home });
 
       expect(mocks.probe.mock.calls.map(([filename]) => filename)).toEqual(
         candidates.slice(0, index + 1),
@@ -768,7 +813,7 @@ describe("runtime recovery discovery", () => {
           `<key>ProgramArguments</key><array>${args.map((arg) => `<string>${arg.replaceAll("&", "&amp;")}</string>`).join("")}</array>`,
         );
 
-        await expectRecoveryStarted(home);
+        await expectRecoveryStarted({ homeDir: home });
 
         expect(mocks.probe.mock.calls.map(([filename]) => filename)).toEqual([candidate]);
         expect(mocks.spawn.mock.calls[0]?.[0]).toBe(candidate);
@@ -863,7 +908,7 @@ describe("runtime recovery discovery", () => {
         const originalEnv = { ...process.env };
         const originalCwd = process.cwd();
 
-        await expectRecoveryStarted(home);
+        const { completion } = await expectRecoveryStarted({ homeDir: home });
 
         expect(mocks.spawn).toHaveBeenCalledExactlyOnceWith(
           candidate,
@@ -875,9 +920,12 @@ describe("runtime recovery discovery", () => {
           },
         );
         expect(process.cwd()).toBe(originalCwd);
-        expect(exitSpy).not.toHaveBeenCalled();
-        expect(() => child.emit("exit", exitCode, null)).toThrow(exitSentinel);
-        expect(exitSpy).toHaveBeenCalledExactlyOnceWith(exitCode);
+        expect(process.exitCode).toBeUndefined();
+        child.emit("exit", exitCode, null);
+        expect(process.exitCode).toBeUndefined();
+        child.emit("close", exitCode, null);
+        await expect(completion).resolves.toBe(true);
+        expect(process.exitCode).toBe(exitCode);
       });
     },
   );

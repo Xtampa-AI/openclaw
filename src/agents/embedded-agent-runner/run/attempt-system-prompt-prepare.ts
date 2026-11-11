@@ -16,6 +16,7 @@ import {
   buildBootstrapPromptWarningNotice,
   buildBootstrapTruncationReportMeta,
 } from "../../bootstrap-budget.js";
+import { buildCodeModeCatalogPrompt } from "../../code-mode.js";
 import { resolveOpenClawReferencePaths } from "../../docs-path.js";
 import { prepareAgentMemoryPrompt } from "../../memory-prompt-prepare.js";
 import { buildModelToolsUnavailablePrompt } from "../../model-tool-support.js";
@@ -36,6 +37,7 @@ import type { prepareEmbeddedAttemptBootstrap } from "./attempt-bootstrap-prepar
 import { resolvePromptModeForSession } from "./attempt-prompt-helpers.js";
 import type { EmbeddedAttemptSetup } from "./attempt-setup.js";
 import { buildAttemptSystemPrompt, type SystemPromptRefresh } from "./attempt-system-prompt.js";
+import { resolveSessionPromptDelivery } from "./turn-delivery-context.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type PreparedBootstrap = Awaited<ReturnType<typeof prepareEmbeddedAttemptBootstrap>>;
@@ -73,7 +75,6 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
   toolSchemaDirectoryPrompt?: () => string | undefined;
   bootstrap: PreparedBootstrap;
   capabilityToolNames: Set<string>;
-  requireExplicitMessageTarget?: boolean;
   effectiveTools: PromptTools;
   isRawModelRun: boolean;
   modelToolsEnabled: boolean;
@@ -146,20 +147,30 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
   });
   const resolveToolSchemaDirectoryPrompt = () =>
     params.toolSchemaDirectoryPrompt?.() ??
-    (params.toolSearchDirectoryEnabled && params.toolSearchCatalogRef?.current?.entries.length
-      ? buildToolSchemaDirectoryPrompt(
+    (params.codeModeActive
+      ? buildCodeModeCatalogPrompt(
           {
             config: attempt.config,
-            runtimeConfig: params.toolSearchRuntimeConfig,
+            catalogRef: params.toolSearchCatalogRef,
             agentId: params.setup.sessionAgentId,
             sessionKey: params.setup.sandboxSessionKey,
-            sessionId: attempt.sessionId,
-            runId: attempt.runId,
-            catalogRef: params.toolSearchCatalogRef,
           },
-          { contextTokenBudget: attempt.contextTokenBudget },
+          params.toolSearchCatalogRef?.current?.entries ?? [],
         )
-      : undefined);
+      : params.toolSearchDirectoryEnabled && params.toolSearchCatalogRef?.current?.entries.length
+        ? buildToolSchemaDirectoryPrompt(
+            {
+              config: attempt.config,
+              runtimeConfig: params.toolSearchRuntimeConfig,
+              agentId: params.setup.sessionAgentId,
+              sessionKey: params.setup.sandboxSessionKey,
+              sessionId: attempt.sessionId,
+              runId: attempt.runId,
+              catalogRef: params.toolSearchCatalogRef,
+            },
+            { contextTokenBudget: attempt.contextTokenBudget },
+          )
+        : undefined);
 
   const toolSchemaDirectoryPrompt = resolveToolSchemaDirectoryPrompt();
 
@@ -317,8 +328,14 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
         ? params.bootstrap.workspaceNotes
         : undefined,
       promptMode: effectivePromptMode,
-      sourceReplyDeliveryMode: attempt.sourceReplyDeliveryMode,
-      requireExplicitMessageTarget: params.requireExplicitMessageTarget,
+      // The cached prompt uses session delivery facts; a turn that differs gets
+      // its delivery rules in the turn's runtime context instead.
+      ...resolveSessionPromptDelivery({
+        config: attempt.config,
+        sessionKey: attempt.sessionKey,
+        chatType: attempt.chatType,
+        channel: runtimeChannel,
+      }),
       silentReplyPromptMode: attempt.silentReplyPromptMode,
       proactiveSubagentOrchestration: params.setup.proactiveSubagentOrchestration,
       acpEnabled: isAcpRuntimeSpawnAvailable({

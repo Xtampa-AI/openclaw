@@ -25,6 +25,7 @@ import type { AuthProfileCredential, AuthProfileStore } from "./types.js";
 import {
   clearExpiredCooldowns,
   isProfileInCooldown,
+  readAuthProfileUsageStats,
   resolveProfileUnusableUntil,
 } from "./usage-state.js";
 
@@ -65,7 +66,7 @@ export function isStoredCredentialCompatibleWithAuthProvider(params: {
   cfg?: OpenClawConfig;
   authAliasLookupParams?: ProviderAuthAliasLookupParams;
   provider: string;
-  credential: AuthProfileCredential;
+  credential: Pick<AuthProfileCredential, "provider">;
 }): boolean {
   return prepareProviderCompatibility(params).matchesStoredProvider(params.credential.provider);
 }
@@ -253,7 +254,7 @@ export function resolveAuthProfileOrderWithMetadata(
   const isInCooldown = (profileId: string) =>
     isProfileInCooldown(store, profileId, now, cooldownModel);
   const unusableUntil = (profileId: string) =>
-    resolveProfileUnusableUntil(store.usageStats?.[profileId] ?? {}, cooldownModel);
+    resolveProfileUnusableUntil(readAuthProfileUsageStats(store, profileId) ?? {}, cooldownModel);
 
   const available: string[] = [];
   const inCooldown: Array<{ profileId: string; cooldownUntil: number }> = [];

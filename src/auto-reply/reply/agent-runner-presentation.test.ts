@@ -22,7 +22,7 @@ function createPresentation(
   options: {
     isHeartbeat?: boolean;
     silentExpected?: boolean;
-    directBlockDeliveries?: DirectBlockDelivery[];
+    directBlockDeliveries?: import("./reply-delivery.js").DirectBlockDelivery[];
     conversationContext?: string;
     onPartialReply?: GetReplyOptions["onPartialReply"];
     normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
@@ -57,81 +57,6 @@ function createPresentation(
 }
 
 describe("agent runner streaming presentation", () => {
-  it.each(["direct", "buffered"] as const)(
-    "applies silent-turn policy before %s delivery bookkeeping",
-    async (mode) => {
-      const delivered: ReplyPayload[] = [];
-      const directBlockDeliveries: DirectBlockDelivery[] = [];
-      const onBlockReply = (payload: ReplyPayload) => {
-        delivered.push(payload);
-      };
-      const pipeline =
-        mode === "buffered" ? createBlockReplyPipeline({ onBlockReply, timeoutMs: 0 }) : null;
-      const typing = createTypingController({});
-      const { blockReplyHandler } = createPresentation({
-        silentExpected: true,
-        directBlockDeliveries,
-        delivery: {
-          opts: { onBlockReply },
-          blockStreamingEnabled: true,
-          blockReplyPipeline: pipeline,
-          applyReplyToMode: (payload) => payload,
-          typingSignals: createTypingSignaler({ typing, mode: "never", isHeartbeat: false }),
-        },
-      });
-      if (!blockReplyHandler) {
-        throw new Error("expected the block delivery handler");
-      }
-      try {
-        const suppressed: ReplyPayload[] = [
-          { text: "Private maintenance output." },
-          { mediaUrls: ["https://example.invalid/private.png"] },
-          { presentation: { blocks: [{ type: "text", text: "Private card" }] } },
-          {
-            interactive: {
-              blocks: [{ type: "buttons", buttons: [{ label: "Open", value: "open" }] }],
-            },
-          },
-          { channelData: { telegram: { buttons: [[{ text: "Open", callback_data: "open" }]] } } },
-          { location: { latitude: 1, longitude: 2 } },
-          { audioAsVoice: true },
-        ];
-        for (const payload of suppressed) {
-          await blockReplyHandler(payload);
-        }
-        await pipeline?.flush({ force: true });
-        expect(delivered).toEqual([]);
-        expect(directBlockDeliveries).toEqual([]);
-        expect(pipeline?.didStream() ?? false).toBe(false);
-
-        const permitted: ReplyPayload[] = [
-          { text: "Maintenance failed.", isError: true },
-          {
-            text: "Spoken reply.",
-            mediaUrls: ["https://example.invalid/voice.opus"],
-            audioAsVoice: true,
-          },
-          markReplyPayloadForSourceSuppressionDelivery({
-            text: "Host notice.",
-            isStatusNotice: true,
-          }),
-        ];
-        for (const payload of permitted) {
-          await blockReplyHandler(payload);
-          await pipeline?.flush({ force: true });
-        }
-        expect(delivered).toHaveLength(3);
-        expect(delivered).toMatchObject(permitted);
-        expect(getReplyPayloadMetadata(delivered[2]!)?.deliverDespiteSourceReplySuppression).toBe(
-          true,
-        );
-      } finally {
-        pipeline?.stop();
-        typing.cleanup();
-      }
-    },
-  );
-
   it.each([
     { name: "cleaned silent token", caption: "NO_REPLY", silent: true },
     { name: "cleaned silent envelope", caption: '{"action":"NO_REPLY"}', silent: true },
@@ -552,3 +477,78 @@ describe("agent runner streaming presentation", () => {
     expect(onPartialReply).toHaveBeenCalledExactlyOnceWith({ text });
   });
 });
+
+it.each(["direct", "buffered"] as const)(
+  "applies silent-turn policy before %s delivery bookkeeping",
+  async (mode) => {
+    const delivered: ReplyPayload[] = [];
+    const directBlockDeliveries: DirectBlockDelivery[] = [];
+    const onBlockReply = (payload: ReplyPayload) => {
+      delivered.push(payload);
+    };
+    const pipeline =
+      mode === "buffered" ? createBlockReplyPipeline({ onBlockReply, timeoutMs: 0 }) : null;
+    const typing = createTypingController({});
+    const { blockReplyHandler } = createPresentation({
+      silentExpected: true,
+      directBlockDeliveries,
+      delivery: {
+        opts: { onBlockReply },
+        blockStreamingEnabled: true,
+        blockReplyPipeline: pipeline,
+        applyReplyToMode: (payload) => payload,
+        typingSignals: createTypingSignaler({ typing, mode: "never", isHeartbeat: false }),
+      },
+    });
+    if (!blockReplyHandler) {
+      throw new Error("expected the block delivery handler");
+    }
+    try {
+      const suppressed: ReplyPayload[] = [
+        { text: "Private maintenance output." },
+        { mediaUrls: ["https://example.invalid/private.png"] },
+        { presentation: { blocks: [{ type: "text", text: "Private card" }] } },
+        {
+          interactive: {
+            blocks: [{ type: "buttons", buttons: [{ label: "Open", value: "open" }] }],
+          },
+        },
+        { channelData: { telegram: { buttons: [[{ text: "Open", callback_data: "open" }]] } } },
+        { location: { latitude: 1, longitude: 2 } },
+        { audioAsVoice: true },
+      ];
+      for (const payload of suppressed) {
+        await blockReplyHandler(payload);
+      }
+      await pipeline?.flush({ force: true });
+      expect(delivered).toEqual([]);
+      expect(directBlockDeliveries).toEqual([]);
+      expect(pipeline?.didStream() ?? false).toBe(false);
+
+      const permitted: ReplyPayload[] = [
+        { text: "Maintenance failed.", isError: true },
+        {
+          text: "Spoken reply.",
+          mediaUrls: ["https://example.invalid/voice.opus"],
+          audioAsVoice: true,
+        },
+        markReplyPayloadForSourceSuppressionDelivery({
+          text: "Host notice.",
+          isStatusNotice: true,
+        }),
+      ];
+      for (const payload of permitted) {
+        await blockReplyHandler(payload);
+        await pipeline?.flush({ force: true });
+      }
+      expect(delivered).toHaveLength(3);
+      expect(delivered).toMatchObject(permitted);
+      expect(getReplyPayloadMetadata(delivered[2]!)?.deliverDespiteSourceReplySuppression).toBe(
+        true,
+      );
+    } finally {
+      pipeline?.stop();
+      typing.cleanup();
+    }
+  },
+);

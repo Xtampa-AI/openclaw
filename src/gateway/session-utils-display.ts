@@ -9,11 +9,10 @@ import {
 } from "../agents/subagents/registry/subagent-registry-read.js";
 import {
   isTerminalSessionStatus,
-  buildGroupDisplayName,
-  buildGroupDisplayTitle,
   resolveSessionGoalDisplayState,
   type InternalSessionEntry as SessionEntry,
 } from "../config/sessions.js";
+import { buildGroupDisplayName, buildGroupDisplayTitle } from "../config/sessions/group-display.js";
 import { resolveProjectedAgentRunProgressState } from "../infra/agent-run-registry.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { classifySessionKind } from "../sessions/classify-session-kind.js";
@@ -95,6 +94,7 @@ export function resolveGatewaySessionKind(key: string, entry?: SessionEntry) {
 
 export function projectGatewaySessionRunState(params: {
   key: string;
+  parsedKey?: ReturnType<typeof parseAgentSessionKey>;
   entry?: SessionEntry;
   now: number;
   rowContext?: Pick<
@@ -109,23 +109,20 @@ export function projectGatewaySessionRunState(params: {
     normalizeOptionalString(subagentRun?.controllerSessionKey) ||
     normalizeOptionalString(subagentRun?.requesterSessionKey);
   const liveSubagentRunActive = isSubagentRunLive(subagentRun) || isSubagentRunQueued(subagentRun);
-  const hasProjectedRun = (sessionKey: string, sessionId?: string) => {
-    if (!rowContext?.projectedAgentRuns) {
-      return false;
-    }
-    const state = resolveProjectedAgentRunProgressState({
-      sessionKeys: [sessionKey],
-      sessionId,
-      index: rowContext.projectedAgentRuns,
-    });
-    return state !== undefined;
-  };
   // Follow-up turns retain the child session while owning a different run from its original spawn.
   const hasActiveSubagentRun =
     liveSubagentRunActive ||
     subagentRuns.countActiveDescendantRuns(key) > 0 ||
     ((subagentRun !== null || entry?.spawnedBy !== undefined) &&
-      hasProjectedRun(key, entry?.sessionId)) ||
+      rowContext?.projectedAgentRuns !== undefined &&
+      resolveProjectedAgentRunProgressState({
+        sessionKeys: [key],
+        sessionId: entry?.sessionId,
+        agentId:
+          (params.parsedKey === undefined ? parseAgentSessionKey(key) : params.parsedKey)
+            ?.agentId ?? "",
+        index: rowContext.projectedAgentRuns,
+      }) !== undefined) ||
     rowContext?.projectedSubagentActivity?.has(key) === true;
   const fields: Pick<
     GatewaySessionRow,

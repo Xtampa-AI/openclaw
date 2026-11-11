@@ -1,4 +1,5 @@
 import { getAgentToolAssistantTurnId } from "../../../../packages/agent-core/src/tool-execution-context.js";
+import { emitTrustedDiagnosticEvent } from "../../../infra/diagnostic-events.js";
 import {
   getPluginToolMeta,
   getPluginToolSideEffectOwnerKey,
@@ -40,6 +41,8 @@ export function prepareEmbeddedAttemptClientTools(params: {
   codeModeControlsEnabledForRun: boolean;
   deferredDirectoryToolsCallable: boolean;
   effectiveTools: AgentTool[];
+  /** Applies the session tool pin each time the surface is built, including permission refreshes. */
+  pinTools?: (tools: AgentTool[]) => AgentTool[];
   replaySafetyOptions: Parameters<typeof isAgentToolReplaySafe>[1];
   sandboxSessionKey?: string;
   sessionAgentId: string;
@@ -101,6 +104,7 @@ export function prepareEmbeddedAttemptClientTools(params: {
       )
     : [];
   const buildSurface = () => {
+    const effectiveTools = params.pinTools?.(params.effectiveTools) ?? params.effectiveTools;
     // Raw names gate trusted local media passthrough; normalized aliases are insufficient.
     const builtinToolNames = new Set<string>();
     const trustedLocalMediaToolNames = new Set<string>();
@@ -132,7 +136,7 @@ export function prepareEmbeddedAttemptClientTools(params: {
     // the same name must never be mistaken for one at tool completion. The marked
     // controls exist only on the post-catalog `effectiveTools` surface.
     const codeModeExecToolNames = new Set(
-      params.effectiveTools.filter((tool) => isCodeModeExecTool(tool)).map((tool) => tool.name),
+      effectiveTools.filter((tool) => isCodeModeExecTool(tool)).map((tool) => tool.name),
     );
     // Only a tool author can opt a tool into delivering its result as the source reply.
     // Names are policy-normalized because completion and terminal hooks compare them so.
@@ -178,7 +182,13 @@ export function prepareEmbeddedAttemptClientTools(params: {
     });
     clientToolDefs = clientToolSearch.tools;
     if (clientToolSearch.compacted) {
-      log.info(
+      emitTrustedDiagnosticEvent({
+        type: "tool.catalog",
+        source: "client",
+        mode: params.codeModeControlsEnabledForRun ? "code-mode" : "tool-search",
+        toolCount: clientToolSearch.catalogToolCount,
+      });
+      log.debug(
         params.codeModeControlsEnabledForRun
           ? `code-mode: cataloged ${clientToolSearch.catalogToolCount} client tools behind exec/wait`
           : `tool-search: cataloged ${clientToolSearch.catalogToolCount} client tools behind compact prompt surface`,
@@ -186,7 +196,7 @@ export function prepareEmbeddedAttemptClientTools(params: {
     }
 
     const customTools = toToolDefinitions(
-      params.effectiveTools,
+      effectiveTools,
       params.catalogToolHookContext,
       params.getToolAbortSignal?.(),
     );

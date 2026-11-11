@@ -6,7 +6,7 @@ import { uniqueStrings } from "@openclaw/normalization-core/string-normalization
 import { resolveDefaultAgentDir } from "../agents/agent-scope-config.js";
 import { authProfileRuntimeMode } from "../agents/auth-profiles/runtime-scope.js";
 import { getRuntimeAuthProfileStoreSnapshotCore } from "../agents/auth-profiles/runtime-snapshots.js";
-import { hasAnyAuthProfileStoreSourceAsync } from "../agents/auth-profiles/source-check.js";
+import { ensureAuthProfileStoreWithoutExternalProfilesAsync } from "../agents/auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import { hasAuthProfileForProvider } from "../agents/tools/model-config.helpers.js";
 import {
@@ -18,6 +18,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { coerceSecretRef } from "../config/types.secrets.js";
 import { logVerbose } from "../globals.js";
 import { withGuardedFetchRequestAuthority } from "../infra/net/fetch-request-authority.js";
+import { prepareBundledDiscoveryMode } from "../plugins/bundled-discovery-state.js";
 import { sortPluginEntriesForAutoDetect } from "../plugins/plugin-entry-order.js";
 import { resolveManifestContractOwnerPluginId } from "../plugins/plugin-registry-contributions.js";
 import type { PluginWebSearchProviderEntry } from "../plugins/types.js";
@@ -77,7 +78,7 @@ function hasEntryCredential(
       hasAuthProfileForProvider({
         provider: providerId,
         authStore,
-        authProfileStoreSource: resolveAuthProfileStoreSource?.(),
+        authProfileStoreSource: authStore ? undefined : resolveAuthProfileStoreSource?.(),
         agentDir:
           agentDir?.trim() || (authStore ? undefined : resolveDefaultAgentDir(config ?? {})),
       }),
@@ -125,6 +126,14 @@ export function listWebSearchProviders(params?: {
   return resolveRuntimeWebSearchProviders({
     config,
   });
+}
+
+/** Prepare machine-owned discovery policy before enumerating runtime providers. */
+export async function listWebSearchProvidersAsync(params?: {
+  config?: OpenClawConfig;
+}): Promise<PluginWebSearchProviderEntry[]> {
+  await prepareBundledDiscoveryMode();
+  return listWebSearchProviders(params);
 }
 
 /** Lists plugin-configured web_search providers without runtime-only providers. */
@@ -193,6 +202,7 @@ function resolveRuntimePreferredWebSearchProviderId(params: {
   runtimeWebSearch?: RuntimeWebSearchMetadata;
   providers?: PluginWebSearchProviderEntry[];
   agentDir?: string;
+  authStore?: AuthProfileStore;
   resolveAuthProfileStoreSource?: () => boolean;
 }): string | undefined {
   const runtimeProviderId = normalizeOptionalLowercaseString(
@@ -219,7 +229,7 @@ function resolveRuntimePreferredWebSearchProviderId(params: {
       provider,
       params.config,
       params.agentDir,
-      undefined,
+      params.authStore,
       params.resolveAuthProfileStoreSource,
     )
   ) {
@@ -237,12 +247,13 @@ type WebSearchRequestContext = {
   config?: OpenClawConfig;
   search?: WebSearchConfig;
   runtimeWebSearch?: RuntimeWebSearchMetadata;
+  sandboxed?: boolean;
 };
 
 function resolveWebSearchRequestContext(
   options?: Pick<
     ResolveWebSearchDefinitionParams,
-    "config" | "preferInputConfig" | "runtimeWebSearch"
+    "config" | "preferInputConfig" | "runtimeWebSearch" | "sandboxed"
   >,
 ): WebSearchRequestContext {
   const config = resolveWebSearchRuntimeConfig({
@@ -254,6 +265,7 @@ function resolveWebSearchRequestContext(
     search: resolveSearchConfig(config),
     runtimeWebSearch:
       options?.runtimeWebSearch ?? getActiveRuntimeWebToolsMetadataFromState()?.search,
+    sandboxed: options?.sandboxed,
   };
 }
 
@@ -286,6 +298,7 @@ function loadSortedWebSearchProviders(
   return sortPluginEntriesForAutoDetect(
     resolveProviders({
       config: params.config,
+      sandboxed: params.sandboxed,
       ...(pluginId ? { onlyPluginIds: [pluginId] } : {}),
     }),
   );
@@ -295,15 +308,14 @@ async function resolveWebSearchCandidates(
   options?: ResolveWebSearchDefinitionParams,
   context = resolveWebSearchRequestContext(options),
 ): Promise<PluginWebSearchProviderEntry[]> {
-  const { config, search, runtimeWebSearch } = context;
+  const { config, search } = context;
   if (search?.enabled === false) {
     return [];
   }
 
+  await prepareBundledDiscoveryMode();
   const providers = loadSortedWebSearchProviders({
-    config,
-    search,
-    runtimeWebSearch,
+    ...context,
     providerId: options?.providerId,
     preferRuntimeProviders: options?.preferRuntimeProviders,
   });
@@ -312,11 +324,19 @@ async function resolveWebSearchCandidates(
   }
 
   const agentDir = options?.agentDir?.trim() || resolveDefaultAgentDir(config ?? {});
+  const preparedAuthStore =
+    options?.authStore ??
+    (authProfileRuntimeMode.getStore()
+      ? undefined
+      : getRuntimeAuthProfileStoreSnapshotCore(agentDir));
+  const preparedOptions = preparedAuthStore
+    ? { ...options, authStore: preparedAuthStore }
+    : options;
   let needsAuthSource = false;
   let autoDetectionMessage: string | undefined;
   try {
     const candidates = selectWebSearchCandidates(
-      options,
+      preparedOptions,
       context,
       providers,
       agentDir,
@@ -340,13 +360,13 @@ async function resolveWebSearchCandidates(
     }
     // Resolve the earlier profile gate before reporting a later selection error.
   }
-  const authProfileStoreSource = await hasAnyAuthProfileStoreSourceAsync(agentDir);
+  const authStore = await ensureAuthProfileStoreWithoutExternalProfilesAsync(agentDir);
   return selectWebSearchCandidates(
-    options,
+    { ...options, authStore },
     context,
     providers,
     agentDir,
-    () => authProfileStoreSource,
+    () => true,
   );
 }
 
@@ -369,11 +389,13 @@ function selectWebSearchCandidates(
         runtimeWebSearch,
         providers,
         agentDir,
+        authStore: options?.authStore,
         resolveAuthProfileStoreSource,
       }),
       resolveWebSearchProviderId({
         config,
         agentDir,
+        authStore: options?.authStore,
         search,
         providers,
         resolveAuthProfileStoreSource,
@@ -402,7 +424,7 @@ function selectWebSearchCandidates(
           provider,
           config,
           agentDir,
-          undefined,
+          options?.authStore,
           resolveAuthProfileStoreSource,
         ),
       );
@@ -453,12 +475,15 @@ export function hasConfiguredWebSearchProvider(
   );
 }
 
-/** Prepare agent-scoped source facts without synchronous store discovery in tool assembly. */
+/** Prepare the agent-owned store once before synchronous provider selection. */
 export async function prepareWebSearchConfiguration(
   options: WebSearchConfigurationParams = {},
-  prepareAuthSource: (agentDir: string) => Promise<boolean> = hasAnyAuthProfileStoreSourceAsync,
+  prepareAuthStore: (
+    agentDir: string,
+  ) => Promise<AuthProfileStore> = ensureAuthProfileStoreWithoutExternalProfilesAsync,
 ): Promise<boolean> {
-  if (options.authStore || options.resolveAuthProfileStoreSource) {
+  await prepareBundledDiscoveryMode();
+  if (options.authStore) {
     return hasConfiguredWebSearchProvider(options);
   }
   const agentDir = options.agentDir?.trim() || resolveDefaultAgentDir(options.config ?? {});
@@ -481,10 +506,11 @@ export async function prepareWebSearchConfiguration(
   if (configured || !needsAuthSource) {
     return configured;
   }
-  const hasSource = await prepareAuthSource(agentDir);
+  const preparedAuthStore = await prepareAuthStore(agentDir);
   return hasConfiguredWebSearchProvider({
     ...options,
-    resolveAuthProfileStoreSource: () => hasSource,
+    agentDir,
+    authStore: preparedAuthStore,
   });
 }
 
@@ -541,7 +567,11 @@ export async function runWebSearch(params: RunWebSearchParams): Promise<RunWebSe
     context,
   );
   if (candidates.length === 0) {
-    throw new Error("web_search is disabled or no provider is available.");
+    throw new Error(
+      params.sandboxed
+        ? "web_search is unavailable. Enable or select a bundled or verified official search provider for sandboxed agents."
+        : "web_search is disabled or no provider is available.",
+    );
   }
   const allowFallback = !hasExplicitWebSearchSelection({
     search,

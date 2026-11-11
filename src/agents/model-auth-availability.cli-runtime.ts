@@ -132,18 +132,23 @@ export function createCliRuntimeModelAuthEvaluator(
         });
       }
     }
+    const runtimeAuth = { id: runtimeProvider, source: "native" as const };
     if (normalizeProviderId(runtimeProvider) === normalizeProviderId(provider)) {
-      return runtimeOwners?.length ? evaluation : undefined;
+      return runtimeOwners?.length ? { ...evaluation, runtimeAuth } : undefined;
     }
     const runtimeAuthMode =
       params.preparedRuntimeAuthModes?.[normalizeProviderIdForAuth(runtimeProvider)];
-    if (typeof runtimeAuthMode === "string") {
-      // Without a forwarded account, the prepared native login owns readiness.
+    const selectedAuthMode =
+      typeof runtimeAuthMode === "object" ? runtimeAuthMode.mode : runtimeAuthMode;
+    if (selectedAuthMode) {
+      // The prepared native-runtime result is authoritative for this exact runtime route. Provider
+      // credentials cannot prove that the separately authenticated CLI is usable.
       return {
         availability: true,
         routeResolution: null,
-        selectedAuthMode: runtimeAuthMode,
+        selectedAuthMode,
         evidence: "runtime",
+        runtimeAuth,
       };
     }
     // Preparation probes the native login of every configured runtime; only routes found by
@@ -159,7 +164,12 @@ export function createCliRuntimeModelAuthEvaluator(
     );
     return params.preparedSyntheticAuthComplete ||
       configuredRuntimes.has(normalizeProviderId(runtimeProvider))
-      ? { availability: false, routeResolution: null, unavailableReason: "missing-auth" }
-      : { availability: undefined, routeResolution: null };
+      ? {
+          availability: false,
+          routeResolution: null,
+          unavailableReason: "missing-auth",
+          runtimeAuth,
+        }
+      : { availability: undefined, routeResolution: null, runtimeAuth };
   };
 }

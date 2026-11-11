@@ -6,6 +6,7 @@ import type {
 import { runEmbeddedAgent } from "../../agents/embedded-agent.js";
 import { resolveAgentHarnessPolicy } from "../../agents/harness/policy.js";
 import { resolveOpenAIRuntimeProvider } from "../../agents/openai-routing.js";
+import type { ReplyDeliveryState } from "../../agents/reply-completion.js";
 import type { CompactionRequestBudget } from "../../agents/sessions/compaction/request-budget.js";
 import { resolveGroupSessionKey } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
@@ -53,6 +54,26 @@ export async function runEmbeddedFallbackCandidate(
   compactionRequestBudget?: CompactionRequestBudget;
 }> {
   const turn = params.turn;
+  const resolveReplyDeliveryFacts: NonNullable<
+    RunEmbeddedAgentInternalParams["resolveReplyDeliveryFacts"]
+  > = async (minimumAssistantMessageIndex) => {
+    let source: ReplyDeliveryState = "pending";
+    const terminal = await resolveTerminalReplyDelivery({
+      blockReplyPipeline: turn.blockReplyPipeline,
+      directBlockDeliveries: params.directBlockDeliveries,
+      minimumAssistantMessageIndex,
+      resolveReplyDelivery: async (minimum) => {
+        const facts = await turn.opts?.resolveReplyDeliveryFacts?.(minimum);
+        if (facts) {
+          source = facts.source;
+          return facts.terminal;
+        }
+        source = (await turn.opts?.resolveReplyDelivery?.(minimum)) ?? "missing";
+        return source;
+      },
+    });
+    return { source, terminal };
+  };
   let maintenanceAuthProfile: CompletedAgentAuthSelection | undefined;
   let compactionRequestBudget: CompactionRequestBudget | undefined;
   const sourceReplyDeliveryRuntime = readSourceReplyDeliveryRuntime(params.candidateRun);
@@ -121,6 +142,7 @@ export async function runEmbeddedFallbackCandidate(
     const result = await params.timing.measure("embedded_run", () => {
       const embeddedRunParams: RunEmbeddedAgentInternalParams = {
         ...runBaseParams,
+        ...params.scheduledInference?.runParams,
         lifecycleGeneration: params.getLifecycleGeneration(),
         allowGatewaySubagentBinding: true,
         cronCreatorAuthorityCapability: turn.opts?.cronCreatorAuthorityCapability,
@@ -140,7 +162,16 @@ export async function runEmbeddedFallbackCandidate(
           agentHarnessPolicy.runtimeSource !== "implicit" ? agentHarnessPolicy.runtime : undefined,
         sandboxSessionKey: turn.runtimePolicySessionKey,
         explicitSkillSelections: turn.followupRun.explicitSkillSelections,
-        forceMessageTool: turn.followupRun.run.sourceReplyDeliveryMode === "message_tool_only",
+        forceMessageTool:
+          turn.followupRun.run.scheduledAutomation?.sourceDelivery?.messageTool.force ??
+          turn.followupRun.run.sourceReplyDeliveryMode === "message_tool_only",
+        ...(turn.followupRun.run.scheduledAutomation
+          ? {
+              disableMessageTool:
+                turn.followupRun.run.scheduledAutomation.sourceDelivery?.messageTool.enabled ===
+                false,
+            }
+          : {}),
         suppressTranscriptOnlyAssistantPersistence:
           turn.followupRun.run.suppressTranscriptOnlyAssistantPersistence,
         assistantErrorTranscript: params.assistantErrorTranscript,
@@ -175,6 +206,35 @@ export async function runEmbeddedFallbackCandidate(
           if (agentHarnessPolicy.runtime !== "openclaw" || info?.backend === "cloud-worker") {
             await params.prepareAgentRunStart();
           }
+          if (turn.followupRun.run.scheduledAutomation) {
+            try {
+              await turn.followupRun.run.internalEventExecution?.beforeScheduledStart?.(
+                params.runId,
+              );
+              params.runAbortSignal?.throwIfAborted();
+              turn.followupRun.run.internalEventExecution?.assertCurrent?.();
+              const automation = turn.followupRun.run.scheduledAutomation;
+              const sessionKey = turn.sessionKey ?? turn.followupRun.run.sessionKey;
+              if (automation && sessionKey) {
+                automation.onExecutionStarted?.({
+                  runId: params.runId,
+                  sessionId: turn.followupRun.run.sessionId,
+                  sessionKey,
+                  provider: params.provider,
+                  model: params.model,
+                  ...(params.isFallbackRetry ? { isFallback: true } : {}),
+                });
+              }
+            } catch (error) {
+              if (!params.hasAgentRunStarted()) {
+                lifecycleBackstop.note({
+                  stream: "lifecycle",
+                  data: { phase: "finishing", executionStarted: false, providerStarted: false },
+                });
+              }
+              throw error;
+            }
+          }
         },
         onExecutionPhase: (info) => {
           if (info.phase === "model_call_started" && attemptCompactionCount > 0) {
@@ -187,6 +247,7 @@ export async function runEmbeddedFallbackCandidate(
           if (waiting && replyOperation) {
             markReplyOperationGlobalLaneWaitProgress(replyOperation);
           }
+          turn.followupRun.run.scheduledAutomation?.onLaneWait?.({ waiting: waiting !== false });
         },
         blockReplyBreak: turn.resolvedBlockStreamingBreak,
         blockReplyChunking: turn.blockReplyChunking,
@@ -244,13 +305,9 @@ export async function runEmbeddedFallbackCandidate(
         },
         // Flush-before-tool requires a handler even when regular block streaming is off.
         onBlockReply: params.presentation.blockReplyHandler,
-        resolveReplyDelivery: (minimumAssistantMessageIndex) =>
-          resolveTerminalReplyDelivery({
-            blockReplyPipeline: turn.blockReplyPipeline,
-            directBlockDeliveries: params.directBlockDeliveries,
-            minimumAssistantMessageIndex,
-            resolveReplyDelivery: turn.opts?.resolveReplyDelivery,
-          }),
+        resolveReplyDelivery: async (minimumAssistantMessageIndex) =>
+          (await resolveReplyDeliveryFacts(minimumAssistantMessageIndex)).terminal,
+        resolveReplyDeliveryFacts,
         onBlockReplyFlush:
           turn.blockStreamingEnabled && turn.blockReplyPipeline
             ? async () => {
@@ -289,15 +346,17 @@ export async function runEmbeddedFallbackCandidate(
           : undefined,
       };
       embeddedRunParams.onSuccessfulAuthProfile = (profileId) => {
+        params.scheduledInference?.runParams.onSuccessfulAuthProfile?.(profileId);
         maintenanceAuthProfile = {
           authProfileId: profileId,
           authProfileIdSource: profileId
-            ? profileId === runBaseParams.authProfileId
-              ? runBaseParams.authProfileIdSource
+            ? profileId === embeddedRunParams.authProfileId
+              ? embeddedRunParams.authProfileIdSource
               : "auto"
             : undefined,
         };
       };
+      params.scheduledInference?.assertCandidate(params.provider, false);
       return runEmbeddedAgent(embeddedRunParams);
     });
     const resultCompactionCount = Math.max(0, result.meta?.agentMeta?.compactionCount ?? 0);

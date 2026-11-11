@@ -1,53 +1,32 @@
-import type { DatabaseSync } from "node:sqlite";
 import { UPDATE_RUN_PHASES } from "../../packages/gateway-protocol/src/update-run-vocabulary.js";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import { runExistingOpenClawStateWriteTransaction } from "../state/openclaw-state-db-existing-write.js";
 import type { DB } from "../state/openclaw-state-db.generated.js";
-import { OPENCLAW_STATE_SCHEMA_SQL } from "../state/openclaw-state-schema.js";
+import { getOpenClawStateFeatureSchemaSql } from "../state/openclaw-state-feature-schema.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
-import { extractSqliteTableSchema } from "./sqlite-schema-sql.js";
+import type { EngineConnection } from "./sql-connection.js";
 import { createUpdateErrorFact } from "./update-failure-facts.js";
 import { completeUpdateFailureSummary } from "./update-failure-result.js";
-import { encodeRun, isRetainedStep, type UpdateRunLedgerOptions } from "./update-run-codec.js";
+import { encodeRun, type UpdateRunLedgerOptions } from "./update-run-codec.js";
 import type { UpdateRunPhasePatch } from "./update-run-mutation.types.js";
 import { decodeRun, readUpdateRunRecord } from "./update-run-read.kernel.js";
 import {
   finishUpdateRunRecord,
-  type FinishUpdateRunResult,
+  type FinishUpdateRunInput,
+  type UpdateRunDiagnostics,
   type UpdateRunPhase,
   type UpdateRunRecord,
   type UpdateRunStep,
 } from "./update-run-record.js";
-import type { UpdateRunResult } from "./update-run-result.js";
 import { updateRunStepKey } from "./update-run-step-key.js";
+import { upsertStep } from "./update-run-step-upsert.js";
 import { updateRunStepsFromResultStep } from "./update-run-step.js";
 import { recordUpdateRunVerificationRecord } from "./update-run-verification.js";
 
-export const updateRunLedgerSchema = extractSqliteTableSchema(
-  OPENCLAW_STATE_SCHEMA_SQL,
-  "update_runs",
-  {
-    endMarker: "ON update_runs(status, created_at_ms DESC, run_id);",
-    errorMessage: "Update run schema markers are missing",
-  },
-);
-
-export function upsertStep(record: UpdateRunRecord, input: UpdateRunStep): void {
-  const step = { ...input, step: updateRunStepKey(input.step) };
-  const index = record.steps.findIndex((existing) => existing.step === step.step);
-  if (index >= 0) {
-    record.steps[index] = { ...record.steps[index], ...step };
-  } else {
-    record.steps.push(step);
-  }
-  while (record.steps.length > 128) {
-    const disposable = record.steps.findIndex((entry) => !isRetainedStep(entry));
-    if (disposable < 0) {
-      throw new Error("Update run retained steps exceed the step limit");
-    }
-    record.steps.splice(disposable, 1);
-  }
-}
+export const updateRunLedgerSchema = getOpenClawStateFeatureSchemaSql("update_runs", {
+  endMarker: "ON update_runs(status, created_at_ms DESC, run_id);",
+  errorMessage: "Update run schema markers are missing",
+});
 
 export function applyUpdateRunPhase(
   record: UpdateRunRecord,
@@ -110,7 +89,7 @@ export function applyUpdateRunStep(
 }
 
 export function persistRun(
-  db: DatabaseSync,
+  db: EngineConnection,
   record: UpdateRunRecord,
   options: UpdateRunLedgerOptions,
 ): UpdateRunRecord {
@@ -136,7 +115,7 @@ export function persistRun(
 }
 
 export function mutateRunInTransaction(
-  db: DatabaseSync,
+  db: EngineConnection,
   runId: string,
   update: (record: UpdateRunRecord) => void,
   options: UpdateRunLedgerOptions,
@@ -166,6 +145,7 @@ export function mutateRun(
     {
       schemaSql: updateRunLedgerSchema,
       operationLabel: "update.run",
+      attributeUpdateWrite: options.attributeUpdateWrite,
       busyTimeoutMs: options.busyTimeoutMs,
     },
   );
@@ -207,15 +187,11 @@ export function isRequiredUpdateRunStep(step: UpdateRunStep & { reason?: string 
 }
 
 type RecoveryDiagnostics = Pick<UpdateRunRecord["verification"], "recovery" | "rollbackOutcome">;
-type UpdateRunDiagnostics = RecoveryDiagnostics &
-  Partial<Pick<UpdateRunResult, "verification" | "steps">> & {
-    failure?: Pick<UpdateRunStep, "step" | "detail" | "failureFacts" | "exitCode">;
-  };
 type UpdateRunDiagnosticsInput =
   | UpdateRunDiagnostics
   | ((recorded: Readonly<RecoveryDiagnostics>) => UpdateRunDiagnostics);
 
-function applyUpdateRunDiagnostics(
+export function applyUpdateRunDiagnostics(
   record: UpdateRunRecord,
   diagnostics: UpdateRunDiagnosticsInput,
 ): void {
@@ -258,8 +234,7 @@ function applyUpdateRunDiagnostics(
   }
   const constraint = record.verification.recovery;
   const recovery =
-    (verification || (constraint?.serviceRestartSafe === false && constraint.dataAtRisk)) &&
-    constraint?.serviceRestartSafe === false
+    verification && constraint?.serviceRestartSafe === false
       ? !constraint.dataAtRisk &&
         observedRecovery?.serviceRestartSafe === false &&
         observedRecovery.dataAtRisk
@@ -310,47 +285,42 @@ export function recordUpdateRunDiagnostics(
 
 export function finishUpdateRun(
   runId: string,
-  result: FinishUpdateRunResult & {
-    before?: UpdateRunRecord["before"];
-    diagnostics?: UpdateRunDiagnostics;
-  },
+  result: FinishUpdateRunInput,
   options: UpdateRunLedgerOptions = {},
 ): UpdateRunRecord {
-  return mutateRun(
-    runId,
-    (record) => {
-      if (record.status === "running") {
-        const diagnostics = result.diagnostics;
-        if (diagnostics) {
-          applyUpdateRunDiagnostics(record, diagnostics);
-          if (!diagnostics.verification) {
-            for (const step of (diagnostics.steps ?? []).flatMap(updateRunStepsFromResultStep)) {
-              upsertStep(record, step);
-            }
-          }
-        }
-        record.before = { ...record.before, ...result.before };
-        const failed =
-          record.steps.find((step) => step.status === "failed" && step.failureFacts?.length) ??
-          (result.status === "failed"
-            ? record.steps.find((step) => step.step === record.phase)
-            : undefined);
-        finishUpdateRunRecord(record, result);
-        if (result.status === "failed" || result.status === "rolled-back") {
-          const summary = completeUpdateFailureSummary(record.reason, failed?.failureFacts);
-          record.reason = summary.reason;
-          if (failed) {
-            failed.failureFacts = summary.failureFacts;
-          } else {
-            upsertStep(record, {
-              step: "update",
-              status: "failed",
-              failureFacts: summary.failureFacts,
-            });
-          }
+  return mutateRun(runId, (record) => applyFinishUpdateRun(record, result), options);
+}
+
+export function applyFinishUpdateRun(record: UpdateRunRecord, result: FinishUpdateRunInput): void {
+  if (record.status === "running") {
+    const diagnostics = result.diagnostics;
+    if (diagnostics) {
+      applyUpdateRunDiagnostics(record, diagnostics);
+      if (!diagnostics.verification) {
+        for (const step of (diagnostics.steps ?? []).flatMap(updateRunStepsFromResultStep)) {
+          upsertStep(record, step);
         }
       }
-    },
-    options,
-  );
+    }
+    record.before = { ...record.before, ...result.before };
+    const failed =
+      record.steps.find((step) => step.status === "failed" && step.failureFacts?.length) ??
+      (result.status === "failed"
+        ? record.steps.find((step) => step.step === record.phase)
+        : undefined);
+    finishUpdateRunRecord(record, result);
+    if (result.status === "failed" || result.status === "rolled-back") {
+      const summary = completeUpdateFailureSummary(record.reason, failed?.failureFacts);
+      record.reason = summary.reason;
+      if (failed) {
+        failed.failureFacts = summary.failureFacts;
+      } else {
+        upsertStep(record, {
+          step: "update",
+          status: "failed",
+          failureFacts: summary.failureFacts,
+        });
+      }
+    }
+  }
 }

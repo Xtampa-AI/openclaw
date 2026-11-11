@@ -423,7 +423,7 @@ export function renderSystemNodeWarning(
     systemNode.capabilityError &&
     (!systemNode.sqliteProbe.text || systemNode.sqliteProbe.error)
   ) {
-    return `${systemNode.capabilityError}${selectedLabel}`;
+    return `System Node ${versionLabel} at ${systemNode.path} failed its SQLite capability check: ${systemNode.capabilityError}${selectedLabel}`;
   }
   if (isSupportedNodeVersion(systemNode.version)) {
     const sqliteLabel = systemNode.sqliteVersion ?? "unknown";
@@ -569,7 +569,7 @@ export async function resolvePinnedDaemonRuntimePath(
       info.capabilityError ??
       (runtime === "node"
         ? `Node ${SUPPORTED_NODE_VERSIONS} with WAL-reset-safe SQLite is required.`
-        : "Bun 1.4+ with WAL-reset-safe node:sqlite is required.");
+        : "Bun 1.4.4+ with WAL-reset-safe node:sqlite is required.");
     throw new Error(`Pinned runtime ${runtimePath} is unsupported: ${detail}`);
   }
   return runtimePath;

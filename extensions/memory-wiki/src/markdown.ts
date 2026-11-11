@@ -23,6 +23,23 @@ export const WIKI_PAGE_GROUPS = [
 ] as const;
 export const WIKI_RAW_SOURCE_MARKER = "<!-- openclaw:wiki:raw-source -->";
 
+class WikiPageNotUtf8Error extends Error {
+  constructor(displayPath: string) {
+    super(
+      `Wiki page is not valid UTF-8 and cannot be rewritten safely: ${displayPath}. ` +
+        "The file was left unchanged. Keep a byte-for-byte backup, convert a copy to UTF-8 with its original encoding, then retry.",
+    );
+    this.name = "WikiPageNotUtf8Error";
+  }
+}
+
+export function decodeWikiPageUtf8(bytes: Buffer, displayPath: string): string {
+  if (!isUtf8(bytes)) {
+    throw new WikiPageNotUtf8Error(displayPath);
+  }
+  return bytes.toString("utf8");
+}
+
 export type WikiPageKind = (typeof WIKI_PAGE_GROUPS)[number]["kind"];
 type GeneratedSourceBody = "bridge" | "unsafe-local" | "local-file" | "chatgpt-export";
 

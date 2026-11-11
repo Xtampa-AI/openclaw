@@ -1,6 +1,7 @@
 import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPluginRuntimeStore } from "../plugin-sdk/runtime-store.js";
+import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { attachPluginApiFacades, instrumentPluginInstanceApi } from "./api-facades.js";
 import { registerPluginCommandInRegistry } from "./command-registration.js";
@@ -30,6 +31,37 @@ import type { OpenClawPluginApi } from "./types.js";
 
 describe("managed plugin instances", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("keeps healthy cleanup within its budget when the wall clock jumps forward", async () => {
+    vi.useFakeTimers();
+    const instance = new PluginInstance("cleanup-clock");
+    const owner = new AsyncWorkScope();
+    const cleanupEntered = createDeferredCore();
+    const cleanupFinished = vi.fn();
+    instance.lifecycle.onDispose(() => {
+      vi.setSystemTime(Date.now() + 4_000);
+      cleanupEntered.resolve();
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          cleanupFinished();
+          resolve();
+        }, 1_500);
+      });
+    });
+
+    const disposal = owner.track(() => instance.dispose());
+    let ownerDrained = false;
+    const drained = owner.drain().then(() => {
+      ownerDrained = true;
+    });
+    await cleanupEntered.promise;
+    expect(ownerDrained).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect((await disposal).errors).toEqual([]);
+    await drained;
+    expect(cleanupFinished).toHaveBeenCalledOnce();
+    expect(ownerDrained).toBe(true);
+  });
 
   it.each(["call", "cleanup", "consumer", "host prelude"] as const)(
     "forces logical retirement at the existing deadline while a %s never settles",

@@ -29,10 +29,14 @@ import { classifyReleaseTrain, parseReleaseVersion } from "./lib/release-version
 import { parseGithubResponse } from "./pr-lib/gh-api-preflight.mjs";
 import { validateQualificationCoverage } from "./release-qualification-coverage.mjs";
 
-export { MAX_RELEASE_ARTIFACT_BYTES, serializeReleaseArtifact, buildReleaseValidationManifest };
+export {
+  MAX_RELEASE_ARTIFACT_BYTES,
+  serializeReleaseArtifact,
+  buildReleaseValidationManifest,
+  releaseChildAdvisories,
+};
 
-function validateReleaseAdvisoryJobs(value) {
-  const expected = [];
+function validateReleaseAdvisoryJobs(value, expected = []) {
   const recorded = value === undefined ? [] : value;
   if (!Array.isArray(recorded) || jsonSha256(recorded) !== jsonSha256(expected)) {
     throw new Error("Release advisory jobs differ from the release policy evidence");
@@ -61,7 +65,12 @@ export function validateReleaseManifestAdvisoryJobs(manifest) {
       throw new Error("Release manifest contains failed selected job evidence");
     }
   }
-  return validateReleaseAdvisoryJobs(manifest.advisoryJobs);
+  return validateReleaseAdvisoryJobs(
+    manifest.advisoryJobs,
+    Object.entries(manifest.childEvidence ?? {}).flatMap(([key, child]) =>
+      releaseChildAdvisories({ ...child, key }),
+    ),
+  );
 }
 
 const SUCCESSFUL_JOB_CONCLUSIONS = new Set(["neutral", "skipped", "success"]);
@@ -73,6 +82,9 @@ const MAX_URL_LENGTH = 1024;
 const EXACT_TARGET_EVIDENCE_REUSE_POLICY = "exact-target-full-validation-v1";
 const CHANGELOG_ONLY_EVIDENCE_REUSE_POLICY = "changelog-only-release-v1";
 export const SPLIT_CHANGELOG_EVIDENCE_REUSE_POLICY = "split-changelog-release-v1";
+// GitHub can leave runnerless same-name copies after any rerun request; they never settle.
+export const GHOST_JOBS_ADVICE =
+  "GitHub ghost jobs detected; stop rerunning, cancel that attempt, and start a fresh all-group FRV";
 
 export function assertReleasePublicationKnownBudget(plan, context, reusedManifest) {
   serializeReleaseArtifact(plan);
@@ -224,6 +236,7 @@ const LEGACY_CHILD_SPECS = Object.freeze([
       "all",
       "install-smoke",
       "cross-os",
+      "windows-node",
       "live-e2e",
       "package",
       "qa-parity",
@@ -275,7 +288,7 @@ const CHILD_SPECS = Object.freeze([
     displayName: "OpenClaw Release Checks",
     key: "releaseChecksCandidate",
     parentJobName: "Run release checks candidate validation",
-    rerunGroups: ["all", "cross-os", "live-e2e", "package"],
+    rerunGroups: ["all", "cross-os", "windows-node", "live-e2e", "package", "qualified-package"],
     suffix: "-release-checks-candidate",
     workflow: "openclaw-release-checks.yml",
   },
@@ -727,12 +740,31 @@ export function composeReleaseAttemptJobs(attempts, expected = {}) {
     if (attempt.runAttempt !== expectedAttempt || attempt.jobs.length === 0) {
       throw new Error("release child attempt evidence is gapped");
     }
+    const identityNames = new Set();
+    for (const job of attempt.jobs) {
+      if (job?.status === "completed" && job?.conclusion === "skipped") {
+        continue;
+      }
+      const name = boundedString(job?.name, MAX_LABEL_LENGTH);
+      if (!name) {
+        throw new Error(`release child attempt ${expectedAttempt} contains an unnamed job`);
+      }
+      if (identityNames.has(name)) {
+        throw Object.assign(
+          new Error(
+            `release child attempt ${expectedAttempt} is unsealable due to duplicate job identity: ${name || "(unnamed)"}; ${GHOST_JOBS_ADVICE}`,
+          ),
+          { code: "FRV_DUPLICATE_JOB_IDENTITY", runAttempt: expectedAttempt },
+        );
+      }
+      identityNames.add(name);
+    }
     const names = new Set();
     const completedNames = new Set(
       attempt.jobs.filter((job) => job?.status === "completed").map((job) => job.name),
     );
     const runningNames = new Set(
-      expected.effectiveRunStatus === "in_progress" &&
+      ["queued", "in_progress"].includes(expected.effectiveRunStatus) &&
         expectedAttempt === effectiveRunAttempt &&
         effectiveRunAttempt > plannedRunAttempt
         ? attempt.jobs
@@ -744,20 +776,13 @@ export function composeReleaseAttemptJobs(attempts, expected = {}) {
       const job = normalizedAttemptJob(rawJob, expectedAttempt);
       // GitHub's runnerless queued copies can outlive the real rerun job. While
       // the latest rerun is active, retain its running job so collection stays
-      // pending; terminal evidence still requires the completed sibling. Mirrored
-      // steps do not identify a real runner.
+      // pending even when the aggregate run status still says queued. Terminal
+      // evidence still requires the completed sibling. Mirrored steps do not
+      // identify a real runner.
       const ghost = job.status === "queued" && !rawJob.runner_id && !rawJob.runner_name;
       const skipped = job.status === "completed" && job.conclusion === "skipped";
       if (skipped || (ghost && (completedNames.has(job.name) || runningNames.has(job.name)))) {
         continue;
-      }
-      if (names.has(job.name)) {
-        throw Object.assign(
-          new Error(
-            `release child attempt ${expectedAttempt} contains duplicate job identity: ${job.name}`,
-          ),
-          { code: "FRV_DUPLICATE_JOB_IDENTITY", runAttempt: expectedAttempt },
-        );
       }
       names.add(job.name);
       accepted.set(job.name, job);
@@ -856,7 +881,16 @@ function candidatePreparationRequired(input) {
   ) {
     return false;
   }
-  if (["all", "plugin-prerelease", "cross-os", "package"].includes(input.rerunGroup)) {
+  if (
+    [
+      "all",
+      "plugin-prerelease",
+      "cross-os",
+      "windows-node",
+      "package",
+      "qualified-package",
+    ].includes(input.rerunGroup)
+  ) {
     return true;
   }
   return input.rerunGroup === "live-e2e" && !stringValue(input.liveSuiteFilter).trim();
@@ -874,7 +908,9 @@ function releaseExecutionChildRequired(spec, input, npmTelegramForAll) {
       return input.rerunGroup === "npm-telegram" || npmTelegramForAll;
     case "releaseChecksCandidate":
       return (
-        ["all", "cross-os", "package"].includes(input.rerunGroup) ||
+        ["all", "cross-os", "windows-node", "package", "qualified-package"].includes(
+          input.rerunGroup,
+        ) ||
         (input.rerunGroup === "live-e2e" && !stringValue(input.liveSuiteFilter).trim())
       );
     default:
@@ -1154,6 +1190,9 @@ function releaseExecutionPlanShape(payload) {
         : []),
       ...(Object.hasOwn(payload, "telegramWaiver") ? ["targetVersion", "telegramWaiver"] : []),
       ...(Object.hasOwn(payload, "coveragePolicy") ? ["targetVersion", "coveragePolicy"] : []),
+      ...(payload.evidenceReuse?.requested === true && Object.hasOwn(payload, "targetVersion")
+        ? ["targetVersion"]
+        : []),
       ...(Object.hasOwn(payload, "sourceAdmissionContract")
         ? ["sourceAdmissionContract", "sourceAdmission"]
         : []),
@@ -1171,6 +1210,9 @@ function releaseExecutionPlanShape(payload) {
     (Object.hasOwn(payload, "sealParentRunAttempt") && !hasAttemptEvidence) ||
     (Object.hasOwn(payload, "knownFlakyJobs") && !hasAttemptEvidence) ||
     (Object.hasOwn(payload, "coveragePolicy") && attemptEvidenceVersion !== 3) ||
+    (payload.evidenceReuse?.requested === true &&
+      Object.hasOwn(payload.evidenceReuse, "sourceArtifact") &&
+      !Object.hasOwn(payload, "targetVersion")) ||
     !hasExactKeys(payload, expectedPlanKeys) ||
     !Array.isArray(payload.children) ||
     payload.children.some((child) => !hasExactKeys(child, expectedChildKeys))
@@ -1199,11 +1241,13 @@ function executionPlanDigestPayload(plan) {
   const coverage = Object.hasOwn(plan, "coveragePolicy")
     ? { targetVersion: plan.targetVersion, coveragePolicy: plan.coveragePolicy }
     : {};
+  const reuse = plan.evidenceReuse?.requested === true ? { targetVersion: plan.targetVersion } : {};
   const attemptAware = Object.hasOwn(plan, "attemptEvidenceVersion");
   return {
     ...source,
     ...publication,
     ...waiver,
+    ...reuse,
     ...(attemptAware
       ? {
           ...coverage,
@@ -1366,6 +1410,7 @@ export function buildReleaseExecutionPlanArtifact({
     workflowRef: boundedString(expected.workflowRef, MAX_LABEL_LENGTH),
     workflowSha: boundedString(expected.workflowSha, MAX_LABEL_LENGTH),
     targetSha: boundedString(expected.targetSha, MAX_LABEL_LENGTH),
+    ...(normalizedReuse.requested ? { targetVersion: normalizedTargetVersion } : {}),
     trustedWorkflow: normalizedTrustedWorkflow(trustedWorkflow),
     releaseProfile: boundedString(releaseProfile, MAX_LABEL_LENGTH),
     rerunGroup: boundedString(rerunGroup, MAX_LABEL_LENGTH),
@@ -1639,14 +1684,68 @@ function isFailedJob(job) {
   );
 }
 
+const WINDOWS_NODE_STABLE_JOB =
+  "Run Windows-node stable E2E / Setup, connect, and invoke candidate gateway";
+const WINDOWS_NODE_ADVISORY_JOBS = new Set([
+  "Resolve Windows-node main source",
+  "Run Windows-node prerelease E2E / Setup, connect, and invoke candidate gateway",
+  "Run Windows-node main E2E / Setup, connect, and invoke candidate gateway",
+]);
+
+function isReleaseAdvisoryJob(childKey, job) {
+  return (
+    childKey === "releaseChecksCandidate" &&
+    (WINDOWS_NODE_ADVISORY_JOBS.has(job.name) ||
+      (job.status === "completed" &&
+        job.conclusion === "skipped" &&
+        ["Run Windows-node prerelease E2E", "Run Windows-node main E2E"].includes(job.name)))
+  );
+}
+
+function releaseChildAdvisories(child) {
+  if (child.key !== "releaseChecksCandidate") {
+    return [];
+  }
+  const stableRan = child.jobs.some(
+    (job) => job.name === WINDOWS_NODE_STABLE_JOB && job.conclusion !== "skipped",
+  );
+  return child.jobs
+    .filter(
+      (job) =>
+        isReleaseAdvisoryJob(child.key, job) &&
+        (isFailedJob(job) || (stableRan && job.conclusion === "skipped")),
+    )
+    .map((job) => ({
+      class: "windows-node-preview",
+      child: child.key,
+      job: job.name,
+      conclusion: job.conclusion,
+      runId: String(child.runId),
+      url: job.html_url ?? job.url ?? "",
+    }))
+    .toSorted((left, right) => compareAscii(left.job, right.job));
+}
+
 export function terminalPolicyPass(child) {
   const failures = child.jobs.filter(isFailedJob);
-  return child.status === "completed" && child.conclusion === "success" && failures.length === 0;
+  const previewFailure = failures.some((job) => isReleaseAdvisoryJob(child.key, job));
+  return (
+    child.status === "completed" &&
+    child.jobs.every((job) => job.status === "completed") &&
+    (child.conclusion === "success" || (child.conclusion === "failure" && previewFailure)) &&
+    (!previewFailure ||
+      [WINDOWS_NODE_STABLE_JOB, "Verify release checks"].every((name) =>
+        child.jobs.some(
+          (job) => job.name === name && job.status === "completed" && job.conclusion === "success",
+        ),
+      )) &&
+    failures.every((job) => isReleaseAdvisoryJob(child.key, job))
+  );
 }
 
 export function planReleaseChildRerun({ childKey, jobs }) {
   const failed = jobs
-    .filter(isFailedJob)
+    .filter((job) => isFailedJob(job) && !isReleaseAdvisoryJob(childKey, job))
     .map((job) => job.name)
     .toSorted();
   if (failed.length === 0) {
@@ -1657,21 +1756,12 @@ export function planReleaseChildRerun({ childKey, jobs }) {
   if (failed.length === 1 && failed[0] === FULL_RELEASE_CHILD_EVIDENCE_JOB) {
     return { failed, mode: "receipt", producer: FULL_RELEASE_CHILD_EVIDENCE_JOB };
   }
-  // These consumers bind their producer's artifact to the current run attempt, so a
-  // failed-jobs rerun that leaves the green producer behind stays red (#161317).
-  const producer = "install_smoke_release_checks / installer_smoke_candidate_payload";
-  const producerJob = jobs.find((job) => job.name === producer);
-  if (
-    producerJob?.status === "completed" &&
-    producerJob.conclusion === "success" &&
-    [
-      "install_smoke_release_checks / installer_smoke_nonroot_image",
-      "install_smoke_release_checks / installer_smoke_nonroot",
-    ].some((name) => failed.includes(name))
-  ) {
-    return { failed, mode: "producer", producer };
+  if (failed.length !== 1) {
+    throw new Error(
+      `${childKey} has ${failed.length} blocking failed jobs; refusing a multi-job rerun because GitHub can create persistent duplicate jobs. Start a fresh all-group FRV instead`,
+    );
   }
-  return { failed, mode: "failed-jobs" };
+  return { failed, jobName: failed[0], mode: "single-job" };
 }
 
 function dispatchBlockers(children) {
@@ -1714,18 +1804,20 @@ function releaseState(cancelled, activeRunIds, blockers, errors) {
 
 function releaseChildBlockers(selected) {
   const childJobBlockers = selected.flatMap((child) =>
-    child.jobs.filter(isFailedJob).map((job) => ({
-      child: child.key,
-      conclusion: job.conclusion,
-      job: job.name,
-      kind: "job_failure",
-      message: `${child.key} job failed policy`,
-      primaryAt: stringValue(
-        job.completed_at ?? job.completedAt ?? job.started_at ?? job.startedAt,
-      ),
-      runId: child.runId,
-      url: job.html_url ?? job.url ?? child.url,
-    })),
+    child.jobs
+      .filter((job) => isFailedJob(job) && !isReleaseAdvisoryJob(child.key, job))
+      .map((job) => ({
+        child: child.key,
+        conclusion: job.conclusion,
+        job: job.name,
+        kind: "job_failure",
+        message: `${child.key} job failed policy`,
+        primaryAt: stringValue(
+          job.completed_at ?? job.completedAt ?? job.started_at ?? job.startedAt,
+        ),
+        runId: child.runId,
+        url: job.html_url ?? job.url ?? child.url,
+      })),
   );
   const childJobBlockerKeys = new Set(
     childJobBlockers.map((blocker) => `${blocker.child}:${blocker.runId}`),
@@ -1782,7 +1874,7 @@ export function classifyReleaseSnapshot({
     .toSorted((left, right) => String(left.primaryAt).localeCompare(String(right.primaryAt), "en"));
   return {
     activeRunIds,
-    advisoryJobs: [],
+    advisoryJobs: selected.flatMap(releaseChildAdvisories),
     blockerCount: rawBlockers.length,
     blockerIndex: blockerIndex(rawBlockers),
     blockers,
@@ -2357,7 +2449,12 @@ export function validateReleaseStateArtifact(payload, expected, expectedMode) {
   return {
     ...payload,
     activeRunIds,
-    advisoryJobs: validateReleaseAdvisoryJobs(payload.advisoryJobs),
+    advisoryJobs: validateReleaseAdvisoryJobs(
+      payload.advisoryJobs,
+      Object.entries(children).flatMap(([key, child]) =>
+        releaseChildAdvisories({ ...child, key, jobs: child.timing.jobs }),
+      ),
+    ),
     blockerCount: machineEvidence ? payload.blockerCount : null,
     blockerIndex: completeBlockerIndex,
     blockers,

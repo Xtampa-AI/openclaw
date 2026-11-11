@@ -10,6 +10,7 @@ import { normalizeNullableString } from "@openclaw/normalization-core/string-coe
 import { createSqliteAuditRecordWriter } from "../infra/sqlite-audit-record-store.async.js";
 import { createSqliteAuditRecordStore } from "../infra/sqlite-audit-record-store.js";
 import { redactSecrets } from "../logging/redact.js";
+import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { resolveConfigAuditStoreEnv } from "./config-journal-snapshot.js";
 import type { ConfigHealthFingerprint } from "./io.health-state.types.js";
 import type { ConfigWriteAuditOrigin } from "./io.types.js";
@@ -24,6 +25,7 @@ const CONFIG_SET_VALUE_OPTIONS = new Set([
   "--batch-file",
   "--batch-json",
   "--container",
+  "--expect-current-json",
   "--log-level",
   "--profile",
   "--provider-allowlist",
@@ -109,14 +111,12 @@ function redactConfigAuditArgv(argv: readonly string[]): string[] {
       redacted[index] = "--batch-json=***";
     }
   }
-  const positionals = findConfigPositionals(redacted, setIndex + 1, 2);
-  if (positionals.length < 2) {
+  const [pathIndex, valueIndex] = findConfigPositionals(redacted, setIndex + 1, 2);
+  if (pathIndex === undefined || valueIndex === undefined) {
     return redacted;
   }
-  const pathIndex = positionals[0]!;
-  const valueIndex = positionals[1]!;
   const configPath = redacted[pathIndex];
-  if (typeof configPath === "string" && isSensitiveConfigPath(configPath)) {
+  if (configPath !== undefined && isSensitiveConfigPath(configPath)) {
     redacted[valueIndex] = "***";
   }
   return redacted;
@@ -574,15 +574,9 @@ export async function appendConfigAuditRecord(
   await captureConfigAuditAppender(params, assertCurrent)(params.record);
 }
 
-export function appendConfigAuditRecordSync(params: ConfigAuditAppendParams): void {
-  try {
-    const record = sanitizeConfigAuditRecord(params.record);
-    openConfigAuditStore(resolveConfigAuditStoreEnv(params)).register(
-      configAuditEntryKey(record),
-      record,
-      Date.parse(record.ts),
-    );
-  } catch {
-    // best-effort
-  }
+/** Synchronous observations join their task's cleanup without opening SQLite here. */
+export function enqueueConfigAuditRecord(params: ConfigAuditAppendParams): void {
+  void trackAsyncWork(() => appendConfigAuditRecord(params)).catch(() => {
+    // A closed task can reject admission; diagnostic history remains best-effort.
+  });
 }

@@ -4,7 +4,6 @@ import { NODE_WORKER_CAPACITY_MAX } from "../../packages/gateway-protocol/src/wo
 import { toErrorObject } from "../infra/errors.js";
 import { NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE } from "../infra/node-commands.js";
 import type { NodeWorkerCapacitySnapshot } from "../infra/node-runner-inventory.js";
-import type { NodeWorkerJournalAuthority } from "./node-worker-journal.types.js";
 import {
   NodeWorkerLaunchStore,
   type NodeWorkerLaunchClaim,
@@ -96,7 +95,7 @@ export class NodeWorkerCapacity {
     signal?: AbortSignal,
     reclaimIdle?: () => Promise<boolean>,
   ): Promise<Exclude<NodeWorkerLaunchClaimResult, { action: "at-capacity" }>> {
-    const deadlineMs = Date.now() + this.waitMs;
+    const deadlineMs = performance.now() + this.waitMs;
     const assertCurrent = () => {
       if (this.closeAbort.signal.aborted) {
         throw new Error("node worker supervisor is closed");
@@ -126,10 +125,9 @@ export class NodeWorkerCapacity {
   async finish(
     params: Parameters<NodeWorkerLaunchStore["finish"]>[0],
     notify = true,
-    authority?: NodeWorkerJournalAuthority,
   ): Promise<NodeWorkerLaunchReceipt> {
     return this.update(async () => {
-      const receipt = await this.store.finish(params, authority);
+      const receipt = await this.store.finish(params);
       if (notify && receipt.state !== "pending" && receipt.state !== "running") {
         await this.changed();
       }
@@ -223,7 +221,7 @@ export class NodeWorkerCapacity {
     signal?: AbortSignal,
     reclaimIdle?: () => Promise<boolean>,
   ): Promise<boolean> {
-    const remainingMs = deadlineMs - Date.now();
+    const remainingMs = deadlineMs - performance.now();
     if (remainingMs <= 0) {
       throw new NodeWorkerCapacityExhaustedError(this.waitMs);
     }
@@ -247,7 +245,7 @@ export class NodeWorkerCapacity {
               ? new Error("node worker supervisor is closed")
               : capacityAbortReason(waiting),
           );
-        } else if (reclaimIdle && Date.now() >= deadlineMs) {
+        } else if (reclaimIdle && performance.now() >= deadlineMs) {
           reject(new NodeWorkerCapacityExhaustedError(this.waitMs));
         } else {
           complete();

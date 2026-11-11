@@ -9,7 +9,6 @@ import {
 import { GUEST_FILESYSTEM_PYTHON } from "@openclaw/fs-safe/guest";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
-import { lstatIfExists } from "openclaw/plugin-sdk/path-existence-runtime";
 import type {
   CreateSandboxBackendParams,
   OpenClawConfig,
@@ -42,6 +41,7 @@ import type { OpenShellFsBridgeContext, OpenShellSandboxBackend } from "./backen
 import { createOpenShellSshSession, runOpenShellCli, type OpenShellExecContext } from "./cli.js";
 import { resolveOpenShellPluginConfig, type ResolvedOpenShellPluginConfig } from "./config.js";
 import { createOpenShellFsBridge } from "./fs-bridge.js";
+import { lstatIfExists } from "./lstat-if-exists.js";
 import {
   DEFAULT_OPEN_SHELL_MIRROR_EXCLUDE_DIRS,
   replaceDirectoryContents,
@@ -469,7 +469,7 @@ class OpenShellSandboxBackendImpl {
       let local = root.local;
       for (const part of root.local === skillsWorkspaceDir ? ["", ...parts] : parts) {
         local = path.join(local, part);
-        const stats = await lstatIfExists(local, "ENOENT");
+        const stats = await lstatIfExists(local);
         if (!stats?.isDirectory()) {
           return null;
         }
@@ -592,7 +592,7 @@ class OpenShellSandboxBackendImpl {
     await this.ensureSandboxExists();
     await this.maybeSeedRemoteWorkspace();
     const target = this.resolveRemoteTarget(remotePath);
-    const stats = await lstatIfExists(localPath, "ENOENT");
+    const stats = await lstatIfExists(localPath);
     if (!stats || stats.isSymbolicLink()) {
       await this.removeRemotePath(remotePath, { recursive: true, ignoreMissing: true });
       return;
@@ -897,7 +897,7 @@ class OpenShellSandboxBackendImpl {
     const remoteSkillsWorkspaceDir = resolveRemoteMaterializedSkillsWorkspaceDir(
       this.params.remoteWorkspaceDir,
     );
-    const stats = await lstatIfExists(this.params.createParams.skillsWorkspaceDir, "ENOENT");
+    const stats = await lstatIfExists(this.params.createParams.skillsWorkspaceDir);
     await this.runRemoteShellScriptInternal({
       script: `${ENSURE_OPEN_SHELL_REMOTE_REAL_DIRECTORY_SCRIPT}\nfind "$1" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +`,
       args: [remoteSkillsWorkspaceDir, this.params.remoteWorkspaceDir],
@@ -1156,7 +1156,7 @@ async function removeDownloadedWorkspacePath(
   let cursor = tmpDir;
   for (const [index, part] of parts.entries()) {
     const next = path.join(cursor, part);
-    const stats = await lstatIfExists(next, "ENOENT");
+    const stats = await lstatIfExists(next);
     if (!stats) {
       return;
     }
@@ -1181,11 +1181,11 @@ async function moveLocalShadowAside(params: {
   preservedShadows: PreservedLocalShadow[];
 }): Promise<void> {
   const shadowPath = path.join(params.workspaceDir, ...params.relativeParts);
-  const parentStats = await lstatIfExists(path.dirname(shadowPath), "ENOENT");
+  const parentStats = await lstatIfExists(path.dirname(shadowPath));
   if (!parentStats?.isDirectory() || parentStats.isSymbolicLink()) {
     return;
   }
-  const shadowStats = await lstatIfExists(shadowPath, "ENOENT");
+  const shadowStats = await lstatIfExists(shadowPath);
   if (!shadowStats || shadowStats.isSymbolicLink()) {
     return;
   }
@@ -1222,7 +1222,7 @@ async function restoreLocalShadow(preserved: PreservedLocalShadow): Promise<Erro
   const { shadowPath, receipt } = preserved;
   const assertBackup = () => assertPreservedShadowIdentity(receipt);
   const parentPath = path.dirname(shadowPath);
-  const parentStats = await lstatIfExists(parentPath, "ENOENT");
+  const parentStats = await lstatIfExists(parentPath);
   if (parentStats?.isSymbolicLink()) {
     throw new Error(`Refusing to restore workspace shadow through symlink parent: ${parentPath}`);
   }

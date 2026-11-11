@@ -11,10 +11,7 @@ import { resolveConfigWidePluginMetadataSnapshot } from "../config/io.plugin-met
 import { resolveIsConfigReadOnly } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveClawHubBaseUrl } from "../infra/clawhub-client.js";
-import {
-  fetchClawHubPluginDetail,
-  fetchClawHubPluginVersionCategories,
-} from "../infra/clawhub-plugin-catalog.js";
+import { fetchClawHubPluginDetail } from "../infra/clawhub-plugin-catalog.js";
 import { resolvePluginActivationSourceConfig } from "./activation-source-config.js";
 import { resolvePendingPluginCapabilityReview } from "./capability-consent.js";
 import {
@@ -54,11 +51,12 @@ import {
   resolvePluginIconSources,
   resolvePluginActivityIconSource,
   type ManagedPluginCatalogEntry,
-  getManagedPluginCache,
   withManagedPluginCache,
   prepareCatalogEntry,
   prepareCatalogEntries,
   loadOfficialCatalog,
+  loadInstalledPluginCategories,
+  pluginVersionKey,
   normalizeKinds,
   normalizeFeaturedAt,
   firstPluginError,
@@ -96,10 +94,6 @@ import { listRecommendedToolInstalls } from "./recommended-tool-installs.js";
 import { projectPluginInstallHealth } from "./status-snapshot.js";
 
 const CLAWHUB_CATEGORY_BATCH_LIMIT = 200;
-
-function pluginVersionKey(name: string, version: string): string {
-  return JSON.stringify([name, version]);
-}
 
 function resolveManagedPluginMetadataParams(config: OpenClawConfig, env: NodeJS.ProcessEnv) {
   const workspace = resolvePluginControlPlaneWorkspace({ config, env });
@@ -226,6 +220,8 @@ export const listManagedPlugins = withManagedPluginCache(
     env?: NodeJS.ProcessEnv;
     officialCatalog?: OfficialCatalogResult;
     metadata?: PluginMetadataSnapshot;
+    /** Serve prepared remote presentation facts without waiting for enrichment. */
+    cachedCatalogOnly?: boolean;
   }): Promise<PluginsListResult> => {
     // Manifest schemas describe authored SecretRefs, not resolved runtime strings.
     // Retain the paired source before hosted catalog I/O can publish another generation.
@@ -233,16 +229,19 @@ export const listManagedPlugins = withManagedPluginCache(
     const env = params.env ?? process.env;
     const workspace = resolvePluginControlPlaneWorkspace({ config: params.config, env });
     const metadata = params.metadata ?? resolveManagedPluginMetadata(params.config, env);
-    const officialCatalog = params.officialCatalog ?? (await loadOfficialCatalog());
-    const diagnosticsEnabled = createInstalledPluginEnabledPredicate(
+    const officialCatalog =
+      params.officialCatalog ?? (await loadOfficialCatalog(params.cachedCatalogOnly));
+    const isEnabled = createInstalledPluginEnabledPredicate(
       metadata.index.plugins,
       params.config,
+      env,
     );
+    const ownership = createInstalledPluginOwnershipResolver(metadata.index, env);
     const { diagnostics: pluginDiagnostics } = projectPluginInstallHealth(
       {
         plugins: metadata.index.plugins.map((record) => {
           const manifest = metadata.byPluginId.get(record.pluginId);
-          const enabled = diagnosticsEnabled(record.pluginId);
+          const enabled = isEnabled(record.pluginId);
           return {
             id: record.pluginId,
             source: manifest?.source ?? record.source ?? record.manifestPath,
@@ -253,6 +252,7 @@ export const listManagedPlugins = withManagedPluginCache(
         diagnostics: [...metadata.diagnostics],
       },
       { metadata, config: params.config, env },
+      ownership,
     );
     // Prepare the merged entry once; display names never add install identities.
     const officialEntries = prepareCatalogEntries(officialCatalog.entries);
@@ -273,19 +273,12 @@ export const listManagedPlugins = withManagedPluginCache(
       >
     >();
     let categoryTargetCount = 0;
-    // Hosted loading can yield; prepare this phase from the current config.
-    const isEnabled = createInstalledPluginEnabledPredicate(
-      metadata.index.plugins,
-      params.config,
-      env,
-    );
-    const ownershipResolver = createInstalledPluginOwnershipResolver(metadata.index);
     const plugins = metadata.index.plugins.map((record): ManagedPluginCatalogEntry => {
       const enabled = isEnabled(record.pluginId);
       const manifest = metadata.byPluginId.get(record.pluginId);
       const localCatalog = normalizeManifestCatalog(manifest?.catalog);
-      const ownership = ownershipResolver.resolvePackage(record.pluginId);
-      const installOwner = ownership.ok ? ownership.value.installOwner : undefined;
+      const packageOwner = ownership.resolvePackage(record.pluginId);
+      const installOwner = packageOwner.ok ? packageOwner.value.installOwner : undefined;
       const installRecord = installOwner ? metadata.index.installRecords[installOwner] : undefined;
       const { entry: officialEntry, clawhubPackage } = resolveInstalledHostedOfficialEntry({
         record,
@@ -431,45 +424,30 @@ export const listManagedPlugins = withManagedPluginCache(
       }
       return plugin;
     });
-    const cache = getManagedPluginCache();
-    const categoryCache = cache.pluginVersionCategories ?? new Map();
-    cache.pluginVersionCategories = categoryCache;
     for (const [baseUrl, categoryTargets] of categoryTargetsByRegistry) {
-      try {
-        let load = categoryCache.get(baseUrl);
-        if (!load) {
-          load = fetchClawHubPluginVersionCategories({
-            baseUrl,
-            skipAuth: true,
-            packages: [...categoryTargets.values()].map((target) => target.request),
-          }).then(
-            (results) =>
-              new Map(
-                results.map(
-                  (result) =>
-                    [pluginVersionKey(result.name, result.version), result.categories] as const,
-                ),
-              ),
-          );
-          categoryCache.set(baseUrl, load);
-          void load.catch(() => {
-            if (categoryCache.get(baseUrl) === load) {
-              categoryCache.delete(baseUrl);
-            }
-          });
+      const resolved = await loadInstalledPluginCategories({
+        baseUrl,
+        packages: [...categoryTargets.values()].map((target) => target.request),
+        cachedOnly: params.cachedCatalogOnly,
+      });
+      if (!resolved) {
+        pluginDiagnostics.push({
+          level: "warn",
+          message:
+            resolved === null
+              ? "Installed plugin category enrichment unavailable; reload plugins or restart the Gateway to retry."
+              : "Installed plugin category enrichment pending; refresh the plugin list to see completed enrichment.",
+        });
+        continue;
+      }
+      for (const [key, target] of categoryTargets) {
+        const categories = resolved.get(key);
+        if (!categories?.length) {
+          continue;
         }
-        const resolved = await load;
-        for (const [key, target] of categoryTargets) {
-          const categories = resolved.get(key);
-          if (!categories?.length) {
-            continue;
-          }
-          for (const plugin of target.plugins) {
-            plugin.categories = [...categories];
-          }
+        for (const plugin of target.plugins) {
+          plugin.categories = [...categories];
         }
-      } catch {
-        // Registry metadata is optional presentation data. Installed plugins remain usable offline.
       }
     }
     const installedIds = new Set(plugins.map((plugin) => plugin.id));

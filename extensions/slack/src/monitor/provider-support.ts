@@ -25,7 +25,7 @@ type SlackSocketModeLogger = SlackSdkLogger & {
 type SlackSocketDisconnect = Awaited<ReturnType<typeof waitForSlackSocketDisconnect>>;
 
 const OPENCLAW_SLACK_CLIENT_PING_TIMEOUT_MS = 15_000;
-const OPENCLAW_SLACK_SOCKET_START_FAILED_EVENT = "unable_to_socket_mode_start";
+const SLACK_SOCKET_START_FAILED_EVENT = "unable_to_socket_mode_start";
 const SLACK_NATIVE_RECONNECT_OBSERVER_KEY = "__openclawNativeReconnectFailureObserver";
 const SLACK_SOCKET_PONG_TIMEOUT_WARNING_PREFIX = "A pong wasn't received from the server";
 const SLACK_SOCKET_PING_TIMEOUT_WARNING_PREFIX = "A ping wasn't received from the server";
@@ -110,7 +110,7 @@ function installSlackNativeReconnectFailureObserver(receiver: unknown) {
           emit.call(this, "reconnecting");
           Promise.resolve(callback.call(this)).then(resolve, (error: unknown) => {
             if (callback === Reflect.get(this, "start")) {
-              emit.call(this, OPENCLAW_SLACK_SOCKET_START_FAILED_EVENT, error);
+              emit.call(this, SLACK_SOCKET_START_FAILED_EVENT, error);
               resolve(undefined);
               return;
             }

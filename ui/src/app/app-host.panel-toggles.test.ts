@@ -8,18 +8,19 @@ import {
 } from "../components/panel-toggle-contract.ts";
 import { takeSessionPanelToggle } from "../components/session-panel-toggle-buffer.ts";
 import { createStorageMock } from "../test-helpers/storage.ts";
+import { createShellOwner } from "./app-host-solid.test-support.ts";
 import {
   createLazyElementSpec,
   resetAppHostTestGlobals,
   type TestOptionalCustomElement,
 } from "./app-host.test-support.ts";
-import "./app-host.ts";
 import { ShellChromeOwner, type ShellChromeHost } from "./app-shell-chrome.ts";
 import type { ApplicationContext } from "./context.ts";
 import type { LazyCustomElementRequestController } from "./lazy-custom-element.ts";
 import { persistLazyShellAction, readLazyShellAction } from "./lazy-shell-action.ts";
 
 type ShellPanelToggleState = {
+  element: HTMLElement;
   lazyCustomElements: LazyCustomElementRequestController;
   routeState: { routeId: string };
   runtime: { context: ApplicationContext };
@@ -36,7 +37,7 @@ function configurePanelShell(
   kind: "terminal" | "browser" = "terminal",
 ): ShellPanelToggleState {
   window.history.replaceState(null, "", "/usage");
-  const shell = document.createElement("openclaw-app-shell") as unknown as ShellPanelToggleState;
+  const shell = createShellOwner() as unknown as ShellPanelToggleState;
   if (kind === "browser") {
     shell.browserPanelElement = element;
     Object.defineProperty(window, "webkit", {
@@ -67,13 +68,8 @@ function configurePanelShell(
     configurable: true,
     get: () => Promise.resolve(true),
   });
-  // The production shell keeps panel tags mounted before definition; replay is
-  // gated on the rendered element, so the harness mounts the tag the same way.
-  Object.defineProperty(shell, "renderRoot", {
-    configurable: true,
-    get: () => shell,
-  });
-  (shell as unknown as HTMLElement).appendChild(document.createElement(element.tagName));
+  // Unported panel tags stay mounted before their modules define them.
+  shell.element.appendChild(document.createElement(element.tagName));
   return shell;
 }
 
@@ -83,6 +79,40 @@ afterEach(() => {
 });
 
 describe("OpenClaw shell panel toggles", () => {
+  it.each(["pending", "closed"] as const)(
+    "does not toggle a %s cold palette on a held shortcut",
+    (phase) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+      const shell = configurePanelShell(createLazyElementSpec("held shortcut terminal"));
+      // Hold the real lazy owner at its loading boundary, without importing the palette.
+      const lazy = {
+        ...createLazyElementSpec("held shortcut palette"),
+        loadModule: () => new Promise<void>(() => {}),
+      };
+      Object.defineProperty(shell, "commandPaletteElement", { configurable: true, value: lazy });
+      const owner = chromeOwner(shell);
+      const chord = (repeat = false) =>
+        new KeyboardEvent("keydown", {
+          key: "k",
+          code: "KeyK",
+          ctrlKey: true,
+          cancelable: true,
+          repeat,
+        });
+      owner.handleDocumentKeydown(chord());
+      expect(owner.commandPaletteLoading.active).toBe(true);
+      if (phase === "closed") {
+        owner.handleDocumentKeydown(chord());
+        expect(owner.commandPaletteLoading.active).toBe(false);
+      }
+      const repeated = chord(true);
+      owner.handleDocumentKeydown(repeated);
+      expect(repeated.defaultPrevented).toBe(true);
+      expect(owner.commandPaletteLoading.active).toBe(phase === "pending");
+      owner.abandonPendingLazyActionForContext();
+    },
+  );
+
   it("captures the terminal chord once before a consuming target", async () => {
     const element = createLazyElementSpec("keyboard terminal");
     const owner = chromeOwner(configurePanelShell(element));
@@ -154,7 +184,7 @@ describe("OpenClaw shell panel toggles", () => {
 
   it("buffers panel toggle events until the active chat pane mounts", () => {
     const terminalElement = createLazyElementSpec("session terminal panel");
-    const shell = document.createElement("openclaw-app-shell") as unknown as ShellPanelToggleState;
+    const shell = createShellOwner() as unknown as ShellPanelToggleState;
     shell.terminalPanelElement = terminalElement;
     shell.routeState = { routeId: "chat" };
 

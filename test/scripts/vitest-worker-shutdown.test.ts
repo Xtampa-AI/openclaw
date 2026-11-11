@@ -91,12 +91,9 @@ it
   "$route wrapper joins $phase work before honoring $shutdownSignal",
   ({ route, phase, shutdownSignal }, { workerArtifacts, signal, onTestFinished }) =>
     workerArtifacts.fixtureLifetime.run(async () => {
+      // Canceling the sole CI compiler still rejects disposal; settled signals retain their status.
       const expectedExitCode =
-        route.startsWith("ci") && phase !== "deletion"
-          ? 1
-          : shutdownSignal === "SIGINT"
-            ? 130
-            : 143;
+        route === "ci" && phase === "compilation" ? 1 : shutdownSignal === "SIGINT" ? 130 : 143;
       const root = workerArtifacts.fixtureDirectory();
       const input = writeFixture(root, "input", "owned verification input");
       const released = path.join(root, "release");
@@ -293,37 +290,44 @@ syncFixtureBuiltinExports(["node:child_process", "node:fs", "node:fs/promises"])
       const command = workerArtifacts.fixtureLifetime.track(
         runNodeScript(
           args,
-          preparedScriptWrapperEnv(preparedModules, {
-            PATH: process.env.PATH,
-            HOME: root,
-            USERPROFILE: root,
-            TMPDIR: root,
-            TMP: root,
-            TEMP: root,
-            ...(route.startsWith("ci")
-              ? {
-                  OPENCLAW_VITEST_MAX_WORKERS: "3",
-                  RAYON_NUM_THREADS: "",
-                  TOKIO_WORKER_THREADS: "",
-                  OPENCLAW_NODE_TEST_GROUPS_JSON: JSON.stringify(
-                    ["ci-shutdown", ...(route === "ci-shared" ? ["ci-held"] : [])].map(
-                      (shard_name) => ({
-                        configs: ["test/vitest/vitest.tooling.config.ts"],
-                        includePatterns: ["test/scripts/vitest-worker-shutdown.test.ts"],
-                        shard_name,
-                        env: { OPENCLAW_VITEST_MAX_WORKERS: shard_name === "ci-held" ? "1" : "2" },
-                      }),
+          preparedScriptWrapperEnv(
+            preparedModules,
+            {
+              PATH: process.env.PATH,
+              HOME: root,
+              USERPROFILE: root,
+              TMPDIR: root,
+              TMP: root,
+              TEMP: root,
+              ...(route.startsWith("ci")
+                ? {
+                    OPENCLAW_VITEST_MAX_WORKERS: "3",
+                    RAYON_NUM_THREADS: "",
+                    TOKIO_WORKER_THREADS: "",
+                    OPENCLAW_NODE_TEST_GROUPS_JSON: JSON.stringify(
+                      ["ci-shutdown", ...(route === "ci-shared" ? ["ci-held"] : [])].map(
+                        (shard_name) => ({
+                          configs: ["test/vitest/vitest.tooling.config.ts"],
+                          includePatterns: ["test/scripts/vitest-worker-shutdown.test.ts"],
+                          shard_name,
+                          env: {
+                            OPENCLAW_VITEST_MAX_WORKERS: shard_name === "ci-held" ? "1" : "2",
+                          },
+                        }),
+                      ),
                     ),
-                  ),
-                  OPENCLAW_NODE_TEST_GROUPS_GZIP_BASE64: "",
-                  OPENCLAW_NODE_TEST_TARGETS_JSON: "[]",
-                  OPENCLAW_NODE_TEST_VITEST_ARGS_JSON: "[]",
-                  OPENCLAW_NODE_TEST_PLAN_CONCURRENCY: route === "ci-shared" ? "2" : "1",
-                }
-              : {}),
-            // runNodeScript owns every wrapper route, so its fixture preload is always a Node import.
-            ...fixturePreloadEnv(preload, "node"),
-          }),
+                    OPENCLAW_NODE_TEST_GROUPS_GZIP_BASE64: "",
+                    OPENCLAW_NODE_TEST_TARGETS_JSON: "[]",
+                    OPENCLAW_NODE_TEST_VITEST_ARGS_JSON: "[]",
+                    OPENCLAW_NODE_TEST_PLAN_CONCURRENCY: route === "ci-shared" ? "2" : "1",
+                  }
+                : {}),
+              // runNodeScript owns every wrapper route, so its fixture preload is always a Node import.
+              ...fixturePreloadEnv(preload, "node"),
+            },
+            [],
+            path.join(root, "prepared-wrapper-preload.mjs"),
+          ),
           20_000,
           {
             cwd: repoRoot,
@@ -342,11 +346,22 @@ syncFixtureBuiltinExports(["node:child_process", "node:fs", "node:fs/promises"])
         withinTest(
           Promise.race([
             receipts.waitFor(filename, "ready"),
-            command.then(() => {
+            command.then((result) => {
               // Publication precedes the receipt and command completion, but their
               // separate transports can deliver command completion first.
               if (!fs.existsSync(filename) || fs.statSync(filename).size === 0) {
-                throw new Error(`Missing shutdown receipt: ${filename}`);
+                throw new Error(
+                  [
+                    `Missing shutdown receipt: ${filename}`,
+                    JSON.stringify({
+                      error: result.error instanceof Error ? result.error.message : result.error,
+                      status: result.status,
+                      signal: result.signal,
+                      launchDiagnostics: result.launchDiagnostics,
+                      stderr: result.stderr.slice(-4096),
+                    }),
+                  ].join("; "),
+                );
               }
             }),
           ]),
@@ -569,7 +584,7 @@ it("rejects a live borrower when its owner closes during verification", ({
           throw new Error("Borrower exited before verification was held");
         }),
       ]);
-      expect(controlled.read()).toMatchObject([{ directory, inputs: 2, outputs: 2 }]);
+      expect(controlled.read()).toMatchObject([{ directory, inputs: 3, outputs: 3 }]);
       let disposed = false;
       const disposal = workerArtifacts.fixtureLifetime.track(
         owner.dispose().then(() => {

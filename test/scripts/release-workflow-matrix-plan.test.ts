@@ -10,6 +10,7 @@ import { resolveDockerE2ePlan } from "../../scripts/lib/docker-e2e-plan.mts";
 import { allReleasePathLanes } from "../../scripts/lib/docker-e2e-scenarios.mts";
 import { createPluginPrereleaseTestPlan } from "../../scripts/lib/plugin-prerelease-test-plan.mts";
 import {
+  createReleaseCheckSelection,
   createReleaseSourceSelection,
   createReleaseWorkflowMatrixPlan,
 } from "../../scripts/plan-release-workflow-matrix.mjs";
@@ -69,6 +70,21 @@ type WorkflowDocument = {
 
 function requiredJob(definition: WorkflowDocument, name: string): WorkflowJob {
   return expectDefined(definition.jobs[name], `release workflow job ${name}`);
+}
+
+function requiredStep(job: WorkflowJob, name: string): WorkflowStep {
+  return expectDefined(
+    job.steps.find((step) => step.name === name),
+    name,
+  );
+}
+
+function bashRun(command: string, env: NodeJS.ProcessEnv, cwd?: string) {
+  return spawnSync("bash", ["--noprofile", "--norc", "-c", command], {
+    encoding: "utf8",
+    env,
+    cwd,
+  });
 }
 
 // Direct dispatches build from the selected ref. Only trusted workflow callers
@@ -137,6 +153,37 @@ const PROFILE_EXPECTATIONS = [
     liveModelProviders: ["anthropic", "google", "minimax", "openai"],
   },
 ];
+
+describe("Windows node release-check selection", () => {
+  it.each([
+    ["all", "all", true],
+    ["all", "candidate", true],
+    ["all", "independent", false],
+    ["windows-node", "all", true],
+    ["windows-node", "candidate", true],
+    ["windows-node", "independent", false],
+    ["cross-os", "candidate", false],
+  ])("schedules %s/%s only with candidate execution", (rerunGroup, phase, scheduled) => {
+    const selected = createReleaseCheckSelection({ rerunGroup, phase });
+    expect(selected.windows_node_scheduled).toBe(scheduled);
+    if (scheduled) {
+      expect(selected.package_required).toBe(true);
+      expect(JSON.parse(selected.release_check_groups_json)).toContain("windows-node");
+    }
+    if (rerunGroup === "windows-node") {
+      expect(selected).toMatchObject({
+        package_required: scheduled,
+        cross_os_scheduled: false,
+        package_acceptance_scheduled: false,
+        docker_required: false,
+        install_smoke_scheduled: false,
+        live_e2e_scheduled: false,
+        qa_parity_scheduled: false,
+        qa_live_scheduled: false,
+      });
+    }
+  });
+});
 
 describe("scripts/plan-release-workflow-matrix.mjs", () => {
   it.each([{ input: "", profile: "stable" }])(
@@ -263,6 +310,91 @@ describe("scripts/plan-release-workflow-matrix.mjs", () => {
       ).not.toContain("openwebui");
     },
   );
+
+  it.each(["beta", "minimum", "stable", "full"])(
+    "selects prompt-cache checks by default and for focused %s validation",
+    (releaseProfile) => {
+      const job = requiredJob(workflow(), "validate_release_live_cache");
+      expect(job["timeout-minutes"]).toBe(30);
+      const condition = expectDefined(job.if, "live-cache job selection");
+      for (const [liveSuiteFilter, enabled] of [
+        ["", true],
+        ["live-cache", true],
+        ["docker-live-models", false],
+      ] as const) {
+        expect(
+          runInNewContext(condition, {
+            inputs: {
+              prepare_only: false,
+              include_live_suites: true,
+              live_models_only: false,
+              live_suite_filter: liveSuiteFilter,
+              release_test_profile: releaseProfile,
+            },
+          }),
+        ).toBe(enabled);
+      }
+      expect(job.steps.map((step) => step.name)).toEqual(
+        expect.arrayContaining([
+          "Verify live prompt cache floors",
+          "Verify live prompt prefix reuse",
+          "Verify live agent prompt prefix reuse",
+        ]),
+      );
+    },
+  );
+
+  it.each([
+    [
+      "Verify live prompt prefix reuse",
+      "--import ./scripts/tsx.mjs scripts/e2e/anthropic-cache-live.mts",
+    ],
+    [
+      "Verify live agent prompt prefix reuse",
+      "test:live src/agents/embedded-agent-runner.cache.live.test.ts --testNamePattern release prompt-prefix gate --reporter=default --reporter=json --outputFile.json=.artifacts/live-cache/agent-prefix-reuse.vitest.json",
+    ],
+  ])("propagates harness results from %s to the release gate", (stepName, args) => {
+    const job = requiredJob(workflow(), "validate_release_live_cache");
+    const step = expectDefined(
+      job.steps.find((entry) => entry.name === stepName),
+      "prompt-prefix step",
+    );
+    for (const code of [0, 23]) {
+      const cwd = tempDirs.make("openclaw-live-cache-shell-replay-");
+      const result = bashRun(
+        `timeout() { while [[ "$1" == --* ]]; do shift; done; shift; "$@"; }
+node() { printf '%s\\n' "$*"; return "$HARNESS_EXIT"; }
+pnpm() { node "$@"; }
+${expectDefined(step.run, "prompt-prefix command")}`,
+        { PATH: process.env.PATH, HARNESS_EXIT: String(code) },
+        cwd,
+      );
+      expect(result.stdout.trim()).toBe(args);
+      expect(result.status, result.stderr).toBe(code);
+    }
+    expect(step["continue-on-error"]).not.toBe(true);
+  });
+
+  it("retains exact-candidate live cache diagnostics on failure", () => {
+    const job = requiredJob(workflow(), "validate_release_live_cache");
+    expect(requiredStep(job, "Verify live prompt cache floors").run).toContain(
+      "cache-floors.vitest.json",
+    );
+    expect(requiredStep(job, "Verify live agent prompt prefix reuse").run).toContain(
+      "agent-prefix-reuse.vitest.json",
+    );
+    const upload = requiredStep(job, "Upload live cache diagnostics");
+    expect(upload).toMatchObject({
+      if: "always()",
+      uses: "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+      with: {
+        name: "live-cache-${{ needs.validate_selected_ref.outputs.selected_sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+        path: ".artifacts/live-cache/",
+        "retention-days": 14,
+        "if-no-files-found": "warn",
+      },
+    });
+  });
 
   it.each([
     ["validate_docker_e2e", "Run Docker E2E chunk"],

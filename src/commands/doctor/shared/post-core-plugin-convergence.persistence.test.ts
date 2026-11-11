@@ -12,7 +12,7 @@ import { commitPluginInstallRecordsWithConfig } from "../../../plugins/install-r
 import * as pluginInstaller from "../../../plugins/install.js";
 import {
   loadInstalledPluginIndexInstallRecords,
-  readPersistedInstalledPluginIndexInstallRecords,
+  readPersistedInstalledPluginIndexInstallRecordsAsync,
 } from "../../../plugins/installed-plugin-index-records.js";
 import { resolveRetainedManagedNpmInstallMarkerPath } from "../../../plugins/managed-npm-retention.js";
 import { withPluginLifecycleLease } from "../../../plugins/plugin-lifecycle-lease.js";
@@ -210,7 +210,9 @@ describe("post-core plugin persistence cancellation", () => {
       rmSpy.mockRestore();
       expect(restoredRow).toBeDefined();
       expect(readPersistedInstalledPluginIndexRowSync({ env: state.env })).toEqual(restoredRow);
-      expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual(records);
+      expect(
+        await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+      ).toEqual(records);
       expect(fs.existsSync(firstMarker)).toBe(false);
       expect(fs.existsSync(secondMarker)).toBe(true);
       expect(fs.readFileSync(state.configPath, "utf8")).toBe(configBefore);
@@ -234,6 +236,7 @@ describe("post-core plugin persistence cancellation", () => {
       await cleanupGatewayRetiredPluginArtifacts({
         log,
         startupInstallPaths: [],
+        startupConfig: {},
         signal: new AbortController().signal,
         assertCurrent: () => {},
       });
@@ -270,7 +273,9 @@ describe("post-core plugin persistence cancellation", () => {
         controller.abort(refusal);
         await expect(repair).rejects.toBe(refusal);
       });
-      expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual(previous);
+      expect(
+        await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+      ).toEqual(previous);
     });
   });
 
@@ -325,7 +330,9 @@ describe("post-core plugin persistence cancellation", () => {
         },
       });
       await expect(repair).rejects.toBe(refusal);
-      expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual({});
+      expect(
+        await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+      ).toEqual({});
     });
   });
 

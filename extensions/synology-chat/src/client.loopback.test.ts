@@ -26,19 +26,6 @@ vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => ({
 
 const USER_LIST_RESPONSE_MAX_BYTES = 1 * 1024 * 1024;
 
-function readForm(req: http.IncomingMessage, done: (payload: string | null) => void) {
-  let body = "";
-  req.setEncoding("utf8");
-  req.on("data", (chunk: string) => {
-    body += chunk;
-  });
-  req.on("end", () => done(new URLSearchParams(body).get("payload")));
-}
-
-function config(incomingUrl: string, token = "loopback-token") {
-  return { channels: { "synology-chat": { enabled: true, token, incomingUrl } } };
-}
-
 describe("Synology Chat client loopback", () => {
   let server: http.Server | undefined;
 
@@ -348,7 +335,8 @@ describe("Synology Chat client loopback", () => {
     async ({ text, media, missingChunk, ids }) => {
       let requestCount = 0;
       const port = await listenLoopback((req, res) => {
-        readForm(req, () => {
+        req.resume();
+        req.on("end", () => {
           const index = requestCount++;
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -365,7 +353,15 @@ describe("Synology Chat client loopback", () => {
           );
         });
       });
-      const cfg = config(`http://127.0.0.1:${port}/incoming`);
+      const cfg = {
+        channels: {
+          "synology-chat": {
+            enabled: true,
+            token: "synology-receipt-proof",
+            incomingUrl: "http://127.0.0.1:" + port + "/incoming",
+          },
+        },
+      };
       const context = { cfg, text, to: "123456" };
       const result = media
         ? await synologyChatPlugin.message.send?.media?.({

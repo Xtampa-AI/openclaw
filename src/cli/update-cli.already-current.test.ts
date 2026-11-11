@@ -7,6 +7,7 @@ import { resolveConfigPath } from "../config/paths.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import * as serviceMembership from "../daemon/service-process-membership.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
+import * as versionManagerPath from "../shared/version-manager-path.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { VERSION } from "../version.js";
 import {
@@ -176,7 +177,12 @@ describe("update-cli", () => {
           new ExitError(1),
         );
         expect(serviceStop).toHaveBeenCalledTimes(failure === "changed owner" ? 0 : 1);
-        expect(freshRestartCalls()).toHaveLength(0);
+        // The native stop mutation precedes the failed listener check; recovery must start it.
+        expect(freshRestartCalls()).toHaveLength(failure === "stop" ? 1 : 0);
+        if (failure === "stop") {
+          expect(freshRestartCalls()[0]?.[0]).toContain("--preserve-definition");
+        }
+        expect(packageInstallCommandCall()).toBeUndefined();
         expect(lastWriteJsonCall()).toMatchObject({
           status: "error",
           reason: "post-update-plugins",
@@ -185,19 +191,14 @@ describe("update-cli", () => {
             : {
                 run: {
                   verification: {
-                    recovery: {
-                      serviceRestartSafe: false,
-                      reason: "runtime-verification-failed",
-                    },
+                    serviceRunning: true,
+                    readyz: true,
+                    settled: true,
+                    recovery: { serviceRestartSafe: true, service: "healthy" },
                   },
                 },
               }),
         });
-        if (failure === "stop") {
-          // Failed restoration publishes its refusal, not an unobserved runtime state.
-          expect(lastWriteJsonCall()).not.toHaveProperty("run.verification.serviceRunning");
-          expect(JSON.stringify(lastWriteJsonCall())).toContain("listener check failed after stop");
-        }
         return;
       }
       await updateCommand({ yes: true, restart: true, json: true });
@@ -278,8 +279,8 @@ describe("update-cli", () => {
 
   it("refuses a current Git core with an incompatible before-only version receipt", async () => {
     runtimeRecovery.stubNodeRuntime();
-    // This case specifies native system-runtime guidance, not container deployment.
-    runtimeRecovery.mockNonContainerSystemRuntime();
+    // This case specifies system-runtime guidance, independent of the host Node manager.
+    vi.spyOn(versionManagerPath, "resolveNodeVersionManager").mockReturnValue("system");
     const fixture = runtimeRecovery.currentGitCoreFixture(process.cwd(), VERSION);
     readPackageVersion.mockResolvedValue(VERSION);
     vi.mocked(updateGitCheckout).mockResolvedValueOnce(fixture.outcome);

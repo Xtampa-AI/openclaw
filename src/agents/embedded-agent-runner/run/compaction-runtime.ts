@@ -1,5 +1,9 @@
+import path from "node:path";
 import { acknowledgeReplySessionTransition } from "../../../auto-reply/reply/reply-run-registry.state.js";
-import { loadSessionEntry } from "../../../config/sessions/session-accessor.js";
+import {
+  captureSessionActorStorageOwner,
+  readCapturedSessionActorEntry,
+} from "../../../config/sessions/session-actor-storage-binding.js";
 import { captureSessionEntrySourceAssertion } from "../../../config/sessions/session-entry-source-authority.js";
 import { composeSessionSourceAssertion } from "../../../config/sessions/session-source-authority.js";
 import {
@@ -16,6 +20,7 @@ import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js
 import { retireSessionMcpRuntime } from "../../agent-bundle-mcp-manager-api.js";
 import { listActiveProcessSessionReferences } from "../../bash-process-references.js";
 import { resolveProcessToolScopeKey } from "../../bash-process-scope.js";
+import { resolveModelCallUrgency } from "../../run-trigger.js";
 import { SessionManager } from "../../sessions/session-manager.js";
 import { buildEmbeddedCompactionRuntimeContext } from "../compaction-runtime-context.js";
 import {
@@ -95,7 +100,8 @@ export async function compactEmbeddedRunForRecovery(
   const requestFromEntryId =
     requestAdmission?.agentId === input.sessionAgentId &&
     requestAdmission.sessionKey === input.resolvedSessionKey &&
-    requestAdmission.storePath === activeSession.target?.storePath
+    activeSession.target?.storePath !== undefined &&
+    path.resolve(requestAdmission.storePath) === path.resolve(activeSession.target.storePath)
       ? requestAdmission.entryId
       : undefined;
   const promptCacheIdentity = {
@@ -111,6 +117,7 @@ export async function compactEmbeddedRunForRecovery(
     ...buildEmbeddedCompactionRuntimeContext(
       {
         ...runParams,
+        modelCallUrgency: resolveModelCallUrgency(runParams),
         authProfileId: input.modelSelection.authProfileId,
         authProfileIdSource: input.modelSelection.authProfileIdSource,
         runtimeAuthPlan: input.runtimeAuthPlan,
@@ -160,7 +167,7 @@ export async function compactEmbeddedRunForRecovery(
     sessionId: activeSession.id,
     sessionKey: input.resolvedSessionKey,
     agentId: input.sessionAgentId,
-    sessionTarget: buildContextEngineCompactionSessionTarget({
+    sessionTarget: await buildContextEngineCompactionSessionTarget({
       agentId: input.sessionAgentId,
       config: runParams.config,
       sessionFile: activeSession.file,
@@ -291,6 +298,17 @@ export function createEmbeddedRunCompactionRuntime(input: {
       ? params.sessionManager
       : undefined;
   const detached = params.sessionPersistence === "detached";
+  const initialTarget = sessionPromptState.sessionTarget;
+  const incognito =
+    !memoryManager && !detached && initialTarget
+      ? captureSessionActorStorageOwner(initialTarget, {
+          assertCurrent() {
+            abortSignal?.throwIfAborted();
+            admittedAssertion?.();
+          },
+          authorize() {},
+        })
+      : undefined;
   const assertAdmittedActive = composeSessionSourceAssertion(
     [admittedAssertion],
     (assertSource) => {
@@ -311,23 +329,27 @@ export function createEmbeddedRunCompactionRuntime(input: {
     if (memoryManager || detached) {
       return;
     }
-    const entry =
-      target?.sessionKey && target.storePath
-        ? loadSessionEntry({
-            agentId: target.agentId,
-            sessionKey: target.sessionKey,
-            storePath: target.storePath,
-            readConsistency: "latest",
-          })
-        : undefined;
     if (
-      !writerFence ||
-      writerFence.expectedWriterRunId !== runId ||
-      entry?.sessionId !== sessionId ||
-      entry.lifecycleRevision !== writerFence.expectedLifecycleRevision ||
-      entry.activeWriterRunId !== writerFence.expectedWriterRunId
+      incognito &&
+      (target?.agentId !== initialTarget?.agentId || target?.storePath !== initialTarget?.storePath)
     ) {
       throw new SessionTranscriptWriterClaimReboundError();
+    }
+    if (!writerFence || writerFence.expectedWriterRunId !== runId) {
+      throw new SessionTranscriptWriterClaimReboundError();
+    }
+    if (incognito) {
+      const entry =
+        target?.sessionKey && target.storePath
+          ? readCapturedSessionActorEntry(incognito, target.sessionKey)
+          : undefined;
+      if (
+        entry?.sessionId !== sessionId ||
+        entry.lifecycleRevision !== writerFence.expectedLifecycleRevision ||
+        entry.activeWriterRunId !== writerFence.expectedWriterRunId
+      ) {
+        throw new SessionTranscriptWriterClaimReboundError();
+      }
     }
   };
   const assertRecoveryActive = () => assertRecoveryTarget(sessionPromptState.sessionTarget);

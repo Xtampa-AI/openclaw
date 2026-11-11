@@ -6,8 +6,13 @@ import { resolveControlUiAssetHealth } from "./control-ui-assets.js";
 import { hasErrnoCode } from "./errno.js";
 import { formatErrorMessage } from "./errors.js";
 import { readPackageManagerSpec } from "./package-json.js";
-import { DEV_BRANCH, resolveDevUpstreamRefs } from "./update-channels.js";
+import { DEV_BRANCH } from "./update-channels.js";
 import { resolveDevUpdateTargetRevision, type DevUpdateTarget } from "./update-dev-target.js";
+import {
+  resolveGitUpdateTrackingRef,
+  readGitTargetSchemaVersions,
+  type GitFetchTarget,
+} from "./update-git-metadata.js";
 import {
   parsePnpmPackageManagerVersion,
   resolveUpdateBuildManager,
@@ -123,6 +128,7 @@ async function resolveUpstreamCandidates(params: {
   gitRoot: string;
   needsCheckoutMain: boolean;
   refreshedRemotes: readonly string[];
+  devSource?: GitFetchTarget & { revision?: string };
   step: StepFactory;
 }): Promise<
   | {
@@ -136,50 +142,30 @@ async function resolveUpstreamCandidates(params: {
 > {
   const step = createGitStepFactory(params.gitRoot, params.step);
   let localDevBranchExists: boolean | null = null;
-  let remoteBranchRefs: string[] = [];
   if (params.needsCheckoutMain) {
     const localMainStep = await runStep(
       step("git-show-branch", "show-ref", "--verify", `refs/heads/${DEV_BRANCH}`),
     );
     localDevBranchExists = localMainStep.exitCode === 0;
   }
-  if (params.needsCheckoutMain && localDevBranchExists === false) {
-    remoteBranchRefs = params.refreshedRemotes.map(
-      (remote) => `refs/remotes/${remote}/${DEV_BRANCH}`,
-    );
+  const readGit = async (...args: string[]) => {
+    const result = await runStep(step("upstream-check", ...args));
+    return !isFailedUpdateStep(result) ? result.stdoutTail?.trim() || null : null;
+  };
+  const source = params.devSource;
+  if (!source || (source.remote !== "." && !params.refreshedRemotes.includes(source.remote))) {
+    return { status: "skipped", reason: "no-upstream" };
   }
-  const upstreamRefs = resolveDevUpstreamRefs(params.needsCheckoutMain, remoteBranchRefs);
-  let upstreamSha: string | null = null;
-  let selectedDevUpstream: string | null = null;
-  let sawResolvableUpstreamRef = false;
-  for (const upstreamRef of upstreamRefs) {
-    let resolvedUpstreamRef = upstreamRef;
-    if (upstreamRef.endsWith("@{upstream}")) {
-      const upstreamStep = await runStep(
-        step("upstream-check", "rev-parse", "--symbolic-full-name", upstreamRef),
-      );
-      if (isFailedUpdateStep(upstreamStep)) {
-        continue;
-      }
-      sawResolvableUpstreamRef = true;
-      resolvedUpstreamRef = upstreamStep.stdoutTail?.trim() ?? upstreamRef;
-    }
-    const shaStep = await runStep(step("git-resolve-upstream", "rev-parse", upstreamRef));
-    const sha = shaStep.stdoutTail?.trim();
-    if (!isFailedUpdateStep(shaStep) && sha) {
-      upstreamSha = sha;
-      selectedDevUpstream = /^refs\/remotes\/(.+)$/u.exec(resolvedUpstreamRef)?.[1] ?? null;
-      break;
-    }
-    if (!isFailedUpdateStep(shaStep)) {
-      sawResolvableUpstreamRef = true;
-    }
+  const upstreamRef = await resolveGitUpdateTrackingRef(readGit, DEV_BRANCH, source);
+  if (!upstreamRef) {
+    return { status: "skipped", reason: "no-upstream" };
   }
+  const upstreamSha = await readGit("rev-parse", "--verify", `${upstreamRef}^{commit}`);
   if (!upstreamSha) {
-    return sawResolvableUpstreamRef
-      ? { status: "error", reason: "no-upstream-sha" }
-      : { status: "skipped", reason: "no-upstream" };
+    return { status: "error", reason: "no-upstream-sha" };
   }
+  // Local branches are operator state, not remote cache refs to publish after admission.
+  const selectedDevUpstream = upstreamRef.startsWith("refs/heads/") ? null : upstreamRef;
   const revListStep = await runStep(
     step("git-rev-list", "rev-list", `--max-count=${PREFLIGHT_MAX_COMMITS}`, upstreamSha),
   );
@@ -410,7 +396,7 @@ async function testPreflightCandidate(
     // the resulting candidate only after that preparation finishes.
     await params.prepareGitExposure?.(params.worktreeDir, candidateSha, candidateCommand.env);
     await candidateCommand.restoreWorkspace?.();
-    await params.validateCandidate(params.worktreeDir);
+    params.steps.push(...((await params.validateCandidate(params.worktreeDir)) ?? []));
     // Activation checks out candidateSha and promotes only generated runtime paths.
     // Check after repair so validated source edits cannot disappear at activation.
     const { result: cleanCheck } = await runGitCleanCheckStep(
@@ -448,6 +434,7 @@ export async function runGitCandidatePreflight(params: {
   artifactRoot: string;
   devTarget?: DevUpdateTarget;
   refreshedRemotes: readonly string[];
+  devSource?: GitFetchTarget & { revision?: string };
   targetRevision?: string;
   beforeSha?: string | null;
   referenceSource?: {
@@ -498,7 +485,6 @@ export async function runGitCandidatePreflight(params: {
   const devTargetRef = params.devTarget
     ? normalizeNullableString(resolveDevUpdateTargetRevision(params.devTarget))
     : null;
-  let preflightBaseSha: string;
   let candidates: string[];
   let selectedDevUpstream: string | null = null;
   let localDevBranchExists: boolean | null = null;
@@ -513,14 +499,12 @@ export async function runGitCandidatePreflight(params: {
     if (result.code !== 0 || !result.stdout.trim()) {
       return { status: "error", reason: "no-target-sha" };
     }
-    preflightBaseSha = result.stdout.trim();
-    candidates = [preflightBaseSha];
+    candidates = [result.stdout.trim()];
   } else if (devTargetRef) {
     const targetSha = await resolveExplicitTarget({ ...params, devTargetRef });
     if (!targetSha) {
       return { status: "error", reason: "no-target-sha" };
     }
-    preflightBaseSha = targetSha;
     candidates = [targetSha];
     if (params.devTarget?.mode === "tracked") {
       const ancestryStep = await runStep(
@@ -529,7 +513,7 @@ export async function runGitCandidatePreflight(params: {
           "merge-base",
           "--is-ancestor",
           targetSha,
-          `${params.devTarget.upstreamRef}^{commit}`,
+          `${params.devSource?.revision ?? params.devTarget.upstreamRef}^{commit}`,
         ),
       );
       if (isFailedUpdateStep(ancestryStep)) {
@@ -541,7 +525,6 @@ export async function runGitCandidatePreflight(params: {
     if (upstream.status !== "ok") {
       return upstream;
     }
-    preflightBaseSha = upstream.sha;
     candidates = upstream.candidates;
     selectedDevUpstream = upstream.selectedDevUpstream;
     localDevBranchExists = upstream.localDevBranchExists;
@@ -551,6 +534,59 @@ export async function runGitCandidatePreflight(params: {
   // Source identity alone cannot prove the installed build is complete.
   const canSkipActivation =
     !params.referenceSource && !params.prepareGitExposure && params.beforeRuntimeVerified;
+  const rebaseFrom = params.referenceSource
+    ? params.referenceSource.branch === DEV_BRANCH
+      ? undefined
+      : (params.beforeSha ?? undefined)
+    : !params.targetRevision && !params.devTarget && localDevBranchExists !== false
+      ? params.needsCheckoutMain
+        ? DEV_BRANCH
+        : (params.beforeSha ?? undefined)
+      : undefined;
+
+  const checkNodeRuntime = async (sha: string) => {
+    if (params.referenceSource || (canSkipActivation && sha === params.beforeSha)) {
+      return true;
+    }
+    // A local rebase can change the manifest; its final runtime check owns that result.
+    if (
+      rebaseFrom &&
+      (
+        await params.runCommand(
+          ["git", "-C", params.gitRoot, "merge-base", "--is-ancestor", rebaseFrom, sha],
+          { cwd: params.gitRoot, timeoutMs: params.timeoutMs },
+        )
+      ).code !== 0
+    ) {
+      return true;
+    }
+    const target = await readGitTargetSchemaVersions({
+      ...params,
+      root: params.gitRoot,
+      revision: sha,
+    });
+    if (target.status !== "ok") {
+      return true;
+    }
+    const runtime = await prepareGitCandidateNodeRuntime(
+      params.artifactRoot,
+      params.defaultCommandEnv,
+      "package-tooling",
+      target.nodeEngine,
+    );
+    if (!runtime.step) {
+      return true;
+    }
+    params.steps.push(runtime.step);
+    return false;
+  };
+  while (candidates.length > 0 && !(await checkNodeRuntime(candidates[0]!))) {
+    candidates.shift();
+  }
+  if (candidates.length === 0) {
+    return { status: "error", reason: "preflight-node-runtime-incompatible" };
+  }
+  const preflightBaseSha = candidates[0]!;
   if (canSkipActivation && preflightBaseSha === params.beforeSha) {
     return { status: "skipped", reason: "already-current" };
   }
@@ -561,15 +597,6 @@ export async function runGitCandidatePreflight(params: {
       return { status: "error", reason: admission.failureReason };
     }
   }
-  const rebaseFrom = params.referenceSource
-    ? params.referenceSource.branch === DEV_BRANCH
-      ? undefined
-      : (params.beforeSha ?? undefined)
-    : !params.targetRevision && !params.devTarget && localDevBranchExists !== false
-      ? params.needsCheckoutMain
-        ? DEV_BRANCH
-        : (params.beforeSha ?? undefined)
-      : undefined;
 
   // Worktree checkout can execute filters, and subsequent checks run target code.
   // Admit its metadata before either operation, then admit each distinct fallback.
@@ -606,6 +633,9 @@ export async function runGitCandidatePreflight(params: {
         return { status: "skipped", reason: "already-current" };
       }
       if (sha !== preflightBaseSha) {
+        if (!(await checkNodeRuntime(sha))) {
+          continue;
+        }
         await params.beforeCandidate(sha);
       }
       const candidate = await testPreflightCandidate({

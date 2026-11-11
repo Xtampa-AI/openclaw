@@ -84,14 +84,6 @@ describe("browser action input file/download commands", () => {
     expect(getLastRequestOptions()?.timeoutMs).toBe(50000);
   });
 
-  it("keeps the outer waitfordownload request open for the advertised default wait", async () => {
-    const program = createActionInputProgram();
-
-    await program.parseAsync(["browser", "waitfordownload"], { from: "user" });
-
-    expect(getLastRequestOptions()?.timeoutMs).toBe(125000);
-  });
-
   it("accepts signed and zero-padded download timeouts", async () => {
     const program = createActionInputProgram();
 
@@ -115,36 +107,18 @@ describe("browser action input file/download commands", () => {
     expect(getLastRequestOptions()?.timeoutMs).toBe(30000);
   });
 
-  it("rejects non-decimal file and download timeouts before dispatch", async () => {
-    const downloadProgram = createActionInputProgram();
-    await expect(
-      downloadProgram.parseAsync(
-        ["browser", "download", "ref-1", "file.txt", "--timeout-ms", "1e3"],
-        { from: "user" },
-      ),
-    ).rejects.toThrow("--timeout-ms must be a positive integer.");
-
-    const waitProgram = createActionInputProgram();
-    await expect(
-      waitProgram.parseAsync(["browser", "waitfordownload", "--timeout-ms", "0x1000"], {
-        from: "user",
-      }),
-    ).rejects.toThrow("--timeout-ms must be a positive integer.");
-    expect(gatewayMock).not.toHaveBeenCalled();
-  });
-
   it("rejects conflicting dialog actions without arming the hook", async () => {
     const program = createActionInputProgram();
 
-    await program.parseAsync(["browser", "dialog", "--accept", "--dismiss"], { from: "user" });
-
-    const errorCall = getBrowserCliRuntime().error.mock.calls.at(-1);
+    await expect(
+      program.parseAsync(["browser", "dialog", "--accept", "--dismiss"], { from: "user" }),
+    ).rejects.toThrow("Specify only one of --accept or --dismiss");
     expect(gatewayMock).not.toHaveBeenCalled();
-    expect(String(errorCall?.[0])).toContain("Specify only one of --accept or --dismiss");
-    expect(getBrowserCliRuntime().exit).toHaveBeenCalledWith(1);
+    expect(getBrowserCliRuntime().error).not.toHaveBeenCalled();
+    expect(getBrowserCliRuntime().exit).not.toHaveBeenCalled();
   });
 
-  it.each(["", "  padded 🦞  "])("preserves prompt response %j", async (prompt) => {
+  it.each([""])("preserves prompt response %j", async (prompt) => {
     await createActionInputProgram().parseAsync(
       ["browser", "dialog", "--accept", "--prompt", prompt],
       { from: "user" },

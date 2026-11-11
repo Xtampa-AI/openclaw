@@ -39,6 +39,11 @@
       - any-glob-to-any-file:
           - "extensions/pixverse/**"
           - "docs/providers/pixverse.md"
+"plugin: particle":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/particle/**"
+          - "docs/providers/particle.md"
 "plugin: typesafe":
   - changed-files:
       - any-glob-to-any-file:
@@ -161,6 +166,23 @@
           - "extensions/migrate-claude/**"
           - "docs/cli/migrate.md"
           - "docs/install/migrating-claude.md"
+"plugin: mcp-events":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/mcp-events/**"
+          - "docs/automation/mcp-events.md"
+"plugin: mcp-relay":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/mcp-relay/**"
+          - "docs/plugins/mcp-relay.md"
+          - "docs/plugins/reference/mcp-relay.md"
+"plugin: muse":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/muse/**"
+          - "docs/plugins/muse.md"
+          - "docs/plugins/reference/muse.md"
 "plugin: mxc":
   - changed-files:
       - any-glob-to-any-file:
@@ -451,6 +473,10 @@
   - changed-files:
       - any-glob-to-any-file:
           - "extensions/llama-cpp/**"
+"extensions: advisor":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/advisor/**"
 "extensions: active-memory":
   - changed-files:
       - any-glob-to-any-file:

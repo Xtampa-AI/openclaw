@@ -10,14 +10,17 @@ import { createDeferredCore } from "../shared/deferred.js";
 
 const fixture = vi.hoisted(() => ({
   close: vi.fn<() => Promise<void>>(),
+  closeNative: vi.fn<() => Promise<void>>(),
   budget: vi.fn(),
   activation: vi.fn(),
   finish: vi.fn(),
   terminal: vi.fn(),
   writeFile: vi.fn(),
   stopService: vi.fn(),
-  ownerLease: vi.fn(),
+  createCapture: vi.fn(),
   recordStep: vi.fn(),
+  recordLedgerStep: vi.fn(),
+  adopt: vi.fn(),
   fence: { assertCurrent: vi.fn() },
 }));
 
@@ -56,10 +59,6 @@ vi.mock("../cli/update-cli/update-command-service-maintenance.js", () => ({
   createWindowsTaskAutoStartGuard: vi.fn(),
   maybeStopManagedServiceBeforeMutableUpdate: fixture.stopService,
 }));
-vi.mock("../state/openclaw-state-db-doctor-schema.js", () => ({
-  openDoctorStateSchemaReadAdmission: vi.fn(),
-}));
-vi.mock("./gateway-owner-lease.js", () => ({ readGatewayOwnerLease: fixture.ownerLease }));
 vi.mock("../cli/update-cli/update-command-terminal.js", () => ({
   withUpdateCommandTerminalResult: async (run: (registerRun: () => void) => Promise<unknown>) =>
     run(vi.fn()),
@@ -70,10 +69,16 @@ vi.mock("../cli/update-cli/update-command-windows-task.js", () => ({
 vi.mock("../state/openclaw-state-db.js", () => ({
   closeOpenClawStateDatabaseAsync: fixture.close,
 }));
+// mock-isolation: Finalizer fixtures observe cleanup without closing the test process's native workers.
+vi.mock("./worker-native-lifecycle.js", () => ({
+  closeDefaultRetainedNativeWorkerSource: fixture.closeNative,
+}));
 vi.mock("./update-finalization-budget.js", () => ({
   resolveUpdateFinalizationTimeoutMs: fixture.budget,
 }));
+// mock-isolation: Observe finalizer handoff calls without opening or mutating real databases.
 vi.mock("./update-doctor-result.js", () => ({
+  createUpdateDoctorDatabaseWriteCapture: fixture.createCapture,
   UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV: "OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH",
   recordUpdateDoctorConfigWriteRefusal: vi.fn(),
   writeUpdatePostInstallDoctorResult: vi.fn(),
@@ -82,9 +87,11 @@ vi.mock("./update-requester-authority.js", () => ({
   createManagedUpdateRequesterAuthority: vi.fn(),
   UpdateRequesterRevokedError: class extends Error {},
 }));
+// mock-isolation: Worker lifecycle tests replace ledger access without opening a real state database.
 vi.mock("./update-run-ledger.js", () => ({
-  adoptUpdateRun: vi.fn(),
+  adoptUpdateRun: fixture.adopt,
   getUpdateRun: fixture.terminal,
+  recordUpdateRunStep: fixture.recordLedgerStep,
 }));
 vi.mock("./update-run-write.async.js", () => ({ recordUpdateRunStepAsync: fixture.recordStep }));
 
@@ -99,6 +106,8 @@ const result = { status: "ok", mode: "npm", steps: [], durationMs: 0 };
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  fixture.createCapture.mockReset();
+  fixture.stopService.mockReset().mockResolvedValue({ stopped: false });
   stdout.length = 0;
   stderr.length = 0;
   loggingState.forceConsoleToStderr = false;
@@ -136,6 +145,8 @@ async function runWorker(
   const settled = createDeferredCore();
   fixture.close.mockImplementation(async () => {
     await cleanup?.();
+  });
+  fixture.closeNative.mockImplementation(async () => {
     settled.resolve();
   });
   process.argv = [process.execPath, "update-migrated-finalize.worker.js", ...(mode ? [mode] : [])];
@@ -265,7 +276,11 @@ it.each([false, true])(
           run: { ...input.params.opts.run, executorFence: fixture.fence },
         },
       },
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.fence.assertCurrent).toHaveBeenCalled();
     expect(fixture.writeFile).toHaveBeenCalledExactlyOnceWith(
@@ -283,6 +298,87 @@ it.each([false, true])(
     );
   },
 );
+
+it("times the fresh-driver handoff from the previous driver's last receipt", async () => {
+  const handoffStartedAtMs = 1_791_594_640_455;
+  const readyAtMs = handoffStartedAtMs + 23_400;
+  vi.spyOn(Date, "now").mockReturnValue(readyAtMs);
+  fixture.adopt.mockReturnValueOnce({
+    runId: "handoff-run",
+    steps: [
+      { step: "validating", status: "completed", endedAtMs: handoffStartedAtMs - 10_000 },
+      { step: "driver:adopted", status: "completed", endedAtMs: handoffStartedAtMs + 15_494 },
+    ],
+  });
+  const steps: unknown[] = [];
+  const input = {
+    params: {
+      root: "/fixture/candidate",
+      result: { status: "ok", mode: "git", root: "/fixture/candidate", steps, durationMs: 0 },
+      opts: { json: true, run: { runId: "handoff-run", env: {}, activationTimeoutMs: 1_000 } },
+      preUpdatePluginInstallRecords: {},
+      updateStepTimeoutMs: 1_000,
+      rollbackBlockedReason: "state-migrated-no-rollback",
+    },
+    bufferedSteps: [
+      {
+        step: "git-verify-head",
+        status: "completed",
+        startedAtMs: handoffStartedAtMs - 36,
+        endedAtMs: handoffStartedAtMs,
+        exitCode: 0,
+      },
+    ],
+    resultPath: "/fixture/result.json",
+  };
+  let stepsAtFinish: unknown[] = [];
+  fixture.finish.mockImplementation(async (params) => {
+    stepsAtFinish = [...params.result.steps];
+    return input.params.result;
+  });
+  fixture.terminal.mockReturnValue({ runId: "handoff-run", status: "succeeded" });
+
+  await runWorker(input);
+
+  const handoff = {
+    name: "update-driver-handoff",
+    command: "openclaw update",
+    cwd: "/fixture/candidate",
+    durationMs: 23_400,
+    exitCode: 0,
+    diagnostics: [
+      'Handoff began after "git-verify-head"; the fresh driver adopted the run after 15494ms.',
+    ],
+  };
+  expect(stepsAtFinish).toEqual([handoff]);
+  expect(fixture.recordStep).toHaveBeenCalledWith(
+    "handoff-run",
+    input.bufferedSteps[0],
+    expect.anything(),
+  );
+  expect(fixture.recordLedgerStep.mock.calls).toEqual([
+    [
+      "handoff-run",
+      expect.objectContaining({
+        step: "update-driver-handoff",
+        status: "completed",
+        startedAtMs: handoffStartedAtMs,
+        endedAtMs: readyAtMs,
+      }),
+      { env: {} },
+    ],
+    [
+      "handoff-run",
+      expect.objectContaining({
+        step: "diagnostic:update-driver-handoff",
+        detail: handoff.diagnostics[0],
+        startedAtMs: handoffStartedAtMs,
+        endedAtMs: readyAtMs,
+      }),
+      { env: {} },
+    ],
+  ]);
+});
 
 it.each([
   {
@@ -409,7 +505,11 @@ it.each([
       expect.objectContaining({
         opts: expect.objectContaining({ timeout: undefined }),
       }),
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.writeFile).toHaveBeenCalledWith(
       input.resultPath,
@@ -471,36 +571,137 @@ it.each(["inspected", "legacy-unavailable", "windows-suspended"] as const)(
         shouldRestart: false,
         preManagedServiceStop: { ...transferred, windowsTaskAutoStartRecovery: undefined },
       }),
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.stopService).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(originalExitCode);
   },
 );
 
+it("does not stop a supervised predecessor when the delegated Doctor deadline expires during startup", async () => {
+  const doctor = vi.fn();
+  let wallNow = 1_000;
+  let elapsedMs = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+  const deadlineAtMs = wallNow + 500;
+  const errorReported = createDeferredCore();
+  vi.spyOn(process.stderr, "write").mockImplementation((value) => {
+    stderr.push(String(value));
+    errorReported.resolve();
+    return true;
+  });
+  vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+  // mock-isolation: Keep real Doctor repair, service and database effects outside this worker fixture.
+  vi.doMock("../flows/doctor-health.js", () => {
+    wallNow -= 90_000;
+    elapsedMs = 501;
+    return { runDoctorHealthFlow: doctor };
+  });
+  process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
+  try {
+    await runWorker(
+      {
+        executor: {},
+        runId: "synthetic-run",
+        root: "/synthetic",
+        configInputHash: "hash",
+        repair: true,
+        serviceInspectionDeadlineAtMs: deadlineAtMs,
+      },
+      "--doctor",
+    );
+    // Database cleanup settles before the executable reports its terminal error.
+    await errorReported.promise;
+  } finally {
+    delete process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH;
+    vi.doUnmock("../flows/doctor-health.js");
+  }
+
+  expect(fixture.stopService).not.toHaveBeenCalled();
+  expect(doctor).not.toHaveBeenCalled();
+  expect(stderr.join("")).toContain("Doctor service-inspection deadline has expired.");
+  expect(process.exitCode).toBe(1);
+});
+
+it("bounds a supervised predecessor stop by the remaining Doctor deadline", async () => {
+  const doctor = vi.fn();
+  const deadlineAtMs = 1_500;
+  vi.spyOn(Date, "now").mockReturnValue(1_000);
+  vi.spyOn(performance, "now").mockReturnValue(0);
+  // mock-isolation: Keep real Doctor repair, service and database effects outside this worker fixture.
+  vi.doMock("../flows/doctor-health.js", () => ({ runDoctorHealthFlow: doctor }));
+  fixture.recordStep.mockImplementation(async (runId: string, step: unknown) => ({
+    runId,
+    status: "running",
+    steps: [step],
+  }));
+  const stoppedState = {
+    stopped: true,
+    stoppedAtMs: 7,
+    inspected: true,
+    runtimeInspected: true,
+    running: true,
+    servicePid: 631,
+    serviceManagerUid: 1000,
+    serviceUpdateVerdict: { kind: "owned", root: "/synthetic", fingerprint: "f" },
+  };
+  fixture.stopService.mockImplementation(
+    async (params: { timeoutMs?: number; onStopped?: (s: unknown) => void }) => {
+      params.onStopped?.(stoppedState);
+      return stoppedState;
+    },
+  );
+  process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
+  try {
+    await runWorker(
+      {
+        executor: {},
+        runId: "synthetic-run",
+        root: "/synthetic",
+        configInputHash: "hash",
+        repair: true,
+        serviceInspectionDeadlineAtMs: deadlineAtMs,
+      },
+      "--doctor",
+    );
+  } finally {
+    delete process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH;
+    vi.doUnmock("../flows/doctor-health.js");
+  }
+
+  expect(fixture.stopService).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ phase: "prepare", timeoutMs: deadlineAtMs - 1_000 }),
+  );
+  expect(doctor).toHaveBeenCalledOnce();
+});
+
 it.each([
-  {
-    name: "stops a live supervised predecessor",
-    owner: { state: "live", mode: "supervised" },
-    stops: true,
-    uncertain: false,
-  },
+  { name: "stops a live supervised predecessor", stops: true, uncertain: false, bound: false },
   {
     name: "does not enter Doctor after an uncertain native stop",
-    owner: { state: "live", mode: "supervised" },
     stops: true,
     uncertain: true,
+    bound: false,
   },
   {
-    name: "leaves a foreground owner to Doctor's own wait",
-    owner: { state: "live", mode: "foreground" },
-    stops: false,
+    name: "retains the receipt when the port remains bound",
+    stops: true,
+    uncertain: false,
+    bound: true,
   },
-  { name: "does nothing without an owner", owner: undefined, stops: false },
-])("delegated Doctor $name before entering maintenance", async ({ owner, stops, uncertain }) => {
+  {
+    name: "does not publish a receipt when native inspection did not stop a service",
+    stops: false,
+    uncertain: false,
+    bound: false,
+  },
+])("delegated Doctor $name before entering maintenance", async ({ stops, uncertain, bound }) => {
   const doctor = vi.fn();
   vi.doMock("../flows/doctor-health.js", () => ({ runDoctorHealthFlow: doctor }));
-  fixture.ownerLease.mockReturnValue(owner);
   fixture.recordStep.mockImplementation(async (runId: string, step: unknown) => ({
     runId,
     status: "running",
@@ -517,10 +718,17 @@ it.each([
     serviceUpdateVerdict: { kind: "owned", root: "/synthetic", fingerprint: "f" },
   };
   fixture.stopService.mockImplementation(async (params: { onStopped?: (s: unknown) => void }) => {
+    if (!stops) {
+      return { stopped: false, inspected: true };
+    }
     params.onStopped?.(stoppedState);
-    throw uncertain
-      ? new CommandProcessCleanupError()
-      : new Error("port still bound after bootout");
+    if (uncertain) {
+      throw new CommandProcessCleanupError();
+    }
+    if (bound) {
+      throw new Error("port still bound after bootout");
+    }
+    return stoppedState;
   });
   process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
   try {
@@ -570,6 +778,43 @@ it.each([
       );
     }
   } else {
-    expect(fixture.stopService).not.toHaveBeenCalled();
+    expect(fixture.stopService).toHaveBeenCalledOnce();
+    expect(fixture.recordStep).not.toHaveBeenCalled();
   }
+});
+
+it("passes the same original capture from worker admission into Doctor", async () => {
+  const doctor = vi.fn();
+  // mock-isolation: Observe the original handoff capture without running real Doctor repairs.
+  vi.doMock("../flows/doctor-health.js", () => ({ runDoctorHealthFlow: doctor }));
+  const capture = { admit: vi.fn(async () => undefined) };
+  fixture.createCapture.mockReturnValue(capture);
+  const generations = { "/synthetic/agent.sqlite": "original" };
+  process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
+  try {
+    await runWorker(
+      {
+        executor: {},
+        runId: "synthetic-run",
+        root: "/synthetic",
+        configInputHash: "hash",
+        repair: true,
+        databaseGenerations: generations,
+      },
+      "--doctor",
+    );
+  } finally {
+    delete process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH;
+    vi.doUnmock("../flows/doctor-health.js");
+  }
+  expect(fixture.createCapture).toHaveBeenCalledExactlyOnceWith(
+    generations,
+    expect.objectContaining({ assertCurrent: expect.any(Function) }),
+  );
+  expect(capture.admit).toHaveBeenCalledExactlyOnceWith();
+  expect(doctor).toHaveBeenCalledExactlyOnceWith(
+    expect.anything(),
+    expect.anything(),
+    expect.objectContaining({ databaseWriteCapture: capture, databaseGenerations: generations }),
+  );
 });

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Command } from "commander";
 import { AUTO_MANAGED_CONFIG_META_PATHS } from "../config/io.meta.js";
 import { formatConfigIssueLines, normalizeConfigIssues } from "../config/issue-format.js";
@@ -55,21 +56,63 @@ type ConfigOperationParams = Parameters<
   typeof import("./config-cli-runner.js").runConfigOperations
 >[0];
 
+type ConfigCommit = NonNullable<ConfigOperationParams["commit"]>;
+
 async function runConfigMutation(
-  opts: { cliOptions: ConfigMutationOptions; runtime?: RuntimeEnv; throwOnError?: boolean },
+  opts: {
+    cliOptions: ConfigMutationOptions;
+    runtime?: RuntimeEnv;
+    throwOnError?: boolean;
+    commit?: ConfigCommit;
+  },
   prepare: () => Promise<Omit<ConfigOperationParams, "runtime" | "options">>,
   jsonOutput = Boolean(opts.cliOptions.json),
 ) {
   const runtime = opts.runtime ?? defaultRuntime;
   const { handleConfigMutationError, runConfigOperations } = await import("./config-cli-runner.js");
   try {
-    await runConfigOperations({ runtime, options: opts.cliOptions, ...(await prepare()) });
+    await runConfigOperations({
+      runtime,
+      options: opts.cliOptions,
+      ...(await prepare()),
+      ...(opts.commit ? { commit: opts.commit } : {}),
+    });
   } catch (err) {
     if (opts.throwOnError) {
       throw err;
     }
     handleConfigMutationError({ err, runtime, options: opts.cliOptions, jsonOutput });
   }
+}
+
+/**
+ * The Gateway stays the single config writer: this process prepares the same change it
+ * would write offline, and the owner commits it as one config.patch against baseHash.
+ * Every refusal is raised inside the commit so the command's own error output reports it.
+ */
+export function routeConfigMutationToOwner(
+  run: (commit: ConfigCommit) => Promise<void>,
+  method: string,
+) {
+  return async ({
+    env,
+    requestOwner,
+  }: {
+    env: NodeJS.ProcessEnv;
+    requestOwner: <R>(method: string, params: Record<string, unknown>) => Promise<R>;
+  }) => {
+    await run(async (change) => {
+      if (!isDeepStrictEqual(change.previous.database, change.next.database)) {
+        throw new Error(
+          `Cannot admit ${method} while a Gateway owns this state directory: This command is offline-only. Database settings select the state database the running Gateway holds open, so they change only offline. No settings were saved. To run offline, stop the Gateway through its service owner, wait for ownership to release, then rerun this exact command.`,
+        );
+      }
+      const { bindConfigOwner } = await import("./config-cli-owner-patch.js");
+      return await (
+        await bindConfigOwner(requestOwner, env)
+      )(change);
+    });
+  };
 }
 
 export async function runConfigSet(opts: {
@@ -80,6 +123,7 @@ export async function runConfigSet(opts: {
   beforePersistentApply?: () => void;
   /** Embedded recovery needs the writer's typed postcommit/rollback outcome. */
   throwOnError?: boolean;
+  commit?: ConfigCommit;
 }) {
   return runConfigMutation(
     opts,
@@ -108,6 +152,7 @@ export async function runConfigSet(opts: {
 export async function runConfigPatch(opts: {
   cliOptions: ConfigPatchOptions;
   runtime?: RuntimeEnv;
+  commit?: ConfigCommit;
 }) {
   return runConfigMutation(opts, async () => {
     const { configPatchModeError, readConfigPatchOperations } =
@@ -131,20 +176,33 @@ export async function runConfigGet(opts: { path: string; json?: boolean; runtime
     const parsedPath = parseConfigSetPath(opts.path);
     const { readConfigFileSnapshotWithPluginMetadata } = await import("../config/config.js");
     const { ensureValidConfigSnapshotForCli } = await import("./config-cli-validation.js");
-    const read = await readConfigFileSnapshotWithPluginMetadata({ observe: false });
+    // Plugins also extend provider model parameters within agent configuration.
+    const needsPluginSchema = ["plugins", "channels", "agents"].includes(parsedPath[0] ?? "");
+    const read = await readConfigFileSnapshotWithPluginMetadata({
+      observe: false,
+      completePluginMetadata: needsPluginSchema,
+    });
     const { snapshot, pluginMetadataSnapshot } = read;
     ensureValidConfigSnapshotForCli(snapshot, runtime, { json: opts.json });
-    if (!pluginMetadataSnapshot) {
+    if (needsPluginSchema && !pluginMetadataSnapshot) {
       throw new Error("Config plugin metadata unavailable; refusing to display config values.");
     }
-    const { buildRuntimeConfigSchemaFromRegistry } = await import("../config/runtime-schema.js");
     const { redactConfigObject } = await import("../config/redact-snapshot.js");
-    const { schema, uiHints } = buildRuntimeConfigSchemaFromRegistry(
-      pluginMetadataSnapshot.manifestRegistry,
-      snapshot.sourceConfig,
-    );
+    const runtimeSchema =
+      needsPluginSchema && pluginMetadataSnapshot
+        ? (await import("../config/runtime-schema.js")).buildRuntimeConfigSchemaFromRegistry(
+            pluginMetadataSnapshot.manifestRegistry,
+            snapshot.sourceConfig,
+          )
+        : undefined;
+    const uiHints =
+      runtimeSchema?.uiHints ??
+      (await import("../config/schema-base.js")).computeBaseConfigUiHints();
     const res = getAtPath(redactConfigObject(snapshot.config, uiHints), parsedPath);
     if (!res.found || res.value === undefined) {
+      const schema =
+        runtimeSchema?.schema ??
+        (await import("../config/schema.js")).buildConfigSchemaCore().schema;
       const autoManaged = AUTO_MANAGED_CONFIG_META_PATHS.some(
         (managedPath) =>
           parsedPath.every((segment, index) => managedPath[index] === segment) ||
@@ -190,6 +248,7 @@ export async function runConfigUnset(opts: {
   cliOptions?: ConfigUnsetOptions;
   runtime?: RuntimeEnv;
   beforePersistentApply?: () => void;
+  commit?: ConfigCommit;
 }) {
   const cliOptions = opts.cliOptions ?? {};
   return runConfigMutation({ ...opts, cliOptions }, async () => {
@@ -251,6 +310,7 @@ async function runConfigValidate(opts: { json?: boolean; runtime?: RuntimeEnv } 
     const read = await readConfigFileSnapshotWithPluginMetadata({
       observe: false,
       prepareValidation: "strict",
+      completePluginMetadata: false,
     });
     const snapshot = await finishConfigValidationForCli(read);
     outputPath = snapshot.path;
@@ -423,7 +483,22 @@ export function registerConfigCli(program: Command) {
     .option("--batch-json <json>", "Batch mode: JSON array of set operations")
     .option("--batch-file <path>", "Batch mode: read JSON array of set operations from file")
     .action(async (path: string | undefined, value: string | undefined, opts: ConfigSetOptions) => {
-      await runConfigSet({ path, value, cliOptions: opts });
+      const runLocal = () => runConfigSet({ path, value, cliOptions: opts });
+      if (opts.dryRun) {
+        return runLocal();
+      }
+      const { runWithLocalStateOwner } = await import("./local-state-owner.js");
+      await runWithLocalStateOwner({
+        method: "config set",
+        params: {},
+        target: path ?? "config",
+        ...(path ? { recoveryCommand: `openclaw config get ${quoteCliArg(path)}` } : {}),
+        onForeignOwner: routeConfigMutationToOwner(
+          (commit) => runConfigSet({ path, value, cliOptions: opts, commit }),
+          "config set",
+        ),
+        runLocal,
+      });
     });
 
   cmd
@@ -449,7 +524,21 @@ export function registerConfigCli(program: Command) {
       [] as string[],
     )
     .action(async (opts: ConfigPatchOptions) => {
-      await runConfigPatch({ cliOptions: opts });
+      const runLocal = () => runConfigPatch({ cliOptions: opts });
+      if (opts.dryRun) {
+        return runLocal();
+      }
+      const { runWithLocalStateOwner } = await import("./local-state-owner.js");
+      await runWithLocalStateOwner({
+        method: "config patch",
+        params: {},
+        target: "config",
+        onForeignOwner: routeConfigMutationToOwner(
+          (commit) => runConfigPatch({ cliOptions: opts, commit }),
+          "config patch",
+        ),
+        runLocal,
+      });
     });
 
   cmd
@@ -460,7 +549,22 @@ export function registerConfigCli(program: Command) {
     .option("--allow-exec", "allow exec SecretRef providers during --dry-run")
     .option("--json", "print dry-run result as JSON")
     .action(async (path: string, options: ConfigUnsetOptions) => {
-      await runConfigUnset({ path, cliOptions: options });
+      const runLocal = () => runConfigUnset({ path, cliOptions: options });
+      if (options.dryRun) {
+        return runLocal();
+      }
+      const { runWithLocalStateOwner } = await import("./local-state-owner.js");
+      await runWithLocalStateOwner({
+        method: "config unset",
+        params: {},
+        target: path,
+        recoveryCommand: `openclaw config get ${quoteCliArg(path)}`,
+        onForeignOwner: routeConfigMutationToOwner(
+          (commit) => runConfigUnset({ path, cliOptions: options, commit }),
+          "config unset",
+        ),
+        runLocal,
+      });
     });
 
   cmd

@@ -45,15 +45,16 @@ import { releaseRuntimePluginWork, retainRuntimePluginWork } from "./runtime-plu
 
 const log = createSubsystemLogger("agents/prepared-model-runtime");
 type Lifetime = ReturnType<typeof createLifetime>;
+type PreparedPluginGenerationResources = Pick<
+  PreparedModelRuntimePluginGeneration,
+  "pluginMetadataSnapshot" | "pluginRegistry" | "inboundPluginRegistry"
+>;
 // Source and compiled consumers can share the same generation and registry objects.
 // Share only cleanup ownership; model/auth snapshots keep their existing module identity.
 const { generations, active, retirements, publications } = resolveGlobalSingleton(
   Symbol.for("openclaw.preparedPluginLifetimes"),
   () => ({
-    generations: new WeakMap<
-      PreparedModelRuntimePluginGeneration,
-      { lifetime: Lifetime; releaseUnpublished?: () => void | Promise<void> }
-    >(),
+    generations: new WeakMap<PreparedPluginGenerationResources, Lifetime>(),
     active: new Set<Lifetime>(),
     retirements: new Set<Promise<void>>(),
     publications: new WeakMap<object, { release: () => Promise<void> }>(),
@@ -170,12 +171,11 @@ export function registerPreparedPluginLifetime(): void {
 }
 
 export function ownPreparedPluginGeneration(
-  generation: PreparedModelRuntimePluginGeneration,
-  options: { unpublished?: boolean } = {},
+  generation: PreparedPluginGenerationResources,
 ): Lifetime {
   const existing = generations.get(generation);
   if (existing) {
-    return existing.lifetime;
+    return existing;
   }
   registerPreparedPluginLifetime();
   const releaseMetadata = retainPluginCache(
@@ -217,12 +217,7 @@ export function ownPreparedPluginGeneration(
     void lifetime.close().catch(() => {});
     throw error;
   }
-  // Catalog work may acquire and release this generation before its first publication.
-  // Construction remains its owner until publication takes custody or the build discards it.
-  generations.set(generation, {
-    lifetime,
-    ...(options.unpublished ? { releaseUnpublished: lifetime.retain() } : {}),
-  });
+  generations.set(generation, lifetime);
   return lifetime;
 }
 
@@ -234,11 +229,6 @@ export function retainPreparedPluginGeneration(
     await release();
   };
 }
-
-// Only configured publication grants fresh-admission authority. Parent-derived and run-owned
-// generations stay confined to their exact selections after a newer configured publication.
-export const configuredPreparedPluginGenerations =
-  new WeakSet<PreparedModelRuntimePluginGeneration>();
 
 /** Publishing replaces one reference, while admitted leases retain their exact generation. */
 export function publishPreparedPluginGeneration(
@@ -262,13 +252,6 @@ export function publishPreparedPluginGeneration(
     );
   }
   const release = ownPreparedPluginGeneration(generation).retain();
-  if (owner.provenance === "configured") {
-    configuredPreparedPluginGenerations.add(generation);
-  }
-  const construction = generations.get(generation)!;
-  const releaseUnpublished = construction.releaseUnpublished;
-  construction.releaseUnpublished = undefined;
-  void releaseUnpublished?.();
   const version = owner.generation;
   const gatewayLenders = new Set<PluginRegistry>();
   let signal: AbortSignal | undefined;
@@ -348,15 +331,9 @@ export function releasePreparedPluginPublication(owner: object): void {
 export async function discardPreparedPluginGeneration(
   generation: PreparedModelRuntimePluginGeneration,
 ): Promise<void> {
-  const construction = generations.get(generation);
-  if (!construction) {
-    return;
-  }
-  const releaseUnpublished = construction.releaseUnpublished;
-  construction.releaseUnpublished = undefined;
-  await releaseUnpublished?.();
-  if (!construction.lifetime.referenced) {
-    await construction.lifetime.close();
+  const lifetime = generations.get(generation);
+  if (lifetime && !lifetime.referenced) {
+    await lifetime.close();
   }
 }
 

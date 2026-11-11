@@ -1,13 +1,11 @@
 import { closeAuthProfileUsage } from "../agents/auth-profiles/usage-lifecycle.js";
 import { resolveActiveEmbeddedRunSessionId } from "../agents/embedded-agent-runner/active-run-projections.js";
-import { createAgentRunRestartAbortError } from "../agents/run-termination.js";
 import { prepareSandboxRegistryClose } from "../agents/sandbox/registry-lifecycle.js";
 import { fenceSessionSuspensionWritesForGatewayShutdown } from "../agents/session-suspension.js";
 import { prepareWorktreeRunEndClose } from "../agents/worktrees/run-end-lifecycle.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import { listLoadedChannelPluginsForRegistry } from "../channels/plugins/registry-loaded.js";
 import { getRuntimeConfig } from "../config/io.js";
-import { beginCronReceiptAuthorityClose } from "../cron/store/receipt-authority-owner.js";
 import { markGatewaySuspendExiting } from "../infra/gateway-suspend-coordinator.js";
 import { commitPresence, upsertPresence } from "../infra/system-presence.js";
 import { stopGatewayDiagnosticHeartbeat } from "../logging/diagnostic.js";
@@ -29,6 +27,7 @@ import type { RestartRecoveryCandidate } from "./chat-abort.js";
 import { prepareControlUiSessionPrRead } from "./control-ui-session-pr-read.js";
 import { createControlUiSessionPullRequestSubscriptions } from "./control-ui-session-pr-subscriptions.js";
 import { retireDeviceTokenClients } from "./device-token-client-lifecycle.js";
+import { publishHooksTokenEnvKey } from "./hooks.js";
 import { STARTUP_UNAVAILABLE_GATEWAY_METHODS } from "./methods/core-method-policy.js";
 import { startNodeConnectionNotifications } from "./node-connection-notifications.js";
 import { waitForNodeWorkerSupervisor } from "./node-registry-private.js";
@@ -49,6 +48,7 @@ import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 import { refreshGatewayHealthSnapshot } from "./server/health-state.js";
 import { createSessionViewerPresenceDeclarations } from "./session-viewer-presence.js";
 import { prepareTalkConnectionClose } from "./talk/session-registry.js";
+import { withAgentTerminalOpenAdmission } from "./terminal/open-admission.js";
 
 type GatewayRuntimePreparation = Awaited<ReturnType<typeof prepareGatewayKernelState>>;
 type GatewayLogger = ReturnType<typeof createSubsystemLogger>;
@@ -76,6 +76,7 @@ export async function prepareGatewayLifecycle(params: {
     mentionInbox,
     broadcast,
     cfgAtStart,
+    cronStorePath,
     pluginRuntime,
     authRateLimiter,
     nodeReapprovalCoordinator,
@@ -120,8 +121,6 @@ export async function prepareGatewayLifecycle(params: {
     onRunnerStateChanged: (nodeId, change) => {
       if (change.availabilityChanged) {
         workerPlacementRuntime?.runnerAvailability.markChanged(nodeId);
-      }
-      if (change.inventoryChanged || change.availabilityChanged) {
         void workerPlacementRuntime?.scheduleNodeWorkspaceRetention(nodeId);
       }
     },
@@ -214,6 +213,7 @@ export async function prepareGatewayLifecycle(params: {
     await import("./terminal/session-manager.js");
   const { createTerminalSessionTransport } = await import("./terminal/gateway-transport.js");
   const terminalSessions = new TerminalSessionManager({
+    withOpenAdmission: withAgentTerminalOpenAdmission,
     ...createTerminalSessionTransport(broadcastToConnIds, getBufferedAmount),
     detachGraceMs:
       (cfgAtStart.gateway?.terminal?.detachedSessionTimeoutSeconds ??
@@ -226,6 +226,7 @@ export async function prepareGatewayLifecycle(params: {
     hookClientIpConfig: initialHookClientIpConfig,
     cronState: createLazyGatewayCronState({
       scheduler: runtime.scheduler,
+      storePath: cronStorePath,
       cfg: cfgAtStart,
       deps,
       broadcast,
@@ -301,6 +302,7 @@ export async function prepareGatewayLifecycle(params: {
       hookClientIpConfig: typeof runtimeState.hookClientIpConfig;
     }) => {
       runtimeState.hooksConfig = next.hooksConfig;
+      publishHooksTokenEnvKey(next.hooksConfig);
       runtimeState.hookClientIpConfig = next.hookClientIpConfig;
     },
     setHeartbeatRunner: (next: typeof runtimeState.heartbeatRunner) => {
@@ -348,6 +350,7 @@ export async function prepareGatewayLifecycle(params: {
     clients,
     publishPresence: runtime.publishPresence,
   });
+  runtime.attachSessionViewerPresence(runtimeState.sessionViewerPresence);
   deps.cron = runtimeState.cronState.cron;
   const cronReconciliation = createGatewayCronReconciliation({
     port,
@@ -390,18 +393,12 @@ export async function prepareGatewayLifecycle(params: {
     worktreeRunEnd.beginClose();
     sandboxRegistry.beginClose();
     talkClose.beginClose();
-    if (prelude) {
-      beginCronReceiptAuthorityClose();
-    }
     void stopModelAccountsForClose();
     void closeAuthProfileUsage(params.sdkResourceHost);
     runtime.scheduler.beginClose();
     void runtimeState.maintenance?.stopPeriodicTasks();
-    // Publish the exact cancellation before withdrawing capabilities or running
-    // disposal callbacks; startup can otherwise fail before restart marking.
-    runtime.connectionWork.beginClose(
-      notice.restartExpectedMs !== undefined ? createAgentRunRestartAbortError() : undefined,
-    );
+    // Fence new entry now; the run-shutdown owner records recovery before
+    // canceling admitted work or withdrawing its runtime capabilities.
     requestEntryLifetime.beginClose();
     void mentionInbox.dispose();
     healthWork.beginClose();
@@ -416,8 +413,6 @@ export async function prepareGatewayLifecycle(params: {
     void runtimeState.controlUiSessionPullRequests?.stop();
     runtimeState.sessionViewerPresence?.stop();
     runtime.stopPresencePublications();
-    kernel.setDispatchReady(false);
-    gatewayInstanceRuntimeRef.current?.close();
     cronReconciliation.invalidate();
     return prelude;
   };
@@ -513,8 +508,6 @@ export async function prepareGatewayLifecycle(params: {
       {
         resolveGatewayContext: runtime.resolvePluginGatewayContext,
         preparePluginRegistryClose: () => pluginRuntime.prepareClose(),
-        // Preparation can publish writes before it has a native database borrower.
-        drainPersistence: () => drainClosePersistence().then(() => runtimeState.agentUnsub?.()),
         chatRunState,
         chatAbortControllers,
         chatQueuedTurns,
@@ -536,6 +529,13 @@ export async function prepareGatewayLifecycle(params: {
             cfg: getRuntimeConfig(),
             ...restart,
           });
+        },
+        cancelReceivedWork: (reason) => {
+          // Publish cancellation before retained principals lose their authority,
+          // so interrupted preparation observes the exact restart reason.
+          runtime.connectionWork.beginClose(reason);
+          kernel.setDispatchReady(false);
+          gatewayInstanceRuntimeRef.current?.close();
         },
         getPendingReplyCount: getTotalPendingReplies,
         disposeAllCodeModeRuns: shutdownRuntime.disposeAllCodeModeRuns,
@@ -561,6 +561,7 @@ export async function prepareGatewayLifecycle(params: {
         await withPluginRuntimeRegistryScope(pluginRuntime.registry, () =>
           shutdownRuntime.completeGatewayClose(
             {
+              retainSharedState: optsValue?.retainSharedState,
               resolveGatewayContext: runtime.resolvePluginGatewayContext,
               closePluginRegistry: (onRetirement) => pluginRuntime.close(onRetirement),
               pluginMetadata: {

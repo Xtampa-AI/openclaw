@@ -4,7 +4,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLegacyInboundContextLabelsJson } from "../config/sessions/legacy-inbound-context-labels.js";
 import { withSqliteSessionImportStage } from "../config/sessions/session-accessor.sqlite-import-stage.js";
 import { getSessionKysely } from "../config/sessions/session-accessor.sqlite-scope.js";
-import { canonicalizeTranscriptEventMedia } from "../config/sessions/session-accessor.sqlite-transcript-store.js";
+import { canonicalizeTranscriptEventMedia } from "../config/sessions/transcript-event-media.js";
 import { transcriptEventJsonSql } from "../config/sessions/transcript-payload.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import { executeSqliteQueryTakeFirstSync, iterateSqliteQuerySync } from "./kysely-sync.js";
@@ -37,7 +37,7 @@ export function verifyTranscriptEvents(
     );
     const repair = stage.repairLegacyTranscript(0, mode !== "ordered");
     if (mode === "ordered") {
-      // Receipt adoption retains its original order and branch-repair contract after label normalization.
+      // Receipt adoption retains its original order and branch-repair contract.
       if (repair.repaired || !repair.recognized) {
         return undefined;
       }

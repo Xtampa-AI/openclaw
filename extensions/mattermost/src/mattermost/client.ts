@@ -387,6 +387,7 @@ export async function fetchMattermostChannelPosts(
     limit?: number;
     before?: string;
     after?: string;
+    skipFetchThreads?: boolean;
   } = {},
 ): Promise<{ messages: MattermostPost[]; hasMore: boolean }> {
   const before = normalizeOptionalString(options.before);
@@ -405,6 +406,9 @@ export async function fetchMattermostChannelPosts(
   }
   if (after) {
     query.set("after", after);
+  }
+  if (options.skipFetchThreads) {
+    query.set("skipFetchThreads", "true");
   }
   const response = await client.request<unknown>(
     `/channels/${encodeURIComponent(channelId)}/posts?${query.toString()}`,
@@ -517,20 +521,15 @@ export async function createMattermostDirectChannelWithRetry(
 
   return await retryAsync(
     async () => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       try {
         return await client.request<MattermostChannel>("/channels/direct", {
           method: "POST",
           body: JSON.stringify(userIds),
-          signal: controller.signal,
           timeoutMs,
         });
       } catch (err) {
         // Normalize before rethrowing so shouldRetry/onRetry below always see Errors.
         throw err instanceof Error ? err : new Error(String(err));
-      } finally {
-        clearTimeout(timeoutId);
       }
     },
     {

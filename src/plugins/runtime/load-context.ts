@@ -30,6 +30,8 @@ export type PluginRuntimeLoadContext = {
   logger: PluginLogger;
   manifestRegistry?: PluginManifestRegistry;
   metadataSnapshot?: PluginMetadataSnapshot;
+  /** Alias identity used for the registered callbacks, including metadata-free lookups. */
+  normalizePluginId?: PluginLoadOptions["normalizePluginId"];
   installRecords?: Record<string, PluginInstallRecord>;
   preferBuiltPluginArtifacts?: boolean;
   expectedSourceDigests?: PluginLoadOptions["expectedSourceDigests"];
@@ -63,15 +65,6 @@ function activationInputFingerprint(config: OpenClawConfig, env: NodeJS.ProcessE
   return hashStableJson({ config: activationConfigFingerprint(config), env });
 }
 
-function activationResultFingerprint(context: PluginRuntimeLoadContext): string {
-  return hashStableJson({
-    config: activationConfigFingerprint(context.config),
-    activationSourceConfig: activationConfigFingerprint(context.activationSourceConfig),
-    autoEnabledReasons: context.autoEnabledReasons,
-    env: context.env,
-  });
-}
-
 export function setPluginRuntimeLoadContext(
   registry: PluginRegistry,
   context: PluginRuntimeLoadContext,
@@ -82,8 +75,8 @@ export function setPluginRuntimeLoadContext(
   const capturedIdentity = previous?.loaderCacheIdentity ?? loaderCacheIdentity;
   const bound = {
     ...context,
+    normalizePluginId: previous ? previous.normalizePluginId : context.normalizePluginId,
     activationInputFingerprint: activationInputFingerprint(context.rawConfig, context.env),
-    activationResultFingerprint: activationResultFingerprint(context),
     ...(capturedIdentity ? { loaderCacheIdentity: capturedIdentity } : {}),
     // Host preparation may rebind metadata, but it cannot change already-registered closures.
     registrationConfigKey:
@@ -117,7 +110,7 @@ export const getPluginRuntimeLoadContext = (
     | (PluginRuntimeLoadContext & PluginRuntimeLoadContextState)
     | undefined;
 
-/** Reuses activation decisions only within the exact metadata generation and unchanged inputs. */
+/** Reuses captured activation decisions for matching metadata and requested inputs. */
 export function getReusablePluginRuntimeActivation(
   registry: object | undefined,
   params: {
@@ -133,8 +126,7 @@ export function getReusablePluginRuntimeActivation(
   if (
     !context ||
     context.metadataSnapshot !== params.metadataSnapshot ||
-    context.workspaceDir !== params.workspaceDir ||
-    context.activationResultFingerprint !== activationResultFingerprint(context)
+    context.workspaceDir !== params.workspaceDir
   ) {
     return undefined;
   }

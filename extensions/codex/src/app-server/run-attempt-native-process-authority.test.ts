@@ -3,15 +3,18 @@ import path from "node:path";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { invokeNativeHookRelay } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { captureSessionEntryCurrentCheckAsync } from "openclaw/plugin-sdk/session-binding-runtime";
 import { patchSessionEntry, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WebSocket } from "ws";
 import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
+import { resolveCodexAppServerHomeDir } from "./auth-start-options.js";
 import { consumeCodexAppServerLiveThread, hasCodexAppServerLiveThread } from "./client-runtime.js";
-import {
-  createCodexTestHostCapabilities,
-  setCodexTestToolFactory,
-} from "./host-capability.test-support.js";
+import { setCodexTestToolFactory } from "./host-capability.test-support.js";
 import { buildCodexNativeHookRelayId } from "./native-hook-relay.js";
 import {
   flattenCodexDynamicToolFunctions,
@@ -19,9 +22,12 @@ import {
   type CodexTurnStartParams,
 } from "./protocol.js";
 import {
+  createSandboxPolicyRun,
+  createSourceBoundHostCapabilities,
+} from "./run-attempt-native-process-authority.test-support.js";
+import {
   createCodexRuntimePlanFixture,
   createParams,
-  createRuntimeDynamicTool,
   createStartedThreadHarness,
   runCodexAppServerAttempt,
   setCodexAppServerClientFactoryForTest,
@@ -43,13 +49,16 @@ import {
   readCodexAppServerBinding,
   testCodexAppServerBindingStore,
 } from "./session-binding.test-helpers.js";
+import { withCodexSessionDescendantCancellation } from "./session-cancellation.js";
 import {
   appendSqliteHistoryMessage,
   attachSqliteSessionTarget,
   readTranscriptMessagesByIdentity,
 } from "./sqlite-session.test-helpers.js";
+import { writeNativeCatalogFixture } from "./thread-lifecycle.test-fixtures.js";
 
 setupRunAttemptTestHooks();
+afterEach(() => clearRuntimeConfigSnapshot());
 
 type Actor = "maintainer" | "guest";
 type Terminal = {
@@ -63,27 +72,16 @@ type Terminal = {
   settled: Promise<unknown>;
 };
 
-function createSourceBoundHostCapabilities(signal: AbortSignal) {
-  const bindModelExecution = () => ({
-    signal,
-    assertCurrent: () => signal.throwIfAborted(),
-    release: () => {},
-  });
-  return createCodexTestHostCapabilities({
-    bindModelExecution,
-    retainSourceAuthority: () => ({
-      ...bindModelExecution(),
-      modelPolicyRequired: false,
-      bindModelExecution,
-    }),
-  });
-}
-
 async function fixture(options: { failSettlement?: boolean } = {}) {
+  setRuntimeConfigSnapshot({ tools: { web: { search: { enabled: false } } } });
   // Keep the attempt budget under test control while sockets, workers, and real children progress.
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   const sessionFile = path.join(tempDir, "native-owner-session.jsonl");
   const workspaceDir = path.join(tempDir, "workspace");
+  const agentDir = path.join(tempDir, "wire-agent");
+  const codexHome = resolveCodexAppServerHomeDir(agentDir);
+  const rolloutPath = path.join(codexHome, "sessions", "native-owner.jsonl");
+  let nativeTools: unknown;
   const threadId = "qualification-shared-thread";
   const sessionScope = {
     agentId: "main",
@@ -109,6 +107,7 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
         error.errors.length > 0 &&
         error.errors.every(isExpectedSettlementFailure)));
   const turns: string[] = [];
+  const nativeChildTurns = new Map<string, string>();
   let attemptSequence = 0;
   let socket: WebSocket | undefined;
   let registeredUrl: string | undefined;
@@ -171,16 +170,21 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
         return {};
       }
       if (method === "thread/start" || method === "thread/resume") {
+        if (method === "thread/start") {
+          nativeTools = input.dynamicTools;
+        }
         if (method === "thread/resume") {
           expect(input.threadId).toBe(threadId);
         }
-        return threadStartResult(threadId, { cwd: "/workspace" });
+        const result = threadStartResult(threadId, { cwd: "/workspace" });
+        return { ...result, thread: { ...result.thread, path: rolloutPath } };
       }
       if (method === "thread/read") {
         const requestedThreadId = typeof input.threadId === "string" ? input.threadId : threadId;
         return { thread: { ...threadStartResult(requestedThreadId).thread, turns: [] } };
       }
       if (method === "turn/start") {
+        await writeNativeCatalogFixture(rolloutPath, threadId, nativeTools);
         expect(input.threadId).toBe(threadId);
         expect(input.environments).toEqual([
           { environmentId: expect.stringMatching(/^openclaw-sandbox-/), cwd: "/workspace" },
@@ -190,14 +194,18 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
         return turnStartResult(turnId);
       }
       if (method === "turn/interrupt") {
-        expect(input.threadId).toBe(threadId);
-        expect(input.turnId).toBe(turns.at(-1));
+        const interruptedThreadId = String(input.threadId);
+        expect(input.turnId).toBe(
+          interruptedThreadId === threadId
+            ? turns.at(-1)
+            : nativeChildTurns.get(interruptedThreadId),
+        );
         // Codex acknowledges the interrupt before publishing its matching terminal.
         void nextTurn().then(() =>
           harness.notify({
             method: "turn/completed",
             params: {
-              threadId,
+              threadId: interruptedThreadId,
               turn: { id: String(input.turnId), status: "interrupted", items: [] },
             },
           }),
@@ -224,7 +232,7 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
       }
       return undefined;
     },
-    { persistedThreads: [threadId] },
+    { persistedThreads: [threadId], codexHome },
   );
 
   const begin = async (
@@ -242,8 +250,10 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
       runId: `${actor}-run-${attemptId}`,
       prompt: `${actor} qualification turn`,
     });
+    params.agentDir = agentDir;
     params.sessionTarget = { ...sessionScope, sessionId: params.sessionId };
-    params.hostCapabilities = createSourceBoundHostCapabilities(source.signal);
+    const requestCustody = Object.freeze({});
+    params.hostCapabilities = createSourceBoundHostCapabilities(source.signal, requestCustody);
     params.senderId = actor;
     params.onAgentEvent = (event) => {
       events.push(event);
@@ -281,6 +291,7 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
     const commandThreadId = nativeChild?.threadId ?? threadId;
     const commandTurnId = nativeChild?.turnId ?? turnId;
     if (nativeChild) {
+      nativeChildTurns.set(nativeChild.threadId, nativeChild.turnId);
       await harness.notify({
         method: "thread/started",
         params: {
@@ -415,6 +426,26 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
         }
       },
       run,
+      stopDescendants: async () => {
+        const current = await captureSessionEntryCurrentCheckAsync(sessionScope);
+        try {
+          return await withCodexSessionDescendantCancellation(
+            bindingStore,
+            {
+              agentId: sessionScope.agentId,
+              sessionKey: sessionScope.sessionKey,
+              sessionId: params.sessionId,
+              lifecycleRevision: current.entry?.lifecycleRevision,
+              requesterTurnRunId: params.runId,
+              acceptsRequest: (custody) => custody === requestCustody,
+              assertCurrent: () => source.signal.throwIfAborted(),
+            },
+            (cancel) => cancel(),
+          );
+        } finally {
+          current.release();
+        }
+      },
       complete: async (answer?: string) => {
         if (answer) {
           await harness.notify({
@@ -524,33 +555,6 @@ async function fixture(options: { failSettlement?: boolean } = {}) {
   };
 }
 
-function createSandboxPolicyRun() {
-  const params = createParams(
-    path.join(tempDir, "managed-policy.jsonl"),
-    path.join(tempDir, "workspace"),
-  );
-  const controller = new AbortController();
-  const preparation: string[] = [];
-  const exec = createRuntimeDynamicTool("exec");
-  params.hostCapabilities = createSourceBoundHostCapabilities(controller.signal);
-  params.sandbox = {
-    ...createSandboxContext({}),
-    sessionKey: params.sessionKey!,
-    workspaceDir: params.workspaceDir,
-    agentWorkspaceDir: params.workspaceDir,
-    runtimeId: `managed-policy-${path.basename(tempDir)}`,
-  };
-  params.abortSignal = controller.signal;
-  params.runtimePlan = createCodexRuntimePlanFixture();
-  setCodexTestModelSupportsTools(params, true);
-  const selectTools = vi.fn(() => {
-    preparation.push("tools");
-    return [exec];
-  });
-  setCodexTestToolFactory(params, selectTools);
-  return { params, controller, exec, preparation, selectTools };
-}
-
 describe("native background process source authority", () => {
   it("reports failed real-child settlement and preserves its command custody", async () => {
     const f = await fixture({ failSettlement: true });
@@ -613,6 +617,29 @@ describe("native background process source authority", () => {
       await guest.terminal.settled;
       expect(f.terminated).toEqual([]);
       expect(staff.terminal.alive).toBe(true);
+    } finally {
+      await f.dispose();
+    }
+  });
+
+  it("descendant Stop settles its admitted child process without canceling foreground or retained peer work", async () => {
+    const f = await fixture();
+    try {
+      const staff = await f.begin("maintainer");
+      await f.retainSecondConsumer();
+      await staff.complete();
+      const guest = await f.begin("guest", {
+        threadId: "guest-native-child",
+        turnId: "guest-native-child-turn",
+      });
+      expect((await guest.stopDescendants()).killed).toBe(1);
+      expect(guest.terminal.alive).toBe(false);
+      await guest.terminal.settled;
+      expect(guest.controller.signal.aborted).toBe(false);
+      expect(guest.sourceSignal.aborted).toBe(false);
+      expect(staff.terminal.alive).toBe(true);
+      expect(f.terminated).toEqual([]);
+      expect(readAttemptTerminal(await guest.complete()).aborted).toBe(false);
     } finally {
       await f.dispose();
     }

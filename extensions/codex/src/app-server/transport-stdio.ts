@@ -95,7 +95,7 @@ export function resolveCodexAppServerSpawnEnv(
 export async function createStdioTransport(
   options: CodexAppServerStartOptions,
   baseEnv: NodeJS.ProcessEnv = process.env,
-  assertCurrent?: () => void,
+  assertCurrent?: () => void | Promise<void>,
   onSpawn?: (child: ChildProcessWithoutNullStreams) => void,
 ): Promise<ChildProcessWithoutNullStreams> {
   const isHostedGateway = baseEnv.OPENCLAW_GATEWAY_HOST_LIFELINE?.trim() === "stdin";
@@ -118,7 +118,7 @@ export async function createStdioTransport(
     throw previousFailure;
   }
   const register = await prepareCodexAppServerProcessRegistration();
-  assertCurrent?.();
+  await assertCurrent?.();
   embeddedAgentLog.debug("Codex app-server spawn", {
     command: invocation.command,
     launcher: options.command,
@@ -150,11 +150,11 @@ export async function createStdioTransport(
     // Attach lifecycle observers before inspection can yield to an early exit.
     onSpawn?.(child);
     await register(child);
-    assertCurrent?.();
+    await assertCurrent?.();
     return child;
   } catch (error) {
     await closeCodexAppServerTransportAndWait(child, { drainStdio: true });
-    assertCurrent?.();
+    await assertCurrent?.();
     throw (
       child.startupFailure?.error ??
       recordCodexAppServerSpawnFailure(error, invocation.command, launchKey)

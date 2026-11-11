@@ -11,7 +11,10 @@ import {
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import type { CronJob } from "../api/types.ts";
-import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
+import {
+  controlUiE2eWaitTimeoutMs,
+  waitForControlUiGatewayReady,
+} from "../test-helpers/control-ui-e2e-readiness.ts";
 import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { pickerValue, selectPickerValue } from "../test-helpers/select-picker-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
@@ -25,6 +28,7 @@ const suite = createControlUiE2eSuite({
       name: "control-ui-exact-stagger",
       config: {
         gateway: { controlUi: { enabled: true } },
+        agents: { defaults: { model: "openai/gpt-4.1" } },
         cron: {
           enabled: false,
           failureAlert: {
@@ -40,6 +44,16 @@ const suite = createControlUiE2eSuite({
     });
     instance = owner;
     try {
+      await owner.state.writeAuthProfiles({
+        version: 1,
+        profiles: {
+          "openai:cron-duration-fixture": {
+            type: "api_key",
+            provider: "openai",
+            key: "synthetic-cron-duration-inference-key",
+          },
+        },
+      });
       await owner.startGateway();
       return { baseUrl: `http://127.0.0.1:${owner.port}/`, close: () => owner.cleanup() };
     } catch (error) {
@@ -114,7 +128,15 @@ catalogSuite.define(() => {
     const commands: unknown[] = [];
     let rejectCatalogReplies = false;
     const rejected = new Set<string>();
+    const configChangedCount = () =>
+      frames.filter((entry) => {
+        const record = requireRecord(entry);
+        return (
+          record.direction === "received" && requireRecord(record.frame).event === "config.changed"
+        );
+      }).length;
     const publish = async (id: string) => {
+      const previousConfigChanges = configChangedCount();
       const args = [
         "config",
         "set",
@@ -126,6 +148,12 @@ catalogSuite.define(() => {
       const result = await owner.cli(args);
       commands.push({ args, ...result });
       expect(result.code, result.stderr).toBe(0);
+      // The CLI commits before the running Gateway observes its atomic config
+      // replacement. Synchronize on the real publication event before asserting
+      // the refreshed picker instead of racing the file watcher.
+      await expect
+        .poll(configChangedCount, { timeout: controlUiE2eWaitTimeoutMs })
+        .toBeGreaterThan(previousConfigChanges);
     };
     try {
       await catalogSuite.withPage(
@@ -499,7 +527,6 @@ suite.define(() => {
       const jobId = cronJobId(job);
       await withCronJobPage(cliJson, jobId, async (evidence) => {
         const { page, servedDocumentSha256, servedAssets } = evidence;
-        await page.getByRole("button", { name: "Dismiss and don't show again" }).click();
         await page.locator("details.cron-advanced > summary").click();
         const timeout = page.locator("#cron-timeout-seconds");
         expect(await timeout.inputValue()).toBe("90");
@@ -625,9 +652,9 @@ suite.define(() => {
         const saved = await submitCronForm(evidence, cliJson, "cron.update");
         const savedFields = await readAlertFields(page);
         await capture(page, "real-alert-saved", { ...saved, savedFields });
-        const menu = page.locator(".cron-detail-actions wa-dropdown");
-        await menu.locator('button[slot="trigger"]').click();
-        await menu.locator('wa-dropdown-item[value="clone"]').click();
+        const menu = page.locator(".cron-detail-actions .cron-job-menu");
+        await menu.locator(".cron-job-menu__trigger").click();
+        await menu.locator('[data-value="clone"]').click();
         await page.locator("#cron-name").fill("Cloned partial failure policy");
         const cloned = await submitCronForm(evidence, cliJson, "cron.add");
         const cloneId = cronJobId(cloned.stored);
@@ -789,9 +816,9 @@ suite.define(() => {
             original,
             servedDocumentSha256,
           });
-          const menu = page.locator(".cron-detail-actions wa-dropdown");
-          await menu.locator('button[slot="trigger"]').click();
-          await menu.locator('wa-dropdown-item[value="clone"]').click();
+          const menu = page.locator(".cron-detail-actions .cron-job-menu");
+          await menu.locator(".cron-job-menu__trigger").click();
+          await menu.locator('[data-value="clone"]').click();
           await page.locator('.cron-page[data-panel-mode="create"]').waitFor();
           await expect
             .poll(() => page.locator("#cron-name").inputValue())

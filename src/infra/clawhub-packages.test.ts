@@ -1,15 +1,23 @@
 // Verifies ClawHub package metadata, security, and artifact resolver APIs.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   fetchClawHubPackageArtifact,
   fetchClawHubPackageSecurity,
   resolveLatestVersionFromPackage,
+  searchClawHubPackages,
 } from "./clawhub-packages.js";
 
 const packageSelector = { name: "@openclaw/diagnostics-otel", version: "2026.3.22" };
 const securityReport = {
   package: { name: packageSelector.name, displayName: "Diagnostics", family: "code-plugin" },
-  release: { releaseId: "rel_demo", version: packageSelector.version },
+  release: {
+    releaseId: "rel_demo",
+    version: packageSelector.version,
+    artifactKind: "npm-pack",
+    artifactSha256: "a".repeat(64),
+    npmIntegrity: "sha512-proof",
+    npmShasum: "abc",
+  },
   overview: "The plugin uses privileged local APIs.\n\nReview those capabilities.",
   securityAuditUrl:
     "https://clawhub.ai/plugins/@openclaw/diagnostics-otel/security-audit?version=2026.3.22",
@@ -31,6 +39,29 @@ function jsonResponse(body: unknown) {
 }
 
 describe("clawhub packages", () => {
+  it("requests official search results before ClawHub applies the result cap", async () => {
+    let requestedUrl = "";
+    await expect(
+      searchClawHubPackages({
+        query: " research ",
+        family: "claw",
+        isOfficial: true,
+        limit: 1,
+        fetchImpl: vi.fn(async (input) => {
+          requestedUrl = input instanceof Request ? input.url : String(input);
+          return jsonResponse({ results: [] });
+        }),
+      }),
+    ).resolves.toEqual([]);
+    expect(new URL(requestedUrl).pathname).toBe("/api/v1/packages/search");
+    expect(Object.fromEntries(new URL(requestedUrl).searchParams)).toEqual({
+      q: "research",
+      family: "claw",
+      isOfficial: "true",
+      limit: "1",
+    });
+  });
+
   it("resolves latest versions from latestVersion before tags", () => {
     const pkg = {
       name: "demo",
@@ -64,10 +95,10 @@ describe("clawhub packages", () => {
     await expect(
       fetchClawHubPackageArtifact({
         ...packageSelector,
-        fetchImpl: async (input) => {
+        fetchImpl: vi.fn(async (input) => {
           requestedUrl = input instanceof Request ? input.url : String(input);
           return jsonResponse(report);
-        },
+        }),
       }),
     ).resolves.toEqual(report);
     expect(new URL(requestedUrl).pathname).toBe(
@@ -80,14 +111,21 @@ describe("clawhub packages", () => {
     await expect(
       fetchClawHubPackageSecurity({
         ...packageSelector,
-        fetchImpl: async (input) => {
+        fetchImpl: vi.fn(async (input) => {
           requestedUrl = input instanceof Request ? input.url : String(input);
           return jsonResponse(securityReport);
-        },
+        }),
       }),
     ).resolves.toEqual({
       ...securityReport,
-      release: { id: "rel_demo", version: "2026.3.22" },
+      release: {
+        id: "rel_demo",
+        version: "2026.3.22",
+        artifactKind: "npm-pack",
+        artifactSha256: "a".repeat(64),
+        npmIntegrity: "sha512-proof",
+        npmShasum: "abc",
+      },
     });
     expect(new URL(requestedUrl).pathname).toBe(
       "/api/v1/packages/%40openclaw%2Fdiagnostics-otel/versions/2026.3.22/security",
@@ -98,8 +136,9 @@ describe("clawhub packages", () => {
     await expect(
       fetchClawHubPackageSecurity({
         ...packageSelector,
-        fetchImpl: async () =>
+        fetchImpl: vi.fn(async () =>
           jsonResponse({ trust: { ...securityReport.trust, reasons: "clean", stale: false } }),
+        ),
       }),
     ).rejects.toThrow("expected reasons to be a string array");
   });
@@ -108,11 +147,12 @@ describe("clawhub packages", () => {
     await expect(
       fetchClawHubPackageSecurity({
         ...packageSelector,
-        fetchImpl: async () =>
+        fetchImpl: vi.fn(async () =>
           jsonResponse({
             securityAuditUrl: securityReport.securityAuditUrl,
             trust: { blockedFromDownload: false, reasons: [], pending: false, stale: false },
           }),
+        ),
       }),
     ).rejects.toThrow("expected overview to be a non-empty string");
   });

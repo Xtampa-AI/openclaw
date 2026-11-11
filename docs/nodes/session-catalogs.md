@@ -9,8 +9,11 @@ title: "Node session catalogs"
 sidebarTitle: "Session catalogs"
 ---
 
-Catalog listing waits up to one second per provider, concurrently. Providers that
-finish within that budget return normally. A slow provider returns
+Cold catalog listing waits up to one second per provider, concurrently. Providers that
+finish within that budget return normally. When a page is already available for
+the same caller and query, listing returns it promptly while discovery refreshes
+in the background; an already-settled refresh returns its fresh page instead.
+A slow provider returns
 `catalog.error.code: "catalog_pending"`; when available, its latest available page
 for the same caller and query is included with hosts marked `pending: true` and
 a stale-results message. A failed catalog enumeration can likewise return that page with
@@ -242,6 +245,14 @@ turn them off in the Web UI under **Config > Plugins**.
 Terminal resume uses the stored session working directory and the same
 allowlisted duplex PTY relay as Codex and Claude. It does not expose arbitrary
 node command execution.
+
+## Activity probe failures
+
+For adopted Claude or Pi sessions on the Gateway, an unreadable transcript produces
+a `plugins/session-catalog` warning with the path and recovery guidance. Check that
+the Gateway can read the file. Probing retries automatically while preserving the
+session link and activity marker; an access failure does not mean the transcript
+was deleted.
 
 ## OpenClaw sessions and transcripts
 

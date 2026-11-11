@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { buildAcpDatabaseSessionKey } from "../acp/runtime/session-meta-keys.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { setRuntimeConfigSnapshot } from "../config/io.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   listSessionParticipantsReadOnly,
@@ -14,7 +15,7 @@ import {
   toDatabaseOptions,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import { resolveGatewaySessionStoreTargetWithStore } from "../gateway/session-utils-store-lookup.js";
+import { resolveGatewaySessionStoreTargetWithStoreAsync } from "../gateway/session-utils-store-lookup.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -43,7 +44,7 @@ vi.mock("../acp/runtime/session-meta.js", () => ({
   }) => {
     params.assertCurrent?.();
     const cfg = params.cfg ?? config;
-    const target = resolveGatewaySessionStoreTargetWithStore({
+    const target = await resolveGatewaySessionStoreTargetWithStoreAsync({
       cfg,
       key: params.sessionKey,
       agentId: params.agentId,
@@ -70,13 +71,15 @@ vi.mock("../acp/runtime/session-meta.js", () => ({
     };
   },
 }));
+// mock-isolation: Keep ACP database reads controlled by each coordination scenario.
 vi.mock("../acp/runtime/session-meta-readonly.js", async () => {
   const { rowToAcpSessionMeta } = await vi.importActual<
     typeof import("../acp/runtime/session-meta-readonly.js")
   >("../acp/runtime/session-meta-readonly.js");
   return {
     rowToAcpSessionMeta,
-    readAcpSessionMetaForEntry: (params: unknown) => readAcpSessionMetaForEntryMock(params),
+    readAcpSessionMetaForEntryAsync: async (params: unknown) =>
+      readAcpSessionMetaForEntryMock(params),
   };
 });
 vi.mock("../gateway/call.js", () => ({ callGateway: (opts: unknown) => callGatewayMock(opts) }));
@@ -105,6 +108,7 @@ import { clearActiveEmbeddedRun, setActiveEmbeddedRun } from "./embedded-agent-r
 import { createEmbeddedRunHandle } from "./embedded-agent-runner/runs.test-support.js";
 import { createRequesterYieldCallback } from "./openclaw-tools.requester-yield.js";
 import {
+  endChildRun,
   registerSessionsSendRequesterRetirementTests,
   type GatewayCall,
 } from "./openclaw-tools.sessions-send-requester-retirement.test-support.js";
@@ -114,6 +118,7 @@ import { subscribeSubagentRunChanges } from "./subagents/registry/subagent-regis
 import { observeRootWork } from "./subagents/registry/subagent-registry.browser-cleanup.test-support.js";
 import {
   addSubagentRunForTests,
+  countPendingDescendantRuns,
   getSubagentRunByRunId,
   resetSubagentRegistryForTests,
   settleRequesterAfterSessionSpawns,
@@ -215,6 +220,7 @@ describe("sessions_send child coordination", () => {
       dmScope: "main",
       store: state.path("configured", "agents", "{agentId}", "sessions", "sessions.json"),
     };
+    setRuntimeConfigSnapshot(config);
     resetGatewayWorkAdmission();
     callGatewayMock.mockReset();
     calls.length = 0;
@@ -264,6 +270,15 @@ describe("sessions_send child coordination", () => {
       const previous = () => getSubagentRunByRunId("steer-A")!;
       const queueB = vi.fn(async () => {});
       const handleB = createEmbeddedRunHandle({ runId: "steer-B", queueMessage: queueB });
+      handleB.messageInjectionV2 = {
+        version: 2,
+        isAvailable: () => true,
+        queueMessage: async (_text, options, assertCurrent) => {
+          assertCurrent();
+          await queueB();
+          options?.onQueueAccepted?.(true);
+        },
+      };
       const completePrevious = async (delivered = false) => {
         await mutateSubagentRuns(["steer-A"], (rows) => {
           const current = rows.get("steer-A");
@@ -307,6 +322,15 @@ describe("sessions_send child coordination", () => {
         }
       });
       const handleA = createEmbeddedRunHandle({ runId: "steer-A", queueMessage: queueA });
+      handleA.messageInjectionV2 = {
+        version: 2,
+        isAvailable: () => true,
+        queueMessage: async (_text, options, assertCurrent) => {
+          assertCurrent();
+          await queueA();
+          options?.onQueueAccepted?.(true);
+        },
+      };
       setActiveEmbeddedRun(sessionId, handleA, childSessionKey);
       const deliver = sendDelivery.trySessionsSendActiveRunDelivery;
       const admission = vi
@@ -373,11 +397,14 @@ describe("sessions_send child coordination", () => {
   );
 
   it.each([
-    { acknowledgment: "acknowledged", watch: undefined },
-    { acknowledgment: "ACK lost", watch: true },
+    { acknowledgment: "acknowledged", watch: undefined, timeoutSeconds: 0, observation: "timeout" },
+    { acknowledgment: "acknowledged", watch: undefined, timeoutSeconds: 1, observation: "timeout" },
+    { acknowledgment: "acknowledged", watch: undefined, timeoutSeconds: 1, observation: "yielded" },
+    { acknowledgment: "acknowledged", watch: undefined, timeoutSeconds: 1, observation: "pending" },
+    { acknowledgment: "ACK lost", watch: true, timeoutSeconds: 0, observation: "timeout" },
   ] as const)(
     "delivers a queued child follow-up after its original wake was consumed ($acknowledgment, watch=$watch)",
-    async ({ acknowledgment, watch }) => {
+    async ({ acknowledgment, watch, timeoutSeconds, observation }) => {
       const requesterSessionKey = "agent:main:dashboard:requester";
       const childSessionKey = "agent:main:dashboard:existing-child";
       const requesterTurnRunId = "followup-requester-turn";
@@ -404,6 +431,7 @@ describe("sessions_send child coordination", () => {
         requesterTurnRunId: undefined,
         requesterSettleWake: undefined,
       });
+      let inlineObserved = false;
       let finishChild = () => {};
       const childPending = new Promise<void>((resolve) => {
         finishChild = resolve;
@@ -419,6 +447,12 @@ describe("sessions_send child coordination", () => {
           return receipt;
         }
         if (request.method === "agent.wait" && request.params?.runId === runId) {
+          if (!inlineObserved && request.params?.timeoutMs === 1000) {
+            inlineObserved = true;
+            return observation === "yielded"
+              ? { status: "ok", yielded: true }
+              : { status: observation };
+          }
           await childPending;
           return {
             runId,
@@ -452,7 +486,7 @@ describe("sessions_send child coordination", () => {
           sessionKey: childSessionKey,
           mode: "followup",
           ...(watch === undefined ? {} : { watch }),
-          timeoutSeconds: 0,
+          timeoutSeconds,
           message: "Return the follow-up result",
         });
         expect(result.details).toMatchObject({
@@ -532,6 +566,90 @@ describe("sessions_send child coordination", () => {
         await resetSubagentRegistryForTests();
         announceTesting.setDepsForTest();
       }
+    },
+  );
+
+  it.each(["ok", "error", "timeout"] as const)(
+    "consumes an inline native child result without a later parent notice (%s)",
+    async (status) => {
+      const requesterSessionKey = "agent:main:dashboard:inline-parent";
+      const childSessionKey = "agent:main:dashboard:inline-child";
+      const requesterTurnRunId = "inline-parent-turn";
+      const runId = "inline-followup";
+      const terminalReply = { disposition: "visible" as const, text: "Inline result" };
+      await writeEntry(requesterSessionKey, { sessionId: "inline-parent", updatedAt: 1 });
+      await writeEntry(childSessionKey, {
+        sessionId: "inline-child",
+        updatedAt: 1,
+        spawnedBy: requesterSessionKey,
+        spawnDepth: 1,
+      });
+      await resetSubagentRegistryForTests();
+      callGatewayMock.mockImplementation(async (request: GatewayCall) => {
+        calls.push(request);
+        if (request.method === "agent") {
+          return { runId, status: "accepted", targetDisposition: "queued" };
+        }
+        if (request.method === "agent.wait") {
+          if (status === "ok") {
+            await endChildRun(runId, childSessionKey, terminalReply);
+            // The live inline claim owns cleanup until its guarded acknowledgement.
+            expect(getSubagentRunByRunId(runId)?.cleanupCompletedAt).toBeUndefined();
+          }
+          return {
+            runId,
+            status,
+            startedAt: 1,
+            endedAt: Date.now(),
+            ...(status === "ok" ? { terminalReply } : { error: "Child failed" }),
+          };
+        }
+        return {};
+      });
+      const result = await createSessionsSendTool({
+        agentSessionKey: requesterSessionKey,
+        requesterTurnRunId,
+        config,
+        callGateway: callGatewayMock,
+      }).execute("inline", {
+        sessionKey: childSessionKey,
+        mode: "followup",
+        timeoutSeconds: 1,
+        message: "Continue",
+      });
+      expect(result.details).toMatchObject({ status });
+      expect(getSubagentRunByRunId(runId)).toMatchObject({
+        expectsCompletionMessage: false,
+        completion: { required: false },
+        delivery: { status: "delivered" },
+      });
+      await settleRequesterAfterSessionSpawns({
+        requesterSessionKey,
+        requesterAgentId: "main",
+        requesterTurnRunId,
+        requesterYielded: false,
+        acceptedSessionSpawns: [{ runId, childSessionKey, expectsCompletionMessage: false }],
+      });
+      if (status !== "ok") {
+        // A later lifecycle terminal still owns its normal cleanup after acknowledgement.
+        await endChildRun(runId, childSessionKey, terminalReply);
+      }
+      await settleSessionWork();
+      expect(getSubagentRunByRunId(runId)?.cleanupCompletedAt).toEqual(expect.any(Number));
+      expect(await countPendingDescendantRuns(requesterSessionKey, () => {})).toBe(0);
+      // Replaying the lifecycle cannot revive the consumed notice.
+      emitAgentEvent({
+        runId,
+        sessionKey: childSessionKey,
+        stream: "lifecycle",
+        data: { phase: "end", endedAt: Date.now() },
+      });
+      await settleSessionWork();
+      expect(
+        calls.filter(
+          (call) => call.method === "agent" && call.params?.sessionKey === requesterSessionKey,
+        ),
+      ).toHaveLength(0);
     },
   );
 
@@ -813,16 +931,17 @@ describe("sessions_send child coordination", () => {
       // join its metadata against the entry already selected by sessions_send.
       readAcpSessionMetaMock.mockImplementation(
         (params: Parameters<typeof metadata.readAcpSessionEntry>[0]) =>
-          metadataRead.readAcpSessionMetaForEntry({
+          metadataRead.readAcpSessionMetaForEntryAsync({
             ...params,
             databasePath,
             entry: { sessionId, lifecycleRevision, sessionStartedAt: 50 },
           }),
       );
       readAcpSessionMetaForEntryMock.mockImplementation(
-        (params: Parameters<typeof metadataRead.readAcpSessionMetaForEntry>[0]) =>
-          metadataRead.readAcpSessionMetaForEntry({ ...params, databasePath }),
+        (params: Parameters<typeof metadataRead.readAcpSessionMetaForEntryAsync>[0]) =>
+          metadataRead.readAcpSessionMetaForEntryAsync({ ...params, databasePath }),
       );
+      await writeEntry(peerKey, { sessionId: "peer-session", updatedAt: 1 });
       await writeEntry(reusedKey, currentEntry);
       const result = await send(requesterKey, targetKey, direction === "target" ? 0 : 1);
       await settleSessionWork();
@@ -863,8 +982,18 @@ describe("sessions_send child coordination", () => {
     "sessions_send does not start reply turns for $name after timeoutSeconds=$timeoutSeconds",
     async ({ requesterKey, entry, timeoutSeconds, targetKey = "agent:main:main" }) => {
       await writeEntry(requesterKey, { sessionId: "child", updatedAt: 1, ...entry });
+      await writeEntry(targetKey, { sessionId: "target", updatedAt: 1 });
       mockGatewayReply({ status: "timeout" });
       const result = await send(requesterKey, targetKey, timeoutSeconds);
+      if (entry.spawnedBy) {
+        expect(result.details).toMatchObject({
+          status: "forbidden",
+          error: "Session communication ancestry is invalid.",
+        });
+        expect(getActiveGatewayRootWorkCount()).toBe(0);
+        expect(calls.map((call) => call.method)).toEqual(["sessions.resolve"]);
+        return;
+      }
       expect(result.details).toMatchObject({
         status: "accepted",
         delivery: { status: "skipped" },

@@ -135,3 +135,30 @@ it("joins the suspended task's cleanup when capacity readmission is refused", as
     await outcome;
   }
 });
+
+it.each([false, true])(
+  "propagates an active queue failure without joining uncooperative work (resumed: %s)",
+  async (resumed) => {
+    const failure = new Error("queue revoked the active task");
+    const queueFailure = createDeferredCore<never>();
+    const started = createDeferredCore();
+    const finishRawTask = createDeferredCore();
+    const enqueue: CommandQueueEnqueueFn = (task) => Promise.race([task(), queueFailure.promise]);
+    const work = withReleasableExecutionCapacity(enqueue, async () => {
+      if (resumed) {
+        await outsideExecutionCapacity(async () => undefined);
+      }
+      started.resolve();
+      await finishRawTask.promise;
+    });
+    const outcome = work.catch((error: unknown) => error);
+    try {
+      await started.promise;
+      queueFailure.reject(failure);
+      expect(await outcome).toBe(failure);
+    } finally {
+      finishRawTask.resolve();
+      await outcome;
+    }
+  },
+);

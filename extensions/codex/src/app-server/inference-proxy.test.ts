@@ -104,7 +104,7 @@ async function fixture(
   });
   proxies.push(proxy);
   const controller = new AbortController();
-  const registration = proxy.context.register({
+  const registration = await proxy.context.register({
     threadId: "root",
     text: contextText,
     signal: controller.signal,
@@ -238,7 +238,7 @@ it.each(["HTTP", "WebSocket"] as const)(
       expect(observedStartup).toBeUndefined();
       expect(response).toBe(final);
       expect(bindModelExecution).toHaveBeenCalledOnce();
-      expect(store.readNativeSubagentAssignments?.(identity, owner)).toEqual([assignment]);
+      expect(await store.readNativeSubagentAssignments?.(identity, owner)).toEqual([assignment]);
       expect(kind === "HTTP" ? transport.fetch : forwarded).toHaveBeenCalledOnce();
       await expect(staleWrite()).rejects.toThrow("Lost Codex binding lease");
       expect(store.read(identity)).toEqual(binding);
@@ -307,13 +307,9 @@ describe("private inference HTTP relay", () => {
     );
   });
 
-  it("rejects OAuth use after refresh loses the admitted turn and before physical I/O loses the grant", async () => {
-    let loseAdmission = true;
+  it("rejects OAuth use when asynchronous transport preparation loses the grant", async () => {
     let grantCurrent = true;
     const resolve = vi.fn(async () => {
-      if (loseAdmission) {
-        registration.release();
-      }
       return {
         token: "synthetic-access",
         assertCurrent: () => {
@@ -323,10 +319,6 @@ describe("private inference HTTP relay", () => {
         },
       };
     });
-    const { proxy, body, registration } = await fixture(true, undefined, { resolve });
-    expect((await post(proxy.baseUrl + "/responses", body)).status).toBe(502);
-    expect(transport.fetch).not.toHaveBeenCalled();
-    loseAdmission = false;
     const next = await fixture(true, undefined, { resolve });
     let writes = 0;
     transport.fetch.mockImplementation(async (args) => {

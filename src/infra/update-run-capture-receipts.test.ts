@@ -12,12 +12,8 @@ import { requireNodeSqlite } from "./node-sqlite.js";
 import { encodeRun } from "./update-run-codec.js";
 import { readUpdateRunRecord } from "./update-run-read.kernel.js";
 import { toPublicUpdateRun, type UpdateRunRecord } from "./update-run-record.js";
-import {
-  mutateRunInTransaction,
-  persistRun,
-  updateRunLedgerSchema,
-  upsertStep,
-} from "./update-run-write.js";
+import { upsertStep } from "./update-run-step-upsert.js";
+import { mutateRunInTransaction, persistRun, updateRunLedgerSchema } from "./update-run-write.js";
 
 let root: string;
 let database: DatabaseSync | undefined;
@@ -210,6 +206,21 @@ describe("durable update capture receipts", () => {
       expect(repaired.verification.recovery).not.toHaveProperty("dataAtRisk");
     },
   );
+
+  it("preserves pre-backport migration risk without a separate risk field", () => {
+    const legacy = record();
+    legacy.verification.recovery = {
+      serviceRestartSafe: false,
+      reason: "state-migration-started",
+    };
+    persistRun(ownedDatabase(), legacy, { env });
+    expect(readUpdateRunRecord(ownedDatabase(), legacy.runId)?.verification.recovery).toMatchObject(
+      {
+        serviceRestartSafe: false,
+        dataAtRisk: "legacy-state-migration",
+      },
+    );
+  });
 
   it("keeps database recovery locations when later diagnostics exhaust the history budget", () => {
     const summaries = [

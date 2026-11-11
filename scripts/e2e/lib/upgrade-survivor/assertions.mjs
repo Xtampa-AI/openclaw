@@ -1168,39 +1168,9 @@ function assertSessionMetadataMigrated(stateDir, stage) {
   assert(direct?.sessionId === LEGACY_SESSION_DIRECT_ID, "direct legacy session row missing");
   assert(group?.sessionId === LEGACY_SESSION_GROUP_ID, "channel legacy session row missing");
   if (getScenario() === "acpx-openclaw-tools-bridge") {
-    let acp;
-    if (stage === "baseline") {
-      acp = group.acp;
-    } else {
-      readDatabase(path.join(stateDir, "state", "openclaw.sqlite"), (db) => {
-        const rows = db
-          .prepare(
-            `SELECT backend, agent, runtime_session_name, identity_json, mode,
-                    runtime_options_json, cwd, state, last_activity_at, last_error
-             FROM acp_sessions
-             WHERE session_id = ?`,
-          )
-          .all(LEGACY_SESSION_GROUP_ID);
-        assert(rows.length <= 1, "saved ACP session binding is ambiguous");
-        const row = rows[0];
-        if (row) {
-          acp = {
-            backend: row.backend,
-            agent: row.agent,
-            runtimeSessionName: row.runtime_session_name,
-            ...(row.identity_json ? { identity: JSON.parse(row.identity_json) } : {}),
-            mode: row.mode === "oneshot" ? "oneshot" : "persistent",
-            ...(row.runtime_options_json
-              ? { runtimeOptions: JSON.parse(row.runtime_options_json) }
-              : {}),
-            ...(row.cwd != null ? { cwd: row.cwd } : {}),
-            state: row.state === "running" || row.state === "error" ? row.state : "idle",
-            lastActivityAt: row.last_activity_at,
-            ...(row.last_error != null ? { lastError: row.last_error } : {}),
-          };
-        }
-      });
-    }
+    const acp =
+      group.acp ??
+      readMigratedAcpSessionMeta(stateDir, "agent:main:slack:channel:cupgrade", "main");
     assertStrict.deepEqual(acp, LEGACY_ACP_META, "saved ACP session or model selection changed");
   }
   const migratedSessions = [
@@ -1259,6 +1229,29 @@ function assertSessionMetadataMigrated(stateDir, stage) {
     main.skillsSnapshot?.resolvedSkills === undefined,
     "heavy resolvedSkills cache was persisted into migrated session metadata",
   );
+}
+
+function readMigratedAcpSessionMeta(stateDir, sessionKey, agentId) {
+  const databaseKey = `@acp:v1:${Buffer.from(JSON.stringify([agentId, sessionKey]), "utf8").toString("base64url")}`;
+  const dbPath = path.join(stateDir, "state", "openclaw.sqlite");
+  return readDatabase(dbPath, (db) => {
+    const row = db.prepare("SELECT * FROM acp_sessions WHERE session_key = ?").get(databaseKey);
+    if (!row) {
+      return undefined;
+    }
+    return {
+      backend: row.backend,
+      agent: row.agent,
+      runtimeSessionName: row.runtime_session_name,
+      ...(row.identity_json ? { identity: JSON.parse(row.identity_json) } : {}),
+      mode: row.mode,
+      ...(row.runtime_options_json ? { runtimeOptions: JSON.parse(row.runtime_options_json) } : {}),
+      ...(row.cwd != null ? { cwd: row.cwd } : {}),
+      state: row.state,
+      lastActivityAt: row.last_activity_at,
+      ...(row.last_error != null ? { lastError: row.last_error } : {}),
+    };
+  });
 }
 
 function readMigratedSessionStore(stateDir, targetStorePath) {
@@ -1337,9 +1330,9 @@ function readMigratedSessionStore(stateDir, targetStorePath) {
   return { source: "file", store: readJson(targetStorePath) };
 }
 
-function readInstalledPluginIndex() {
+function readInstalledPluginIndex(options = {}) {
   const stateDir = requireEnv("OPENCLAW_STATE_DIR");
-  const index = readPluginInstallIndex({ stateDir });
+  const index = readPluginInstallIndex({ stateDir, includePlugins: false, ...options });
   assert(index.installRecords, "installed plugin index missing");
   return index;
 }
@@ -1629,7 +1622,10 @@ function assertConfiguredPluginInstalls() {
   if (stage === "baseline") {
     return;
   }
-  const index = readInstalledPluginIndex();
+  const index = readInstalledPluginIndex({
+    includePlugins: true,
+    pluginIds: ["matrix", "brave"],
+  });
   const records = index.installRecords ?? {};
   assertOptionalConfiguredPluginIndex(records, index.plugins ?? [], {
     bundled: true,
@@ -1852,7 +1848,19 @@ function assertSuccessfulUpdateResult(result, expectedVersion) {
           step?.exitCode === 0 ||
           (step?.name === "openclaw doctor" &&
             step.exitCode === 86 &&
-            step.advisory?.kind === "package-post-install-doctor"),
+            step.advisory?.kind === "package-post-install-doctor") ||
+          // Doctor lint exits 1 for selected INFO findings after verified activation.
+          (step?.name === "post-activation doctor inspections" &&
+            step.exitCode === 1 &&
+            step.advisory?.kind === "recoverable-maintenance" &&
+            step.termination === "exit" &&
+            !step.signal &&
+            !step.killed &&
+            !step.outputLimitExceeded &&
+            !step.failureFacts?.length &&
+            Array.isArray(step.doctorLintFindings) &&
+            step.doctorLintFindings.length > 0 &&
+            step.doctorLintFindings.every((finding) => finding?.severity === "info")),
       ),
     "successful update contained a failed core step",
   );

@@ -17,7 +17,7 @@ import {
 import {
   assertSqliteIntegrity,
   classifySqliteFtsIntegrityFindings,
-  readSqliteIntegrityFindings,
+  SqliteIntegrityError,
 } from "../infra/sqlite-integrity.js";
 import {
   inspectSqliteRecoveryFiles,
@@ -223,16 +223,13 @@ async function recoverCorruptSqliteTargets(
       ? inspectSqliteForRecovery(sqlitePath, recoveryFiles.existing)
       : {
           ok: false,
+          ftsOnly: false,
           error: new Error(`SQLite sidecars exist without their main database: ${sqlitePath}`),
         };
     if (inspection.ok) {
       continue;
     }
-    if (
-      hasDatabase &&
-      !("ftsOnly" in inspection && inspection.ftsOnly) &&
-      !isSqliteCorruptionError(inspection.error)
-    ) {
+    if (hasDatabase && !isSqliteCorruptionError(inspection.error)) {
       reports.push(
         createRecoverInspectionFailureTargetReport(target, sqlitePath, inspection.error),
       );
@@ -240,8 +237,7 @@ async function recoverCorruptSqliteTargets(
     }
     if (
       !hasDatabase ||
-      (!("ftsOnly" in inspection && inspection.ftsOnly) &&
-        !isCanonicalAgentIndexCorruptionError(inspection.error))
+      (!inspection.ftsOnly && !isCanonicalAgentIndexCorruptionError(inspection.error))
     ) {
       reports.push(
         recoverCorruptSqliteTarget(target, sqlitePath, inspection.error, () =>
@@ -282,7 +278,7 @@ async function repairCanonicalIndexesForRecovery(
     }
     if (!clearOpenClawAgentDatabaseOpenFailure(sqlitePath, { env: databaseOptions.env })) {
       throw new Error(
-        `Repaired canonical SQLite indexes, but could not clear the quarantine for ${sqlitePath}.`,
+        `Repaired SQLite indexes, but could not clear the quarantine for ${sqlitePath}.`,
       );
     }
     return { ok: true };
@@ -315,17 +311,13 @@ function inspectSqliteForRecovery(
     database = openNodeSqliteDatabase(inspectionPath);
     database.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
     database.exec("PRAGMA trusted_schema = OFF;");
-    assertSqliteIntegrity(database, inspectionPath);
+    assertSqliteIntegrity(database, inspectionPath, { allFindings: true });
   } catch (error) {
     inspectionError = error;
-    if (database && error instanceof Error && error.name === "SqliteIntegrityError") {
+    if (database && error instanceof SqliteIntegrityError && error.findings) {
       try {
         ftsOnly = Boolean(
-          classifySqliteFtsIntegrityFindings(
-            database,
-            readSqliteIntegrityFindings(database),
-            AGENT_FTS_SCHEMAS,
-          ),
+          classifySqliteFtsIntegrityFindings(database, error.findings, AGENT_FTS_SCHEMAS),
         );
       } catch {
         // An unreadable file is never eligible for derived-index repair.

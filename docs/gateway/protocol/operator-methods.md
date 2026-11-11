@@ -165,11 +165,14 @@ catalog consumers, retaining cancellation and any explicit request deadline.
   aliases. Unknown provider IDs return `INVALID_REQUEST` with the rejected ID.
   Omit the filter or run `openclaw models list --all` to list models and their
   provider IDs.
-- `includeDetails: true` includes available input modalities, effective
-  `contextTokens`, and a `local` endpoint classification. It does not expose
-  endpoint URLs, headers, credentials, costs or runtime request parameters.
+- Rows include `contextWindow` (the model maximum) and the effective
+  `contextTokens` budget when known, so pickers can display the active budget
+  without session metadata.
+- `includeDetails: true` also includes available input modalities and a `local`
+  endpoint classification. It does not expose endpoint URLs, headers,
+  credentials, costs or runtime request parameters.
 
-For a conversation picker, pass `sessionKey` to read the session's canonical
+For a conversation picker, pass `sessionKey` to read the session's saved
 agent and saved account selection. A conflicting `agentId` is rejected. The
 viewer's current account default does not replace a saved session's selection.
 For a new draft, `authProfileId` previews a retained account owned by the
@@ -178,7 +181,7 @@ default. `sessionKey` and `authProfileId` are mutually exclusive.
 
 Saved-session metadata and draft previews stay current across unrelated session
 creations and writes. Before publishing, the Gateway rechecks the selected
-session's identity and canonical metadata, runtime configuration, and current
+session's identity and saved metadata, runtime configuration, and current
 access authority. Recreating a row with identical session facts does not invalidate
 the read. `chat.metadata` also tolerates title, activity, and ordinary preference
 updates to the selected row when its metadata inputs and access facts remain
@@ -305,10 +308,10 @@ them rather than returning a native registry skill with the same slug.
 - Operator clients resolve by calling `exec.approval.resolve` (requires
   `operator.approvals`).
 - For `host=node`, `exec.approval.request` must include `systemRunPlan`
-  (canonical `argv`/`cwd`/`rawCommand`/session metadata). Requests missing
+  (prepared `argv`/`cwd`/`rawCommand`/session metadata). Requests missing
   `systemRunPlan` are rejected.
 - After approval, forwarded `node.invoke system.run` calls reuse that
-  canonical `systemRunPlan` as the authoritative command/cwd/session context.
+  stored `systemRunPlan` as the authoritative command/cwd/session context.
 - If a caller mutates `command`, `rawCommand`, `cwd`, `agentId`, or
   `sessionKey` between prepare and the final approved `system.run` forward,
   the gateway rejects the run instead of trusting the mutated payload.

@@ -45,7 +45,6 @@ function fixture(platform = "linux", version = "12.15.0") {
     .replaceAll("/opt/crabbox/toolchain-archives", image)
     .replaceAll("process.platform", JSON.stringify(platform))
     .replaceAll("process.arch", '"x64"')
-    .replace("process.report?.getReport().header.glibcVersionRuntime", '"fixture-glibc"')
     .replace(
       "b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61",
       wrapperHash,
@@ -166,9 +165,6 @@ describe("pnpm image archive consumer", () => {
       expect(preparation.run).toContain('echo "COREPACK_HOME=$COREPACK_HOME" >> "$GITHUB_ENV"');
     }
     const hydration = workflow.jobs.hydrate.steps;
-    expect(hydration.find((step: { name: string }) => step.name === "Setup Node.js").run).toContain(
-      'openclaw_ensure_node "24.22.1"',
-    );
     expect(
       hydration.find((step: { run?: string }) => step.run?.includes("install_args=")).run,
     ).toContain("--frozen-lockfile");

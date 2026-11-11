@@ -14,5 +14,10 @@ export type DoctorMaintenanceParams = {
   runId?: string;
   assertCurrent?: () => void;
   databaseGenerations?: UpdateDatabaseGenerations;
+  databaseWriteCapture?: ReturnType<
+    typeof import("../infra/update-doctor-result.js").createUpdateDoctorDatabaseWriteCapture
+  >;
+  /** Parent Doctor phase deadline for nested managed-service inspection. */
+  serviceInspectionDeadlineAtMs?: number;
   beforeStateMutation?: (context: { env: NodeJS.ProcessEnv; signal: AbortSignal }) => Promise<void>;
 };

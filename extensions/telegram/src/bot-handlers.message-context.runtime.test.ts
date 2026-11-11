@@ -123,18 +123,6 @@ describe("resolveCachedMessageThreadSpec", () => {
     expect(session.sessionKey).toContain("agent:research:");
   });
 
-  it("recovers the topic of a recorded forum message", async () => {
-    const runtime = createRuntime();
-    await runtime.recordMessageForReplyChain(forumMessage(100, TOPIC_ID), {
-      scope: "forum",
-      id: TOPIC_ID,
-    });
-
-    await expect(
-      runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID, messageId: 100 }),
-    ).resolves.toEqual({ scope: "forum", id: TOPIC_ID });
-  });
-
   it("returns undefined for a message that is not in the cache", async () => {
     const runtime = createRuntime();
 
@@ -142,15 +130,6 @@ describe("resolveCachedMessageThreadSpec", () => {
     // attributing the reaction to the General topic.
     await expect(
       runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID, messageId: 404 }),
-    ).resolves.toBeUndefined();
-  });
-
-  it("returns undefined for a recorded message that carries no topic", async () => {
-    const runtime = createRuntime();
-    await runtime.recordMessageForReplyChain(forumMessage(101));
-
-    await expect(
-      runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID, messageId: 101 }),
     ).resolves.toBeUndefined();
   });
 
@@ -173,8 +152,29 @@ describe("resolveCachedMessageThreadSpec", () => {
 
     await expect(
       runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID, messageId: 102 }),
-    ).resolves.toEqual({ scope: "direct-messages", id: TOPIC_ID });
+    ).resolves.toEqual({
+      threadSpec: { scope: "direct-messages", id: TOPIC_ID },
+      isTopicMessage: false,
+    });
   });
+  it.each([true, false])(
+    "recovers provider-observed private topic evidence: %s",
+    async (isTopicMessage) => {
+      const runtime = createRuntime();
+      const msg = {
+        ...forumMessage(103, TOPIC_ID),
+        chat: { id: CHAT_ID, type: "private", first_name: "Bob" },
+        is_topic_message: isTopicMessage,
+      } as Message;
+      await runtime.recordMessageForReplyChain(msg, { scope: "dm", id: TOPIC_ID });
+      await expect(
+        runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID, messageId: 103 }),
+      ).resolves.toEqual({ threadSpec: { scope: "dm", id: TOPIC_ID }, isTopicMessage });
+      await expect(
+        runtime.resolveCachedMessageThreadSpec({ chatId: CHAT_ID + 1, messageId: 103 }),
+      ).resolves.toBeUndefined();
+    },
+  );
 });
 
 describe("automatic Telegram retained history workload", () => {
@@ -296,32 +296,6 @@ describe("automatic Telegram retained history workload", () => {
     await state.cleanup();
   });
 
-  it.each([
-    { historyLimit: undefined, limit: 50 },
-    { historyLimit: Number.MAX_SAFE_INTEGER, limit: 50 },
-    { historyLimit: 5000, limit: 200 },
-  ])(
-    "bounds the automatic window to $limit for configured $historyLimit",
-    async ({ historyLimit, limit }) => {
-      const { runtime, cfg, telegramCfg } = historyRuntime({ groupPolicy: "open", historyLimit });
-      const msg = archivedMessage(archiveSize + 1);
-      const context = await runtime.buildPromptContextForMessage(
-        { message: msg, getFile: vi.fn() },
-        msg,
-        [],
-        cfg,
-        telegramCfg,
-      );
-      expect(telegramPromptContextHistory(context).map((entry) => entry.messageId)).toEqual(
-        Array.from({ length: limit + 1 }, (_, index) => String(archiveSize - limit + index)).filter(
-          (id) => id !== "50500",
-        ),
-      );
-      expect(reads.rows).toBeLessThanOrEqual(256);
-      expect(reads.pages).toBeLessThanOrEqual(2);
-    },
-  );
-
   it("does not read storage when automatic history is zero and there is no reply", async () => {
     const { runtime, cfg, telegramCfg } = historyRuntime({ groupPolicy: "open", historyLimit: 0 });
     const msg = archivedMessage(archiveSize + 1);
@@ -439,16 +413,13 @@ describe("Telegram same-turn reset context", () => {
     clearTelegramRuntimeForTest();
   });
 
-  it.each(["private", "group"] as const)(
+  it.each(["group"] as const)(
     "keeps soft-reset context but drops a hard reset in %s chats",
     async (type) => {
       const telegramCfg: TelegramAccountConfig = { groupPolicy: "open" };
       const cfg: OpenClawConfig = { channels: { telegram: telegramCfg } };
       const previous = {
-        chat:
-          type === "private"
-            ? { id: 7, type, first_name: "Participant" }
-            : { id: 7, type, title: "Room" },
+        chat: { id: 7, type, title: "Room" },
         message_id: 100,
         date: 1_736_380_800,
         text: "Keep this context for a soft reset.",

@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../../config/runtime-snapshot.js";
 import { sqliteWorkerOwnerProbe as probe } from "../../../infra/sqlite-worker-owner-probe.test-support.js";
 import { executeExistingOpenClawStateRead } from "../../../state/openclaw-state-db-readonly.js";
 import * as stateWorker from "../../../state/openclaw-state-worker-store.js";
@@ -7,14 +11,13 @@ import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.j
 import { mutateSubagentRuns } from "./subagent-registry-persistence.js";
 import { retireSupersededSubagentRun } from "./subagent-registry-sweeper-retire.js";
 import { createSubagentSweeperRun as run } from "./subagent-registry-sweeper.test-support.js";
-import type { SubagentRegistryWrite } from "./subagent-registry.store.kernel.js";
+import type { SubagentRegistryWrite } from "./subagent-registry.store.types.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 const removeInternalSessionEffectsSession = vi.hoisted(() => vi.fn(async () => {}));
-// mock-isolation: session-effect removal writes agent state; tests assert only the retirement call.
-vi.mock("../../internal-session-effects.js", () => ({
-  removeInternalSessionEffectsSession,
-}));
+// mock-isolation: Cleanup is gated by the race fixture without deleting real internal-session effects.
+vi.mock("../../internal-session-effects.js", () => ({ removeInternalSessionEffectsSession }));
+afterAll(() => clearRuntimeConfigSnapshot());
 
 describe("superseded subagent retirement", () => {
   it.each([
@@ -25,6 +28,9 @@ describe("superseded subagent retirement", () => {
     "publishes retirement after durable deletion (refused: $refused, successor retires during cleanup: $retireSuccessor)",
     async ({ refused, retireSuccessor }) => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+        setRuntimeConfigSnapshot({
+          session: { store: state.statePath("agents/{agentId}/sessions/sessions.json") },
+        });
         const entry = run();
         if (retireSuccessor) {
           entry.execution.transcriptTarget = {

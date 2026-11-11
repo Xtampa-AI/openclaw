@@ -4,7 +4,10 @@ import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import type { ChannelInboundTurnPlan } from "openclaw/plugin-sdk/channel-inbound";
+import {
+  buildChannelInboundEventContext,
+  type ChannelInboundTurnPlan,
+} from "openclaw/plugin-sdk/channel-inbound";
 import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
@@ -28,6 +31,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MattermostPost } from "./client.js";
 import type { MattermostEventPayload } from "./monitor-websocket.js";
 import { registerMattermostBlockProgressTests } from "./monitor.block-progress.test-support.js";
+import { mattermostPostEvent } from "./monitor.inbound-system-event.test-support.js";
 import { monitorMattermostProvider } from "./monitor.js";
 import { registerMattermostPreviewDeliveryTests } from "./monitor.preview-delivery.test-support.js";
 import { registerMattermostPreviewPolicyTests } from "./monitor.preview-policy.test-support.js";
@@ -101,22 +105,6 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => {
       const draft = actual.createChannelProgressDraftCompositor(...args);
       mockState.progressDrafts.push(draft);
       return draft;
-    },
-  };
-});
-
-vi.mock("openclaw/plugin-sdk/reply-runtime", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/reply-runtime")>();
-  return {
-    ...actual,
-    createReplyDispatcherWithTyping: (...args: unknown[]) =>
-      mockState.createReplyDispatcherWithTyping(...args),
-    dispatchInboundMessage: async (params: Parameters<typeof actual.dispatchInboundMessage>[0]) => {
-      try {
-        return await mockState.dispatchInboundMessage(params);
-      } finally {
-        await params.onSettled?.();
-      }
     },
   };
 });
@@ -400,6 +388,7 @@ function createRuntimeCore(
         updateLastRoute: vi.fn(async () => {}),
       },
       inbound: {
+        buildContext: buildChannelInboundEventContext,
         ingress: createPluginRuntimeMock().channel.inbound.ingress,
         run,
       },
@@ -474,47 +463,6 @@ async function openMonitor(
   return { monitor };
 }
 
-function mattermostPostEvent(params: {
-  id: string;
-  message: string;
-  channelId?: string;
-  rootId?: string;
-  senderId?: string;
-  senderName?: string;
-  createAt?: number;
-  type?: string;
-  fileIds?: string[];
-  channelType?: string;
-  includeChannelLabels?: boolean;
-}) {
-  const senderId = params.senderId ?? "user-1";
-  const channelId = params.channelId ?? "chan-1";
-  return {
-    event: "posted",
-    data: {
-      channel_id: channelId,
-      ...(params.includeChannelLabels === false
-        ? {}
-        : { channel_name: "town-square", channel_display_name: "Town Square" }),
-      channel_type: params.channelType,
-      sender_name: params.senderName ?? "alice",
-      post: JSON.stringify({
-        id: params.id,
-        channel_id: channelId,
-        user_id: senderId,
-        message: params.message,
-        root_id: params.rootId,
-        create_at: params.createAt ?? 1_714_000_000_000,
-        type: params.type,
-        file_ids: params.fileIds,
-      }),
-    },
-    broadcast: {
-      channel_id: channelId,
-      user_id: senderId,
-    },
-  };
-}
 async function emitMattermostChannelPost(
   socket: FakeWebSocket,
   post: Parameters<typeof mattermostPostEvent>[0],
@@ -778,7 +726,7 @@ describe("mattermost inbound user posts", () => {
     expect(statusSink).not.toHaveBeenCalledWith(expect.objectContaining({ lifecycle: "ready" }));
   });
 
-  it("dispatches ordered attachments with a UTF-16-safe inbound preview", async () => {
+  it("dispatches ordered attachments without logging inbound content", async () => {
     const verboseDebug = vi.fn();
     mockState.runtimeCore = createRuntimeCore(testConfig, undefined, { verboseDebug });
     const message = `${"a".repeat(199)}😀tail`;
@@ -811,9 +759,9 @@ describe("mattermost inbound user posts", () => {
     expect(ctx?.media).toEqual(media.map((attachment) => expect.objectContaining(attachment)));
     expect(ctx?.media?.[0]?.path).toBeUndefined();
     expect(ctx?.media?.[0]?.url).toBeUndefined();
-    expect(verboseDebug).toHaveBeenCalledWith(
-      `mattermost inbound: from=mattermost:channel:chan-1 len=${expectedBody.length} preview="${"a".repeat(199)}"`,
-    );
+    const diagnostics = verboseDebug.mock.calls.flat().join("\n");
+    expect(diagnostics).not.toContain("a".repeat(199));
+    expect(diagnostics).toContain(`id=post-regular len=${expectedBody.length}`);
   });
 
   it.each([

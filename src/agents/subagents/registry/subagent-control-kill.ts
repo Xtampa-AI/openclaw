@@ -3,11 +3,15 @@ import { prepareSessionGenerationFacts } from "../../../config/sessions/session-
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { isCurrentChatAbortExecution } from "../../../gateway/chat-abort-lifecycle-internal.js";
 import type { ChatAbortControllerEntry } from "../../../gateway/chat-abort.types.js";
+import { getActiveAgentRunDelegatedAuthority } from "../../../infra/agent-run-registry.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { hasSqliteWorkerOutcomeUnknown } from "../../../infra/sqlite-worker-contract.js";
 import { getGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
-import { resolveSubagentRequesterAgentId } from "../../subagent-requester-owner.js";
+import { retireAcceptedSessionSpawnCompletionForRun } from "../../accepted-session-spawn.js";
+import { getGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
+import { resolveSubagentChildAuthority } from "./subagent-child-owner-match.js";
 import { captureSubagentCommands } from "./subagent-control-commands.js";
+import { collectKillErrors } from "./subagent-control-kill-errors.js";
 import { mutateSubagentRunForKill } from "./subagent-control-kill-runtime.js";
 import {
   withSubagentKillScope,
@@ -17,8 +21,8 @@ import {
   type KillPublicationPreparation,
 } from "./subagent-control-kill-scope.js";
 import {
-  ensureSubagentControllerOwnsRun,
   getLatestOwnedSubagentRun,
+  prepareSessionSubagentKillSelection,
   type captureExecRequestSubagentSelection,
 } from "./subagent-control-scope.js";
 import {
@@ -36,9 +40,8 @@ import {
   getSubagentExecutionCleanup,
 } from "./subagent-registry-execution-cleanup.js";
 import { getCurrentSubagentRunOwner, subagentRuns } from "./subagent-registry-memory.js";
-import { listRunsForControllerFromRuns } from "./subagent-registry-queries.js";
-import { listSubagentRunsForRequester } from "./subagent-registry-read.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import { isSameSubagentRunOwner } from "./subagent-run-generation.js";
 
 async function killSubagentRun(
   params: Parameters<typeof mutateSubagentRunForKill>[0],
@@ -148,7 +151,7 @@ async function killLatestSubagentRun(params: {
   tree: KillTree;
   scope: KillScope;
   suppressTaskDelivery?: boolean;
-  beforeSessionKill?: () => boolean;
+  beforeSessionKill?: () => boolean | Promise<boolean>;
   expectedGeneration?: number;
   expectedOwnerKey?: string;
   commands?: ReturnType<typeof captureSubagentCommands>;
@@ -247,30 +250,6 @@ async function killLatestSubagentRun(params: {
     });
   }
   return { entry: tree.entry, session, result };
-}
-
-function collectKillErrors(trees: KillTree[], unlabeledRoot?: KillTree) {
-  let failed = 0;
-  const errors: string[] = [];
-  const collect = (tree: KillTree) => {
-    const diagnostics = [...tree.errors];
-    if (tree.completedCleanupError) {
-      diagnostics.push(tree.completedCleanupError);
-    }
-    if (diagnostics.length > 0) {
-      failed += 1;
-      for (const error of diagnostics) {
-        errors.push(
-          tree === unlabeledRoot ? error : `${resolveSubagentLabel(tree.entry)}: ${error}`,
-        );
-      }
-    }
-    tree.children.forEach(collect);
-  };
-  // No authority checks or I/O here: a later sibling can fault an already-visited node.
-  // Failures count stable selected nodes, independent of later replacements and killed counts.
-  trees.forEach(collect);
-  return { errors, failed };
 }
 
 type KillTraversal = {
@@ -477,6 +456,9 @@ export async function killAllControlledSubagentRuns(params: {
     }
 > {
   if (params.controller.controlScope !== "children") {
+    if (params.requestSelection?.prepare) {
+      await params.requestSelection.prepare();
+    }
     await params.beforeKill?.(() => {});
     return {
       status: "forbidden" as const,
@@ -494,8 +476,7 @@ export async function killAllControlledSubagentRuns(params: {
         selectPublishedRoot: params.requestSelection.selectPublishedRoot,
       }
     : params;
-  const origin = params.requestSelection?.sessionGeneration;
-  if (!origin) {
+  if (!params.requestSelection?.sessionGeneration && !params.requestSelection?.prepare) {
     return killSelectedSubagentRuns(selection);
   }
   let generation: Awaited<ReturnType<typeof prepareSessionGenerationFacts>> | undefined;
@@ -503,15 +484,29 @@ export async function killAllControlledSubagentRuns(params: {
     params.assertCurrent?.();
     generation?.assertCurrent();
   };
+  let prepared = false;
+  let preparation: Promise<void> | undefined;
+  const prepareRead = () => {
+    if (prepared) {
+      return generation?.prepareRead();
+    }
+    return (preparation ??= (async () => {
+      if (params.requestSelection?.prepare) {
+        await params.requestSelection.prepare();
+      }
+      const origin = params.requestSelection?.sessionGeneration;
+      if (origin) {
+        generation = await prepareSessionGenerationFacts(origin);
+      }
+      prepared = true;
+    })());
+  };
   try {
     return await killSelectedSubagentRuns({
       ...selection,
       assertCurrent,
-      prepareRead: () => generation?.prepareRead(),
+      prepareRead,
       beforeKill: async (sealRootSelection) => {
-        // The native scope already holds every selected root. Retain the fresh
-        // source generation before its first effect, independently of old turns.
-        generation = await prepareSessionGenerationFacts(origin);
         assertCurrent();
         return params.beforeKill ? await params.beforeKill(sealRootSelection) : true;
       },
@@ -528,26 +523,12 @@ export async function killSessionSubagentRuns(params: {
   agentId: string;
   assertCurrent?: () => void;
 }) {
-  const controller = { controllerSessionKey: params.sessionKey, controllerAgentId: params.agentId };
-  return killSelectedSubagentRuns({
-    cfg: params.cfg,
-    assertCurrent: params.assertCurrent,
-    runs: [
-      ...listSubagentRunsForRequester(params.sessionKey, { requesterAgentId: params.agentId }),
-      ...listRunsForControllerFromRuns(subagentRuns, params.sessionKey, params.agentId),
-    ],
-    // Ordinary controller mutations retain their narrower authority. Only an admitted
-    // lifecycle boundary can retire work whose completion belongs to this session.
-    ownsRoot: (entry) =>
-      !ensureSubagentControllerOwnsRun({ cfg: params.cfg, controller, entry }) ||
-      (entry.requesterSessionKey === params.sessionKey &&
-        resolveSubagentRequesterAgentId(params.cfg, entry) === params.agentId),
-    suppressTaskDelivery: true,
-  });
+  return killSelectedSubagentRuns(await prepareSessionSubagentKillSelection(params));
 }
 
 async function killSelectedSubagentRuns(
   params: KillSelection & {
+    preparationErrors?: string[];
     suppressTaskDelivery?: boolean;
     beforeKill?: (sealRootSelection: () => void) => boolean | Promise<boolean>;
   },
@@ -568,6 +549,8 @@ async function killSelectedSubagentRuns(
     });
     return { ...stopped, ...collectKillErrors(acceptedTrees) };
   });
+  result.errors.unshift(...(params.preparationErrors ?? []));
+  result.failed += params.preparationErrors?.length ?? 0;
   if (result.errors.length > 0) {
     return {
       status: "error" as const,
@@ -594,7 +577,7 @@ export async function killSubagentRunAdmin(
   control?: {
     assertCurrent: () => void;
     prepareRead?: () => Promise<void> | undefined;
-    beforeSessionKill?: () => boolean;
+    beforeSessionKill?: () => boolean | Promise<boolean>;
     preparePublication?: KillPublicationPreparation<SubagentAdminKillResult>;
   },
 ): Promise<SubagentAdminKillResult> {
@@ -608,11 +591,17 @@ export async function killSubagentRunAdmin(
   if (!targetSessionKey) {
     return publish({ found: false as const, killed: false as const });
   }
-  const entry = getLatestOwnedSubagentRun(targetSessionKey, params.agentId, params.cfg);
+  const expectedRunId = params.expectedRunId?.trim();
+  const selected = expectedRunId ? subagentRuns.get(expectedRunId) : undefined;
+  const entry =
+    selected &&
+    selected.childSessionKey === targetSessionKey &&
+    resolveSubagentChildAuthority(selected).status !== "verified"
+      ? selected
+      : getLatestOwnedSubagentRun(targetSessionKey, params.agentId, params.cfg);
   if (!entry) {
     return publish({ found: false as const, killed: false as const });
   }
-  const expectedRunId = params.expectedRunId?.trim();
   const expectedTaskRunId = params.expectedTaskRunId?.trim();
   if (
     (expectedRunId && entry.runId !== expectedRunId) ||
@@ -624,6 +613,18 @@ export async function killSubagentRunAdmin(
     return publish({ found: false as const, killed: false as const });
   }
 
+  const authority = resolveSubagentChildAuthority(entry);
+  if (authority.status === "mismatch") {
+    return publish({
+      found: true,
+      killed: false,
+      cascadeKilled: 0,
+      runId: entry.runId,
+      sessionKey: entry.childSessionKey,
+      error: authority.error,
+    });
+  }
+
   let rootStopSuperseded = false;
   return withSubagentKillScope<SubagentAdminKillResult>(
     {
@@ -631,6 +632,17 @@ export async function killSubagentRunAdmin(
       runs: [entry],
       assertCurrent: control?.assertCurrent,
       prepareRead: control?.prepareRead,
+      ownsRoot:
+        params.expectedGeneration === undefined
+          ? undefined
+          : (candidate) => {
+              const current = getLatestOwnedSubagentRun(
+                candidate.childSessionKey,
+                authority.childAgentId,
+                params.cfg,
+              );
+              return !current || isSameSubagentRunOwner(current, candidate);
+            },
     },
     async (scope, [tree]) => {
       if (!tree) {
@@ -694,6 +706,29 @@ export async function killSubagentRunAdmin(
       };
     },
     control?.preparePublication,
-    publish,
+    (result) => {
+      const caller = getGatewayToolCallerIdentity();
+      const instance = caller?.operationalRunInstance;
+      if (
+        result.found &&
+        !result.error &&
+        result.targetState?.state === "terminal" &&
+        result.targetState.task.status === "cancelled" &&
+        caller &&
+        instance &&
+        instance.runId === entry.requesterTurnRunId &&
+        caller.sessionKey === entry.requesterSessionKey &&
+        caller.agentId === authority.requesterAgentId &&
+        getActiveAgentRunDelegatedAuthority(instance)?.operationalRunInstance === instance
+      ) {
+        // Only the final publication follows queued cleanup and its second ownership
+        // check. The earlier snapshot cannot retire an unacknowledged cancellation.
+        retireAcceptedSessionSpawnCompletionForRun(instance, {
+          runId: entry.taskRunId ?? entry.runId,
+          childSessionKey: entry.childSessionKey,
+        });
+      }
+      return publish(result);
+    },
   );
 }

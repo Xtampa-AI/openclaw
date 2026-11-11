@@ -2,6 +2,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { prepareSystemAgentRunAdmission } from "../../agents/admitted-run-context.js";
 import { resolveDefaultAgentId } from "../../agents/agent-scope-config.js";
 import type { MemoryFlushToolRunContext } from "../../agents/agent-tools.memory-flush.types.js";
+import { createSessionMaintenanceFollowup } from "../../agents/session-maintenance/run.js";
 import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -53,6 +54,7 @@ export async function prepareMemoryFlushAttempt(params: {
   followupRun: FollowupRun;
   sessionEntry?: SessionEntry;
   sessionKey?: string;
+  runtimePolicySessionKey?: string;
   storePath?: string;
   preflightAdmission?: UserTurnTranscriptAdmissionReceipt;
   flushRunId: string;
@@ -95,6 +97,8 @@ export async function prepareMemoryFlushAttempt(params: {
             // Maintenance copies carry the source turn's owner status apart from their own grant.
             senderIsOwner: followupRun.memoryAudienceSenderIsOwner ?? followupRun.run.senderIsOwner,
             storePath: sourceStorePath,
+            resolveAgentStorePath: (hopAgentId) =>
+              resolveSessionStorePathForScope({ agentId: hopAgentId }, params.cfg),
             assertCallerCurrent: params.assertCurrent,
           },
           sessionEntry,
@@ -149,6 +153,18 @@ export async function prepareMemoryFlushAttempt(params: {
       plan.model,
       params.cfg,
     );
+    const sourcePolicySessionKey =
+      params.runtimePolicySessionKey ?? followupRun.run.runtimePolicySessionKey ?? sessionKey;
+    const maintenanceRun = createSessionMaintenanceFollowup({
+      run: followupRun.run,
+      sessionEntry: { sessionId: memorySession.sessionId, updatedAt: Date.now() },
+      cfg: params.cfg,
+      sessionKey: memorySession.sessionKey,
+      runtimePolicySessionKey: sourcePolicySessionKey,
+      provider: selection.provider,
+      model: selection.model,
+      auth: followupRun.run,
+    }).run;
     // Delegation shares source revocation while binding tool use to the detached session.
     params.assertCurrent();
     delegated = sourceAudience
@@ -189,6 +205,8 @@ export async function prepareMemoryFlushAttempt(params: {
       memorySession,
       memoryAudience: delegated?.audience,
       memoryFlushTools,
+      maintenanceRun,
+      sourcePolicySessionKey,
       release,
     };
   } catch (error) {

@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMainThread, workerData } from "node:worker_threads";
 import type { JitiOptions, JitiResolveOptions } from "jiti";
+import { isNativeEsmPackage } from "../infra/native-module-format.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { resolveGlobalMap, resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { createJiti } from "./jiti-factory.js";
@@ -37,9 +38,12 @@ import {
   type PluginSourceLoadMode,
 } from "./plugin-source-build.js";
 import { inspectPluginTypeScriptExecutionFacts } from "./plugin-source-references.js";
+import { captureBundledPluginStateOperationModules } from "./plugin-state-operation-module-loader.js";
+import { bindPluginStateOperationModuleSource } from "./plugin-state-operation-source.js";
 import type { PluginRegistry } from "./registry-types.js";
 import { getPluginRuntimeLoadContextState } from "./runtime/load-context-state.js";
 import { preparePluginLoaderAliases, isPluginSdkAliasSpecifier } from "./sdk-alias.js";
+import { recordPluginSdkDeprecatedImport } from "./sdk-deprecated-imports.js";
 
 type SourceBuilds = Map<string, PluginSourceBuild>;
 type RetainedNativeEsm = {
@@ -156,30 +160,6 @@ function retainedNativeEsmFor(
   return retained;
 }
 
-function isNativeEsmPackage(source: string): boolean {
-  let directory = path.dirname(source);
-  while (true) {
-    const manifest = path.join(directory, "package.json");
-    if (fs.existsSync(manifest)) {
-      try {
-        const parsed: unknown = JSON.parse(fs.readFileSync(manifest, "utf8"));
-        return (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          Object.getOwnPropertyDescriptor(parsed, "type")?.value === "module"
-        );
-      } catch {
-        return false;
-      }
-    }
-    const parent = path.dirname(directory);
-    if (parent === directory) {
-      return false;
-    }
-    directory = parent;
-  }
-}
-
 function retainedNativeEsmOwner(retained: RetainedNativeEsm) {
   const requested = pluginInstanceInvocation.getStore()?.instance;
   if (requested && retained.owners.has(requested)) {
@@ -270,6 +250,12 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
       rootDir: params.rootDir,
       cache,
       loader,
+      source: captureBundledPluginStateOperationModules({
+        rootDir: params.rootDir,
+        source: params.source,
+        devSourceRoot: params.devSourceRoot,
+        pluginSdkResolution: params.pluginSdkResolution,
+      }),
     });
     return;
   }
@@ -355,6 +341,7 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
   if (aliases.packageRoot && !reusedArtifact) {
     artifact.linkHost(aliases.packageRoot);
   }
+  bindPluginStateOperationModuleSource({ ...params, artifact });
   installOpenClawPluginSdkNativeResolver({
     moduleUrl: import.meta.url,
     pluginModulePath: params.source,
@@ -458,6 +445,8 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
       return build.resolve(filename, mode, nativeFormat);
     });
   };
+  // Captured sources and compiled outputs share this instance's private namespace.
+  const boundaryUrl = pathToFileURL(artifact.boundaryRoot + path.sep).href;
   const hooks = Module.registerHooks({
     resolve(specifier, context, nextResolve) {
       if (retained && !ownsNativeEsmResolution(retained, params.instance)) {
@@ -466,7 +455,7 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
       // Lazy native imports outlive the binding call. Only this graph's importers
       // borrow its SDK alias cache; callbacks may otherwise use a newer registry.
       const parent = context.parentURL;
-      const parentEntry = parent?.startsWith("file:")
+      const parentEntry = parent?.startsWith(boundaryUrl)
         ? sourceForOutput(fileURLToPath(parent))
         : undefined;
       const parentSource = parentEntry?.source;
@@ -647,7 +636,13 @@ export function bindPluginInstanceModuleLoader(params: PluginInstanceModuleLoade
               }),
             )
           : nextResolve(specifier, nativeContext);
-      if (resolved.url.startsWith("file:")) {
+      if (parentRoot && isPluginSdkAliasSpecifier(specifier)) {
+        recordPluginSdkDeprecatedImport(params.instance.pluginId, specifier);
+      }
+      if (
+        (parentRoot && resolved.url.startsWith("file:")) ||
+        resolved.url.startsWith(boundaryUrl)
+      ) {
         const resolvedFilename = fileURLToPath(resolved.url);
         const entry = sourceForOutput(resolvedFilename);
         const filename = entry.generated ? resolvedFilename : entry.source;

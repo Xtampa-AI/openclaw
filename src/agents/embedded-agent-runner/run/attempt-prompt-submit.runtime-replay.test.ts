@@ -135,14 +135,11 @@ describe("submitEmbeddedAttemptPrompt runtime replay", () => {
         await submit(reopened, "second");
         expect(requests).toHaveLength(3);
         if (retained) {
-          // Boundary timestamp text and retained context before responses must replay byte-for-byte.
-          // The release line deliberately keeps runtime context transient when append-only replay is
-          // disabled, so exclude that final first-request carrier from this prefix comparison.
+          // Boundary timestamp text and content before retained responses must replay byte-for-byte.
           const providerPrefix = (messages: Context["messages"]) =>
             JSON.stringify(messages.map(({ role, content }) => ({ role, content })));
-          const retainedPrefixLength = requests[0]!.length - (appendOnlyRuntimeContext ? 0 : 1);
-          expect(providerPrefix(requests[2]!.slice(0, retainedPrefixLength))).toBe(
-            providerPrefix(requests[0]!.slice(0, retainedPrefixLength)),
+          expect(providerPrefix(requests[2]!.slice(0, requests[0]!.length))).toBe(
+            providerPrefix(requests[0]!),
           );
         }
         const entries = reopened.sessionManager.getEntries();
@@ -163,8 +160,8 @@ describe("submitEmbeddedAttemptPrompt runtime replay", () => {
           (entry) =>
             entry.type === "custom_message" && entry.customType === "openclaw.runtime-context",
         );
-        expect(carriers).toHaveLength(appendOnlyRuntimeContext ? 2 : 0);
-        if (appendOnlyRuntimeContext) {
+        expect(carriers).toHaveLength(retained ? 2 : 0);
+        if (retained) {
           for (const carrier of carriers) {
             expect(carrier).toMatchObject({ display: false });
             const previous = entries[entries.indexOf(carrier) - 1];

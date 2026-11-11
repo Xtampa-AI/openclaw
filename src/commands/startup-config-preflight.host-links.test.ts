@@ -9,7 +9,7 @@ import {
 } from "../infra/state-migrations.messages.js";
 import { buildUpdateRehearsalPathEnv } from "../infra/update-rehearsal-paths.js";
 import { resolvePluginNpmProjectDir } from "../plugins/install-paths.js";
-import { readPersistedInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
+import { readPersistedInstalledPluginIndexInstallRecordsAsync } from "../plugins/installed-plugin-index-records.js";
 import {
   listActiveDegradedPlugins,
   setActiveDegradedPlugins,
@@ -90,7 +90,7 @@ it.each(["present", "missing"])(
         const configPath = path.join(stateDir, "openclaw.json");
         const configBytes = await writeJson(configPath, config);
         await seedInstalledPluginIndex(records, { config });
-        const recordsBefore = readPersistedInstalledPluginIndexInstallRecords();
+        const recordsBefore = await readPersistedInstalledPluginIndexInstallRecordsAsync();
 
         if (oldRootState === "present") {
           // Update rehearsals keep the old links; their candidate owns the repair.
@@ -136,7 +136,7 @@ it.each(["present", "missing"])(
         });
         expect(readStartupMigrationWarning()).toBeUndefined();
         expect(notes.mock.calls.flat().join("\n")).not.toContain("Repaired OpenClaw host link");
-        expect(readPersistedInstalledPluginIndexInstallRecords()).toEqual(recordsBefore);
+        expect(await readPersistedInstalledPluginIndexInstallRecordsAsync()).toEqual(recordsBefore);
         expect(await fs.readFile(configPath, "utf8")).toBe(configBytes);
       }),
     ),

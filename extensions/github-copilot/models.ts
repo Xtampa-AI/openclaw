@@ -5,7 +5,10 @@ import type {
 import { LiveModelCatalogHttpError } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import { readProviderJsonArrayFieldResponse } from "openclaw/plugin-sdk/provider-http";
 import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-shared";
-import { normalizeModelCompat } from "openclaw/plugin-sdk/provider-model-shared";
+import {
+  normalizeModelCompat,
+  resolveDefaultModelMaxTokens,
+} from "openclaw/plugin-sdk/provider-model-shared";
 import {
   fetchWithSsrFGuard,
   ssrfPolicyFromHttpBaseUrlAllowedOrigin,
@@ -25,7 +28,6 @@ import { buildCopilotRuntimeHeaders } from "./runtime-identity.js";
 export const PROVIDER_ID = "github-copilot";
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
-const DEFAULT_MAX_TOKENS = 8192;
 
 function isCopilotCodexModelId(modelId: string): boolean {
   return /(?:^|[-_.])codex(?:$|[-_.])/.test(modelId);
@@ -67,7 +69,9 @@ export function resolveCopilotForwardCompatModel(
     ...(staticOverride?.contextTokens !== undefined
       ? { contextTokens: staticOverride.contextTokens }
       : {}),
-    maxTokens: staticOverride?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    maxTokens:
+      staticOverride?.maxTokens ??
+      resolveDefaultModelMaxTokens(staticOverride?.contextWindow ?? DEFAULT_CONTEXT_WINDOW),
     ...(staticOverride?.thinkingLevelMap
       ? { thinkingLevelMap: staticOverride.thinkingLevelMap }
       : {}),
@@ -86,7 +90,7 @@ type CopilotApiModelEntry = {
   policy?: {
     state?: string;
   };
-  supported_endpoints?: string[];
+  supported_endpoints?: unknown;
   capabilities?: {
     type?: string;
     limits?: {
@@ -184,30 +188,37 @@ type CopilotCatalogModel = Omit<ModelDefinitionConfig, "input"> & {
   input: ProviderRuntimeModel["input"];
 };
 
-const COPILOT_LISTED_ENDPOINT_APIS = [
-  ["/v1/messages", "anthropic-messages"],
-  ["/responses", "openai-responses"],
-  ["/chat/completions", "openai-completions"],
-] as const;
+const COPILOT_TRANSPORT_ENDPOINTS = {
+  "anthropic-messages": "/messages",
+  "openai-completions": "/chat/completions",
+  "openai-responses": "/responses",
+} as const;
 
-// Keep the family transport when the account lists its endpoint; otherwise use
-// an endpoint the account does list (e.g. Chat Completions-only models).
-function resolveCopilotListedApi(
+function resolveCopilotApi(
   entry: CopilotApiModelEntry,
-  modelId: string,
-): "anthropic-messages" | "openai-completions" | "openai-responses" {
+): ReturnType<typeof resolveCopilotTransportApi> {
   const preferred =
     entry.vendor?.toLowerCase() === "anthropic"
       ? "anthropic-messages"
-      : resolveCopilotTransportApi(modelId);
-  const endpoints = entry.supported_endpoints;
-  if (!Array.isArray(endpoints)) {
-    return preferred;
-  }
-  const listed = COPILOT_LISTED_ENDPOINT_APIS.filter(([endpoint]) =>
-    endpoints.includes(endpoint),
-  ).map(([, api]) => api);
-  return listed.includes(preferred) ? preferred : (listed[0] ?? preferred);
+      : resolveCopilotTransportApi(entry.id ?? "");
+  const endpoints = new Set(
+    Array.isArray(entry.supported_endpoints)
+      ? entry.supported_endpoints
+          .filter((endpoint): endpoint is string => typeof endpoint === "string")
+          .map((endpoint) =>
+            endpoint
+              .trim()
+              .replace(/^\/v1(?=\/)/, "")
+              .replace(/\/+$/, ""),
+          )
+      : [],
+  );
+  // Account discovery owns supported transports; naming is only a preference or missing-data fallback.
+  return (
+    ([preferred, "openai-responses", "openai-completions", "anthropic-messages"] as const).find(
+      (api) => endpoints.has(COPILOT_TRANSPORT_ENDPOINTS[api]),
+    ) ?? preferred
+  );
 }
 
 function mergeCopilotCompat(
@@ -258,8 +269,12 @@ function mapCopilotApiModelToDefinition(
   const nativeContextWindow = asPositiveSafeInteger(limits?.max_context_window_tokens);
   // Catalogs retain provider facts; runtime construction supplies an estimate for omissions.
   const contextTokens = asPositiveSafeInteger(limits?.max_prompt_tokens);
-  const maxTokens = asPositiveSafeInteger(limits?.max_output_tokens) ?? DEFAULT_MAX_TOKENS;
-  const api = resolveCopilotListedApi(entry, id);
+  const maxTokens =
+    asPositiveSafeInteger(limits?.max_output_tokens) ??
+    resolveDefaultModelMaxTokens(
+      asPositiveSafeInteger(limits?.max_context_window_tokens) ?? DEFAULT_CONTEXT_WINDOW,
+    );
+  const api = resolveCopilotApi(entry);
   const compat = mergeCopilotCompat(resolveCopilotModelCompat(id, api), supports?.reasoning_effort);
   // Copilot lists effort levels instead of Anthropic's capability tree. Only
   // adaptive-thinking Claude models offer xhigh, so a listed Claude id that

@@ -34,6 +34,7 @@ import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths
 import * as leaseAcquisition from "../state/openclaw-state-lease-acquisition.js";
 import { withOpenClawStateLease } from "../state/openclaw-state-lease.js";
 import { captureEnv } from "../test-utils/env.js";
+import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { collectDoctorFindings } from "./doctor-lint-runner.js";
 import { runDoctorLintCli } from "./doctor-lint.js";
@@ -455,7 +456,16 @@ describe("doctor lint state isolation", () => {
             const findings = JSON.parse(String(stdout.mock.calls.at(-1)?.[0])).findings;
             expect(isolated).toBe(true);
             expect(findings).toEqual(
-              exists ? [] : [expect.objectContaining({ severity: "warning", path: credentials })],
+              exists
+                ? []
+                : [
+                    expect.objectContaining({
+                      checkId: "core/doctor/state-integrity",
+                      message: "OAuth dir is missing.",
+                      severity: "warning",
+                      path: credentials,
+                    }),
+                  ],
             );
             expect(fs.existsSync(credentials)).toBe(exists);
           } finally {
@@ -485,7 +495,7 @@ describe("doctor lint state isolation", () => {
               observed.push(
                 withExistingOpenClawStateDatabaseReadOnly(
                   ({ db }) => {
-                    locations.push(db.location()!);
+                    locations.push(requireNativeSqliteDatabase(db).location()!);
                     return db.prepare("SELECT value FROM marker").all();
                   },
                   { env: ctx.env },

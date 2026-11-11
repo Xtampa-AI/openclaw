@@ -448,6 +448,7 @@ export function loadRuntimePluginCandidate(params: {
   // Preserve the artifact that actually ran; metadata does not complete runtime registration.
   const artifactSelection = bindPluginRuntimeArtifactSelection(record, {
     ...artifactParams,
+    source: candidate.source,
     runtimeEntry: recovery
       ? runtimeCandidateEntry
       : resolvePluginRuntimeExecutionArtifact(runtimeCandidateEntry),
@@ -588,7 +589,7 @@ export function loadRuntimePluginCandidate(params: {
       const wrongLoaderError = formatBundledChannelWrongLoaderError(record.kind);
       if (wrongLoaderError) {
         params.logger.error(
-          `[plugins] ${record.id} ${wrongLoaderError}; ensure plugin is loaded via bundled channel discovery, not legacy plugin loader`,
+          `[plugins] ${record.id} ${wrongLoaderError}; check that plugin is loaded via bundled channel discovery, not legacy plugin loader`,
         );
         pushPluginLoadError(wrongLoaderError);
       } else {

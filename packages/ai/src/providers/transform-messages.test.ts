@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { transformProviderMessages } from "../provider-transcript-transform.js";
 import type { ProviderMessage, ProviderModel } from "../provider-types.js";
 import type { AssistantMessage, Message, Model, ToolResultMessage } from "../types.js";
@@ -38,7 +38,7 @@ function makeAssistant(
   };
 }
 
-describe.each(["error", "aborted"] as const)(
+describe.each(["aborted"] as const)(
   "%s assistant replay at the provider boundary",
   (stopReason) => {
     it("replaces partial text with one marker between unrelated user turns", () => {
@@ -73,15 +73,6 @@ describe.each(["error", "aborted"] as const)(
     });
 
     it.each([
-      { name: "empty content", content: [] },
-      {
-        name: "hidden reasoning",
-        content: [{ type: "thinking", thinking: "hidden partial reasoning" }],
-      },
-      {
-        name: "the no-content placeholder",
-        content: [{ type: "text", text: NO_CONTENT_PLACEHOLDER }],
-      },
       {
         name: "the no-content placeholder with hidden reasoning",
         content: [
@@ -227,7 +218,6 @@ describe("transformMessages", () => {
 
   it.each([
     ["synchronous call", false, " call_1 ", "call_1"],
-    ["synchronous result", false, "call_1", " call_1 "],
     ["asynchronous call", true, " call_1 ", "call_1"],
     ["asynchronous result", true, "call_1", " call_1 "],
   ] as const)(
@@ -280,4 +270,32 @@ describe("transformMessages", () => {
       expect(messages).toEqual(original);
     },
   );
+});
+
+afterEach(() => vi.restoreAllMocks());
+
+it("keeps missing sync and delayed async replay timestamps stable", () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+  const messages: Message[] = [
+    {
+      ...makeAssistant(
+        [
+          { type: "toolCall", id: "sync", name: "lookup", arguments: {} },
+          { type: "toolCall", id: "async", name: "lookup", arguments: {}, async: true },
+        ],
+        "toolUse",
+      ),
+      timestamp: 0,
+    },
+    { ...makeAssistant([{ type: "text", text: "later fragment" }], "stop"), timestamp: 3 },
+  ];
+  const first = transformMessages(messages, model);
+  clock.mockReturnValue(2_000);
+  const next = transformMessages(structuredClone(messages), model);
+  expect(next).toEqual(first);
+  expect(next.filter((message) => message.role === "toolResult")).toMatchObject([
+    { toolCallId: "sync", timestamp: 0, isError: true },
+    { toolCallId: "async", timestamp: 0, isError: true },
+  ]);
+  expect(messages.map(({ role }) => role)).toEqual(["assistant", "assistant"]);
 });

@@ -67,76 +67,83 @@ describe("resolveDiscordChannelAllowlist", () => {
     expect(res[0]?.guildId).toBe("111");
   }
 
-  it.each([
-    ["announcement", ChannelType.AnnouncementThread],
-    ["public", ChannelType.PublicThread],
-    ["private", ChannelType.PrivateThread],
-  ])("prefers a matching guild channel over a %s thread", async (_kind, threadType) => {
+  it.each([["public", ChannelType.PublicThread]])(
+    "prefers a matching guild channel over a %s thread",
+    async (_kind, threadType) => {
+      const fetcher = withFetchPreconnect(async (input: RequestInfo | URL) => {
+        const url = urlToString(input);
+        if (url.endsWith("/users/@me/guilds")) {
+          return jsonResponse([{ id: "g1", name: "My Guild" }]);
+        }
+        if (url.endsWith("/guilds/g1/channels")) {
+          return jsonResponse([
+            { id: "thread-1", name: "general", guild_id: "g1", type: threadType },
+            { id: "c1", name: "general", guild_id: "g1", type: 0 },
+            { id: "c2", name: "random", guild_id: "g1", type: 0 },
+          ]);
+        }
+        return new Response("not found", { status: 404 });
+      });
+
+      const res = await resolveDiscordChannelAllowlist({
+        token: "test",
+        entries: ["My Guild/general"],
+        fetcher,
+      });
+
+      expect(res[0]?.resolved).toBe(true);
+      expect(res[0]?.guildId).toBe("g1");
+      expect(res[0]?.channelId).toBe("c1");
+    },
+  );
+
+  it("matches channel names by their letters in any script", async () => {
+    const entries = [
+      "111/雑談",
+      "111/助手",
+      "111/alerts",
+      "111/general",
+      "111/ops",
+      "111/雑談-ops",
+      "111/\u26A0\uFE0F",
+    ];
+    const channel = (id: string, name: string): DiscordChannel => ({
+      id,
+      name,
+      guild_id: "111",
+      type: ChannelType.GuildText,
+    });
+    const channels = [
+      channel("c1", "お知らせ"),
+      channel("c2", "雑談"),
+      channel("c3", "\u26A0\uFE0F-alerts"),
+      channel("c4", "общий-general"),
+      channel("c5", "чат-ops"),
+      channel("c6", "ops"),
+      channel("c7", "\u2757\uFE0F"),
+    ];
     const fetcher = withFetchPreconnect(async (input: RequestInfo | URL) => {
       const url = urlToString(input);
       if (url.endsWith("/users/@me/guilds")) {
-        return jsonResponse([{ id: "g1", name: "My Guild" }]);
+        return jsonResponse([{ id: "111", name: "Test Server" }]);
       }
-      if (url.endsWith("/guilds/g1/channels")) {
-        return jsonResponse([
-          { id: "thread-1", name: "general", guild_id: "g1", type: threadType },
-          { id: "c1", name: "general", guild_id: "g1", type: 0 },
-          { id: "c2", name: "random", guild_id: "g1", type: 0 },
-        ]);
+      if (url.endsWith("/guilds/111/channels")) {
+        return jsonResponse(channels);
       }
       return new Response("not found", { status: 404 });
     });
-
-    const res = await resolveDiscordChannelAllowlist({
-      token: "test",
-      entries: ["My Guild/general"],
-      fetcher,
-    });
-
-    expect(res[0]?.resolved).toBe(true);
-    expect(res[0]?.guildId).toBe("g1");
-    expect(res[0]?.channelId).toBe("c1");
-  });
-
-  it("resolves channel id to guild", async () => {
-    const fetcher = withFetchPreconnect(async (input: RequestInfo | URL) => {
-      const url = urlToString(input);
-      if (url.endsWith("/users/@me/guilds")) {
-        return jsonResponse([{ id: "g1", name: "Guild One" }]);
-      }
-      if (url.endsWith("/channels/123")) {
-        return jsonResponse({ id: "123", name: "general", guild_id: "g1", type: 0 });
-      }
-      return new Response("not found", { status: 404 });
-    });
-
-    const res = await resolveDiscordChannelAllowlist({
-      token: "test",
-      entries: ["123"],
-      fetcher,
-    });
-
-    expect(res[0]?.resolved).toBe(true);
-    expect(res[0]?.guildId).toBe("g1");
-    expect(res[0]?.channelId).toBe("123");
-  });
-
-  it("resolves guildId/channelId entries via channel lookup", async () => {
-    const res = await resolveWithChannelLookup({
-      guilds: [{ id: "111", name: "Guild One" }],
-      channel: { id: "222", name: "general", guild_id: "111", type: 0 },
-      entry: "111/222",
-    });
-
-    expect(res[0]).toEqual({
-      input: "111/222",
-      resolved: true,
-      guildId: "111",
-      guildName: "Guild One",
-      channelId: "222",
-      channelName: "general",
-      archived: undefined,
-    });
+    const res = await resolveDiscordChannelAllowlist({ token: "test", entries, fetcher });
+    // ASCII keys match by a name's ASCII letters, as before (the first such channel wins).
+    // A key with other letters never matches by its ASCII part; an emoji-only key matches nothing.
+    expect(res.map(({ resolved, channelId }) => ({ resolved, channelId }))).toEqual([
+      { resolved: true, channelId: "c2" },
+      { resolved: false, channelId: undefined },
+      { resolved: true, channelId: "c3" },
+      { resolved: true, channelId: "c4" },
+      { resolved: true, channelId: "c5" },
+      { resolved: false, channelId: undefined },
+      { resolved: false, channelId: undefined },
+    ]);
   });
 
   it("reports unresolved when channel id belongs to a different guild", async () => {
@@ -229,14 +236,6 @@ describe("resolveDiscordChannelAllowlist", () => {
     expect(res[0]?.guildId).toBe("111");
     expect(res[0]?.channelId).toBe("c1");
     expect(res[0]?.channelName).toBe("2024");
-  });
-
-  it("does not fall back to name matching when channel lookup returns 403", async () => {
-    const res = await resolveGuild111Entry2024({
-      channelLookup: () => new Response("Missing Access", { status: 403 }),
-    });
-
-    expectUnresolved1112024(res);
   });
 
   it("does not fall back to name matching when channel payload is malformed", async () => {

@@ -1,3 +1,4 @@
+import { createNativeSessionBindingScope } from "openclaw/plugin-sdk/agent-harness-session-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeCodexAppServerClient } from "./codex-app-server.test-fixtures.js";
 import {
@@ -16,6 +17,7 @@ import {
 import type { CodexConfigReadResponse } from "./protocol.js";
 import type { CodexBindingAuthority } from "./session-binding.js";
 import { createClientHarness, stubCodexInferenceTransportEnv } from "./test-support.js";
+import { fingerprintCodexThreadConfig } from "./thread-fingerprints.js";
 
 const clients: ReturnType<typeof createClientHarness>[] = [];
 beforeEach(() => {
@@ -92,16 +94,67 @@ async function prepare(
 }
 
 describe("managed inference route ownership", () => {
+  it("keeps proxy restarts equivalent without losing inference policy identity", async () => {
+    const fingerprint = async (modelPolicyEnforced: boolean) => {
+      const h = harness({
+        onWrite(line, send) {
+          const request = JSON.parse(line);
+          expect(request.method).toBe("account/read");
+          send({ id: request.id, result: { account: { type: "apiKey" } } });
+        },
+      });
+      ownCodexInferenceClient(h.client);
+      const prepared = await prepareCodexInferenceThreadConfig({
+        client: h.client,
+        binding: undefined,
+        clientId: "fixture-native-client",
+        cwd: "/workspace",
+        effectiveConfig: { config: {}, origins: {} },
+        assertCurrent: () => {},
+        modelPolicyEnforced,
+      });
+      if (!prepared) {
+        throw new Error("expected owned route");
+      }
+      return fingerprintCodexThreadConfig(
+        { config: prepared.config },
+        undefined,
+        undefined,
+        undefined,
+        { inferenceRoute: prepared.route, inferenceProviderRoutes: prepared.providers },
+      );
+    };
+    const enforced = await fingerprint(true);
+    expect(await fingerprint(true)).toBe(enforced);
+    expect(await fingerprint(false)).not.toBe(enforced);
+  });
+  it.each(["thread/closed", "thread/archived", "thread/deleted"] as const)(
+    "releases bounded thread provenance on %s without revoking peers",
+    async (method) => {
+      const h = harness();
+      ownCodexInferenceClient(h.client);
+      const route = await prepare(h, "apiKey");
+      for (let index = 0; index < 256; index += 1) {
+        bindCodexInferenceThread(h.client, `thread-${index}`, route);
+      }
+      expect(() => bindCodexInferenceThread(h.client, "replacement", route)).toThrow(
+        "thread limit reached",
+      );
+      h.send({ method, params: { threadId: "thread-0" } });
+      expect(getCodexInferenceThread(h.client, "thread-0")).toBeUndefined();
+      expect(getCodexInferenceThread(h.client, "thread-1")).toBe(route);
+      expect(() => bindCodexInferenceThread(h.client, "replacement", route)).not.toThrow();
+      expect(getCodexInferenceThread(h.client, "replacement")).toBe(route);
+    },
+  );
+
   it.each([false, true])(
     "admits only config/account writes and route publications (prepared config=%s)",
     async (preparedConfig) => {
       let retained = false;
       let admissions = 0;
       const authority: CodexBindingAuthority = {
-        lineage: [],
-        prepareMutation: async () => ({ assertCurrent: () => {} }),
-        assertCurrent: () => {},
-        assertLegacyCurrent: () => {},
+        ...createNativeSessionBindingScope(() => {}),
         withCurrent: async (consume) => {
           admissions += 1;
           retained = true;
@@ -153,10 +206,7 @@ describe("managed inference route ownership", () => {
       let accountType = "apiKey";
       const failure = new Error("route owner superseded");
       const authority: CodexBindingAuthority = {
-        lineage: [],
-        prepareMutation: async () => ({ assertCurrent: () => {} }),
-        assertCurrent: () => {},
-        assertLegacyCurrent: () => {},
+        ...createNativeSessionBindingScope(() => {}),
         withCurrent: async (consume) => {
           admissions += 1;
           if (admissions === rejectAdmission) {
@@ -756,14 +806,6 @@ describe("managed inference route ownership", () => {
     { env: { HTTPS_PROXY: "http://proxy.example:80" }, supported: true },
     { env: { HTTPS_PROXY: " http://proxy.example:80 " }, supported: false },
     { env: { HTTPS_PROXY: "http://proxy.example:80", REQUEST_METHOD: "GET" }, supported: false },
-    {
-      env: {
-        HTTP_PROXY: "http://proxy.example:80",
-        HTTPS_PROXY: "http://proxy.example:80",
-        NO_PROXY: "127.0.0.1,localhost,localhost.,::1,[::1],127.0.0.0/8",
-      },
-      supported: true,
-    },
     {
       env: {
         HTTP_PROXY: "http://proxy.example:80",

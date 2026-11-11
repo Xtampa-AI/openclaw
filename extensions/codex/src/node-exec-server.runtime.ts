@@ -217,14 +217,17 @@ export async function runCodexNodeExecServer(params: {
     const codexHome = path.join(dir, ".codex");
     // Codex canonicalizes CODEX_HOME during startup and rejects missing directories.
     await mkdir(codexHome, { recursive: true, mode: 0o700 });
-    const resolved = await resolveManagedCodexAppServerStartOptions({
-      transport: "stdio",
-      command: "codex",
-      commandSource: "managed",
-      managedCommandOrder: "package-first",
-      args: ["exec-server", "--listen", "stdio"],
-      headers: {},
-    });
+    const resolved = await resolveManagedCodexAppServerStartOptions(
+      {
+        transport: "stdio",
+        command: "codex",
+        commandSource: "managed",
+        managedCommandOrder: "package-first",
+        args: ["exec-server", "--listen", "stdio"],
+        headers: {},
+      },
+      { preferInstalled: false },
+    );
     const native = resolveManagedCodexNativeCommand(resolved.command);
     if (!native || isManagedCodexDesktopCommand(resolved.command)) {
       throw new Error("Codex node exec-server requires the pinned managed package binary.");
@@ -291,6 +294,13 @@ export async function runCodexNodeExecServer(params: {
             stderr,
             next.subarray(-MAX_CODEX_EXEC_SERVER_STDERR_BYTES),
           ]).subarray(-MAX_CODEX_EXEC_SERVER_STDERR_BYTES);
+          // The byte tail may split a multi-byte UTF-8 sequence; walk past its
+          // continuation bytes so the diagnostic decodes without a leading U+FFFD.
+          let start = 0;
+          while (start < stderr.length && (stderr[start]! & 0xc0) === 0x80) {
+            start++;
+          }
+          stderr = stderr.subarray(start);
           if (pendingLine === undefined) {
             return;
           }

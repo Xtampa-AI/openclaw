@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CallGatewayOptions } from "../../gateway/call.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createSessionConversationTestRegistry } from "../../test-utils/session-conversation-registry.js";
-import { sanitizeAgentRunTerminalReplyText } from "../agent-run-terminal-reply.js";
+import { buildAgentRunTerminalReplySnapshot } from "../agent-run-terminal-reply.js";
 import { runAgentStep } from "./agent-step.js";
 import type { GatewaySessionListRow } from "./sessions-helpers.js";
 import { runSessionsSendA2AFlow } from "./sessions-send-tool.a2a.js";
@@ -105,28 +105,20 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
   });
 
   it.each([true, false])(
-    "recovers a long delayed peer answer or reports missing history (%s)",
+    "recovers delayed full replies or discloses truncation (%s)",
     async (available) => {
-      const fullReply = "A long peer answer. ".repeat(400) + "ANSWER_END";
-      const terminalReply = {
-        disposition: "visible" as const,
-        text: sanitizeAgentRunTerminalReplyText(fullReply),
-      };
-      agentWaitMock.mockResolvedValue({ status: "ok", terminalReply });
+      const full = "Peer answer ".repeat(600) + "ANSWER_END";
+      const terminalReply = buildAgentRunTerminalReplySnapshot({ visibleText: full });
       callGatewayMock.mockImplementation(async (request: CallGatewayOptions) => {
-        if (request.method === "agent.wait") {
-          return await agentWaitMock(request);
+        if (request.method !== "chat.history" || !available) {
+          throw new Error("History unavailable");
         }
-        expect(request.method).toBe("chat.history");
         expect(request.params).toMatchObject({
           sessionKey: "agent:worker:main",
           agentId: "worker",
         });
-        if (!available) {
-          throw new Error("History access denied");
-        }
         return {
-          messages: [{ role: "assistant", content: fullReply, __openclaw: { runId: "run-test" } }],
+          messages: [{ role: "assistant", content: full, __openclaw: { runId: "run-test" } }],
         };
       });
       await runSessionsSendA2AFlow({
@@ -136,20 +128,21 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
         targetSessionKey: "agent:worker:main",
         displayKey: "agent:worker:main",
         requesterSessionKey: "agent:main:main",
-        requesterDeliveryGeneration: {
-          ...requesterDeliveryGeneration,
-          sessionKey: "agent:main:main",
-        },
         replyTimeoutMs: 10_000,
+        reply: {
+          status: "ok",
+          terminalReply,
+          replyText: terminalReply.disposition === "visible" ? terminalReply.text : undefined,
+        },
       });
       expect(runAgentStep).toHaveBeenCalledOnce();
-      const delivered = vi.mocked(runAgentStep).mock.calls[0]![0];
-      expect(delivered.message).toBe(available ? fullReply : terminalReply.text);
-      if (available) {
-        expect(delivered.extraSystemPrompt).not.toContain("The reply may be truncated");
-      } else {
-        expect(delivered.extraSystemPrompt).toContain("The reply may be truncated");
-      }
+      const delivered = firstMockArg(vi.mocked(runAgentStep), "runAgentStep");
+      expect(delivered.message).toBe(
+        available ? full : terminalReply.disposition === "visible" ? terminalReply.text : "",
+      );
+      expect(String(delivered.extraSystemPrompt).includes("The reply may be truncated")).toBe(
+        !available,
+      );
     },
   );
 

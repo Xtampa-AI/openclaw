@@ -35,7 +35,6 @@ export type Entry = {
   cleanup?: SqliteWorkerAdmissionCleanup;
   nativeLostListeners: Set<() => void>;
   activeOperations: number;
-  operationGeneration: number;
   idleTimer?: IdleTimer;
 };
 export type ActorRetirement = {

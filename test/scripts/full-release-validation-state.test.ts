@@ -4,7 +4,6 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, afterEach, assert, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { parse as parseYaml } from "yaml";
 import { buildFullReleaseCandidateBinding } from "../../scripts/full-release-candidate-contract.mjs";
 import { publicationIntentInputs } from "../../scripts/full-release-publication-contract.mjs";
 import {
@@ -17,6 +16,7 @@ import {
   terminalPolicyPass,
   validateReleaseChildDispatchBinding,
   validateReleaseCoveragePolicyBinding,
+  validateReleaseManifestAdvisoryJobs,
 } from "../../scripts/full-release-validation-policy.mjs";
 import {
   affectedActiveRunIds,
@@ -848,7 +848,7 @@ describe("full release execution plan", () => {
     });
   });
 
-  it("does not require candidate acquisition when reusing release evidence", () => {
+  it("routes candidate acquisition for fresh qualified packages but not reused evidence", () => {
     expect(
       plan({
         candidateAcquisitionResult: "skipped",
@@ -861,6 +861,16 @@ describe("full release execution plan", () => {
       required: false,
       result: "skipped",
     });
+
+    const result = plan({
+      candidateRequired: true,
+      childPhaseVersion: 3,
+      rerunGroup: "qualified-package",
+    });
+    const selected = result.children.filter((entry) => entry.selected);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.key).toBe("releaseChecksCandidate");
+    expect(result.gates.at(-1)?.required).toBe(true);
   });
 
   it("retains every required artifact qualification result as a parent gate", () => {
@@ -973,6 +983,25 @@ process.stdout.write(JSON.stringify({
     });
   });
 
+  it("routes focused Windows node validation only to the candidate child", () => {
+    const selected = plan({
+      rerunGroup: "windows-node",
+      childPhaseVersion: 3,
+      candidateRequired: true,
+    });
+    expect(selected.children.filter((entry) => entry.selected).map((entry) => entry.key)).toEqual([
+      "releaseChecksCandidate",
+    ]);
+    expect(selected.gates.at(-1)).toMatchObject({
+      name: "Acquire full release candidate",
+      required: true,
+    });
+    expect(plan({ rerunGroup: "windows-node" }).gates.at(-1)).toMatchObject({ required: true });
+    expect(
+      plan({ rerunGroup: "windows-node", releasePackageSpec: "openclaw@2026.9.9" }).gates.at(-1),
+    ).toMatchObject({ required: false });
+  });
+
   it("requires live-e2e candidate preparation only without a suite filter", () => {
     expect(plan({ rerunGroup: "live-e2e" }).gates.at(-1)).toMatchObject({ required: true });
     expect(plan({ liveSuiteFilter: "discord", rerunGroup: "live-e2e" }).gates.at(-1)).toMatchObject(
@@ -1039,6 +1068,12 @@ process.stdout.write(JSON.stringify({
         },
       },
     );
+    expect(() =>
+      validateReleaseExecutionPlanArtifact({
+        ...artifact,
+        targetVersion: "2026.8.29",
+      }),
+    ).toThrow("digest");
     const incompleteArtifact = {
       ...artifact,
       evidenceReuse: { ...artifact.evidenceReuse, selectedRunId: "" },
@@ -1112,9 +1147,9 @@ describe("release child attempt composition", () => {
       runAttempt: 2,
     };
 
-    it("ignores never-executed copies beside a completed job in a superseded attempt", () => {
-      const result = composeReleaseAttemptJobs(
-        [
+    it.each([
+      {
+        attempts: [
           {
             jobs: [
               job("checks-node-core-runtime-infra-process", "failure"),
@@ -1125,40 +1160,25 @@ describe("release child attempt composition", () => {
           ghostAttempt,
           { jobs: [job("checks-ui", "success")], runAttempt: 3 },
         ],
-        { effectiveRunAttempt: 3, plannedRunAttempt: 1 },
-      );
-      expect(result.jobs).toEqual([
-        expect.objectContaining({
-          acceptedRunAttempt: 2,
-          conclusion: "success",
-          name: "checks-node-core-runtime-infra-process",
-        }),
-        expect.objectContaining({
-          acceptedRunAttempt: 3,
-          conclusion: "success",
-          name: "checks-ui",
-        }),
-      ]);
-    });
-
-    it("ignores never-executed copies beside a completed job in the effective attempt", () => {
-      const result = composeReleaseAttemptJobs([ghostAttempt], {
+        effectiveRunAttempt: 3,
+        plannedRunAttempt: 1,
+      },
+      {
+        attempts: [ghostAttempt],
         effectiveRunAttempt: 2,
         plannedRunAttempt: 2,
-      });
-      expect(result.jobs).toEqual([
-        expect.objectContaining({
-          acceptedRunAttempt: 2,
-          conclusion: "success",
-          name: "checks-node-core-runtime-infra-process",
-        }),
-        expect.objectContaining({
-          acceptedRunAttempt: 2,
-          conclusion: "failure",
-          name: "checks-ui",
-        }),
-      ]);
-    });
+      },
+    ])(
+      "marks a duplicate-contaminated attempt unsealable even when another attempt is effective",
+      ({ attempts, effectiveRunAttempt, plannedRunAttempt }) => {
+        expect(() =>
+          composeReleaseAttemptJobs(attempts, {
+            effectiveRunAttempt,
+            plannedRunAttempt,
+          }),
+        ).toThrow("is unsealable due to duplicate job identity");
+      },
+    );
 
     it.each<{
       label: string;
@@ -1192,16 +1212,22 @@ describe("release child attempt composition", () => {
           jobs: [{ ...ghost, runner_name: "GitHub Actions 2" }, running],
         },
         { label: "with only queued copies", jobs: [ghost, ghost] },
-      ].map(({ label, jobs }) => ({
-        label,
-        attempts: [
-          { jobs: [job("test", "success")], runAttempt: 1 },
-          { jobs, runAttempt: 2 },
-        ],
-        effectiveRunAttempt: 2,
-        effectiveRunStatus: "in_progress",
-        plannedRunAttempt: 1,
-      })),
+        {
+          label: "beside a runnerless running job",
+          jobs: [ghost, { ...running, runner_id: null, runner_name: null }],
+        },
+      ].flatMap(({ label, jobs }) =>
+        ["queued", "in_progress"].map((effectiveRunStatus) => ({
+          label: `${label} in a ${effectiveRunStatus} run`,
+          attempts: [
+            { jobs: [job("test", "success")], runAttempt: 1 },
+            { jobs, runAttempt: 2 },
+          ],
+          effectiveRunAttempt: 2,
+          effectiveRunStatus,
+          plannedRunAttempt: 1,
+        })),
+      ),
       {
         label: "beside a running job in a completed run",
         attempts: [
@@ -1338,6 +1364,110 @@ describe("release decision policy", () => {
     },
   );
 
+  it.each([
+    ["prerelease", "failure"],
+    ["main", "failure"],
+    ["prerelease", "skipped"],
+    ["main", "skipped"],
+  ] as const)("retains Windows-node %s %s as advisory evidence", (lane, conclusion) => {
+    const snapshot = child("releaseChecksCandidate", {
+      conclusion: conclusion === "skipped" ? "success" : "failure",
+      status: "completed",
+      jobs: [
+        {
+          name:
+            conclusion === "skipped"
+              ? `Run Windows-node ${lane} E2E`
+              : `Run Windows-node ${lane} E2E / Setup, connect, and invoke candidate gateway`,
+          status: "completed",
+          conclusion,
+        },
+        {
+          name: "Run Windows-node stable E2E / Setup, connect, and invoke candidate gateway",
+          status: "completed",
+          conclusion: "success",
+        },
+        { name: "Verify release checks", status: "completed", conclusion: "success" },
+      ],
+    });
+    const decision = classifyReleaseSnapshot({ children: [snapshot] });
+    expect(terminalPolicyPass(snapshot)).toBe(true);
+    expect(decision).toMatchObject({
+      state: "passed",
+      blockers: [],
+      advisoryJobs: [
+        { class: "windows-node-preview", child: "releaseChecksCandidate", conclusion },
+      ],
+    });
+    const artifact = buildReleaseStateArtifact({
+      children: [snapshot],
+      decision,
+      executionPlan: { parentRunAttempt: 1, sha256: "a".repeat(64) },
+      expected: { parentRunAttempt: 1, parentRunId: "77", targetSha: TARGET_SHA },
+      mode: "decision",
+      releaseProfile: "stable",
+      rerunGroup: "all",
+    });
+    expect(validateReleaseStateArtifact(artifact).advisoryJobs).toEqual(decision.advisoryJobs);
+    expect(formatReleaseStateOutcome(artifact)).toContain("Advisory [windows-node-preview]");
+    const manifest = buildReleaseValidationManifest({
+      plan: executionPlan(),
+      drain: artifact,
+      context: { releaseProfile: "stable", rerunGroup: "all", validationInputs: {} },
+    });
+    expect(validateReleaseManifestAdvisoryJobs(manifest)).toEqual(decision.advisoryJobs);
+    expect(() => validateReleaseManifestAdvisoryJobs({ ...manifest, advisoryJobs: [] })).toThrow(
+      "advisory jobs differ",
+    );
+  });
+
+  it.each([
+    "stable-failed",
+    "stable-skipped",
+    "verifier-failed",
+    "other-job",
+    "wrong-child",
+    "cancelled",
+  ])("keeps Windows-node advisory admission narrow for %s", (scenario) => {
+    const snapshot = child(scenario === "wrong-child" ? "normalCi" : "releaseChecksCandidate", {
+      conclusion: scenario === "cancelled" ? "cancelled" : "failure",
+      status: "completed",
+      jobs: [
+        {
+          name: "Run Windows-node main E2E / Setup, connect, and invoke candidate gateway",
+          status: "completed",
+          conclusion: "failure",
+        },
+        {
+          name: "Run Windows-node stable E2E / Setup, connect, and invoke candidate gateway",
+          status: "completed",
+          conclusion:
+            scenario === "stable-failed"
+              ? "failure"
+              : scenario === "stable-skipped"
+                ? "skipped"
+                : "success",
+        },
+        {
+          name: "Verify release checks",
+          status: "completed",
+          conclusion: scenario === "verifier-failed" ? "failure" : "success",
+        },
+        ...(scenario === "other-job"
+          ? [
+              {
+                name: "Prepare release package artifact",
+                status: "completed",
+                conclusion: "failure",
+              },
+            ]
+          : []),
+      ],
+    });
+    expect(terminalPolicyPass(snapshot)).toBe(false);
+    expect(classifyReleaseSnapshot({ children: [snapshot] }).state).toBe("blocked_complete");
+  });
+
   it("accepts a human child rerun with retained earlier jobs in a reused plan", async () => {
     const original = child("normalCi");
     const planned = hydrateReusedPlan([original], {
@@ -1381,60 +1511,56 @@ describe("release decision policy", () => {
     ]);
   });
 
-  it("keeps a running rerun pending beside runnerless queued copies, then accepts its result", async () => {
-    const planned = child("normalCi");
-    const ghost = { name: "test", status: "queued", runner_id: null, runner_name: null };
-    let completed = false;
-    const options = {
-      readRun: async () =>
-        githubRun(planned, {
-          conclusion: completed ? "success" : null,
-          run_attempt: 2,
-          status: completed ? "completed" : "in_progress",
-          triggering_actor: { login: "release-operator" },
+  it.each(["queued", "in_progress"])(
+    "marks a %s rerun with runnerless duplicate copies unsealable",
+    async (runStatus) => {
+      const planned = child("normalCi");
+      const name = "checks-node-core-fast-isolated";
+      const ghost = {
+        name,
+        status: "queued",
+        conclusion: null,
+        completed_at: null,
+        runner_id: null,
+        runner_name: null,
+      };
+      const contaminated = await readChild(planned, undefined, undefined, {
+        readRun: async () =>
+          githubRun(planned, {
+            conclusion: null,
+            run_attempt: 2,
+            status: runStatus,
+            triggering_actor: { login: "release-operator" },
+          }),
+        readAttemptJobs: async (_runId: string, attempt: number) =>
+          attempt === 1
+            ? [
+                { name: "lint", status: "completed", conclusion: "success" },
+                { name, status: "completed", conclusion: "failure" },
+              ]
+            : [
+                ghost,
+                {
+                  name,
+                  status: "in_progress",
+                  conclusion: null,
+                  runner_id: 42,
+                  runner_name: "GitHub Actions 42",
+                  started_at: "2026-10-15T10:49:05Z",
+                },
+              ],
+      });
+      expect(contaminated.errors).toEqual([
+        expect.objectContaining({
+          kind: "api_error",
+          message: expect.stringContaining("is unsealable due to duplicate job identity"),
         }),
-      readAttemptJobs: async (_runId: string, attempt: number) =>
-        attempt === 1
-          ? [
-              { name: "lint", status: "completed", conclusion: "success" },
-              { name: "test", status: "completed", conclusion: "failure" },
-            ]
-          : [
-              ghost,
-              {
-                name: "test",
-                status: completed ? "completed" : "in_progress",
-                conclusion: completed ? "success" : null,
-                runner_id: 42,
-                runner_name: "GitHub Actions 42",
-              },
-              ghost,
-            ],
-    };
-    const pending = await readChild(planned, undefined, undefined, options);
-    expect(classifyReleaseSnapshot({ children: [pending] })).toMatchObject({
-      activeRunIds: ["101"],
-      blockers: [],
-      errors: [],
-      state: "qualifying",
-    });
-    expect(pending.jobs).toEqual([
-      expect.objectContaining({ name: "lint", acceptedRunAttempt: 1, conclusion: "success" }),
-      expect.objectContaining({ name: "test", acceptedRunAttempt: 2, status: "in_progress" }),
-    ]);
-
-    completed = true;
-    const settled = await readChild(planned, pending, undefined, options);
-    expect(classifyReleaseSnapshot({ children: [settled] })).toMatchObject({
-      activeRunIds: [],
-      blockers: [],
-      errors: [],
-      state: "passed",
-    });
-    expect(settled.jobs).toContainEqual(
-      expect.objectContaining({ name: "test", acceptedRunAttempt: 2, conclusion: "success" }),
-    );
-  });
+      ]);
+      expect(classifyReleaseSnapshot({ children: [contaminated] })).toMatchObject({
+        state: "orchestration_error",
+      });
+    },
+  );
 
   it.each([
     "HTTP 403: secondary rate limit",
@@ -2617,18 +2743,7 @@ console.log(JSON.stringify({
     if (reuse.name === "changelog-only") {
       const drainPath = join(root, "drain.json");
       writeFileSync(drainPath, serializeReleaseArtifact({ children: {} }));
-      const workflow = parseYaml(
-        readFileSync(".github/workflows/full-release-validation.yml", "utf8"),
-      ) as { jobs: { summary: { steps: Array<{ name: string; env?: Record<string, string> }> } } };
-      const manifestEnv = workflow.jobs.summary.steps.find(
-        (step) => step.name === "Write release validation manifest",
-      )?.env;
       const writeResult = runCollector("write-manifest", {
-        // Exercise the workflow handoff, not collectorEnv's default target.
-        TARGET_SHA: manifestEnv?.TARGET_SHA?.replace(
-          "${{ needs.resolve_target.outputs.sha }}",
-          TARGET_SHA,
-        ),
         FRV_EXPECTED_REUSE: JSON.stringify({
           "--expected-changed-paths-json": JSON.stringify(reuse.changedPaths),
           "--expected-evidence-policy": reuse.policy,
@@ -2663,33 +2778,20 @@ console.log(JSON.stringify({
   });
 
   it.each([
-    { name: "owner-waived evidence", waived: true, mutation: "none", blocker: "" },
+    { name: "unchanged evidence artifact", mutation: "none", blocker: "" },
     {
       name: "changed evidence artifact",
       waived: false,
       mutation: "digest",
       blocker: "provenance_mismatch",
     },
-    {
-      name: "missing source waiver",
-      waived: true,
-      mutation: "waiver",
-      blocker: "reused_evidence_invalid",
-    },
-  ])("revalidates $name at the Decision boundary", ({ waived, mutation, blocker }) => {
+  ])("revalidates $name at the Decision boundary", ({ mutation, blocker }) => {
     const root = tempDirs.make("frv-reuse-decision-");
     const output = join(root, "decision.json");
     const executionPlanPath = join(root, "plan.json");
     const gh = join(root, "gh");
     const validator = join(root, "validator.mjs");
-    const waiver = waived
-      ? { telegramWaiver: "2026.8.1-owner-approved", targetVersion: "2026.8.1" }
-      : {};
-    const sourceManifest = { ...evidenceManifest(), validationInputs: waiver };
-    const revalidatedManifest = structuredClone(sourceManifest);
-    if (mutation === "waiver") {
-      revalidatedManifest.validationInputs = {};
-    }
+    const sourceManifest = { ...evidenceManifest(), validationInputs: {} };
     const sourceArtifact = {
       digest: `sha256:${"f".repeat(64)}`,
       id: "900",
@@ -2706,10 +2808,8 @@ console.log(JSON.stringify({
         rerunGroup: "ci",
         releaseProfile: "stable",
         children: { normalCi: { result: "success", runAttempt: 1, runId: "101" } },
-        ...waiver,
       },
       {
-        ...waiver,
         evidenceReuse: {
           changedPaths: [],
           evidenceSha: TARGET_SHA,
@@ -2741,7 +2841,7 @@ printf '%s\\n' '{"id":101,"event":"workflow_dispatch","path":".github/workflows/
       validator,
       `console.log(JSON.stringify({
   children: ${JSON.stringify(reusedEvidenceChildren())},
-  manifest: ${JSON.stringify(revalidatedManifest)},
+  manifest: ${JSON.stringify(sourceManifest)},
   root: {artifact: ${JSON.stringify(revalidatedArtifact)}},
   releaseProfile: "stable",
   rerunGroup: "ci"

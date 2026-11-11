@@ -3,11 +3,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { updateExecutorEntrypoints } from "../cli/cli-entrypoint.test-support.js";
 import { isPidAlive } from "../shared/pid-alive.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
+import {
+  createManagedHandoffTempDirTracker,
+  readManagedHandoffArtifacts,
+} from "./update-managed-service-handoff-artifacts.test-support.js";
 import { createManagedServiceBoundaryCleanup } from "./update-managed-service-handoff-process.test-support.js";
 import { signalMockManagedUpdateHandoffReady } from "./update-managed-service-handoff.test-support.js";
 
@@ -22,18 +25,17 @@ vi.mock("node:child_process", async () => {
   });
 });
 
-const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
-  afterEach(async () => {
-    await Promise.all([...processCleanups].map((closeProcess) => closeProcess()));
-    processCleanups.clear();
-    for (const releaseLease of leaseCleanups) {
-      releaseLease();
-    }
-    leaseCleanups.clear();
-    cleanup();
-    vi.restoreAllMocks();
-    vi.resetModules();
-  });
+const tempDirs = createManagedHandoffTempDirTracker();
+afterEach(async () => {
+  await Promise.all([...processCleanups].map((closeProcess) => closeProcess()));
+  processCleanups.clear();
+  for (const releaseLease of leaseCleanups) {
+    releaseLease();
+  }
+  leaseCleanups.clear();
+  await tempDirs.cleanup();
+  vi.restoreAllMocks();
+  vi.resetModules();
 });
 
 beforeEach(() => {
@@ -49,7 +51,7 @@ beforeEach(() => {
     process.nextTick(() =>
       signalMockManagedUpdateHandoffReady({
         child,
-        paramsPath: args.at(-1)!,
+        paramsPath: readManagedHandoffArtifacts(args).paramsPath,
         cleanups: leaseCleanups,
       }),
     );
@@ -92,6 +94,7 @@ describe("foreground update through the prepared managed helper", () => {
     ).mockReturnValue(coordinator);
     const fixturePath = path.join(root, "openclaw.mjs");
     const configPath = path.join(root, "openclaw.json");
+    const nativeProbePath = path.join(root, "native-recovery-probe");
     await fs.writeFile(
       path.join(root, "package.json"),
       JSON.stringify({ name: "openclaw", type: "module", version: "1.0.0" }),
@@ -121,7 +124,8 @@ describe("foreground update through the prepared managed helper", () => {
       string[],
       { env: NodeJS.ProcessEnv },
     ];
-    const [scriptPath, paramsPath] = args;
+    tempDirs.add(path.dirname(prepared.logPath));
+    const { scriptPath, paramsPath } = readManagedHandoffArtifacts(args);
     spawnMock.mock.results.at(-1)!.value.emit("exit", 0, null);
     for (const cleanup of leaseCleanups) {
       cleanup();
@@ -143,6 +147,10 @@ describe("foreground update through the prepared managed helper", () => {
       `${bootstrap}
       const ledger = await import(${JSON.stringify(resolveRuntimeWorkerUrl(updateExecutorEntrypoints.ledger).href)});
       export const { adoptUpdateRun, finishUpdateRun, getUpdateRun, recordUpdateRunStep, recordUpdateRunVerification } = ledger;
+      export async function waitForGatewayUpdateRecovery() {
+        fs.writeFileSync(${JSON.stringify(nativeProbePath)}, "unexpected native service probe");
+        throw new Error("Foreground recovery does not own a native service");
+      }
       const handoff = await import(${JSON.stringify(resolveRuntimeWorkerUrl(updateExecutorEntrypoints.handoff).href)});
       export async function assertForegroundUpdateOrigin(...args) {
         await handoff.assertForegroundUpdateOrigin(...args);
@@ -256,6 +264,7 @@ describe("foreground update through the prepared managed helper", () => {
         }
         Object.assign(params, { foregroundOrigin: origin, serviceRecovery: undefined, runId: run.runId,
           beforePark: true, commandArgv: [process.execPath, ${JSON.stringify(fixturePath)}, "update", "--json"], nodeExecArgv: [] });
+        if (mode === "safe-recovery") params.recovery = { serviceRestartSafe: true, version: "1.0.0" };
         const meta = JSON.parse(fs.readFileSync(params.metaPath, "utf8"));
         Object.assign(meta.meta, { root, runId: run.runId, foregroundOrigin: origin, completionOwner: "gateway-restart" });
         fs.writeFileSync(params.metaPath, JSON.stringify(meta));
@@ -383,6 +392,7 @@ describe("foreground update through the prepared managed helper", () => {
         replacementOwner?: string;
       };
       const log = await fs.readFile(prepared.logPath, "utf8");
+      await expect(fs.access(nativeProbePath)).rejects.toMatchObject({ code: "ENOENT" });
       expect(result.helperSignal, log).toBeNull();
       expect(result.helperCode, log).toBe(
         [

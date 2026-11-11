@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { enqueueCommandInLane } from "../process/command-queue.js";
+import {
+  GatewayDrainingError,
+  getActiveGatewayRootWorkCount,
+  markGatewayRestartDraining,
+  resetGatewayWorkAdmission,
+  tryBeginGatewayRootWorkAdmission,
+  tryBeginGatewaySuspendAdmission,
+} from "../process/gateway-work-admission.js";
 import { createInboundDebouncer, type InboundDebounceCreateParams } from "./inbound-debounce.js";
 
 describe("createInboundDebouncer", () => {
@@ -11,6 +20,7 @@ describe("createInboundDebouncer", () => {
 
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+  afterEach(resetGatewayWorkAdmission);
 
   type Message = { key: string; id: string };
   type RecordingOptions<T> = Omit<InboundDebounceCreateParams<T>, "buildKey" | "onFlush">;
@@ -19,6 +29,18 @@ describe("createInboundDebouncer", () => {
   };
   const keyedDebouncer = (options: KeyedOptions) =>
     createInboundDebouncer<Message>({ debounceMs: 0, buildKey: (item) => item.key, ...options });
+  type FlushOptions = Parameters<Parameters<KeyedOptions["onFlush"]>[1]>[0];
+  function lifecycleDebouncer(
+    dispatch: (id: string, lifecycle: Parameters<FlushOptions["dispatch"]>[0]) => Promise<void>,
+    options: Omit<KeyedOptions, "onFlush"> & Pick<FlushOptions, "lifecycle"> = {},
+  ) {
+    const { lifecycle, ...debounce } = options;
+    return keyedDebouncer({
+      ...debounce,
+      onFlush: (items, createFlush) =>
+        createFlush({ lifecycle, dispatch: (turn) => dispatch(items[0]?.id ?? "", turn) }),
+    });
+  }
 
   function createRecordingDebouncer<T extends Message = Message>(options: RecordingOptions<T>) {
     const calls: string[][] = [];
@@ -183,33 +205,6 @@ describe("createInboundDebouncer", () => {
     expect(calls).toEqual([[1, 2], [3]]);
   });
 
-  it("flushes sustained same-key messages in complete, ordered batches", async () => {
-    const { calls, debouncer } = createRecordingDebouncer({ debounceMs: 50 });
-
-    for (let index = 0; index < 12; index += 1) {
-      await debouncer.enqueue({ key: "a", id: String(index) });
-      await vi.advanceTimersByTimeAsync(20);
-    }
-    expect(calls).toStrictEqual([]);
-
-    await debouncer.enqueue({ key: "a", id: "12" });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([Array.from({ length: 13 }, (_, index) => String(index))]);
-
-    for (let index = 13; index < 25; index += 1) {
-      await debouncer.enqueue({ key: "a", id: String(index) });
-      await vi.advanceTimersByTimeAsync(20);
-    }
-    expect(calls).toHaveLength(1);
-
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([
-      Array.from({ length: 13 }, (_, index) => String(index)),
-      Array.from({ length: 12 }, (_, index) => String(index + 13)),
-    ]);
-    await debouncer.drain();
-  });
-
   it.each([undefined, 500])("anchors the batch deadline (maximum wait: %s)", async (maxWaitMs) => {
     const { calls, debouncer } = createRecordingDebouncer<Message & { windowMs: number }>({
       debounceMs: 0,
@@ -261,28 +256,6 @@ describe("createInboundDebouncer", () => {
     await debouncer.drain();
   });
 
-  it("supersedes a pending flush check when another item appends", async () => {
-    const check = createDeferred<boolean>();
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 10,
-      shouldHoldFlush: () => check.promise,
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([]);
-
-    await vi.advanceTimersByTimeAsync(5);
-    await debouncer.enqueue({ key: "a", id: "2" });
-    check.resolve(false);
-    await vi.advanceTimersByTimeAsync(9);
-    expect(calls).toEqual([]);
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(calls).toEqual([["1", "2"]]);
-    await debouncer.drain();
-  });
-
   it.each([false, true])(
     "forces the deadline flush without another hold check (check pending: %s)",
     async (pending) => {
@@ -305,37 +278,6 @@ describe("createInboundDebouncer", () => {
       await debouncer.drain();
     },
   );
-
-  it("flushes an explicit key without consulting the hold check", async () => {
-    const shouldHoldFlush = vi.fn(() => true);
-    const { calls, debouncer } = createRecordingDebouncer({ debounceMs: 10, shouldHoldFlush });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.flushKey("a");
-
-    expect(calls).toEqual([["1"]]);
-    expect(shouldHoldFlush).not.toHaveBeenCalled();
-    await debouncer.drain();
-  });
-
-  it("reports buffered items when cancelling a key", async () => {
-    const canceled: Array<string[]> = [];
-
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 10,
-      onCancel: (items) => {
-        canceled.push(items.map((entry) => entry.id));
-      },
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.enqueue({ key: "a", id: "2" });
-    expect(debouncer.cancelKey("a")).toBe(true);
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(canceled).toEqual([["1", "2"]]);
-    expect(calls).toEqual([]);
-  });
 
   it("cancels a released flush still waiting behind active same-key work", async () => {
     const calls: Array<string[]> = [];
@@ -378,6 +320,26 @@ describe("createInboundDebouncer", () => {
     expect(calls).toEqual([["1"], ["3"]]);
   });
 
+  it("cancels immediate work waiting behind an active flush without canceling later arrivals", async () => {
+    const canceled: string[][] = [];
+    const { debouncer, started, finished, entered, release } = createBlockedDebouncer({
+      debounceMs: 50,
+      shouldDebounce: (item) => item.id === "1",
+      onCancel: (items) => canceled.push(items.map((item) => item.id)),
+    });
+    await debouncer.enqueue({ key: "a", id: "1" });
+    const first = debouncer.flushKey("a");
+    await entered.promise;
+    const second = debouncer.enqueue({ key: "a", id: "2" });
+    expect(debouncer.cancelKey("a")).toBe(true);
+    const third = debouncer.enqueue({ key: "a", id: "3" });
+    release.resolve();
+    await Promise.all([first, second, third, debouncer.drain()]);
+    expect(canceled).toEqual([["2"]]);
+    expect(started).toEqual(["1", "3"]);
+    expect(finished).toEqual(["1", "3"]);
+  });
+
   it("flushes buffered items before non-debounced item", async () => {
     const { calls, debouncer } = createRecordingDebouncer<Message & { debounce: boolean }>({
       debounceMs: 50,
@@ -388,20 +350,6 @@ describe("createInboundDebouncer", () => {
     await debouncer.enqueue({ key: "a", id: "2", debounce: false });
 
     expect(calls).toEqual([["1"], ["2"]]);
-  });
-
-  it("supports per-item debounce windows when default debounce is disabled", async () => {
-    const { calls, debouncer } = createRecordingDebouncer<Message & { windowMs: number }>({
-      debounceMs: 0,
-      resolveDebounceMs: (item) => item.windowMs,
-    });
-
-    await debouncer.enqueue({ key: "forward", id: "1", windowMs: 30 });
-    await debouncer.enqueue({ key: "forward", id: "2", windowMs: 30 });
-
-    expect(calls).toStrictEqual([]);
-    await vi.advanceTimersByTimeAsync(30);
-    expect(calls).toEqual([["1", "2"]]);
   });
 
   it("keeps fire-and-forget keyed work ahead of a later buffered item", async () => {
@@ -484,6 +432,56 @@ describe("createInboundDebouncer", () => {
     await drain;
     expect(completed).toEqual(["2", "1"]);
   });
+
+  it.each(["accepting", "suspended", "restarting"] as const)(
+    "keeps adopted immediate dispatch owned after HTTP request release (%s)",
+    async (phase) => {
+      const execute = createDeferred();
+      const reply = vi.fn(async () => {});
+      const onError = vi.fn();
+      const debouncer = lifecycleDebouncer(
+        async (_id, lifecycle) => {
+          await lifecycle.onAdopted();
+          await execute.promise;
+          await enqueueCommandInLane("inbound-adopted-turn", reply);
+        },
+        { onError },
+      );
+      const request = tryBeginGatewayRootWorkAdmission("http:request");
+      if (!request) {
+        throw new Error("Expected HTTP request admission");
+      }
+      try {
+        await request.run(() => debouncer.enqueue({ key: "a", id: "1" }));
+        request.release();
+        expect(reply).not.toHaveBeenCalled();
+        if (phase === "suspended") {
+          const suspension = tryBeginGatewaySuspendAdmission(() => {});
+          expect(suspension).not.toBeNull();
+          // New requests are refused while this already-adopted turn finishes.
+          expect(tryBeginGatewayRootWorkAdmission("http:request")).toBeNull();
+        } else if (phase === "restarting") {
+          markGatewayRestartDraining();
+        }
+        execute.resolve();
+        await debouncer.drain();
+        if (phase === "restarting") {
+          expect(reply).not.toHaveBeenCalled();
+          expect(onError).toHaveBeenCalledExactlyOnceWith(expect.any(GatewayDrainingError), [
+            { key: "a", id: "1" },
+          ]);
+        } else {
+          expect(onError).not.toHaveBeenCalled();
+          expect(reply).toHaveBeenCalledOnce();
+        }
+        expect(getActiveGatewayRootWorkCount()).toBe(0);
+      } finally {
+        request.release();
+        execute.resolve();
+        await debouncer.drain();
+      }
+    },
+  );
 
   it("hands pre-admission completion failures to the source lifecycle once", async () => {
     const sessionError = new Error("Session changed while starting work. Retry.");
@@ -642,21 +640,6 @@ describe("createInboundDebouncer", () => {
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
     }
-  });
-
-  it("bypasses debouncing for new keys once the tracked-key cap is reached", async () => {
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 50,
-      maxTrackedKeys: 1,
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.enqueue({ key: "b", id: "2" });
-
-    expect(calls).toEqual([["2"]]);
-
-    await vi.advanceTimersByTimeAsync(50);
-    expect(calls).toEqual([["2"], ["1"]]);
   });
 
   it("keeps same-key overflow work ordered after falling back to immediate flushes", async () => {

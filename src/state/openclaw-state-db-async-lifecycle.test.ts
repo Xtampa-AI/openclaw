@@ -1,5 +1,6 @@
 import { existsSync, linkSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { acquireGatewayStateOwner } from "../infra/gateway-state-owner.js";
@@ -10,7 +11,6 @@ import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.j
 import {
   createOpenClawDatabaseMaintenanceScope,
   createOpenClawStateDatabaseAsyncLifecycle,
-  StateDatabaseCustodyRetainedError,
 } from "./openclaw-state-db-async-lifecycle.js";
 import {
   clearOpenClawStateDatabaseOpenFailure,
@@ -99,6 +99,9 @@ describe("canonical shared-state resource drainage", () => {
       created.admission.identity.key,
     );
     expect(precreationProof?.identity.key).toMatch(/^path:/);
+    expect(Atomics.load(new BigInt64Array(precreationProof!.revision), 0)).not.toBe(
+      precreationProof!.epoch,
+    );
     expect(created.admission.coordinationKey).toBe(coordinationKey);
     absent.admission.assertCurrent();
     await closeOpenClawStateDatabaseByPathAsync(pathname);
@@ -174,11 +177,13 @@ describe("canonical shared-state resource drainage", () => {
     const original = lifecycle.capture(pathname);
     expect(original.identity.key).toMatch(/^path:/);
     const coordinationKey = original.coordinationKey;
+    const precreation = original.captureIntegrity!();
     expect(coordinationKey).toBe(original.identity.key);
     writeFileSync(pathname, "");
     linkSync(pathname, alias);
     const observed = lifecycle.capture(alias);
     expect(original.identity.key).toBe(observed.identity.key);
+    expect(Atomics.load(new BigInt64Array(precreation.revision), 0)).not.toBe(precreation.epoch);
     expect(original.coordinationKey).toBe(coordinationKey);
     expect(observed.coordinationKey).toBe(coordinationKey);
     lifecycle.publish(pathname);
@@ -469,28 +474,6 @@ describe("canonical shared-state resource drainage", () => {
     }
   });
 
-  it("keeps reads sealed when a failed resource retains custody past orderly close", async () => {
-    const lifecycle = createOpenClawStateDatabaseAsyncLifecycle();
-    const pathname = databasePath();
-    writeFileSync(pathname, "original");
-    lifecycle.capture(pathname);
-    const failure = new StateDatabaseCustodyRetainedError("retire the process");
-    const close = vi.fn(async () => {
-      throw failure;
-    });
-    const unregister = lifecycle.register({ close });
-    const retireNative = vi.fn(() => true);
-    try {
-      await expect(lifecycle.close(pathname, retireNative)).rejects.toBe(failure);
-      expect(() => lifecycle.capture(pathname)).toThrow(/admission is closed/);
-      await expect(lifecycle.close(pathname, retireNative)).rejects.toBe(failure);
-      expect(() => lifecycle.capture(pathname)).toThrow(/admission is closed/);
-      expect(retireNative).not.toHaveBeenCalled();
-    } finally {
-      unregister();
-    }
-  });
-
   it.each(["after failed drainage", "during drainage"] as const)(
     "keeps failed path-close custody when a replacement publishes %s",
     async (timing) => {
@@ -585,6 +568,7 @@ describe("canonical shared-state resource drainage", () => {
       assertOwnerCurrent,
       assertDatabaseAccess: processOwner.assertDatabaseAccess,
     });
+    const ownedResources = vi.spyOn(maintenance, "own");
     const acquiring = maintenance.run(() =>
       prepareOpenClawStateDatabaseRemoval(owner.path, assertOwnerCurrent),
     );
@@ -597,6 +581,12 @@ describe("canonical shared-state resource drainage", () => {
       removal = await acquiring;
       expect(reader.database.db.isOpen).toBe(false);
       expect(owner.db.isOpen).toBe(false);
+      if (process.platform !== "win32") {
+        const exclusion = ownedResources.mock.calls
+          .map(([resource]) => resource)
+          .find((resource) => resource instanceof DatabaseSync);
+        expect(exclusion?.isTransaction).toBe(true);
+      }
       removal.assertCurrent();
       expect(() => captureOpenClawStateDatabaseReadAdmission(owner.path)).toThrow(/closed/);
       removal.release();
@@ -610,6 +600,7 @@ describe("canonical shared-state resource drainage", () => {
         removal.release();
         await maintenance.close();
       } finally {
+        ownedResources.mockRestore();
         processOwner.release();
       }
     }

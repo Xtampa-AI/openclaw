@@ -126,9 +126,6 @@ it.each([false, true])(
     const generation = ownPreparedPluginGeneration({
       pluginMetadataSnapshot: createPluginMetadataSnapshotFixture(),
       pluginRegistry: inspection.registry,
-      remoteCatalog: null,
-      inlineProviderModels: [],
-      configuredCatalogEntries: [],
     });
     await inspection.release();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -200,8 +197,9 @@ it.each([true, false])(
       expect(registry.plugins[0]?.status).toBe("loaded");
       const expected = (phase: string) => ({
         phase,
-        set: activate,
-        ...(activate ? { value: { phase } } : {}),
+        // Admitted registration and callbacks can share scratch state without global activation.
+        set: true,
+        value: { phase },
         event: activate
           ? { emitted: true, stream: `${id}.startup` }
           : { emitted: false, reason: "global side effects disabled" },

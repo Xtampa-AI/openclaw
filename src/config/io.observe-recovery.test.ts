@@ -635,16 +635,23 @@ describe("config observe recovery", () => {
               return deps.fs.renameSync(source, target);
             },
           };
-    const recover = (recoveryDeps: ObserveRecoveryDeps) => {
+    const recover = async (recoveryDeps: ObserveRecoveryDeps) => {
       const input = {
         deps: recoveryDeps,
         configPath,
         ...clobbered,
         prepareBackup: approveRecoveryCandidate,
       };
-      return mode === "async"
-        ? maybeRecoverSuspiciousConfigRead(input)
-        : maybeRecoverSuspiciousConfigReadSync(input);
+      const work = new AsyncWorkScope();
+      try {
+        return await work.run(() =>
+          mode === "async"
+            ? maybeRecoverSuspiciousConfigRead(input)
+            : maybeRecoverSuspiciousConfigReadSync(input),
+        );
+      } finally {
+        await work.drain();
+      }
     };
     const recovered = await recover({ ...deps, fs: failingFs });
 

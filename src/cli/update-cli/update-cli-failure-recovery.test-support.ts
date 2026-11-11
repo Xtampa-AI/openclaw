@@ -1,13 +1,26 @@
+import { EventEmitter } from "node:events";
 import fsSync from "node:fs";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { expect, it, vi, type Mock } from "vitest";
 import type { readConfigFileSnapshot as ReadConfigFileSnapshot } from "../../config/config.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import type { runUpdateFailureTriage as RunUpdateFailureTriage } from "../../infra/update-triage.js";
+import type {
+  defaultRuntime as DefaultRuntime,
+  ExitError as ExitErrorType,
+} from "../../runtime.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import type { TempHomeEnv } from "../../test-utils/temp-home.js";
 import type { updateFinalizeCommand as UpdateFinalizeCommand } from "./update-command-finalize.js";
 import type { updateCommand as UpdateCommand } from "./update-command.js";
+
+export async function mockUnbuiltRecoveryFixture(): Promise<void> {
+  // These fixtures must not inherit build identity from the checkout's generated dist.
+  vi.spyOn(
+    await import("../../infra/update-git-runtime.js"),
+    "readBuiltGatewayBuildId",
+  ).mockResolvedValue(null);
+}
 
 export const recoveryVerificationStep = (
   failureFacts?: UpdateRunResult["steps"][number]["failureFacts"],
@@ -20,6 +33,83 @@ export const recoveryVerificationStep = (
   exitCode: failureFacts ? 1 : 0,
   ...(failureFacts ? { failureFacts } : {}),
 });
+export function registerForegroundFailureRecoveryTests({
+  setupUpdatedRootRefresh,
+  spawn,
+  updateCommand,
+  defaultRuntime,
+  ExitError,
+  spawnCall,
+  lastWriteJsonCall,
+  updateNpmInstalledPlugins,
+}: {
+  setupUpdatedRootRefresh: () => { root: string };
+  spawn: Mock;
+  updateCommand: typeof UpdateCommand;
+  defaultRuntime: typeof DefaultRuntime;
+  ExitError: typeof ExitErrorType;
+  spawnCall: () => [string, string[], { env?: NodeJS.ProcessEnv; stdio?: unknown }] | undefined;
+  lastWriteJsonCall: () => unknown;
+  updateNpmInstalledPlugins: Mock;
+}) {
+  it.each([
+    { exitCode: 2, handoff: undefined, expectedExit: 1 },
+    { exitCode: 2, handoff: "1", expectedExit: 79 },
+    { exitCode: 78, handoff: "1", expectedExit: 79 },
+    { exitCode: 79, handoff: "1", expectedExit: 79 },
+    { exitCode: 80, handoff: "1", expectedExit: 79 },
+  ])(
+    "preserves foreground failure $exitCode without granting handoff $handoff authority",
+    async ({ exitCode, handoff, expectedExit }) => {
+      const { root } = setupUpdatedRootRefresh();
+      spawn.mockImplementationOnce(() => {
+        const child = new EventEmitter() as EventEmitter & {
+          once: EventEmitter["once"];
+        };
+        queueMicrotask(() => {
+          child.emit("exit", exitCode, null);
+          child.emit("close", exitCode, null);
+        });
+        return child;
+      });
+
+      await withEnvAsync({ OPENCLAW_UPDATE_RUN_HANDOFF: handoff }, async () => {
+        await expect(updateCommand({ yes: true, json: true })).rejects.toEqual(
+          new ExitError(expectedExit),
+        );
+      });
+
+      expect(defaultRuntime.exit).not.toHaveBeenCalled();
+      expect(spawnCall()?.[2]?.env?.OPENCLAW_UPDATE_RUN_HANDOFF).toBe(handoff);
+      // The foreground failure precedes any service stop, so recovery only observes.
+      const result = lastWriteJsonCall() as { verification?: unknown } | undefined;
+      expect(result?.verification).toEqual({});
+      expect(result).toMatchObject({
+        status: "error",
+        reason: "post-core-update-failed",
+        recovery: { serviceRestartSafe: false },
+        steps: [
+          expect.objectContaining({ name: "updater-runtime-retention", exitCode: 0 }),
+          {
+            name: "post-update verification",
+            command: "openclaw update",
+            cwd: root,
+            durationMs: 0,
+            exitCode,
+            stderrTail: undefined,
+            failureFacts: [
+              { check: "runtime", code: "post-core-update-failed" },
+              { check: "update", code: "update-failed" },
+            ],
+          },
+          expect.objectContaining({ name: "gateway recovery observation", exitCode: 0 }),
+        ],
+      });
+      expect(updateNpmInstalledPlugins).not.toHaveBeenCalled();
+    },
+  );
+}
+
 export function registerFailureSelectorTests({
   updateCommand,
   updateFinalizeCommand,

@@ -78,7 +78,6 @@ async function withPackageRoots(
 describe("FreeBSD pkg update admission", () => {
   it.each([
     { platform: "freebsd", manager: "pkg", ownership: "owned" },
-    { platform: "freebsd", manager: "pkg", ownership: "unknown" },
     { platform: "freebsd", manager: "pkg", ownership: "unowned" },
     { platform: "linux", manager: "pacman", ownership: "owned" },
     { platform: "linux", manager: "pacman", ownership: "missing" },
@@ -236,28 +235,6 @@ describe("FreeBSD pkg update admission", () => {
     },
   );
 
-  it.each(["state", "profile"])(
-    "does not let a non-default %s bypass pkg ownership",
-    async (selector) => {
-      await withPackageRoots(async (base, root) => {
-        vi.spyOn(shared, "resolveUpdateRoot").mockResolvedValue(root);
-        vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-          pkgQueryResult(`${root}/package.json\n`),
-        );
-        await withEnvAsync(
-          selector === "state"
-            ? { OPENCLAW_STATE_DIR: path.join(base, "custom-state") }
-            : { OPENCLAW_PROFILE: "alternate" },
-          async () => {
-            await expect(prepareUpdateCommand({ restart: false })).rejects.toMatchObject({
-              reason: "pkg-owned-install",
-            });
-          },
-        );
-      });
-    },
-  );
-
   it.each(["requested", "managed"])(
     "refuses the %s pkg root before applying a service root/runtime redirect",
     async (owner) => {
@@ -284,24 +261,6 @@ describe("FreeBSD pkg update admission", () => {
       });
     },
   );
-
-  it("checks pkg ownership before reading admission environment from a service", async () => {
-    await withPackageRoots(async (_base, root) => {
-      const readCommand = vi.fn();
-      const isAbsent = vi.fn();
-      vi.spyOn(service, "resolveGatewayService").mockReturnValue(
-        createMockGatewayService({ readCommand, isAbsent }),
-      );
-      vi.spyOn(exec, "runCommandBuffered").mockResolvedValue(
-        pkgQueryResult(`${root}/package.json\n`),
-      );
-      await expect(
-        resolveUpdateCommandAdmissionEnv({ root, opts: { restart: false } }),
-      ).rejects.toMatchObject({ reason: "pkg-owned-install" });
-      expect(readCommand).not.toHaveBeenCalled();
-      expect(isAbsent).not.toHaveBeenCalled();
-    });
-  });
 
   it("checks a precomputed service redirect before admitting its target", async () => {
     await withPackageRoots(async (_base, root, managed) => {

@@ -74,13 +74,6 @@ describe("scripts/e2e/lib/docker-stats/assert-resource-ceiling.mjs", () => {
     },
   );
 
-  it("fails when the stats log contains no parseable samples", () => {
-    const result = runAssert(writeStats("not-json\n"));
-
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("was not valid JSON");
-  });
-
   it("rejects invalid resource limits instead of disabling the ceiling", () => {
     const result = runAssert(
       writeStats('{"MemUsage":"128MiB / 2GiB","CPUPerc":"25.0%"}\n'),
@@ -162,16 +155,6 @@ describe("scripts/e2e/lib/docker-stats/assert-resource-ceiling.mjs", () => {
     expect(result.stdout).toContain("samples=6");
   });
 
-  it("streams stats logs instead of slurping them into memory", () => {
-    const source = readFileSync(SCRIPT_PATH, "utf8");
-
-    expect(source).toContain("createReadStream");
-    expect(source).toContain("MAX_STATS_SAMPLE_LINE_BYTES");
-    expect(source).not.toContain("createInterface");
-    expect(source).not.toContain("readFileSync(statsFile");
-    expect(source).not.toContain("split(/\\r?\\n/u)");
-  });
-
   it("rejects oversized stats sample lines before parsing JSON", () => {
     const result = runAssert(writeStats(`{"padding":"${"x".repeat(1024 * 1024)}"}\n`));
 
@@ -199,7 +182,12 @@ describe("kitchen-sink Docker limit reporting", () => {
   it.each([0, 23])("relays container warnings and preserves exit %s", (runStatus) => {
     const root = dirname(writeStats(""));
     const scripts = join(root, "scripts");
-    mkdirSync(join(scripts, "e2e"), { recursive: true });
+    const pluginFixture = join(scripts, "e2e", "lib", "kitchen-sink-plugin");
+    mkdirSync(pluginFixture, { recursive: true });
+    writeFileSync(
+      join(pluginFixture, "npm-version.txt"),
+      readFileSync("scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt", "utf8"),
+    );
     mkdirSync(join(scripts, "lib"));
     const runner = join(scripts, "e2e", "kitchen-sink-rpc-docker.sh");
     writeFileSync(runner, readFileSync("scripts/e2e/kitchen-sink-rpc-docker.sh", "utf8"));

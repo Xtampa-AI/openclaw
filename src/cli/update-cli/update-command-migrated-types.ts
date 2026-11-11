@@ -1,4 +1,3 @@
-import type { TriageFailureContext } from "../../commands/triage-prompt.js";
 import type { UpdateDatabaseGenerations } from "../../infra/update-database-generations.js";
 import type { UpdateRecoveryBaselineRef } from "../../infra/update-recovery-baseline-capture.js";
 import type {
@@ -29,6 +28,8 @@ export type UpdateDoctorInput = Omit<UpdatePostCoreInput, "opts"> & {
   workspaceSuggestions?: boolean;
   postCoreSchemaRepair?: true;
   databaseGenerations?: UpdateDatabaseGenerations;
+  /** Parent Doctor phase deadline for nested managed-service inspection. */
+  serviceInspectionDeadlineAtMs?: number;
 };
 
 export type MigratedUpdateFinalizationInput = Partial<UpdateTimeoutHandoff> & {
@@ -62,7 +63,6 @@ export type MigratedUpdateFinalizationResult = {
   /** Missing on older workers; only explicit false permits pre-start database restoration. */
   candidateStartAttempted?: boolean;
   executorDelegation?: "pid-start-v1";
-  automaticTriage?: TriageFailureContext;
 } & (
   | { terminalRunId: string; restartRunId?: never }
   | { restartRunId: string; terminalRunId?: never }

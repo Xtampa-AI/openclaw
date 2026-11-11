@@ -1,8 +1,10 @@
 import type { ChildProcess, Serializable, SpawnOptions } from "node:child_process";
 import type { Duplex } from "node:stream";
+import { stripNodeStartupHooks } from "../../../node-runtime-env.mjs";
 import { formatChildRuntimeSpawnWarning } from "../../infra/child-runtime-viability.js";
 import { resolveRuntimeWorkerArgv } from "../../infra/runtime-worker-url.js";
 import { resolveLaunchableNodePath } from "../../infra/stable-node-path.js";
+import { withChildProcessOperation } from "../spawn-diagnostics.js";
 import type { SpawnInitiation } from "../spawn-initiation.js";
 import { spawnProcess } from "../spawn-utils.js";
 import { createServiceChildCleanup } from "../supervisor/service-child-cleanup.js";
@@ -98,12 +100,21 @@ export function spawnServiceChildRelay(params: {
   transportReady: Promise<void> | undefined;
 } {
   const executable = resolveLaunchableNodePath();
-  const child = spawnProcess(executable, resolveRuntimeWorkerArgv(params.workerUrl, executable), {
-    stdio: params.stdio,
-    detached: params.detached,
-    windowsHide: true,
-    env: params.env,
-  });
+  const env = { ...params.env };
+  if (env.NODE_OPTIONS !== undefined) {
+    env.NODE_OPTIONS = stripNodeStartupHooks(env.NODE_OPTIONS);
+  }
+  const child = withChildProcessOperation(
+    "service.relay",
+    () =>
+      spawnProcess(executable, resolveRuntimeWorkerArgv(params.workerUrl, executable), {
+        stdio: params.stdio,
+        detached: params.detached,
+        windowsHide: true,
+        env,
+      }),
+    "default",
+  );
   const cleanup = createServiceChildCleanup();
   params.onSpawnCleanup?.(cleanup.promise);
   let transportReady: Promise<void> | undefined;

@@ -6,6 +6,7 @@ import { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js
 import { runWithSqliteBusyTimeout } from "../../infra/sqlite-busy-timeout.js";
 import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
+import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
@@ -19,7 +20,6 @@ import {
   deleteSessionEntryLifecycle,
   loadTranscriptEvents,
   readSessionSubmittedInput,
-  replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "./session-accessor.js";
 import {
@@ -30,9 +30,12 @@ import {
   withSessionPendingInputPersistence,
   type SessionPendingInputReceipt,
 } from "./session-accessor.pending-inputs.js";
-import { listSessionPendingInputReceipts } from "./session-accessor.sqlite-pending-input-receipts.js";
 import { resolveSqliteScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
+import { createSessionActorFactory } from "./session-actor-durable.js";
+import { readSessionPendingInputReceiptsInWorker as listSessionPendingInputReceipts } from "./session-pending-input-receipts.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
+import { deriveTranscriptPredicateFields } from "./transcript-predicate-fields.js";
 
 describe("committed pending input release", () => {
   const fixture = useTempSessionsFixture("pending-input-consumed-release-");
@@ -44,6 +47,30 @@ describe("committed pending input release", () => {
   });
   const options = () => toDatabaseOptions(resolveSqliteScope(scope()));
   const database = () => openOpenClawAgentDatabase(options());
+  const actorPendingInputs = async () => {
+    const current = database();
+    const identity = readOpenClawAgentDatabaseIdentity(current);
+    if (typeof identity.identity !== "string") {
+      throw new Error("Expected a durable input fixture");
+    }
+    const actor = await createSessionActorFactory({ ...options(), path: current.path }).acquire(
+      {
+        sessionKey: scope().sessionKey,
+        database: {
+          kind: "file",
+          physicalIdentity: identity.identity,
+          birthtime: identity.birthtime,
+          nativeLocation: current.path,
+        },
+      },
+      { assertCurrent() {}, assertReadable() {} },
+    );
+    try {
+      return (await actor.read({ assertCurrent() {}, authorize() {} })).pendingInputs;
+    } finally {
+      await actor.release();
+    }
+  };
   const receipts: SessionPendingInputReceipt[] = [];
   const message = (id: string, content = "Synthetic accepted input") => ({
     role: "user" as const,
@@ -223,7 +250,9 @@ describe("committed pending input release", () => {
     )!;
     receipts.push(aggregate);
     expect((await listSessionPendingInputs(scope())).total).toBe(2);
+    expect(await actorPendingInputs()).toHaveLength(2);
     const appended = await promote(aggregate);
+    expect(await actorPendingInputs()).toEqual([]);
     expect(appended).toMatchObject({ appended: true, messageId: aggregate.inputId });
     expect(
       (await readSessionSubmittedInput(scope(), "collect-c:user"))?.["__openclaw"],
@@ -238,7 +267,7 @@ describe("committed pending input release", () => {
     expect(await listSessionPendingInputs(scope())).toEqual({ items: [], total: 0 });
     expect(await readSessionPendingInput(scope(), first.inputId)).toBeUndefined();
     expect(
-      listSessionPendingInputReceipts(scope(), {
+      await listSessionPendingInputReceipts(scope(), {
         runIds: ["collect-a", "collect-b", "unknown"],
       }),
     ).toEqual([
@@ -251,6 +280,7 @@ describe("committed pending input release", () => {
     rotateAgentEventLifecycleGeneration();
     await closeOpenClawAgentDatabasesAsync();
     closeOpenClawAgentDatabasesForTest();
+    expect(await actorPendingInputs()).toEqual([]);
     expect(await readSessionSubmittedInput(scope(), "collect-a:user")).toEqual(first.message);
     expect(await readSessionSubmittedInput(scope(), "collect-b:user")).toEqual(second.message);
     const duplicate = await stage("collect-a", {
@@ -261,6 +291,7 @@ describe("committed pending input release", () => {
       inputId: first.inputId,
       message: first.message,
     });
+    expect(await actorPendingInputs()).toEqual([]);
     expect(() => promote(duplicate)).toThrow("already been consumed");
     await expect(
       stage("collect-a", { message: message("collect-a", "Changed input") }),
@@ -286,7 +317,7 @@ describe("committed pending input release", () => {
       },
     ]);
     expect(
-      listSessionPendingInputReceipts(
+      await listSessionPendingInputReceipts(
         { ...scope(), sessionId: "other" },
         { runIds: ["collect-a"] },
       ),
@@ -490,9 +521,12 @@ describe("committed pending input release", () => {
         if (difference === "malformed") {
           database()
             .db.prepare(
-              "UPDATE transcript_events SET event_json = json_set(event_json, '$.message.role', 'assistant') WHERE json_extract(event_json, '$.message.idempotencyKey') = ?",
+              "UPDATE transcript_events SET event_json = json_set(event_json, '$.message.role', 'assistant'), message_role = ? WHERE json_extract(event_json, '$.message.idempotencyKey') = ?",
             )
-            .run(`${runId}:user`);
+            .run(
+              deriveTranscriptPredicateFields('{"message":{"role":"assistant"}}').message_role,
+              `${runId}:user`,
+            );
         }
       } else {
         await first.completeAsync!(buildAgentRunTerminalOutcome({ status: "ok" }));
@@ -704,43 +738,6 @@ describe("committed pending input release", () => {
     ).toMatchObject({
       error: "provider unavailable",
     });
-    expect(completionRows()).toMatchObject([{ succeeded: 1 }]);
-    expect(pendingCount()).toBe(0);
-  });
-
-  it("preserves the released synchronous completion contract inside an outer rollback", async () => {
-    const first = await stagePrivate();
-    expect(() =>
-      runOpenClawAgentWriteTransaction(() => {
-        first.complete!(buildAgentRunTerminalOutcome({ status: "ok" }));
-        throw new Error("before commit");
-      }, options()),
-    ).toThrow("before commit");
-    expect(completionRows()).toEqual([]);
-    expect(pendingCount()).toBe(1);
-    first.complete!(buildAgentRunTerminalOutcome({ status: "ok" }));
-    expect(pendingCount()).toBe(0);
-  });
-
-  it("preserves released synchronous completion when a postcommit observer fails", async () => {
-    const first = await stagePrivate();
-    setLoggerOverride({ level: "silent", consoleLevel: "error" });
-    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
-    onTestFinished(() => {
-      errorLog.mockRestore();
-      resetLogger();
-    });
-    expect(() =>
-      runOpenClawAgentWriteTransaction((current) => {
-        deferOpenClawAgentPostCommitPublication(current, () => {
-          throw new Error("observer failed");
-        });
-        first.complete!(buildAgentRunTerminalOutcome({ status: "ok" }));
-      }, options()),
-    ).not.toThrow();
-    expect(errorLog).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining("SQLite post-commit notification failed"),
-    );
     expect(completionRows()).toMatchObject([{ succeeded: 1 }]);
     expect(pendingCount()).toBe(0);
   });

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { persistAuthProfileBatch } from "../../../../src/agents/auth-profiles/upsert-with-lock.js";
 import { withFastReplyConfig } from "../../../../src/auto-reply/reply/get-reply-fast-path.test-support.js";
 import {
   clearConfigCache,
@@ -40,8 +41,6 @@ import {
 import { createDeferred, withinTest } from "../../../helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../helpers/temp-dir.js";
 
-// Release adaptation: main shares these two values through gateway-recovery.test-support,
-// which this release line does not carry.
 const isolatedGatewayEnv = {
   OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
   OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
@@ -171,8 +170,8 @@ function writeToolCall(
 
 // This complements the mocked-runner authority matrix: real model tool calls,
 // authenticated ingress, detached timer admission, rearm, and durable output.
-// Release adaptation: this line has no GitHub inspect/merge actions, so the
-// continuation proves restored operator authority through guarded session writes.
+// GitHub's real identity owner is reached, but no publication/identity is invented:
+// the unavailable-credential verdict below is NOT proof of publication or successful landing.
 it(
   "continues an authenticated conversation after disconnect and rearms only its original job",
   {
@@ -213,7 +212,7 @@ it(
     let jobId: string | undefined;
     let creator: GatewayClient | undefined;
     let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
-    const envPatch = {
+    const envPatch: Record<string, string | undefined> = {
       ...isolatedGatewayEnv,
       HOME: home,
       OPENCLAW_STATE_DIR: stateDir,
@@ -245,6 +244,20 @@ it(
         setTestEnvValue(key, value);
       }
     }
+    const inferenceProfileId = "mock-openai:authorized-continuation";
+    await persistAuthProfileBatch({
+      stateDir,
+      profiles: [
+        {
+          profileId: inferenceProfileId,
+          credential: {
+            type: "api_key",
+            provider: "mock-openai",
+            key: "synthetic-authorized-continuation-key",
+          },
+        },
+      ],
+    });
     let provider: Awaited<ReturnType<typeof startOpenAiResponsesModelServer>> | undefined;
     try {
       provider = await startOpenAiResponsesModelServer({
@@ -285,7 +298,7 @@ it(
                     payload: {
                       kind: "agentTurn",
                       message: continuation,
-                      toolsAllow: ["sessions", "automations"],
+                      toolsAllow: ["sessions", "github_identity_status", "automations"],
                     },
                     delivery: { mode: "none" },
                   },
@@ -302,23 +315,31 @@ it(
               case 2:
                 expect(creatorDisconnected).toBe(true);
                 expect(JSON.stringify(body.input)).toContain(continuation);
-                writeToolCall(response, "sessions", "pin", { action: "patch", pinned: true });
+                writeToolCall(response, "github_identity_status", "identity", {});
                 break;
               case 3:
+                // This secret-free status follows the current operator-read guard.
+                // A missing tool, schema-only offer, or authorization error cannot pass.
+                expect(JSON.parse(toolOutput(body, "identity"))).toMatchObject({
+                  effective: { credentialState: expect.any(String) },
+                });
+                writeToolCall(response, "sessions", "pin", { action: "patch", pinned: true });
+                break;
+              case 4:
                 expect(JSON.parse(toolOutput(body, "pin"))).toMatchObject({
                   status: "updated",
                   sessionKey,
                 });
                 writeToolCall(response, "automations", "rearm", { action: "next_check", in: "5s" });
                 break;
-              case 4:
+              case 5:
                 expect(JSON.parse(toolOutput(body, "rearm"))).toMatchObject({
                   ok: true,
                   delayMs: 5_000,
                 });
                 reply(waiting);
                 break;
-              case 5:
+              case 6:
                 expect(JSON.stringify(body.input)).toContain(waiting);
                 writeToolCall(response, "sessions", "finish", {
                   action: "patch",
@@ -326,7 +347,7 @@ it(
                   statusNote: completed,
                 });
                 break;
-              case 6:
+              case 7:
                 expect(JSON.parse(toolOutput(body, "finish"))).toMatchObject({
                   status: "updated",
                   sessionKey,
@@ -352,10 +373,19 @@ it(
       });
       const config: OpenClawConfig = {
         ...modelConfig,
+        auth: {
+          profiles: {
+            [inferenceProfileId]: { provider: "mock-openai", mode: "api_key" },
+          },
+          order: { "mock-openai": [inferenceProfileId] },
+        },
         agents: {
           ...modelConfig.agents,
           defaults: {
             ...modelConfig.agents?.defaults,
+            model: {
+              primary: `mock-openai/qa-authorized-continuation@${inferenceProfileId}`,
+            },
             workspace: workspaceDir,
             models: {
               "mock-openai/qa-authorized-continuation": {
@@ -367,7 +397,7 @@ it(
           entries: { main: {} },
         },
         tools: {
-          allow: ["automations", "sessions"],
+          allow: ["automations", "sessions", "github_identity_status"],
           toolSearch: { enabled: false },
         },
         gateway: { auth: { mode: "token", token } },
@@ -477,7 +507,7 @@ it(
       }
       void clock.advanceTo(nextRunAtMs);
       await observe(removed.promise);
-      expect(step).toBe(7);
+      expect(step).toBe(8);
       const runs = await observer.request<{
         entries: Array<{ status: string; sessionKey?: string; sessionId?: string }>;
       }>("cron.runs", { id: jobId });

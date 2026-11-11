@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants, promises as fs, type Stats } from "node:fs";
+import { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
@@ -48,7 +48,7 @@ type SystemdDefinitionMutation = {
   restoreAll: () => Promise<boolean>;
   remove: (file: string) => Promise<void>;
 };
-const identity = (stat: Stats, contents?: Buffer) =>
+const identity = (stat: BigIntStats, contents?: Buffer) =>
   [stat.dev, stat.ino, stat.uid, stat.gid, stat.mode, contents && sha256Hex(contents)].join(":");
 
 function resolveMutationTargets(
@@ -66,7 +66,7 @@ function resolveMutationTargets(
 
 async function readStableFile(
   file: string,
-  stat: Stats,
+  stat: BigIntStats,
   requireReplacement: boolean,
 ): Promise<{ contents: Buffer } | { sealed: true }> {
   const handle = await fs.open(
@@ -74,7 +74,7 @@ async function readStableFile(
     constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0),
   );
   try {
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || identity(opened) !== identity(stat)) {
       throw new Error("changed artifact");
     }
@@ -163,7 +163,7 @@ async function inspect(
       const inspected =
         directory && !required ? ((await findExistingAncestor(file)) ?? file) : file;
       artifactPath = inspected;
-      const stat = await fs.lstat(inspected).catch((error: unknown) => {
+      const stat = await fs.lstat(inspected, { bigint: true }).catch((error: unknown) => {
         if (required || !hasErrnoCode(error, "ENOENT")) {
           throw error;
         }
@@ -176,8 +176,9 @@ async function inspect(
       if (!directory && stat.isSymbolicLink()) {
         return result({ kind: "unknown", reason: "symlink", artifact });
       }
-      const actual = directory && stat.isSymbolicLink() ? await fs.stat(inspected) : stat;
-      if (!shared.has(file) && actual.uid !== process.geteuid?.()) {
+      const actual =
+        directory && stat.isSymbolicLink() ? await fs.stat(inspected, { bigint: true }) : stat;
+      if (!shared.has(file) && actual.uid !== BigInt(process.geteuid?.() ?? -1)) {
         return result({ kind: "sealed", reason: "foreign-owner", artifact });
       }
       if (directory && !actual.isDirectory()) {
@@ -192,7 +193,7 @@ async function inspect(
         file === path.dirname(generated) &&
         inspected === file &&
         !stat.isSymbolicLink();
-      const requiresRegeneration = Boolean(actual.mode & 0o022);
+      const requiresRegeneration = Boolean(actual.mode & 0o022n);
       if (requiresRegeneration && !repairableGeneratedFile && !repairableStateDirectory) {
         return result({ kind: "unknown", reason: "unsafe-permissions", artifact });
       }
@@ -211,7 +212,7 @@ async function inspect(
       if (targets.has(file)) {
         snapshots.set(file, {
           contents,
-          mode: stat.mode & 0o777,
+          mode: Number(stat.mode & 0o777n),
           ...(requiresRegeneration ? { requiresRegeneration: true } : {}),
         });
       }
@@ -453,7 +454,7 @@ export async function withSystemdDefinitionMutation<T>(
         } finally {
           await temporaryHandle.close();
         }
-        const written = await fs.lstat(temporary);
+        const written = await fs.lstat(temporary, { bigint: true });
         if (file === unit || file === generated) {
           await options?.definitionTransaction?.filePrepared(file, temporary);
         }
@@ -474,8 +475,8 @@ export async function withSystemdDefinitionMutation<T>(
           const after = await readServiceFileState(file);
           if (
             !after ||
-            after.dev !== written.dev ||
-            after.ino !== written.ino ||
+            after.dev !== written.dev.toString() ||
+            after.ino !== written.ino.toString() ||
             after.sha256 !== sha256Hex(Buffer.from(contents)) ||
             after.mode !== mode
           ) {

@@ -8,6 +8,7 @@ import { createDeferredCore } from "../../../shared/deferred.js";
 import { runInDetachedAsyncContext } from "../../../shared/detached-async-context.js";
 import { writeConfigMachineState } from "../../../state/config-machine-state-write.js";
 import { closeOpenClawAgentDatabases } from "../../../state/openclaw-agent-db-lifecycle.js";
+import * as agentDatabaseRuntime from "../../../state/openclaw-agent-db.js";
 import {
   closeOpenClawAgentDatabaseByPath,
   closeOpenClawAgentDatabaseByPathAsync,
@@ -21,6 +22,7 @@ import {
   type OpenClawTestState,
 } from "../../../test-utils/openclaw-test-state.js";
 import { noteCommittedSharedAuthStoreOwnership } from "../../auth-profiles/path-resolve.js";
+import { prepareSharedAuthStoreOwnershipForNative } from "../../auth-profiles/path-resolve.native.js";
 import { loadPersistedAuthProfileStore } from "../../auth-profiles/persisted.js";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
@@ -108,6 +110,7 @@ async function fixture(state: OpenClawTestState, owner: Owner, empty = false) {
   } satisfies OpenClawConfig;
   await state.writeConfig(config);
   setRuntimeConfigSnapshot(config, config);
+  prepareSharedAuthStoreOwnershipForNative(state.env);
   let sharedBefore: AuthProfileStore | undefined;
   if (owner === "main-with-shared-base") {
     writeConfigMachineState(
@@ -655,6 +658,27 @@ it("leaves inline-key health unchanged after a controller timeout without host d
         caller: store,
         runtime: getRuntimeAuthProfileStoreSnapshotCore(agentDir),
       }).toEqual(before);
+    },
+  );
+});
+
+it("persists inline-key failure without reopening a caller-thread agent database runtime", async () => {
+  await withOpenClawTestState(
+    { label: "inline-no-host-runtime", scenario: "minimal" },
+    async (state) => {
+      const { agentDir, controller } = await fixture(state, "local-agent");
+      const hostRuntime = vi
+        .spyOn(agentDatabaseRuntime, "withOpenClawAgentDatabaseRuntime")
+        .mockImplementation(() => {
+          throw new Error("caller-thread runtime is forbidden for inline failure");
+        });
+      try {
+        await controller.maybeMarkAuthProfileFailure({ reason: "auth" });
+        expect(hostRuntime).not.toHaveBeenCalled();
+      } finally {
+        hostRuntime.mockRestore();
+      }
+      expect(loadPersistedAuthProfileStore(agentDir)?.usageStats?.[usageId]?.errorCount).toBe(3);
     },
   );
 });

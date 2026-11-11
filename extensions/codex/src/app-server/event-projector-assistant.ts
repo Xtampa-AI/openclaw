@@ -4,7 +4,7 @@ import { isSilentReplyPayloadText } from "openclaw/plugin-sdk/reply-chunking";
 import { readStringField as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { readCodexAsyncQuestions, type CodexAsyncQuestion } from "./async-questions.js";
 import {
-  createAssistantAsyncMessage as buildAssistantAsyncMessage,
+  createAssistantAsyncDelivery as buildAssistantAsyncDelivery,
   createAssistantCommentaryMessage as buildAssistantCommentaryMessage,
   createAssistantMessage as buildAssistantMessage,
   type AssistantMessageOptions,
@@ -57,6 +57,8 @@ export class CodexAssistantProjection {
   private responseModel: string | undefined;
   // Native handoffs retire earlier finals; terminal summaries contain only the last answer.
   private persistableAssistantBarrier = 0;
+  // Stable partial answers survive native work, but not a completed transcript mirror.
+  private persistedAssistantBarrier = 0;
   // A completed answer mirrored before a steer is already durable. Do not
   // replay it as the enclosing turn's terminal answer if Codex emits no coda.
   private persistedAssistantBoundary = false;
@@ -71,6 +73,7 @@ export class CodexAssistantProjection {
       itemId: string,
       entry: CodexTranscriptCheckpointEntry,
     ) => void,
+    private readonly hasDeliveredFinalSourceReply?: () => boolean,
   ) {}
 
   handleNotification(method: string, params: JsonObject): void {
@@ -82,7 +85,7 @@ export class CodexAssistantProjection {
   async handleAssistantDelta(params: JsonObject): Promise<void> {
     const itemId = readString(params, "itemId") ?? "assistant";
     const delta = readString(params, "delta") ?? "";
-    if (!delta) {
+    if (!delta || this.hasDeliveredFinalSourceReply?.()) {
       return;
     }
     if (itemId !== this.pendingRawTerminalAssistantEchoItemId) {
@@ -98,6 +101,9 @@ export class CodexAssistantProjection {
       this.assistantStarted = true;
       await this.params.onAssistantMessageStart?.();
     }
+    if (this.hasDeliveredFinalSourceReply?.()) {
+      return;
+    }
     this.rememberAssistantItem(itemId);
     const text = `${this.assistantTextByItem.get(itemId) ?? ""}${delta}`;
     this.assistantTextByItem.set(itemId, text);
@@ -108,13 +114,14 @@ export class CodexAssistantProjection {
       this.emitCommentaryProgress({ itemId, text, phase: "update" });
       return;
     }
-    const knownFinalAnswer = this.isFinalAnswerAssistantItem(itemId);
-    if (knownFinalAnswer) {
+    const phase = this.assistantPhaseByItem.get(itemId);
+    const knownStableAnswer = phase === "partial_answer" || phase === "final_answer";
+    if (phase === "final_answer") {
       this.emitAnswerCandidate(itemId, "candidate");
     }
     const { occurrenceId, replacement, replaceable } = this.steeringSegments.recordStream(
       itemId,
-      knownFinalAnswer,
+      knownStableAnswer,
     );
     const streamPayload = {
       text,
@@ -132,7 +139,7 @@ export class CodexAssistantProjection {
     });
     // Legacy channel preview callbacks are append-oriented and do not all
     // understand replacement snapshots.
-    if (knownFinalAnswer && !replaceable) {
+    if (knownStableAnswer && !replaceable) {
       await this.params.onPartialReply?.(streamPayload);
     }
   }
@@ -141,6 +148,9 @@ export class CodexAssistantProjection {
     item: CodexThreadItem | undefined,
     itemId: string | undefined,
   ): Promise<void> {
+    if (item?.type === "agentMessage" && this.hasDeliveredFinalSourceReply?.()) {
+      return;
+    }
     this.noteNativeWorkBarrier(item);
     this.rememberAssistantPhase(item);
     if (
@@ -190,6 +200,9 @@ export class CodexAssistantProjection {
     item: CodexThreadItem | undefined,
     notification?: { itemId: string | undefined; activeItemIds: ReadonlySet<string> },
   ): { itemId: string; message: AssistantMessage; text: string } | undefined {
+    if (item?.type === "agentMessage" && this.hasDeliveredFinalSourceReply?.()) {
+      return undefined;
+    }
     this.adoptSteeringPrefixForCompletion(item);
     if (item?.type === "agentMessage" && (!notification || notification.itemId)) {
       this.steeringSegments.recordCompletion(notification?.itemId ?? item.id);
@@ -257,7 +270,7 @@ export class CodexAssistantProjection {
     if (!isPendingTerminalAssistantEcho) {
       this.markTerminalAssistantCandidateSupersededBy(rawItemId);
     }
-    if (role !== "assistant") {
+    if (role !== "assistant" || this.hasDeliveredFinalSourceReply?.()) {
       return;
     }
     if (phase === "commentary" && this.pendingRawCommentaryEchoes > 0) {
@@ -404,12 +417,13 @@ export class CodexAssistantProjection {
     if (prefix.completed) {
       const index = this.assistantItemOrder.indexOf(prefix.itemId);
       this.persistableAssistantBarrier = Math.max(this.persistableAssistantBarrier, index + 1);
+      this.persistedAssistantBarrier = Math.max(this.persistedAssistantBarrier, index + 1);
     }
     this.persistedAssistantBoundary = true;
   }
 
   finalizeAnswerCandidate(turn: { status?: string; items?: CodexThreadItem[] }): void {
-    if (turn.status !== "completed") {
+    if (turn.status !== "completed" || this.hasDeliveredFinalSourceReply?.()) {
       this.supersedeVisibleAnswerCandidate();
       return;
     }
@@ -688,15 +702,15 @@ export class CodexAssistantProjection {
   private collectPersistableAssistantTexts(minIndex: number): string[] {
     let texts: string[] = [];
     let replaceable = false;
-    // Walk time order. Unphased text replaces the current segment. Explicit
-    // finals accumulate unless they follow a replacement. Silent payloads
+    // Walk time order. Unphased text replaces the current segment. Stable partial
+    // and final answers accumulate unless they follow a replacement. Silent payloads
     // never replace; they only ride along for post-handoff identity.
-    for (let index = 0; index < this.assistantItemOrder.length; index += 1) {
-      const itemId = this.assistantItemOrder[index];
+    for (const [index, itemId] of this.assistantItemOrder.entries()) {
+      const phase = this.assistantPhaseByItem.get(itemId);
+      const cutoff = phase === "partial_answer" ? this.persistedAssistantBarrier : minIndex;
       if (
-        !itemId ||
         this.isNonTerminalAssistantItem(itemId) ||
-        (index < minIndex && !this.steeringSegments.survivesHandoff(itemId))
+        (index < cutoff && !this.steeringSegments.survivesHandoff(itemId))
       ) {
         continue;
       }
@@ -708,10 +722,10 @@ export class CodexAssistantProjection {
         texts.push(text);
         continue;
       }
-      const isTerminalFinal = this.assistantPhaseByItem.get(itemId) === "final_answer";
-      if (!isTerminalFinal || replaceable) {
+      const isStableAnswer = phase === "partial_answer" || phase === "final_answer";
+      if (!isStableAnswer || replaceable) {
         texts = [text];
-        replaceable = !isTerminalFinal;
+        replaceable = !isStableAnswer;
         continue;
       }
       texts.push(text);
@@ -745,28 +759,16 @@ export class CodexAssistantProjection {
     }
   }
 
-  private createAsyncDelivery(
-    itemId: string,
-  ): { itemId: string; message: AssistantMessage; text: string } | undefined {
-    if (!this.isAsyncAssistantItem(itemId)) {
-      return undefined;
-    }
-    const text = this.assistantTextByItem.get(itemId);
-    const timestamp = this.assistantTimestampByItem.get(itemId);
-    if (!text?.trim() || timestamp === undefined) {
-      return undefined;
-    }
-    return {
-      itemId,
-      message: buildAssistantAsyncMessage(
-        this.params,
-        text,
-        itemId,
-        timestamp,
-        this.assistantQuestionsByItem.get(itemId),
-      ),
-      text,
-    };
+  private createAsyncDelivery(itemId: string) {
+    return this.isAsyncAssistantItem(itemId)
+      ? buildAssistantAsyncDelivery(
+          this.params,
+          this.assistantTextByItem.get(itemId),
+          itemId,
+          this.assistantTimestampByItem.get(itemId),
+          this.assistantQuestionsByItem.get(itemId),
+        )
+      : undefined;
   }
 
   private isToolProgressEchoText(itemId: string, text: string): boolean {

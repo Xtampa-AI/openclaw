@@ -31,6 +31,7 @@ import {
   stripLeadingPackageManagerSeparator,
 } from "./lib/arg-utils.mts";
 import { readBoundedResponseText } from "./lib/bounded-response.mjs";
+import { resolveNpmJsonEntries } from "./lib/npm-json-output.mts";
 import { parsePluginReleaseSelection } from "./lib/plugin-npm-release.ts";
 import { gitIsAncestor, validateCandidateChangelog } from "./lib/release-candidate-changelog.mts";
 import { releaseBranchForTag } from "./lib/release-context.mjs";
@@ -38,14 +39,19 @@ import { ensureReleasePublishToolingTag } from "./lib/release-publish-preflight-
 import { formatReleasePublishPreflight } from "./lib/release-publish-preflight-interface.mts";
 import { classifyReleaseTrain, parseReleaseVersion } from "./lib/release-version.mjs";
 import { sleep as wait } from "./lib/sleep.mjs";
+import { readUpgradeSurvivorScenarioCatalog } from "./lib/upgrade-survivor-policy.mjs";
 import {
   downloadFullReleaseNpmPreflight,
   verifyNpmPreflightProducer,
   validateReleasePreflightTagIdentity,
 } from "./npm-preflight-tooling-identity.mjs";
-import { validateNpmPreflightDistTag } from "./openclaw-npm-extended-stable-release.mjs";
+import {
+  resolveNpmPreflightSdkSelectors,
+  validateNpmPreflightDistTag,
+} from "./openclaw-npm-extended-stable-release.mjs";
 import {
   PluginSdkApiAcknowledgementError,
+  findPluginSdkApiReleaseNoteOmissions,
   validatePluginSdkApiReleaseEvidence,
 } from "./plugin-sdk-api-release-evidence.mjs";
 import { runReleasePublishPreflight } from "./release-publish-preflight.mts";
@@ -87,6 +93,7 @@ type LocalCheckResult =
   | { status: "passed"; command: string; reason?: never }
   | { status: "skipped"; reason: string; command?: never };
 type PreflightTarballs = Partial<Record<"corePackageTarballs" | "dependencyTarballs", unknown>>;
+type RequiredCandidateFlag = { flag: string; value: string; reason: string };
 const DEFAULT_REPO = "openclaw/openclaw";
 const DEFAULT_PROVIDER = "openai";
 const DEFAULT_MODE = "both";
@@ -109,6 +116,7 @@ const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
 const RELEASE_CANDIDATE_STATE_VERSION = 2;
 const RELEASE_CANDIDATE_STATE_FILE = "release-candidate-state.json";
 const TRUSTED_TOOLING_SHA_ENV = "OPENCLAW_RELEASE_CANDIDATE_TRUSTED_TOOLING_SHA";
+const UPGRADE_SURVIVOR_CATALOG_PATH = "scripts/lib/upgrade-survivor-scenarios.json";
 // Release tooling (toolingSha and its publishWorkflowRef tag) is not candidate
 // identity: each run re-verifies the current tooling against trusted main, and
 // saved FRV/npm evidence is authenticated against its own producer run. Tooling
@@ -156,12 +164,14 @@ Options:
   --tag <tag>                         Release tag. An existing tag must resolve to the target SHA.
   --target-sha <sha>                  Frozen release SHA. Defaults to the current HEAD.
   --workflow-ref <ref>                Trusted helper/publisher source (P), not the candidate harness. Default: main.
-  --workflow-sha <sha>                Trusted helper/publisher SHA (P), a trusted-main commit, not the candidate; reuses or mints its release-publish tag. Fresh qualification runs Q=C.
+  --workflow-sha <sha>                Trusted helper/publisher SHA (P), a trusted-main commit, not the candidate; reuses or mints its release-publish tag. This or --publish-workflow-ref is required. Fresh qualification runs Q=C.
   --publish-workflow-ref <tag>         Protected publication tooling tag matching the trusted helper checkout.
   --publication-route <normal|prepared>
                                       Intended publication route. Default: normal; not inferred from a protected ref.
   --repo <owner/repo>                 GitHub repo. Default: ${DEFAULT_REPO}
-  --full-release-run <id>             Reuse successful Full Release Validation run.
+  --full-release-validation-run-id <id>
+                                      Reuse successful Full Release Validation run.
+  --full-release-run <id>             Deprecated alias for --full-release-validation-run-id.
   --npm-preflight-run <id>            Reuse successful OpenClaw NPM Release preflight run.
   --plugin-sdk-api-acknowledgement <digest>
                                       8-character digest from the Plugin SDK API diff report.
@@ -180,7 +190,7 @@ Options:
   --npm-dist-tag <beta|latest>  Default: ${DEFAULT_NPM_DIST_TAG}
   --plugin-publish-scope <scope>      selected|all-publishable. Default: ${DEFAULT_PLUGIN_SCOPE}
   --plugins <names>                   Required when plugin scope is selected.
-  --output-dir <dir>                  Evidence output dir. Default: .artifacts/release-candidate/<tag>
+  --output-dir <dir>                  Evidence output dir. Default: .artifacts/release-candidate/<tag>/<target-sha>
 `;
 }
 
@@ -188,6 +198,16 @@ export function parseArgs(argv: string[]) {
   const args = stripLeadingPackageManagerSeparator(argv);
   const terminatorIndex = args.indexOf("--");
   const cliArgs = terminatorIndex === -1 ? args : args.slice(0, terminatorIndex);
+  const helpIndex = cliArgs.findIndex((arg) => arg === "-h" || arg === "--help");
+  const parsedArgs = helpIndex === -1 ? cliArgs : cliArgs.slice(0, helpIndex);
+  if (
+    parsedArgs.includes("--full-release-validation-run-id") &&
+    parsedArgs.includes("--full-release-run")
+  ) {
+    throw new Error(
+      "Use --full-release-validation-run-id; do not combine it with the deprecated --full-release-run alias.",
+    );
+  }
   const options = {
     repo: DEFAULT_REPO,
     provider: DEFAULT_PROVIDER,
@@ -221,9 +241,8 @@ export function parseArgs(argv: string[]) {
     windowsNodeInstallerDigests: "",
     outputDir: "",
   };
-  const helpIndex = cliArgs.findIndex((arg) => arg === "-h" || arg === "--help");
   parseFlagArgs(
-    helpIndex === -1 ? cliArgs : cliArgs.slice(0, helpIndex),
+    parsedArgs,
     options,
     [
       ...(
@@ -235,6 +254,7 @@ export function parseArgs(argv: string[]) {
           ["--publish-workflow-ref", "publishWorkflowRef"],
           ["--publication-route", "publicationRoute"],
           ["--repo", "repo"],
+          ["--full-release-validation-run-id", "fullReleaseRunId"],
           ["--full-release-run", "fullReleaseRunId"],
           ["--npm-preflight-run", "npmPreflightRunId"],
           ["--plugin-sdk-api-acknowledgement", "pluginSdkApiAcknowledgement"],
@@ -344,7 +364,7 @@ export function parseArgs(argv: string[]) {
       : "operator skipped --skip-parallels"
     : "";
   if (options.skipDispatch && !options.fullReleaseRunId) {
-    throw new Error("--skip-dispatch requires --full-release-run");
+    throw new Error("--skip-dispatch requires --full-release-validation-run-id");
   }
   if (options.pluginPublishScope === "selected" && !options.plugins.trim()) {
     throw new Error("--plugin-publish-scope selected requires --plugins");
@@ -368,24 +388,44 @@ export function parseArgs(argv: string[]) {
   return options;
 }
 
+export function resolveReleaseCandidateOutputDir({
+  outputDir,
+  tag,
+  targetSha,
+}: {
+  outputDir: string;
+  tag: string;
+  targetSha: string;
+}) {
+  return outputDir || join(".artifacts", "release-candidate", tag, targetSha);
+}
+
 export function run(
   command: string,
   args: string[],
-  options: { capture?: boolean; cwd?: string; env?: NodeJS.ProcessEnv } = {},
+  options: { capture?: boolean | "echo"; cwd?: string; env?: NodeJS.ProcessEnv } = {},
 ) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     encoding: "utf8",
     env: options.env ? { ...process.env, ...options.env } : process.env,
-    maxBuffer: COMMAND_CAPTURE_MAX_BUFFER_BYTES,
+    ...(options.capture === "echo" ? {} : { maxBuffer: COMMAND_CAPTURE_MAX_BUFFER_BYTES }),
     stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
   });
+  if (options.capture === "echo") {
+    if (result.stdout) {
+      process.stdout.write(result.stdout);
+    }
+    if (result.stderr) {
+      process.stderr.write(result.stderr);
+    }
+  }
   if (result.status !== 0) {
     throw new Error(
       `${command} ${args.join(" ")} failed with ${result.status ?? result.signal}\n${result.stderr ?? ""}`,
     );
   }
-  return result.stdout ?? "";
+  return `${result.stdout ?? ""}${options.capture === "echo" ? (result.stderr ?? "") : ""}`;
 }
 
 function readJson(path: string, label: string) {
@@ -400,6 +440,175 @@ function readJson(path: string, label: string) {
       `${label} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
+  }
+}
+
+export function resolveEarlyPluginSdkApiBases({
+  distTags,
+  npmDistTag,
+  packageVersion,
+}: {
+  distTags: unknown;
+  npmDistTag: string;
+  packageVersion: string;
+}): Record<string, string> {
+  const entries = resolveNpmJsonEntries(distTags);
+  if (entries.length !== 1 || !isRecord(entries[0])) {
+    throw new Error("Expected one npm dist-tag selector map for the Plugin SDK API review");
+  }
+  const selectorMap = entries[0];
+  const selectors = resolveNpmPreflightSdkSelectors(packageVersion, npmDistTag);
+  return Object.fromEntries(
+    selectors.map((selector) => {
+      const version = selectorMap[selector];
+      if (typeof version !== "string" || !parseReleaseVersion(version)) {
+        throw new Error(`Invalid npm Plugin SDK API predecessor for ${selector}`);
+      }
+      return [selector, `v${version}`];
+    }),
+  );
+}
+
+// Every flag a rerun needs is reported together with one exact rerun command.
+function formatRequiredCandidateFlagsFailure(flags: RequiredCandidateFlag[], cause?: unknown) {
+  const argv = stripLeadingPackageManagerSeparator(process.argv.slice(2));
+  for (const { flag, value } of flags) {
+    const end = argv.indexOf("--");
+    let replaced = false;
+    for (let index = 0; index < (end === -1 ? argv.length : end); index++) {
+      if (argv[index] === flag) {
+        argv[++index] = value;
+        replaced = true;
+      }
+    }
+    if (!replaced) {
+      argv.unshift(flag, value);
+    }
+  }
+  return new Error(
+    [
+      ...flags.map(({ reason }) => reason),
+      ["pnpm", "release:candidate", "--", ...argv].map(shellQuote).join(" "),
+    ].join("\n\n"),
+    { cause },
+  );
+}
+
+function pluginSdkApiAcknowledgementFlag(
+  error: PluginSdkApiAcknowledgementError,
+  report: string,
+): RequiredCandidateFlag {
+  return {
+    flag: "--plugin-sdk-api-acknowledgement",
+    value: error.digest,
+    reason: [
+      error.message,
+      report || "Review the Plugin SDK API diff artifact before rerunning.",
+    ].join("\n\n"),
+  };
+}
+
+export function resolveEarlyPluginSdkApiReviewPaths({
+  outputDir,
+  targetRoot,
+}: {
+  outputDir: string;
+  targetRoot: string;
+}) {
+  const reviewDir = resolvePath(targetRoot, outputDir, "plugin-sdk-api-early-review");
+  return {
+    reviewDir,
+    evidencePath: join(reviewDir, "plugin-sdk-api-release-evidence.json"),
+    reportPath: join(reviewDir, "plugin-sdk-api-release-diff.md"),
+    diffPath: join(reviewDir, "plugin-sdk-api-release-diff.json"),
+  };
+}
+
+function runEarlyPluginSdkApiReview({
+  npmDistTag,
+  outputDir,
+  targetRoot,
+  targetSha,
+  toolingSha,
+}: {
+  npmDistTag: string;
+  outputDir: string;
+  targetRoot: string;
+  targetSha: string;
+  toolingSha: string;
+}) {
+  const packageManifest: unknown = JSON.parse(
+    run("git", ["show", `${targetSha}:package.json`], { capture: true, cwd: targetRoot }),
+  );
+  const packageVersion = requireString(
+    isRecord(packageManifest) ? packageManifest.version : undefined,
+    "release package version",
+  );
+  const bases = resolveEarlyPluginSdkApiBases({
+    distTags: JSON.parse(
+      run("npm", ["view", "openclaw", "dist-tags", "--json"], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+    ),
+    npmDistTag,
+    packageVersion,
+  });
+  for (const tag of new Set(Object.values(bases))) {
+    run(
+      "git",
+      [
+        "fetch",
+        "--no-tags",
+        "--filter=blob:none",
+        "--depth=1",
+        "origin",
+        `+refs/tags/${tag}:refs/tags/${tag}`,
+      ],
+      { cwd: TOOLING_ROOT },
+    );
+  }
+  const { reviewDir, evidencePath, reportPath, diffPath } = resolveEarlyPluginSdkApiReviewPaths({
+    outputDir,
+    targetRoot,
+  });
+  mkdirSync(reviewDir, { recursive: true });
+  const args = [
+    "run",
+    "plugin-sdk:api:diff",
+    "--",
+    "--head",
+    targetSha,
+    "--evidence",
+    evidencePath,
+    "--json",
+    diffPath,
+    "--summary",
+    reportPath,
+  ];
+  if (Object.keys(bases).length === 2) {
+    args.push("--bases-json", JSON.stringify(bases));
+  } else {
+    args.push("--base", requireString(Object.values(bases)[0], "Plugin SDK API predecessor"));
+  }
+  console.log("Reviewing the Plugin SDK API while Full Release Validation runs...");
+  run("pnpm", args, { cwd: TOOLING_ROOT });
+  const evidence = readJson(evidencePath, "early Plugin SDK API evidence");
+  const report = readFileSync(reportPath, "utf8").trim();
+  try {
+    validatePluginSdkApiReleaseEvidence({
+      acknowledgement: "",
+      evidence,
+      expectedHeadSha: targetSha,
+      expectedWorkflowSha: toolingSha,
+      npmDistTag,
+    });
+    return undefined;
+  } catch (error) {
+    if (error instanceof PluginSdkApiAcknowledgementError) {
+      return pluginSdkApiAcknowledgementFlag(error, report);
+    }
+    throw error;
   }
 }
 
@@ -504,19 +713,37 @@ export function buildReleaseCandidateState(
   };
 }
 
-export function reconcileReleaseCandidateState(saved: unknown, expected: CandidateState) {
+function canUpdateReleaseCandidateState(saved: JsonRecord, hasRetainedRequest: boolean) {
+  // The canonical helper can retain an accepted or uncertain dispatch before
+  // this coordinator receives its run ID. Empty IDs alone do not mean unbound.
+  return (
+    saved.phase === "validated" &&
+    !saved.fullReleaseRunId &&
+    !saved.npmPreflightRunId &&
+    !hasRetainedRequest
+  );
+}
+
+export function reconcileReleaseCandidateState(
+  saved: unknown,
+  expected: CandidateState,
+  hasRetainedRequest = false,
+) {
   if (!saved) {
     return expected;
   }
   if (!isRecord(saved) || saved.version !== RELEASE_CANDIDATE_STATE_VERSION) {
     throw new Error("release candidate state has an unsupported schema");
   }
-  // Historical state emitted the normal command by default. It did not record
-  // source admission, and cannot silently become a newly selected prepared route.
-  if ((saved.publicationRoute ?? "normal") !== expected.publicationRoute) {
+  const canUpdate = canUpdateReleaseCandidateState(saved, hasRetainedRequest);
+  // Once bound, historical state retains its original normal publication route.
+  if (!canUpdate && (saved.publicationRoute ?? "normal") !== expected.publicationRoute) {
     throw new Error("release candidate state mismatch for publicationRoute");
   }
   for (const key of RELEASE_CANDIDATE_STATE_KEYS) {
+    if (canUpdate && key !== "repo" && key !== "tag" && key !== "targetSha") {
+      continue;
+    }
     if (!isDeepStrictEqual(saved[key], expected[key])) {
       throw new Error(
         `release candidate state mismatch for ${key}: saved=${JSON.stringify(saved[key])} current=${JSON.stringify(expected[key])}`,
@@ -768,23 +995,35 @@ function runFromTrustedTooling(
       );
     }
   } finally {
-    // Remove the installed graph before Git walks the checkout to remove it.
+    // Remove the graph first, but retain checkout/.git until Git removes its
+    // worktree registration. Failed Git cleanup leaves a recoverable checkout.
     try {
-      rmSync(tempRoot, { force: true, recursive: true });
+      rmSync(join(toolingRoot, "node_modules"), { force: true, recursive: true });
     } catch (error) {
       console.warn(
-        `could not remove temporary trusted tooling files at ${tempRoot}: ${String(error)}`,
+        `could not remove temporary trusted tooling dependencies at ${toolingRoot}: ${String(error)}`,
       );
     }
+    let worktreeRemoved = !worktreeAdded;
     if (worktreeAdded) {
       const cleanup = spawnSync("git", ["worktree", "remove", "--force", toolingRoot], {
         cwd: targetRoot,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       });
-      if (cleanup.status !== 0) {
+      worktreeRemoved = cleanup.status === 0;
+      if (!worktreeRemoved) {
         console.warn(
-          `could not remove temporary trusted tooling worktree: ${cleanup.stderr?.trim() || cleanup.signal || cleanup.status}`,
+          `could not remove temporary trusted tooling worktree at ${toolingRoot}: ${cleanup.stderr?.trim() || cleanup.error?.message || cleanup.signal || cleanup.status}`,
+        );
+      }
+    }
+    if (worktreeRemoved) {
+      try {
+        rmSync(tempRoot, { force: true, recursive: true });
+      } catch (error) {
+        console.warn(
+          `could not remove temporary trusted tooling files at ${tempRoot}: ${String(error)}`,
         );
       }
     }
@@ -846,6 +1085,7 @@ export function validateCandidateCheckout({
   return { status: "passed", targetSha, toolingSha, workflowRef };
 }
 
+/** Returns whether the remote release tag is already published at the target. */
 export function assertReleaseCandidateTag(tag: string, targetSha: string, cwd: string) {
   const ref = `refs/tags/${tag}`;
   const result = spawnSync(
@@ -854,7 +1094,7 @@ export function assertReleaseCandidateTag(tag: string, targetSha: string, cwd: s
     { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   );
   if (result.status === 2) {
-    return;
+    return false;
   }
   if (result.status !== 0) {
     throw new Error(
@@ -877,16 +1117,22 @@ export function assertReleaseCandidateTag(tag: string, targetSha: string, cwd: s
       `release candidate tag ${tag} resolves to ${tagSha ?? "an unknown target"}, expected ${targetSha}; use the matching release target or a new tag`,
     );
   }
+  return true;
 }
 
 function savedPublishWorkflowRef(statePath: string, toolingSha: string) {
-  const saved = existsSync(statePath)
-    ? readJson(statePath, "release candidate state").publishWorkflowRef
-    : undefined;
-  return typeof saved === "string" &&
-    PUBLISH_TOOLING_TAG_PATTERN.test(saved) &&
-    saved.startsWith(`release-publish/${toolingSha.slice(0, 12)}-`)
-    ? saved
+  if (!existsSync(statePath)) {
+    return "";
+  }
+  const saved = readJson(statePath, "release candidate state");
+  if (saved.version !== RELEASE_CANDIDATE_STATE_VERSION) {
+    throw new Error("release candidate state has an unsupported schema");
+  }
+  const tag = saved.publishWorkflowRef;
+  return typeof tag === "string" &&
+    PUBLISH_TOOLING_TAG_PATTERN.test(tag) &&
+    tag.startsWith(`release-publish/${toolingSha.slice(0, 12)}-`)
+    ? tag
     : "";
 }
 
@@ -918,6 +1164,54 @@ export function validateTrustedToolingPin({
     );
   }
   return pinnedToolingSha;
+}
+
+function releaseScenarioCatalog(source: string, owner: string) {
+  const scenarios = readUpgradeSurvivorScenarioCatalog(source, { includeAssertionOnly: false });
+  if (!scenarios) {
+    throw new Error(`${owner} has an invalid ${UPGRADE_SURVIVOR_CATALOG_PATH}`);
+  }
+  return scenarios;
+}
+
+export function validateReleaseScenarioCatalogCompatibility({
+  candidateCatalog,
+  toolingCatalog,
+  latestTrustedToolingCatalog,
+  toolingSha,
+  latestTrustedToolingSha,
+  workflowRef,
+}: {
+  candidateCatalog: string;
+  toolingCatalog: string;
+  latestTrustedToolingCatalog: string;
+  toolingSha: string;
+  latestTrustedToolingSha: string;
+  workflowRef: string;
+}) {
+  const candidateScenarios = releaseScenarioCatalog(candidateCatalog, "release candidate");
+  const toolingScenarios = new Set(releaseScenarioCatalog(toolingCatalog, `tooling ${toolingSha}`));
+  const unsupported = candidateScenarios
+    .filter((scenario) => !toolingScenarios.has(scenario))
+    .toSorted();
+  if (unsupported.length === 0) {
+    return { status: "passed" as const, unsupported };
+  }
+  const latestScenarios = new Set(
+    releaseScenarioCatalog(
+      latestTrustedToolingCatalog,
+      `trusted ${workflowRef} tooling ${latestTrustedToolingSha}`,
+    ),
+  );
+  const replacementSupportsCandidate = candidateScenarios.every((scenario) =>
+    latestScenarios.has(scenario),
+  );
+  const replacement = replacementSupportsCandidate
+    ? ` Trusted ${workflowRef} tooling ${latestTrustedToolingSha} supports this catalogue; rerun with --workflow-sha ${latestTrustedToolingSha}.`
+    : ` Trusted ${workflowRef} tip ${latestTrustedToolingSha} also lacks support; land the catalogue consumer before qualifying this candidate.`;
+  throw new Error(
+    `Pinned release tooling ${toolingSha} cannot consume candidate upgrade-survivor scenarios: ${unsupported.join(", ")}.${replacement}`,
+  );
 }
 
 export async function validateNpmPreflightRunSource(
@@ -1047,27 +1341,6 @@ async function resolveRunArtifact(
   return artifact;
 }
 
-function runAndEcho(command: string, args: string[]) {
-  const result = spawnSync(command, args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
-  }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      `${command} ${args.join(" ")} failed with ${result.status ?? result.signal}\n${
-        result.stderr ?? ""
-      }`,
-    );
-  }
-  return `${result.stdout ?? ""}${result.stderr ?? ""}`;
-}
-
 function runLocalGeneratedCheckIfNeeded(options: ReturnType<typeof parseArgs>): LocalCheckResult {
   if (options.skipLocalGeneratedCheck) {
     return { status: "skipped", reason: "operator skipped --skip-local-generated-check" };
@@ -1165,7 +1438,7 @@ function dispatchWorkflow(
   for (const [key, value] of Object.entries(fields)) {
     args.push("-f", `${key}=${String(value)}`);
   }
-  return requireRunIdFromDispatchOutput(runAndEcho("gh", args), workflowFile);
+  return requireRunIdFromDispatchOutput(run("gh", args, { capture: "echo" }), workflowFile);
 }
 
 async function runInfo(repo: string, runId: string) {
@@ -1574,14 +1847,14 @@ export function validateFullManifest(manifest: JsonRecord, params: JsonRecord) {
 export function candidateParallelsArgs(
   tarballPath: string,
   dependencyTarballPaths: string[] = [],
-  toolingRoot = TOOLING_ROOT,
+  candidateRoot = process.cwd(),
   registryPackageTarballPaths: string[] = [],
   macosSnapshotHint = "",
 ) {
   return [
     "exec",
     "tsx",
-    join(toolingRoot, "scripts/e2e/parallels/npm-update-smoke.ts"),
+    join(candidateRoot, "scripts/e2e/parallels/npm-update-smoke.ts"),
     "--target-tarball",
     tarballPath,
     ...dependencyTarballPaths.flatMap((dependency) => ["--dependency-tarball", dependency]),
@@ -1600,6 +1873,7 @@ export function candidateParallelsShellCommand(
   dependencyTarballPaths: string[] = [],
   registryPackageTarballPaths: string[] = [],
   macosSnapshotHint = "",
+  candidateRoot = process.cwd(),
 ) {
   // Login shells can replace the candidate's supported Node with ambient host Node.
   // Keep the invoking Node first so pnpm and npm use the validated runtime.
@@ -1615,7 +1889,7 @@ export function candidateParallelsShellCommand(
     ...candidateParallelsArgs(
       tarballPath,
       dependencyTarballPaths,
-      TOOLING_ROOT,
+      candidateRoot,
       registryPackageTarballPaths,
       macosSnapshotHint,
     ).map(shellQuote),
@@ -1627,12 +1901,14 @@ async function runParallelsIfNeeded(
   tarballPath: string,
   dependencyTarballPaths: string[],
   registryPackageTarballPaths: string[],
+  candidateRoot: string,
 ): Promise<LocalCheckResult> {
   if (options.skipParallels) {
     return { status: "skipped", reason: options.parallelsSkipReason };
   }
   const timeoutBin = run("bash", ["-lc", "command -v gtimeout || command -v timeout"], {
     capture: true,
+    cwd: candidateRoot,
   }).trim();
   const command = candidateParallelsShellCommand(
     tarballPath,
@@ -1640,10 +1916,12 @@ async function runParallelsIfNeeded(
     dependencyTarballPaths,
     registryPackageTarballPaths,
     process.env.OPENCLAW_PARALLELS_MACOS_SNAPSHOT_HINT?.trim() ?? "",
+    candidateRoot,
   );
   run("bash", ["-lc", command], {
+    cwd: candidateRoot,
     env: {
-      OPENCLAW_PARALLELS_ARTIFACT_ROOT: join(process.cwd(), ".artifacts", "parallels"),
+      OPENCLAW_PARALLELS_ARTIFACT_ROOT: join(candidateRoot, ".artifacts", "parallels"),
     },
   });
   return {
@@ -1703,15 +1981,61 @@ async function runTelegramIfNeeded(
   manifest: JsonRecord,
   runAttempt: number,
   sourceSha: string,
-  coveragePolicy: string | undefined,
+  fullValidationEvidence: Awaited<ReturnType<typeof authenticateFullReleaseValidationEvidence>>,
+  npmUsesFullRun: boolean,
 ): Promise<TelegramResult> {
   if (options.skipTelegram) {
     return { status: "skipped" };
   }
   // Only the admitted evidence policy defers this wait; legacy beta evidence
   // still requires the separate Telegram qualification.
-  if (coveragePolicy === "npm-beta-v1") {
+  if (fullValidationEvidence.coveragePolicy === "npm-beta-v1") {
     return { status: "deferred-postpublish" };
+  }
+  const qualificationManifest = fullValidationEvidence.evidence.current.manifest;
+  const coversPackageTelegram =
+    fullValidationEvidence.coveragePolicy === "npm-stable-v1" ||
+    (fullValidationEvidence.source === "candidate-owned-admission-v1" &&
+      (qualificationManifest.releaseProfile === "stable" ||
+        qualificationManifest.releaseProfile === "full"));
+  if (
+    npmUsesFullRun &&
+    coversPackageTelegram &&
+    options.telegramProviderMode === "mock-openai" &&
+    !qualificationManifest.validationInputs?.telegramWaiver
+  ) {
+    // Authentication proves package acceptance passed with Q's mock Telegram
+    // harness. Reuse only its exact qualified package, not a separately packed one.
+    return { status: "covered-by-full-release-validation", providerMode: "mock-openai" };
+  }
+  const qualificationRef = fullValidationEvidence.run.headBranch;
+  if (
+    fullValidationEvidence.run.headSha !== sourceSha ||
+    typeof qualificationRef !== "string" ||
+    !isShaPinnedReleaseValidationBranch(qualificationRef) ||
+    !qualificationRef.startsWith(`release-ci/${sourceSha.slice(0, 12)}-`)
+  ) {
+    throw new Error(
+      "Separate Telegram qualification requires candidate-owned Full Release Validation with a retained release-ci ref at the candidate SHA; never use main's harness. Obtain newly bound candidate evidence or use already covered package Telegram proof.",
+    );
+  }
+  const refPath = `repos/${options.repo}/git/ref/heads/${qualificationRef}`;
+  const transport = await githubApi(refPath).catch((cause: unknown) => {
+    throw new Error(
+      `Telegram qualification ref ${qualificationRef} is unavailable; obtain candidate-owned Full Release Validation with a retained qualification ref.`,
+      { cause },
+    );
+  });
+  if (
+    !isRecord(transport) ||
+    transport.ref !== `refs/heads/${qualificationRef}` ||
+    !isRecord(transport.object) ||
+    transport.object.type !== "commit" ||
+    transport.object.sha !== sourceSha
+  ) {
+    throw new Error(
+      `Telegram qualification ref ${qualificationRef} no longer points to candidate ${sourceSha}; obtain newly bound candidate evidence without moving the original ref.`,
+    );
   }
   const workflowFile = "npm-telegram-beta-e2e.yml";
   const artifactInputs = buildTelegramArtifactInputs({
@@ -1721,17 +2045,22 @@ async function runTelegramIfNeeded(
     runId: String(artifact.workflowRunId),
     sourceSha,
   });
-  const runId = dispatchWorkflow(options.repo, workflowFile, options.workflowRef, {
+  const runId = dispatchWorkflow(options.repo, workflowFile, qualificationRef, {
     package_spec: `openclaw@${options.tag.replace(/^v/u, "")}`,
     package_label: options.tag,
     ...artifactInputs,
-    harness_ref: options.workflowRef,
+    harness_ref: sourceSha,
     provider_mode: options.telegramProviderMode,
   });
   const { run: runLocal } = await waitForSuccessfulRun(options.repo, runId, {
     workflowName: "NPM Telegram Beta E2E",
-    workflowRef: options.workflowRef,
+    workflowRef: qualificationRef,
   });
+  if (runLocal.headSha !== sourceSha) {
+    throw new Error(
+      `Telegram qualification SHA mismatch: expected ${sourceSha}, got ${runLocal.headSha}`,
+    );
+  }
   return {
     status: "passed",
     runId,
@@ -1777,9 +2106,13 @@ async function main() {
     });
     return;
   }
-  options.outputDir ||= join(".artifacts", "release-candidate", options.tag);
   const targetSha = gitRevParse(options.targetSha || "HEAD", targetRoot);
-  assertReleaseCandidateTag(options.tag, targetSha, targetRoot);
+  options.outputDir = resolveReleaseCandidateOutputDir({
+    outputDir: options.outputDir,
+    tag: options.tag,
+    targetSha,
+  });
+  const tagPublished = assertReleaseCandidateTag(options.tag, targetSha, targetRoot);
   const toolingSha = gitRevParse("HEAD", TOOLING_ROOT);
   const latestTrustedToolingSha = fetchTrustedWorkflowSha(options.workflowRef, TOOLING_ROOT);
   // The outer process pins a clean main commit before creating this tooling checkout.
@@ -1800,6 +2133,7 @@ async function main() {
   });
   // Publication may use repaired tooling while the prepared tarball retains its original producer.
   const statePath = join(options.outputDir, RELEASE_CANDIDATE_STATE_FILE);
+  const hasRetainedRequest = existsSync(join(options.outputDir, "frv-request.json"));
   if (options.workflowSha && !options.publishWorkflowRef) {
     if (options.workflowSha !== toolingSha) {
       throw new Error(
@@ -1847,6 +2181,7 @@ async function main() {
   let candidateState = reconcileReleaseCandidateState(
     existsSync(statePath) ? readJson(statePath, "release candidate state") : undefined,
     expectedState,
+    hasRetainedRequest,
   );
   options.fullReleaseRunId = candidateState.fullReleaseRunId;
   options.npmPreflightRunId = candidateState.npmPreflightRunId;
@@ -1869,7 +2204,7 @@ async function main() {
   if (androidVersionCheck) {
     console.log(androidVersionCheck.message);
   }
-  const { releaseNotesCheck, releaseNotesProvenance } = validateCandidateChangelog({
+  const { releaseNotes, releaseNotesCheck, releaseNotesProvenance } = validateCandidateChangelog({
     rootDir: targetRoot,
     repository: options.repo,
     tag: options.tag,
@@ -1888,6 +2223,27 @@ async function main() {
   // A new dispatch is gated by the local check; consuming existing evidence
   // defers it until the SDK acknowledgement has been checked.
   const dispatchesValidation = !options.fullReleaseRunId && !options.skipDispatch;
+  const validatesScenarioCatalog = dispatchesValidation && !hasRetainedRequest;
+  if (validatesScenarioCatalog) {
+    validateReleaseScenarioCatalogCompatibility({
+      candidateCatalog: run("git", ["show", `${targetSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+      toolingCatalog: run("git", ["show", `${toolingSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+      latestTrustedToolingCatalog: run(
+        "git",
+        ["show", `${latestTrustedToolingSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`],
+        { capture: true, cwd: targetRoot },
+      ),
+      toolingSha,
+      latestTrustedToolingSha,
+      workflowRef: options.workflowRef,
+    });
+  }
   let localGeneratedCheck = dispatchesValidation
     ? runLocalGeneratedCheckIfNeeded(options)
     : undefined;
@@ -1905,6 +2261,35 @@ async function main() {
     fullReleaseRunId: options.fullReleaseRunId,
     npmPreflightRunId: options.npmPreflightRunId,
   });
+
+  // The validation run continues in GitHub while trusted local tooling computes
+  // the review digest. Missing flags therefore surface together near dispatch
+  // instead of one per pass after every FRV lane has sealed.
+  const requiredFlags: RequiredCandidateFlag[] = [];
+  if (!options.publishWorkflowRef) {
+    // Publish preflight verifies npm evidence against the protected tooling tag,
+    // so an unpinned P can never complete the candidate.
+    requiredFlags.push({
+      flag: "--workflow-sha",
+      value: toolingSha,
+      reason: `Publication needs a protected release-publish tooling tag (P). --workflow-sha ${toolingSha} reuses or mints release-publish/${toolingSha.slice(0, 12)}-<epoch> for this trusted tooling checkout; without tag-push authority, pass --publish-workflow-ref with an existing release-publish tag at that SHA instead.`,
+    });
+  }
+  const sdkAcknowledgement = options.pluginSdkApiAcknowledgement
+    ? undefined
+    : runEarlyPluginSdkApiReview({
+        npmDistTag: options.npmDistTag,
+        outputDir: options.outputDir,
+        targetRoot,
+        targetSha,
+        toolingSha,
+      });
+  if (sdkAcknowledgement) {
+    requiredFlags.push(sdkAcknowledgement);
+  }
+  if (requiredFlags.length > 0) {
+    throw formatRequiredCandidateFlagsFailure(requiredFlags);
+  }
 
   const { run: fullRun } = await waitForSuccessfulRun(options.repo, options.fullReleaseRunId, {
     workflowName: "Full Release Validation",
@@ -2065,29 +2450,24 @@ async function main() {
           });
         }
       }
-      const argv = stripLeadingPackageManagerSeparator(process.argv.slice(2));
-      const end = argv.indexOf("--");
-      const flag = "--plugin-sdk-api-acknowledgement";
-      let replaced = false;
-      for (let index = 0; index < (end === -1 ? argv.length : end); index++) {
-        if (argv[index] === flag) {
-          argv[++index] = error.digest;
-          replaced = true;
-        }
-      }
-      if (!replaced) {
-        argv.unshift(flag, error.digest);
-      }
-      throw new Error(
-        [
-          error.message,
-          report || "Review the Plugin SDK API diff artifact before rerunning.",
-          ["pnpm", "release:candidate", "--", ...argv].map(shellQuote).join(" "),
-        ].join("\n\n"),
-        { cause: error },
+      throw formatRequiredCandidateFlagsFailure(
+        [pluginSdkApiAcknowledgementFlag(error, report)],
+        error,
       );
     }
     throw error;
+  }
+  const releaseNoteOmissions = findPluginSdkApiReleaseNoteOmissions({
+    evidence: npmManifest.pluginSdkApi,
+    npmDistTag: options.npmDistTag,
+    releaseNotes,
+  });
+  if (releaseNoteOmissions.missing.length > 0) {
+    console.warn(
+      `Warning: release notes do not name removed Plugin SDK APIs: ${releaseNoteOmissions.missing
+        .map((reference) => `\`${reference}\``)
+        .join(", ")}`,
+    );
   }
   localGeneratedCheck ??= runLocalGeneratedCheckIfNeeded(options);
   // Only exact historical producers retain local, non-authoritative planning.
@@ -2156,6 +2536,7 @@ async function main() {
     tarballPath,
     dependencyTarballPaths,
     revalidatedRegistryArtifacts.map((artifact) => artifact.tarballPath),
+    targetRoot,
   );
   const npmTelegram = await runTelegramIfNeeded(
     options,
@@ -2163,13 +2544,15 @@ async function main() {
     npmManifest,
     npmRun.runAttempt,
     targetSha,
-    fullValidationEvidence.coveragePolicy,
+    fullValidationEvidence,
+    npmUsesFullRun,
   );
   const publicationOptions = {
     ...options,
     fullReleaseRunAttempt: fullRun.runAttempt,
-    npmTelegramRunId: npmTelegram.runId,
   };
+  // FRV owns required publication qualification. Supplemental Q checks stay in
+  // candidate evidence, not the optional main/P publisher diagnostic input.
   const publicationSelection = publicationSelectionForChecklist(options);
   const publishPreflight = await runReleasePublishPreflight(
     {
@@ -2190,7 +2573,6 @@ async function main() {
       pluginSdkApiAcknowledgement: options.pluginSdkApiAcknowledgement,
       windowsNodeTag: options.windowsNodeTag,
       windowsNodeInstallerDigests: options.windowsNodeInstallerDigests,
-      npmTelegramRunId: npmTelegram.runId ?? "",
     },
     {
       manifest: fullManifest,
@@ -2198,7 +2580,7 @@ async function main() {
       run: fullRun,
       targetSha,
       toolingSha,
-      allowPlannedTag: true,
+      allowPlannedTag: !tagPublished,
       npmManifest,
       npmManifestPath: join(npmDir, "preflight-manifest.json"),
       npmPreflightRun: npmRun,

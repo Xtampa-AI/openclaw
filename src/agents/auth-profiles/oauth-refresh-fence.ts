@@ -135,7 +135,7 @@ type SerializedOAuthRefreshParams<TData> = {
   ) => Promise<SerializedOAuthRefreshResult | null>;
   resolve: (credential: OAuthCredential) => Promise<SerializedOAuthRefreshResult | null>;
   /** Publish only after the caller validates the snapshot against its current owner. */
-  commit: (data: TData) => void;
+  commit: (data: TData) => void | Promise<void>;
 };
 
 /**
@@ -183,7 +183,7 @@ async function runSerializedOAuthRefresh<TData>(
         if (!isSafeOAuthPostClaimSettlement(generation, credential)) {
           return null;
         }
-        params.commit(data);
+        await params.commit(data);
         return await params.resolve(credential);
       },
     });
@@ -201,7 +201,7 @@ async function runSerializedOAuthRefresh<TData>(
     return await observeFence(candidate.generation);
   }
   if (candidate.kind === "use") {
-    params.commit(candidate.data);
+    await params.commit(candidate.data);
     return await params.resolve(candidate.credential);
   }
   if (!(await params.canRefresh(candidate.credential))) {
@@ -240,7 +240,7 @@ async function runSerializedOAuthRefresh<TData>(
       return await observeFence(claim.generation);
     }
     if (claim.kind === "use") {
-      params.commit(claim.data);
+      await params.commit(claim.data);
       return await params.resolve(claim.credential);
     }
     const markFailed = async () => {
@@ -254,7 +254,7 @@ async function runSerializedOAuthRefresh<TData>(
         return { result: nextData, next: params.serialize(nextData) };
       });
       if (failed) {
-        params.commit(failed);
+        await params.commit(failed);
       }
     };
 
@@ -286,7 +286,7 @@ async function runSerializedOAuthRefresh<TData>(
     };
 
     try {
-      params.commit(claim.nextData);
+      await params.commit(claim.nextData);
     } catch (error) {
       return await settleFailure({ error });
     }
@@ -331,7 +331,7 @@ async function runSerializedOAuthRefresh<TData>(
         if (!settled) {
           throw new Error("OAuth credential owner changed before refresh completed");
         }
-        params.commit(settled.data);
+        await params.commit(settled.data);
         return settled.persisted ? refreshed : await params.resolve(settled.credential);
       } catch (error) {
         return settleFailure({ error });

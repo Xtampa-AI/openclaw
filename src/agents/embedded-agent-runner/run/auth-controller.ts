@@ -3,6 +3,7 @@ import { formatErrorMessage } from "../../../infra/errors.js";
 import type { Model } from "../../../llm/types.js";
 import type { ProviderModelRouteAuthRequirement } from "../../../plugin-sdk/provider-model-types.js";
 import { prepareProviderRuntimeAuth } from "../../../plugins/provider-runtime.js";
+import type { CommandQueueTaskDeadline } from "../../../process/command-queue.types.js";
 import { SecretSurfaceUnavailableError } from "../../../secrets/runtime-degraded-state.js";
 import {
   type AuthProfileStore,
@@ -30,7 +31,11 @@ import { providerModelRouteAcceptsAuthMode } from "../../provider-model-route-au
 import { applyPreparedRuntimeAuthToModel } from "../../provider-request-config.js";
 import { protectPreparedProviderRuntimeAuth } from "../../provider-runtime-auth-protection.js";
 import { unwrapSecretSentinelsForProviderEgress } from "../../provider-secret-egress.js";
-import { clampRuntimeAuthRefreshDelayMs } from "../../runtime-auth-refresh.js";
+import {
+  clampRuntimeAuthRefreshDelayMs,
+  createRuntimeAuthDeadline,
+} from "../../runtime-auth-refresh.js";
+import { resolveAgentTimeoutMs } from "../../timeout.js";
 import { resolveAuthProfileFailureReason } from "./auth-profile-failure-policy.js";
 import type { AuthProfileFailurePolicy } from "./auth-profile-failure-policy.types.js";
 import {
@@ -141,6 +146,7 @@ export function createEmbeddedAuthProfileAdmission(
  * share this state so profile rotation cannot leave either with stale credentials.
  */
 export function createEmbeddedRunAuthController(params: {
+  authProfileBinding?: RunEmbeddedAgentParams["authProfileBinding"];
   config: RunEmbeddedAgentParams["config"];
   agentDir: string;
   workspaceDir: string;
@@ -155,6 +161,10 @@ export function createEmbeddedRunAuthController(params: {
   authProfileFailurePolicy?: AuthProfileFailurePolicy;
   authProfileStateMode?: "read-write" | "read-only";
   runId?: string;
+  assertCurrent?: () => void;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  getDeadline?: () => CommandQueueTaskDeadline | undefined;
   provider: string;
   modelId: string;
   state: EmbeddedRunAuthState;
@@ -170,6 +180,21 @@ export function createEmbeddedRunAuthController(params: {
   log: LogLike;
 }) {
   const { state } = params;
+  const {
+    run: withAuthDeadline,
+    signal: authSignal,
+    cancel: cancelAuth,
+  } = createRuntimeAuthDeadline({
+    provider: params.provider,
+    timeoutMs: resolveAgentTimeoutMs({ cfg: params.config, overrideMs: params.timeoutMs }),
+    signal: params.signal,
+    getDeadline: params.getDeadline,
+  });
+  const assertAuthCurrent = () => {
+    authSignal.throwIfAborted();
+    params.assertCurrent?.();
+    params.authProfileBinding?.assertCurrent();
+  };
   // Runtime auth overlays are profile-scoped. Keep the pre-auth model so a
   // later profile cannot inherit an earlier profile's endpoint or headers.
   const baseRuntimeModel = state.models.runtime;
@@ -189,38 +214,45 @@ export function createEmbeddedRunAuthController(params: {
     state.models.effective = applyPreparedRuntimeAuthToModel(state.models.effective, preparedAuth);
   };
 
-  const prepareRuntimeAuthForModel = async (prepareParams: {
+  const prepareRuntimeAuthForModel = (prepareParams: {
     runtimeModel: Model;
     apiKey: string;
     authMode: string;
     profileId?: string;
-  }) => {
-    const preparedAuth = await prepareProviderRuntimeAuth({
-      provider: prepareParams.runtimeModel.provider,
-      config: params.config,
-      workspaceDir: params.workspaceDir,
-      env: process.env,
-      context: {
+  }) =>
+    withAuthDeadline("runtime auth exchange", async (signal) => {
+      // Canonical observation may await storage; recheck authority before provider egress.
+      await params.authProfileBinding?.revalidate();
+      assertAuthCurrent();
+      const preparedAuth = await prepareProviderRuntimeAuth({
+        assertCurrent: assertAuthCurrent,
+        provider: prepareParams.runtimeModel.provider,
         config: params.config,
-        agentDir: params.agentDir,
         workspaceDir: params.workspaceDir,
         env: process.env,
+        context: {
+          config: params.config,
+          agentDir: params.agentDir,
+          workspaceDir: params.workspaceDir,
+          env: process.env,
+          provider: prepareParams.runtimeModel.provider,
+          modelId: params.modelId,
+          model: prepareParams.runtimeModel,
+          apiKey: unwrapSecretSentinelsForProviderEgress(
+            prepareParams.apiKey,
+            "provider runtime auth exchange",
+          ),
+          authMode: prepareParams.authMode,
+          profileId: prepareParams.profileId,
+          signal,
+        },
+      });
+      assertAuthCurrent();
+      return protectPreparedProviderRuntimeAuth({
         provider: prepareParams.runtimeModel.provider,
-        modelId: params.modelId,
-        model: prepareParams.runtimeModel,
-        apiKey: unwrapSecretSentinelsForProviderEgress(
-          prepareParams.apiKey,
-          "provider runtime auth exchange",
-        ),
-        authMode: prepareParams.authMode,
-        profileId: prepareParams.profileId,
-      },
+        preparedAuth,
+      });
     });
-    return protectPreparedProviderRuntimeAuth({
-      provider: prepareParams.runtimeModel.provider,
-      preparedAuth,
-    });
-  };
 
   const clearRuntimeAuthRefreshTimer = () => {
     const runtimeAuthState = state.runtimeAuthState;
@@ -232,9 +264,6 @@ export function createEmbeddedRunAuthController(params: {
   };
 
   const stopRuntimeAuthRefreshTimer = () => {
-    if (!state.runtimeAuthState) {
-      return;
-    }
     state.runtimeAuthRefreshCancelled = true;
     clearRuntimeAuthRefreshTimer();
   };
@@ -282,6 +311,7 @@ export function createEmbeddedRunAuthController(params: {
         );
         return;
       }
+      assertAuthCurrent();
       params.authStorage.setRuntimeApiKey(runtimeModel.provider, preparedAuth.apiKey);
       applyPreparedRuntimeRequestOverrides(runtimeModel, preparedAuth);
       state.runtimeAuthState = {
@@ -318,7 +348,7 @@ export function createEmbeddedRunAuthController(params: {
 
   const scheduleRuntimeAuthRefresh = (): void => {
     const runtimeAuthState = state.runtimeAuthState;
-    if (!runtimeAuthState || state.runtimeAuthRefreshCancelled) {
+    if (!runtimeAuthState || state.runtimeAuthRefreshCancelled || authSignal.aborted) {
       return;
     }
     const runtimeModel = state.models.runtime;
@@ -340,13 +370,17 @@ export function createEmbeddedRunAuthController(params: {
       minDelayMs: RUNTIME_AUTH_REFRESH_MIN_DELAY_MS,
     });
     const refresh = (reason: "scheduled" | "scheduled-retry") => {
-      if (state.runtimeAuthRefreshCancelled) {
+      if (state.runtimeAuthRefreshCancelled || authSignal.aborted) {
         return;
       }
       refreshRuntimeAuth(reason)
         .then(scheduleRuntimeAuthRefresh)
         .catch(() => {
-          if (reason === "scheduled-retry" || state.runtimeAuthRefreshCancelled) {
+          if (
+            reason === "scheduled-retry" ||
+            state.runtimeAuthRefreshCancelled ||
+            authSignal.aborted
+          ) {
             return;
           }
           const retryTimer = setTimeout(
@@ -478,19 +512,30 @@ export function createEmbeddedRunAuthController(params: {
     throw new Error(message);
   };
 
-  const applyApiKeyInfo = async (candidate?: string, attemptIndex?: number): Promise<void> => {
+  const applyApiKeyInfo = async (
+    candidate?: string,
+    attemptIndex?: number,
+    forceRefresh = false,
+  ): Promise<void> => {
+    assertAuthCurrent();
     const preparedModel = await params.prepareModelForAuthProfile?.(candidate, attemptIndex);
-    const apiKeyInfo = await getApiKeyForModelCore({
-      model: preparedModel?.runtimeModel ?? state.models.runtime,
-      cfg: params.config,
-      profileId: candidate,
-      store: params.authStore,
-      agentDir: params.agentDir,
-      workspaceDir: params.workspaceDir,
-      lockedProfile: candidate != null && candidate === params.lockedProfileId,
-      allowAuthProfileFallback: preparedModel?.allowAuthProfileFallback,
-      secretSentinels: true,
+    const apiKeyInfo = await withAuthDeadline("credential resolution", (signal) => {
+      assertAuthCurrent();
+      return getApiKeyForModelCore({
+        model: preparedModel?.runtimeModel ?? state.models.runtime,
+        cfg: params.config,
+        profileId: candidate,
+        store: params.authStore,
+        agentDir: params.agentDir,
+        workspaceDir: params.workspaceDir,
+        lockedProfile: forceRefresh || (candidate != null && candidate === params.lockedProfileId),
+        forceRefresh,
+        allowAuthProfileFallback: preparedModel?.allowAuthProfileFallback,
+        secretSentinels: true,
+        signal,
+      });
     });
+    assertAuthCurrent();
     if (
       preparedModel?.authRequirement &&
       !providerModelRouteAcceptsAuthMode({
@@ -509,6 +554,10 @@ export function createEmbeddedRunAuthController(params: {
         `Resolved ${apiKeyInfo.mode ?? "unknown"} credentials are incompatible with the selected ${preparedModel.authRequirement} route for ${preparedModel.runtimeModel.provider}.`,
       );
     }
+    params.authProfileBinding?.assertCurrent();
+    if (params.authProfileBinding && apiKeyInfo.profileId !== params.authProfileBinding.profileId) {
+      throw new Error("Resolved credentials do not belong to the automation inference owner.");
+    }
     // Preserve the checked source even when resolution fails before route commit.
     state.apiKeyInfo = apiKeyInfo;
     const usesAwsSdkChain = !apiKeyInfo.apiKey && apiKeyInfo.mode === "aws-sdk";
@@ -517,6 +566,7 @@ export function createEmbeddedRunAuthController(params: {
       throw new MissingProviderAuthError(runtimeModel.provider, apiKeyInfo);
     }
     preparedModel?.commit();
+    state.runtimeAuthRefreshCancelled = false;
     if (!preparedModel?.authRequirement) {
       state.models.runtime = baseRuntimeModel;
       state.models.effective = baseEffectiveModel;
@@ -537,6 +587,7 @@ export function createEmbeddedRunAuthController(params: {
       applyPreparedRuntimeRequestOverrides(runtimeModel, preparedAuth);
       if (preparedAuth?.apiKey) {
         clearRuntimeAuthRefreshTimer();
+        assertAuthCurrent();
         params.authStorage.setRuntimeApiKey(runtimeModel.provider, preparedAuth.apiKey);
         state.runtimeAuthState = {
           generation: (state.runtimeAuthState?.generation ?? 0) + 1,
@@ -551,7 +602,7 @@ export function createEmbeddedRunAuthController(params: {
         runtimeAuthHandled = true;
       }
     } catch (error) {
-      if (!usesAwsSdkChain) {
+      if (authSignal.aborted || params.authProfileBinding || !usesAwsSdkChain) {
         throw error;
       }
       params.log.warn(
@@ -559,6 +610,7 @@ export function createEmbeddedRunAuthController(params: {
       );
     }
     if (!runtimeAuthHandled) {
+      assertAuthCurrent();
       clearRuntimeAuthRefreshTimer();
       params.authStorage.setRuntimeApiKey(runtimeModel.provider, sourceApiKey);
       state.runtimeAuthState = null;
@@ -585,7 +637,7 @@ export function createEmbeddedRunAuthController(params: {
         params.attemptedThinking.clear();
         return true;
       } catch (err) {
-        if (err instanceof SecretSurfaceUnavailableError) {
+        if (authSignal.aborted || err instanceof SecretSurfaceUnavailableError) {
           throw err;
         }
         await recordOAuthRefreshFailure(candidate, err);
@@ -610,7 +662,11 @@ export function createEmbeddedRunAuthController(params: {
         throwAuthProfileFailover({ allInCooldown: true });
       }
     } catch (err) {
-      if (err instanceof FailoverError || err instanceof SecretSurfaceUnavailableError) {
+      if (
+        authSignal.aborted ||
+        err instanceof FailoverError ||
+        err instanceof SecretSurfaceUnavailableError
+      ) {
         throw err;
       }
       await recordOAuthRefreshFailure(params.profileCandidates[state.profileIndex], err);
@@ -625,22 +681,39 @@ export function createEmbeddedRunAuthController(params: {
     errorText: string,
     retried: boolean,
   ): Promise<boolean> => {
-    if (!state.runtimeAuthState || retried) {
-      return false;
-    }
-    if (classifyFailoverReason(errorText, { provider: params.provider }) !== "auth") {
+    if (retried || classifyFailoverReason(errorText, { provider: params.provider }) !== "auth") {
       return false;
     }
     try {
-      await refreshRuntimeAuth("auth-error");
-      scheduleRuntimeAuthRefresh();
+      if (state.runtimeAuthState) {
+        await refreshRuntimeAuth("auth-error");
+        scheduleRuntimeAuthRefresh();
+      } else if (
+        params.provider === "openai" &&
+        state.lastProfileId &&
+        state.apiKeyInfo?.mode === "oauth" &&
+        state.apiKeyInfo.authFlow === "chatgpt-token-sharing" &&
+        /\btoken_expired\b|\bauthentication token is expired\b/iu.test(errorText)
+      ) {
+        await applyApiKeyInfo(state.lastProfileId, state.profileIndex, true);
+      } else {
+        return false;
+      }
       return true;
-    } catch {
+    } catch (error) {
+      if (authSignal.aborted) {
+        throw error;
+      }
       return false;
     }
   };
 
   return {
+    close: () => {
+      stopRuntimeAuthRefreshTimer();
+      cancelAuth();
+    },
+    throwIfAborted: () => authSignal.throwIfAborted(),
     applyAuthProfileCandidate: applyApiKeyInfo,
     advanceAuthProfile,
     initializeAuthProfile,

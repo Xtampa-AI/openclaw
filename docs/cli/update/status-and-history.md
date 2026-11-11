@@ -56,11 +56,21 @@ It describes the preferred selection for the observed configured channel, not ca
 An explicit update invocation can select a different target or install method.
 Older installed status commands cannot acquire this observation from candidate code.
 
+Root-owned, protected immutable layouts managed by an external deployment owner
+report a host-managed installation even without native adoption. Startup status
+does not run Git discovery or enable automatic updates for these layouts. Use the
+deployment owner to update them; native preparation and activation still require
+explicit adoption after the previous updater has stopped.
+
 For adopted immutable installations, the installation projection includes
 `activationEnabled` only when explicitly enabled. `activation` reports a
-retained operation's `operationId`, `phase`, `previousSha`, and `candidateSha`;
-`lastActivation` records the verified result and selected generation after
-retirement. Read these under `update.immutable` in CLI JSON or
+retained operation's `operationId`, `phase`, `previousSha`, and `candidateSha`,
+plus optional safe `failure` and the exact retained `recoveryCommand`.
+`lastActivation` records historical verification (`outcome`, `selectedSha`, and
+`verifiedAtMs`), including optional Gateway `version`, `buildId`, `pid`, and
+`bootId`. Text status labels success **accepted** and rollback **restored**;
+a restored predecessor is not candidate success. Older receipts may omit Gateway
+fields. Pending recovery remains separate even when a historical receipt exists. Read these under `update.immutable` in CLI JSON or
 `schedule.install.immutable` in Gateway `update.status`. A prepared generation
 or `starting` phase is not activation success. Use
 [`openclaw update recover --root <installation-root>`](/cli/update#immutable-release-installations)
@@ -85,7 +95,9 @@ including when an older updater did not record those warnings in its run history
 During an active update, let that update finish before following plugin repair
 advice. Existing plugin data and settings are kept until the upgrade completes.
 JSON exposes these messages as `migrationWarnings`; they clear when the plugin migration
-completes. If migration state cannot be read, `migrationWarningsError` reports
+completes. This check also works after a direct Git/source or package-manager upgrade
+with no update run. Run `openclaw doctor --fix` after those upgrades; normal commands
+and Gateway startup do not inspect or apply deferred plugin migrations. If migration state cannot be read, `migrationWarningsError` reports
 that failure while availability and run history remain visible.
 
 The final update summary reconciles plugin migration warnings with the pending
@@ -138,7 +150,10 @@ keep a skipped or failed record with their reason. A fresh-profile dry-run leave
 the database absent and records no run. CLI invocations rejected before admission
 leave state untouched. The same ID follows
 the detached updater and the restarted Gateway, so reconnecting does not lose
-the outcome. Post-core finalization children report back to their parent without
+the outcome. An external supervisor's native update keeps the run ID from its
+`update migrate` receipt. It is recorded as a succeeded CLI run, starting at
+migration, when the supervisor accepts the release and runs `update finish`.
+Retrying `update finish` keeps that one record. Post-core finalization children report back to their parent without
 creating a separate update run, including when an older updater cannot forward
 a run ID.
 

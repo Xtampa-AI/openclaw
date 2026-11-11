@@ -29,7 +29,7 @@ import {
 import { resolveGoogleApiClientHeaders } from "./google-api-client-header.js";
 import { createGoogleGenAI, type GoogleGenAIClient } from "./google-genai-runtime.js";
 import { stripGoogleProviderPrefix } from "./model-id.js";
-import { resolveGoogleGenerativeAiApiOrigin } from "./provider-policy.js";
+import { resolveGoogleGenerativeAiSdkHttpOptions } from "./src/google-api-base-url.js";
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 10_000;
@@ -39,7 +39,8 @@ const GOOGLE_VIDEO_EMPTY_RESULT_MESSAGE =
   "Google video generation response missing generated videos";
 
 function resolveGoogleVideoRestBaseUrl(configuredBaseUrl?: string): string {
-  return `${configuredBaseUrl ?? "https://generativelanguage.googleapis.com"}/v1beta`;
+  const { baseUrl, apiVersion } = resolveGoogleGenerativeAiSdkHttpOptions(configuredBaseUrl);
+  return `${baseUrl ?? "https://generativelanguage.googleapis.com"}${apiVersion ? `/${apiVersion}` : ""}`;
 }
 
 function resolveGoogleVideoRestModelPath(model: string): string {
@@ -425,9 +426,8 @@ export function buildGoogleVideoGenerationProvider(): VideoGenerationProvider {
       const apiKey = auth.apiKey;
 
       const configuredUrl = normalizeOptionalString(req.cfg?.models?.providers?.google?.baseUrl);
-      const configuredBaseUrl = configuredUrl
-        ? resolveGoogleGenerativeAiApiOrigin(configuredUrl)
-        : undefined;
+      const httpOptions = resolveGoogleGenerativeAiSdkHttpOptions(configuredUrl);
+      const configuredBaseUrl = httpOptions.baseUrl;
       const restBaseUrl = resolveGoogleVideoRestBaseUrl(configuredBaseUrl);
       const authHeaders = {
         ...parseGeminiAuth(apiKey).headers,
@@ -451,7 +451,7 @@ export function buildGoogleVideoGenerationProvider(): VideoGenerationProvider {
       const client = createGoogleGenAI({
         apiKey,
         httpOptions: {
-          ...(configuredBaseUrl ? { baseUrl: configuredBaseUrl } : {}),
+          ...httpOptions,
           timeout: resolveProviderOperationTimeoutMs({
             deadline,
             defaultTimeoutMs: DEFAULT_TIMEOUT_MS,
@@ -473,7 +473,7 @@ export function buildGoogleVideoGenerationProvider(): VideoGenerationProvider {
       let operation;
       try {
         operation = await client.models.generateVideos({
-          model,
+          model: stripGoogleProviderPrefix(model),
           prompt: req.prompt,
           image: resolveInputImage(req),
           video: resolveInputVideo(req),
@@ -507,20 +507,16 @@ export function buildGoogleVideoGenerationProvider(): VideoGenerationProvider {
             operation: () => client.operations.getVideosOperation({ operation: sdkOperation }),
           });
         }
+        if (sdkOperation.error) {
+          throw new Error(JSON.stringify(sdkOperation.error));
+        }
         operation = sdkOperation;
       }
-      const finalOperation = operation as { error?: unknown; name?: string };
-      if (finalOperation.error) {
-        throw new Error(JSON.stringify(finalOperation.error));
-      }
-      let generatedVideos = extractGeneratedVideos(operation);
-      if (generatedVideos.length === 0 && !hasReferenceInputs && !usedRestFallback) {
-        operation = await generateViaRest();
-        generatedVideos = extractGeneratedVideos(operation);
-      }
+      const generatedVideos = extractGeneratedVideos(operation);
       if (generatedVideos.length === 0) {
         throw new Error(GOOGLE_VIDEO_EMPTY_RESULT_MESSAGE);
       }
+      const finalOperation = operation as { name?: string };
       const maxVideoBytes = resolveGeneratedMediaMaxBytes(req.cfg, "video");
       const videos = await Promise.all(
         generatedVideos.map(async (entry, index) => {

@@ -196,22 +196,35 @@ it.each([
         {},
       );
       try {
-        const invocation = registry.invoke({
-          nodeId: "legacy-node",
-          command: "system.run",
-          timeoutMs: 0,
-          params: { runId, sessionKey },
-          turnSource: source,
-        });
-        const request = JSON.parse(frames[0]!).payload;
-        registry.handleInvokeResult({
-          id: request.id,
-          nodeId: "legacy-node",
-          connId: "legacy-conn",
-          ok: true,
-          payloadJSON: JSON.stringify({ exitCode: 0, stdout: marker, durationMs: 267 }),
-        });
-        await invocation;
+        // Keep the one-millisecond deadline, but expire it only after real dispatch.
+        // TIMEOUT alone also admits pre-dispatch expiry, which never authorizes an event.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        let invokeNow = 0;
+        const invokeClock = vi.spyOn(performance, "now").mockImplementation(() => invokeNow);
+        try {
+          const onDispatchReady = vi.fn();
+          const invocation = registry.invoke({
+            nodeId: "legacy-node",
+            command: "system.run",
+            timeoutMs: 1,
+            params: { runId, sessionKey },
+            turnSource: source,
+            onDispatchReady,
+          });
+          await vi.advanceTimersByTimeAsync(0);
+          expect(onDispatchReady).toHaveBeenCalledOnce();
+          // A successful inline result belongs to its waiting caller and suppresses
+          // duplicate notices. Exercise a late completion after a dispatched timeout.
+          invokeNow = 1;
+          await vi.advanceTimersByTimeAsync(1);
+          await expect(invocation).resolves.toMatchObject({
+            ok: false,
+            error: { code: "TIMEOUT" },
+          });
+        } finally {
+          invokeClock.mockRestore();
+          vi.useRealTimers();
+        }
         const unexpected = () => {
           throw new Error("Unexpected non-exec node event effect");
         };

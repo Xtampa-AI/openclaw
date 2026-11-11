@@ -21,6 +21,10 @@ fi
 
 set -euo pipefail
 
+# Distros with user private groups (Ubuntu, Fedora) default to umask 002; the
+# installed runtime must not be group-writable or owned-path checks refuse it.
+umask go-w
+
 # BEGIN GENERATED UPDATE NETWORK BUDGET
 # Source: src/infra/update-network-budget.ts; regenerate: node scripts/generate-update-network-budget.mjs
 UPDATE_NETWORK_TIMEOUT_SECONDS=300
@@ -127,9 +131,10 @@ NODE_VERSION_REQUESTED=0
 if [[ -n "${OPENCLAW_NODE_VERSION:-}" ]]; then
   NODE_VERSION_REQUESTED=1
 fi
-MIN_NODE_24_VERSION="24.22.1"
-MIN_NODE_26_VERSION="26.12.1"
-SUPPORTED_NODE_VERSION_LABEL="Node 24.22.1+ or Node 26.12.1+"
+# Compatibility floors mirror node-version.mjs, not the patched download default.
+MIN_NODE_24_VERSION="24.16.0"
+MIN_NODE_26_VERSION="26.1.0"
+SUPPORTED_NODE_VERSION_LABEL="Node 24.16.0+ or Node 26.1.0+"
 NODE_RELEASE_VERSION_CORE=""
 APK_NODE_BIN_DIR="/usr/bin"
 NPM_LOGLEVEL="${OPENCLAW_NPM_LOGLEVEL:-error}"

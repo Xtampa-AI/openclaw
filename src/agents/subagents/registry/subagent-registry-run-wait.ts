@@ -1,6 +1,6 @@
 import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { getRuntimeConfig } from "../../../config/config.js";
-import { runWithoutOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context.js";
+import { runWithoutOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context-owner.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { callGateway } from "../../../gateway/call.js";
 import {
@@ -48,6 +48,7 @@ const WAIT_TIMEOUT_DEADLINE_SKEW_MS = 250;
 
 export type SubagentManagerOptions = {
   runs: Map<string, SubagentRunRecord>;
+  getChildSessionCandidates: (childSessionKey: string) => Iterable<SubagentRunRecord>;
   getRunsForChildSession: (
     childSessionKey: string,
     childAgentId?: string,

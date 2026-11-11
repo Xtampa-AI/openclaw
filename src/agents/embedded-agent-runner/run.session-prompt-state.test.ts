@@ -4,6 +4,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { SessionTranscriptWriterClaimReboundError } from "../../config/sessions/transcript-write-context.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
@@ -39,7 +40,7 @@ import { createEmbeddedRunTerminalRetryState } from "./run/terminal-retry-state.
 const assertActive = () => {};
 
 const CONTINUE_FROM_TRANSCRIPT_PROMPT =
-  "Continue the current task from the existing transcript, preserving completed work. If an action was interrupted, inspect its state before deciding whether to retry it. Do not restart the task or repeat completed actions.";
+  "Continue the current task from the existing transcript, preserving completed work and the user's constraints. Use recorded tool results to determine what completed. Before retrying an action with an unknown outcome, inspect its state. If the recorded results already satisfy the remaining request, report them without additional tool calls. Do not restart the task or repeat completed actions.";
 const CONTINUE_AFTER_TOOL_FAILURE_PROMPT = `${CONTINUE_FROM_TRANSCRIPT_PROMPT} If a tool failed, say so; never claim completion or success.`;
 
 const BASE_RUN_PARAMS = {
@@ -146,6 +147,7 @@ describe("embedded run session prompt state", () => {
         env: { OPENCLAW_EXEC_SHELL_SNAPSHOT: "0" },
       },
       async (fixture) => {
+        setRuntimeConfigSnapshot({});
         const target = {
           agentId: "main",
           sessionId: randomUUID(),
@@ -412,7 +414,7 @@ describe("embedded run session prompt state", () => {
 
     const prompt = state.activePrompt.override ?? "";
     expect(prompt).toContain("The previous attempt did not produce a user-visible answer.");
-    expect(prompt).not.toContain("recorded reasoning");
+    expect(prompt).not.toContain("answer the user's request now");
     expect(prompt.match(/Continue from the compacted transcript/gu)).toHaveLength(1);
   });
 

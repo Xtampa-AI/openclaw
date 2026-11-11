@@ -10,28 +10,16 @@ import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import type { Message } from "../../llm/types.js";
 import type { NormalizedUsage } from "../usage.js";
 import { log } from "./logger.js";
+import type { PromptCacheToolSnapshot } from "./prompt-cache-tool-snapshot.js";
+import type { ProviderPromptCachePrefix } from "./provider-prompt-serialization.js";
 import type { ProviderPromptState } from "./provider-prompt-state.js";
 
-type PromptHistoryRewriteReason =
-  | "compaction"
-  | "pruning"
-  | "runtimeContextCarrier"
-  | "imageCleanup";
+export { collectPromptCacheTools } from "./prompt-cache-tool-snapshot.js";
+
+type PromptHistoryRewriteReason = "compaction" | "pruning" | "runtimeContextCarrier";
 type PromptCacheIdentity = { sessionId: string; promptCacheKey?: string; sessionKey?: string };
 
 export type { PromptCacheChange };
-
-type PromptCacheToolSnapshot = {
-  name: string;
-  descriptionDigest?: string;
-  schemaDigest?: string;
-};
-
-type PromptCacheToolDescriptor = {
-  readonly name?: string;
-  readonly description?: string;
-  readonly parameters?: object;
-};
 
 const PROMPT_SECTION_NAMES = [
   "Skills",
@@ -81,17 +69,18 @@ type PromptCacheTracker = {
   lastProviderPrompt?: ProviderPromptState["lastAttempt"];
   requestedAt: number;
   pendingChanges: PromptCacheChange[] | null;
+  unmeasuredChanges?: PromptCacheChange[] | null;
+  /** The session tool pin changed the tool block on purpose before the next request. */
+  toolPinChanged?: boolean;
 };
 
 type PromptHistoryFingerprint = {
-  digest: string;
   role: string;
   envelopeFields: Map<string, string>;
-  contentDigest: string;
+  envelopeDigest: string;
   contentKind: "string" | "blocks";
-  blockCount: number;
   blocks: string[];
-  remainingBlocksDigest?: string;
+  blockFields: Map<string, string>[];
   stringBlock?: WeakRef<PromptStringFingerprint>;
 };
 
@@ -99,12 +88,13 @@ type PromptStringFingerprint = { value: string; digest: string };
 
 const trackers = new Map<string, PromptCacheTracker>();
 const stringFingerprints = new WeakMap<Message, PromptStringFingerprint>();
-const blockFingerprints = new WeakMap<
-  object,
-  { digest: string; primitives: [string, unknown][] }
->();
-// Schemas are provider-owned declarations; unlike transcript blocks, they do not mutate in place.
-const toolSchemaFingerprints = new WeakMap<object, string>();
+type RecordFingerprint = {
+  digest: string;
+  fields: Map<string, string>;
+  primitives: Map<string, unknown>;
+};
+// Primitive revisions avoid rehashing retained text; nested values remain mutable.
+const recordFingerprints = new WeakMap<object, RecordFingerprint>();
 const MAX_TRACKERS = 512;
 const historyRewriteWarnings = createDedupeCache({ ttlMs: 0, maxSize: MAX_TRACKERS });
 const MAX_HISTORY_DIFF_FIELDS = 8;
@@ -127,21 +117,71 @@ const HISTORY_ENVELOPE_FIELDS = new Set([
   "runtimeContextCarrier",
   "operatorMessage",
 ]);
+const HISTORY_BLOCK_FIELDS = new Set([
+  "type",
+  "text",
+  "textSignature",
+  "thinking",
+  "thinkingSignature",
+  "openclawReasoningReplay",
+  "id",
+  "name",
+  "arguments",
+  "partialJson",
+  "async",
+  "thoughtSignature",
+  "data",
+  "mimeType",
+  "index",
+]);
 
-function fingerprintEnvelope(envelope: object): Map<string, string> {
-  const fields = new Map<string, string>();
-  const other: [string, unknown][] = [];
-  for (const [key, value] of Object.entries(envelope)) {
-    if (HISTORY_ENVELOPE_FIELDS.has(key)) {
-      fields.set(key, sha256Hex(stableStringify({ [key]: value })));
+function fingerprintText(value: string): string {
+  // UTF-8 replaces lone surrogates; escape those without serializing ordinary prompt text.
+  return value.isWellFormed()
+    ? `text:${sha256Hex(value)}`
+    : `escaped:${sha256Hex(stableStringify(value))}`;
+}
+
+function fingerprintRecord(record: object, omit?: string): RecordFingerprint {
+  const previous = recordFingerprints.get(record);
+  let fields = previous ? undefined : new Map<string, string>();
+  const primitives = previous?.primitives ?? new Map<string, unknown>();
+  for (const [key, value] of Object.entries(record)) {
+    if (key === omit) {
+      continue;
+    }
+    const primitive = value === null || typeof value !== "object";
+    const digest =
+      primitive && previous?.primitives.has(key) && Object.is(previous.primitives.get(key), value)
+        ? previous.fields.get(key)!
+        : typeof value === "string"
+          ? fingerprintText(value)
+          : sha256Hex(stableStringify(value));
+    if (!previous || previous.fields.get(key) !== digest) {
+      (fields ??= new Map(previous?.fields)).set(key, digest);
+    }
+    if (primitive) {
+      primitives.set(key, value);
     } else {
-      other.push([key, value]);
+      primitives.delete(key);
     }
   }
-  if (other.length) {
-    fields.set("other", sha256Hex(stableStringify(Object.fromEntries(other))));
+  for (const key of previous?.fields.keys() ?? []) {
+    if (!Object.hasOwn(record, key)) {
+      (fields ??= new Map(previous?.fields)).delete(key);
+      primitives.delete(key);
+    }
   }
-  return fields;
+  if (!fields && previous) {
+    return previous;
+  }
+  const fingerprint = {
+    digest: sha256Hex(stableStringify(Object.fromEntries(fields!))),
+    fields: fields!,
+    primitives,
+  };
+  recordFingerprints.set(record, fingerprint);
+  return fingerprint;
 }
 
 function describeHistoryChange(
@@ -155,93 +195,100 @@ function describeHistoryChange(
   if (previous.contentKind !== next.contentKind) {
     fields.push("content.type");
   }
-  if (previous.contentDigest !== next.contentDigest) {
+  if (
+    previous.blocks.length !== next.blocks.length ||
+    previous.blocks.some((digest, index) => digest !== next.blocks[index])
+  ) {
     if (previous.contentKind === "string" || next.contentKind === "string") {
       fields.push("content");
     } else {
-      if (previous.blockCount !== next.blockCount) {
+      if (previous.blocks.length !== next.blocks.length) {
         fields.push("content.length");
       }
-      for (let index = 0; index < Math.max(previous.blocks.length, next.blocks.length); index++) {
+      for (
+        let index = 0;
+        index <
+        Math.min(MAX_HISTORY_DIFF_FIELDS, Math.max(previous.blocks.length, next.blocks.length));
+        index++
+      ) {
         if (previous.blocks[index] !== next.blocks[index]) {
-          fields.push(`content[${index}]`);
+          const before = previous.blockFields[index];
+          const after = next.blockFields[index];
+          const changed = [
+            ...new Set([...(before?.keys() ?? []), ...(after?.keys() ?? [])]),
+          ].filter((key) => before?.get(key) !== after?.get(key));
+          fields.push(
+            ...(changed.length
+              ? new Set(
+                  changed.map(
+                    (key) => `content[${index}].${HISTORY_BLOCK_FIELDS.has(key) ? key : "other"}`,
+                  ),
+                )
+              : [`content[${index}]`]),
+          );
         }
       }
-      if (previous.remainingBlocksDigest !== next.remainingBlocksDigest) {
+      if (
+        previous.blocks.some(
+          (digest, index) => index >= MAX_HISTORY_DIFF_FIELDS && digest !== next.blocks[index],
+        ) ||
+        (previous.blocks.length !== next.blocks.length &&
+          Math.max(previous.blocks.length, next.blocks.length) > MAX_HISTORY_DIFF_FIELDS)
+      ) {
         fields.push("content[remaining]");
       }
     }
   }
   for (const key of new Set([...previous.envelopeFields.keys(), ...next.envelopeFields.keys()])) {
     if (previous.envelopeFields.get(key) !== next.envelopeFields.get(key)) {
-      fields.push(`envelope.${key}`);
+      const field = `envelope.${HISTORY_ENVELOPE_FIELDS.has(key) ? key : "other"}`;
+      if (!fields.includes(field)) {
+        fields.push(field);
+      }
     }
   }
   return `changed fields: ${fields.slice(0, MAX_HISTORY_DIFF_FIELDS).join(", ")}${fields.length > MAX_HISTORY_DIFF_FIELDS ? ", …" : ""}`;
-}
-
-function fingerprintBlock(block: object): string {
-  const primitives: [string, unknown][] = [];
-  const nested: [string, unknown][] = [];
-  for (const entry of Object.entries(block)) {
-    const value = entry[1];
-    const primitive =
-      value === null || ["string", "number", "boolean", "undefined"].includes(typeof value);
-    (primitive ? primitives : nested).push(entry);
-  }
-  const previous = blockFingerprints.get(block);
-  const unchanged =
-    previous &&
-    previous.primitives.length === primitives.length &&
-    primitives.every(([key, value], index) => {
-      const cached = previous.primitives[index];
-      return cached?.[0] === key && cached[1] === value;
-    });
-  const memo = unchanged
-    ? previous
-    : { digest: sha256Hex(stableStringify(Object.fromEntries(primitives))), primitives };
-  if (!unchanged) {
-    blockFingerprints.set(block, memo);
-  }
-  return nested.length
-    ? sha256Hex(`${memo.digest}:${stableStringify(Object.fromEntries(nested))}`)
-    : memo.digest;
 }
 
 function fingerprintMessage(
   message: Message,
   previous?: PromptHistoryFingerprint,
 ): PromptHistoryFingerprint {
-  const { content, ...envelope } = message;
+  const { content } = message;
   let stringBlock: PromptHistoryFingerprint["stringBlock"];
   let blocks: string[];
+  let fingerprints: RecordFingerprint[] = [];
   if (typeof content === "string") {
     // Transcript messages own text memos; diagnostics retain only weak references.
     const previousMemo = previous?.stringBlock?.deref() ?? stringFingerprints.get(message);
     const memo =
       previousMemo?.value === content
         ? previousMemo
-        : { value: content, digest: sha256Hex(stableStringify(content)) };
+        : { value: content, digest: fingerprintText(content) };
     stringFingerprints.set(message, memo);
     stringBlock = new WeakRef(memo);
     blocks = [memo.digest];
   } else {
     stringFingerprints.delete(message);
-    blocks = content.map(fingerprintBlock);
+    fingerprints = content.map((block) => fingerprintRecord(block));
+    blocks = fingerprints.map(({ digest }) => digest);
   }
-  const envelopeFields = fingerprintEnvelope(envelope);
-  const contentDigest = sha256Hex(stableStringify(blocks));
+  const envelope = fingerprintRecord(message, "content");
+  if (
+    previous?.envelopeDigest === envelope.digest &&
+    previous.contentKind === (typeof content === "string" ? "string" : "blocks") &&
+    previous.blocks.length === blocks.length &&
+    previous.blocks.every((digest, index) => digest === blocks[index])
+  ) {
+    return previous;
+  }
   return {
-    digest: sha256Hex(stableStringify([Object.fromEntries(envelopeFields), contentDigest])),
     role: message.role,
-    envelopeFields,
-    contentDigest,
+    envelopeFields: envelope.fields,
+    envelopeDigest: envelope.digest,
     contentKind: typeof content === "string" ? "string" : "blocks",
-    blockCount: blocks.length,
-    blocks: blocks.slice(0, MAX_HISTORY_DIFF_FIELDS),
-    ...(blocks.length > MAX_HISTORY_DIFF_FIELDS
-      ? { remainingBlocksDigest: sha256Hex(stableStringify(blocks.slice(MAX_HISTORY_DIFF_FIELDS))) }
-      : {}),
+    blocks,
+    blockFields: fingerprints.slice(0, MAX_HISTORY_DIFF_FIELDS).map(({ fields }) => fields),
     stringBlock,
   };
 }
@@ -257,6 +304,26 @@ function buildTrackerKey(params: PromptCacheIdentity): string {
   ]);
 }
 
+function describeProviderFields(
+  before: ProviderPromptCachePrefix["parameters"],
+  after: ProviderPromptCachePrefix["parameters"] | undefined,
+): string {
+  if (!after) {
+    return "removed";
+  }
+  const beforeFields = before.fields ?? {};
+  const afterFields = after.fields ?? {};
+  const changed = [...new Set([...Object.keys(beforeFields), ...Object.keys(afterFields)])].filter(
+    (key) => beforeFields[key] !== afterFields[key],
+  );
+  return changed.length
+    ? changed.slice(0, MAX_HISTORY_DIFF_FIELDS).join("+") +
+        (changed.length > MAX_HISTORY_DIFF_FIELDS ? "+remaining" : "")
+    : Object.keys(beforeFields).length || Object.keys(afterFields).length
+      ? "order"
+      : "value";
+}
+
 function describeProviderPrefix(
   previous: ProviderPromptState["lastAttempt"],
   next: ProviderPromptState["lastAttempt"],
@@ -269,27 +336,37 @@ function describeProviderPrefix(
   if (previous.scopeDigest !== next.scopeDigest) {
     return "provider-scope";
   }
-  for (const segment of ["system", "tools"] as const) {
-    if (before[segment] !== after[segment]) {
-      return segment;
-    }
-  }
-  const index = before.messages.findIndex((digest, i) => digest !== after.messages[i]);
-  if (index >= 0) {
-    return `message:${index}`;
-  }
-  if (before.parameters !== after.parameters) {
-    return "parameters";
-  }
-  if (before.tail !== undefined) {
+  const continuation = before.continuation || after.continuation;
+  const segment = (["system", "tools"] as const).find((key) => before[key] !== after[key]);
+  const index = before.messages.findIndex((item, i) => item.digest !== after.messages[i]?.digest);
+  let prefix = segment ?? (continuation ? "wire-prefix-match" : "prefix-match");
+  if (!segment && index >= 0) {
+    const item = before.messages[index]!;
+    const fields = item.fields ? `.${describeProviderFields(item, after.messages[index])}` : "";
+    prefix = `${continuation ? "wire-input" : "message"}:${index}${fields}`;
+  } else if (!segment && before.tail !== undefined) {
     // A growing tail cannot establish equality of its earlier messages from one digest.
-    return before.messageCount !== after.messageCount
-      ? `unverified-after:${before.messages.length}`
-      : before.tail !== after.tail
-        ? `message-tail:${before.messages.length}`
-        : "prefix-match";
+    prefix =
+      before.messageCount !== after.messageCount
+        ? `unverified-after:${before.messages.length}`
+        : before.tail !== after.tail
+          ? `message-tail:${before.messages.length}`
+          : prefix;
   }
-  return "prefix-match";
+  const parameters =
+    before.parameters.digest !== after.parameters.digest
+      ? `parameters:${describeProviderFields(before.parameters, after.parameters)}`
+      : undefined;
+  const format = before.messageField !== after.messageField ? "input-format" : undefined;
+  const details = [
+    prefix.endsWith("prefix-match") && (parameters || format) ? undefined : prefix,
+    format,
+    parameters,
+  ]
+    .filter(Boolean)
+    .join(",");
+  // A delta request's wire input is not its logical conversation prefix.
+  return `${continuation ? "continuation:" : ""}${details}`;
 }
 
 function describeToolChanges(previous: PromptCacheSnapshot, next: PromptCacheSnapshot): string {
@@ -418,36 +495,9 @@ function diffSnapshots(
   return changes.length > 0 ? changes : null;
 }
 
-export function collectPromptCacheTools(
-  tools: readonly PromptCacheToolDescriptor[],
-): PromptCacheToolSnapshot[] {
-  const snapshots: PromptCacheToolSnapshot[] = [];
-  for (const tool of tools) {
-    try {
-      const name = tool.name?.trim();
-      if (!name) {
-        continue;
-      }
-      const { description, parameters } = tool;
-      let schemaDigest: string | undefined;
-      if (parameters) {
-        schemaDigest = toolSchemaFingerprints.get(parameters);
-        if (!schemaDigest) {
-          schemaDigest = sha256Hex(stableStringify(parameters));
-          toolSchemaFingerprints.set(parameters, schemaDigest);
-        }
-      }
-      snapshots.push({
-        name,
-        descriptionDigest: description === undefined ? undefined : sha256Hex(description),
-        schemaDigest,
-      });
-    } catch {
-      continue;
-    }
-  }
-  return sortPromptCacheToolsByName(snapshots);
-}
+// The session tool pin holds the tool block on every route; system prompts are
+// pinned only on routes with in-history prompt updates, so they are reported, not asserted.
+const PROMPT_PREFIX_CHANGE_CODES = new Set<PromptCacheChange["code"]>(["tools"]);
 
 export function beginPromptCacheObservation(
   params: PromptCacheIdentity & {
@@ -460,6 +510,8 @@ export function beginPromptCacheObservation(
     systemPrompt: string;
     tools: readonly PromptCacheToolSnapshot[];
     messages: readonly Message[];
+    /** Turn attribution for diagnostics, such as the trigger and input provenance. */
+    turn?: string;
   },
 ) {
   const key = buildTrackerKey(params);
@@ -506,6 +558,7 @@ export function beginPromptCacheObservation(
   );
   const changes = previous
     ? [
+        ...(previous.unmeasuredChanges ?? []),
         ...(previous.pendingChanges?.filter(
           (change) => change.code === "aggregateToolResultTruncation",
         ) ?? []),
@@ -518,12 +571,11 @@ export function beginPromptCacheObservation(
   const restarted = changes.some(
     ({ code }) => code === "model" || code === "transport" || code === "cacheRetention",
   );
-  const divergence =
-    previous && !restarted && !previous.declaredRewrites?.size
-      ? previous.history.findIndex((message, index) => message.digest !== history[index]?.digest)
-      : -1;
+  const divergence = previous
+    ? previous.history.findIndex((message, index) => message !== history[index])
+    : -1;
   const violation =
-    divergence < 0
+    divergence < 0 || restarted || previous?.declaredRewrites?.size
       ? undefined
       : {
           code: "historyRewrite" as const,
@@ -532,6 +584,7 @@ export function beginPromptCacheObservation(
   if (violation) {
     changes.push(violation);
   }
+  const pendingChanges = [...new Map(changes.map((change) => [change.code, change])).values()];
   const tracker: PromptCacheTracker = {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey?.trim(),
@@ -541,22 +594,33 @@ export function beginPromptCacheObservation(
     lastCacheReadSnapshot: previous?.lastCacheReadSnapshot,
     lastProviderPrompt: previous?.lastProviderPrompt,
     requestedAt,
-    pendingChanges: changes.length > 0 ? changes : null,
+    pendingChanges: pendingChanges.length > 0 ? pendingChanges : null,
   };
   trackers.delete(key);
   pruneMapToMaxSize(trackers, MAX_TRACKERS - 1);
   trackers.set(key, tracker);
+  // Within one session the tool definitions depend only on session and config facts;
+  // a model, transport or retention change starts over.
+  const prefixChanges =
+    restarted || previous?.toolPinChanged
+      ? []
+      : changes.filter(({ code }) => PROMPT_PREFIX_CHANGE_CODES.has(code));
+  if (process.env.OPENCLAW_PROMPT_CACHE_ASSERT === "1" && (violation || prefixChanges.length)) {
+    const detail = [violation, ...prefixChanges]
+      .filter((change) => change !== undefined)
+      .map((change) => `${change.code}(${change.detail})`)
+      .join(", ");
+    throw new Error(`[prompt-cache] prefix changed within session: ${detail} ${params.turn ?? ""}`);
+  }
   if (violation) {
-    if (process.env.OPENCLAW_PROMPT_CACHE_ASSERT === "1") {
-      throw new Error(violation.detail);
-    }
     if (!historyRewriteWarnings.check(params.sessionKey?.trim() || params.sessionId)) {
       log.warn(`[prompt-cache] ${violation.detail} sessionKey=${params.sessionKey ?? key}`);
     }
   }
   return {
     snapshot,
-    changes: changes.length > 0 ? changes : null,
+    prefixUnchanged: previous !== undefined && divergence < 0,
+    changes: tracker.pendingChanges,
     previousCacheRead: previous?.lastCacheRead ?? null,
     requestGapMs: previous ? Math.max(0, requestedAt - previous.requestedAt) : undefined,
   };
@@ -572,6 +636,17 @@ export function declarePromptHistoryRewrite(
       tracker.sessionKey === params.sessionKey?.trim()
     ) {
       (tracker.declaredRewrites ??= new Set()).add(params.reason);
+    }
+  }
+}
+
+export function declarePromptToolPin(params: PromptCacheIdentity): void {
+  for (const tracker of trackers.values()) {
+    if (
+      tracker.sessionId === params.sessionId &&
+      tracker.sessionKey === params.sessionKey?.trim()
+    ) {
+      tracker.toolPinChanged = true;
     }
   }
 }
@@ -604,9 +679,16 @@ export function completePromptCacheObservation(
   tracker.pendingChanges = null;
 
   const cacheRead = params.usage?.cacheRead;
-  if (typeof cacheRead !== "number" || !Number.isFinite(cacheRead)) {
+  if (
+    params.usage?.cacheTelemetry?.state === "unavailable" ||
+    typeof cacheRead !== "number" ||
+    !Number.isFinite(cacheRead)
+  ) {
+    // Keep cause evidence paired with the last measured cache hit, not a usage-less request.
+    tracker.unmeasuredChanges = changes;
     return null;
   }
+  tracker.unmeasuredChanges = null;
   const previousCacheRead = tracker.lastCacheRead;
   const previousSnapshot = tracker.lastCacheReadSnapshot;
   const previousProviderPrompt = tracker.lastProviderPrompt;
@@ -632,6 +714,14 @@ export function completePromptCacheObservation(
         previousCacheRead,
         cacheRead,
         changes,
+        ...(previousProviderPrompt?.wire || params.providerPrompt?.wire
+          ? {
+              requests: {
+                previous: previousProviderPrompt?.wire,
+                current: params.providerPrompt?.wire,
+              },
+            }
+          : {}),
         ...(params.providerPrompt
           ? {
               providerPrefix: describeProviderPrefix(previousProviderPrompt, params.providerPrompt),

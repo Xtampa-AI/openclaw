@@ -2,13 +2,13 @@ import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export function readReplayedTaskId(
   message: Record<string, unknown>,
-  inputUuid: string,
+  submittedInputUuids: ReadonlySet<string>,
 ): string | undefined {
   if (
     message.type !== "user" ||
     message.isReplay !== true ||
     message.parent_tool_use_id !== null ||
-    message.uuid === inputUuid ||
+    (typeof message.uuid === "string" && submittedInputUuids.has(message.uuid)) ||
     !isRecord(message.message)
   ) {
     return undefined;
@@ -43,12 +43,14 @@ export function recordTaskOwnership(
     return undefined;
   }
   const previous = session.taskOwners.get(taskId);
-  // Nested tasks report back to their launching agent, not the parent input.
-  // Native marks nested Bash explicitly; Agents and workflows carry a parent ID.
   const owner =
-    task.owned_by_subagent === true || typeof task.parent_task_id === "string"
+    task.owned_by_subagent === true
       ? false
-      : (previous ?? inputUuid);
+      : (previous ??
+        (typeof task.parent_task_id === "string"
+          ? session.taskOwners.get(task.parent_task_id)
+          : undefined) ??
+        inputUuid);
   if (owner !== previous) {
     session.taskOwners.set(taskId, owner);
   }
@@ -56,14 +58,4 @@ export function recordTaskOwnership(
     session.taskRuns.set(task.run_id, taskId);
   }
   return owner === false ? undefined : taskId;
-}
-
-/** Agents and workflows make their own tool calls; subagent-owned work can resume its Agent. */
-export function isDescendantTask(task: Record<string, unknown>): boolean {
-  return (
-    task.task_type === "local_agent" ||
-    task.task_type === "local_workflow" ||
-    task.owned_by_subagent === true ||
-    typeof task.parent_task_id === "string"
-  );
 }

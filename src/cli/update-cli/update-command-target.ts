@@ -68,7 +68,11 @@ import { assertUpdatePackageActivationAdmission } from "./update-command-package
 import { inspectNpmGlobalDestination } from "./update-command-package-destination.js";
 import { UnreportedUpdateAdmissionOutcome, type RefuseUpdate } from "./update-command-result.js";
 import { recordUpdateCommandTarget, type prepareUpdateCommand } from "./update-command-run.js";
-import { resolvePackageRuntimePreflight } from "./update-command-runtime-preflight.js";
+import { inspectPackageEngineAdmission } from "./update-command-runtime-admission.js";
+import {
+  recordNodeSecurityWarning,
+  resolvePackageRuntimePreflight,
+} from "./update-command-runtime-preflight.js";
 import type { ManagedServiceRootRedirect } from "./update-command-service-context-types.js";
 import { resolveManagedServicePackageUpdatePlan } from "./update-command-service-plan.js";
 import type { UpdateCommandRecoveryState } from "./update-command-service.js";
@@ -174,6 +178,7 @@ export async function resolveUpdateCommandTarget(
           recordUpdateCommandTarget(opts.run, { step });
         }
       };
+      recordNodeSecurityWarning(recordPreflightStep, root, prepared.nodeSecurityWarning);
       const resolveMode = async (): Promise<UpdateRunResult["mode"]> => {
         // Policy/config refusals can precede target preparation. Inspect their owner too.
         return updateInstallKind === "git"
@@ -362,6 +367,10 @@ export async function resolveUpdateCommandTarget(
       // The service runtime can differ even when its package root matches the shell.
       let managedServiceNodeRunner: string | undefined;
       let packageUpdateNodeRunner: string | undefined;
+      let admittedPackageRuntime:
+        | import("../../infra/package-update-activation-runtime.types.js").PackageActivationRuntime
+        | undefined;
+      let assertPackageRuntimeCurrent: (() => Promise<void>) | undefined;
       let serviceUnitTarget: string | undefined;
 
       if (updateInstallKind === "package") {
@@ -604,15 +613,26 @@ export async function resolveUpdateCommandTarget(
         packageRuntimeTarget?.nodeEngine
       ) {
         // Candidate admission can stage before the activation runtime check.
-        const runtime = await resolvePackageRuntimePreflight({
-          engineOnly: true,
+        const runtimeAdmission = await inspectPackageEngineAdmission({
           channel,
           requestedChannel,
           target: packageRuntimeTarget,
           root,
           nodeRunner: managedServiceNodeRunner ?? packageUpdateNodeRunner,
           timeoutMs: updateStepTimeoutMs,
+          shouldRestart: prepared.shouldRestart,
+          invocationCwd,
+        }).catch(async (error: unknown) => {
+          if (hasCommandProcessCleanupError(error) || !(error instanceof UpdatePreMutationError)) {
+            throw error;
+          }
+          await refuseUpdate(error.reason, error.message, error.failureFacts, error.recoverySteps);
+          return undefined;
         });
+        if (!runtimeAdmission) {
+          return undefined;
+        }
+        const { runtime, assertCurrent } = runtimeAdmission;
         if (!runtime.ok) {
           await refuseUpdate(
             "preflight-node-runtime-incompatible",
@@ -621,6 +641,16 @@ export async function resolveUpdateCommandTarget(
             runtime.recoverySteps,
           );
           return undefined;
+        }
+        if (runtime.value.replacedNodeRunner) {
+          packageUpdateNodeRunner = runtime.value.nodeRunner;
+          admittedPackageRuntime = runtime.value.activationRuntime;
+          assertPackageRuntimeCurrent = assertCurrent;
+        }
+        const runtimeWarning = runtime.value.nodeSecurityWarning;
+        if (runtimeWarning && runtimeWarning !== prepared.nodeSecurityWarning) {
+          warn(`SECURITY WARNING: ${runtimeWarning}`);
+          recordNodeSecurityWarning(recordPreflightStep, root, runtimeWarning);
         }
       }
 
@@ -681,6 +711,8 @@ export async function resolveUpdateCommandTarget(
         managedServiceRoot,
         managedServiceNodeRunner,
         packageUpdateNodeRunner,
+        ...(assertPackageRuntimeCurrent ? { assertPackageRuntimeCurrent } : {}),
+        ...(admittedPackageRuntime ? { admittedPackageRuntime } : {}),
         devTarget,
       };
     });

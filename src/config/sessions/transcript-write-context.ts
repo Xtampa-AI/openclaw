@@ -1,113 +1,54 @@
 // Transcript write contexts carry the admitted run fence and teardown tracking
 // through nested session-manager callbacks.
-import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
-import type {
-  ModelChangeEntry,
-  ThinkingLevelChangeEntry,
-} from "../../agents/sessions/session-manager-types.js";
 import { trackAsyncWork } from "../../shared/async-work-scope.js";
-import { getCliHistoryWriter, runWithCliHistoryWriter } from "./cli-history-boundary.js";
-import type {
-  SessionTranscriptContextVersion,
-  SessionTranscriptWriteScope,
-} from "./session-accessor.sqlite-contract.js";
+import { getCliHistoryWriter } from "./cli-history-boundary.js";
+import { readSessionActorEntryFacts } from "./session-actor-replica.js";
 import {
   assertSessionEntryCohortScope,
   matchSessionEntryCohortScope,
 } from "./session-entry-cohort-scope.js";
-import type { SessionEntryCohortReader } from "./session-entry-read-runtime.types.js";
-import type { CapturedSessionEntryReadSource } from "./session-entry-read-source.types.js";
 import {
   captureExternalSessionCommitGuard,
   composeSessionSourceAssertion,
   type SessionSourceAssertion,
 } from "./session-source-authority.js";
+import type { SessionTranscriptAnchorEntry } from "./session-transcript-anchor-read.types.js";
 import { SessionTranscriptWriterClaimReboundError } from "./session-transcript-writer-claim-error.js";
+import type {
+  InitialSessionTranscriptWriter,
+  SessionTranscriptWriterFence,
+} from "./session-transcript-writer.types.js";
 import {
   captureSessionTranscriptStorageEnvironment,
   captureSessionTranscriptTargetBinding,
   sameSessionTranscriptStorageEnvironment,
   sameSessionTranscriptTargetBinding,
-  type SessionTranscriptTargetBinding,
 } from "./transcript-target-binding.js";
-import type { SessionEntry } from "./types.js";
+import {
+  ownedTranscriptWriteContext,
+  type TranscriptSourcePublication,
+} from "./transcript-write-context-owner.js";
+import type {
+  MetadataPublication,
+  MetadataPublicationOwner,
+  MetadataTarget,
+  OwnedSessionTranscriptWriteContext,
+  SessionMetadataChange,
+  SessionMetadataCommit,
+  SessionTranscriptWriteTarget,
+} from "./transcript-write-context.types.js";
 
 export { SessionTranscriptWriterClaimReboundError } from "./session-transcript-writer-claim-error.js";
-
-export type SessionMetadataChange =
-  | Pick<ModelChangeEntry, "type" | "provider" | "modelId">
-  | Pick<ThinkingLevelChangeEntry, "type" | "thinkingLevel">;
-
-type MetadataTarget = SessionTranscriptTargetBinding;
-type MetadataPublicationOwner = {
-  getSessionId(): string;
-  getSessionTarget(): MetadataTarget | undefined;
-};
-export type SessionMetadataCommit = {
-  entry: ModelChangeEntry | ThinkingLevelChangeEntry;
-  version: SessionTranscriptContextVersion | undefined;
-  target: MetadataTarget | undefined;
-};
-type MetadataPublication = {
-  owner: MetadataPublicationOwner;
-  sessionId: string;
-  target: MetadataTarget | undefined;
-  change: SessionMetadataChange;
-  publish: (commit: SessionMetadataCommit) => undefined;
-};
-
-export type SessionTranscriptWriterFence = Readonly<{
-  expectedLifecycleRevision: string | undefined;
-  expectedWriterRunId: string;
-}>;
-
-/** A first-insert lease, bound to the original admission rather than its run id. */
-export type InitialSessionTranscriptWriter = Readonly<{
-  writerRunId: string;
-  committedFence: SessionTranscriptWriterFence | undefined;
-  assertActive: SessionSourceAssertion;
-  recordCommitted: (fence: SessionTranscriptWriterFence) => void;
-  withTranscriptWrite: <T>(run: () => Promise<T> | T) => Promise<T>;
-}>;
-
-type SessionTranscriptWriteTarget = {
-  agentId?: string;
-  sessionId?: string;
-  sessionKey?: string;
-  storePath?: string;
-  env?: Readonly<NodeJS.ProcessEnv>;
-  expectedLifecycleRevision?: string;
-  expectedWriterRunId?: string;
-  expectedOwner?: SessionTranscriptWriteScope["expectedOwner"];
-};
-
-export type OwnedSessionTranscriptWriteContext = {
-  sessionFile?: string;
-  sessionKey?: string;
-  sessionTarget?: SessionTranscriptWriteTarget;
-  initialWriter?: InitialSessionTranscriptWriter;
-  sessionReader?: SessionEntryCohortReader;
-  /** Revalidate the captured owner, including an absent writer, inside each commit. */
-  assertCommitAllowed?: SessionSourceAssertion;
-  withTranscriptWrite: <T>(run: () => Promise<T> | T) => Promise<T>;
-  metadataPublication?: { current?: MetadataPublication };
-};
+export type {
+  InitialSessionTranscriptWriter,
+  SessionTranscriptWriterFence,
+} from "./session-transcript-writer.types.js";
 
 type SessionTranscriptWriteRequest = Pick<
   OwnedSessionTranscriptWriteContext,
   "sessionFile" | "sessionKey" | "sessionTarget"
 >;
-
-type TranscriptSourcePublication = {
-  target: SessionTranscriptWriteTarget;
-  claimed: boolean;
-  publish?: (source: CapturedSessionEntryReadSource, entry: SessionEntry) => void;
-};
-
-const ownedTranscriptWriteContext = new AsyncLocalStorage<
-  OwnedSessionTranscriptWriteContext & { sourcePublication?: TranscriptSourcePublication }
->();
 
 /** Bind an initiating write's acknowledged source before fallible publication observers. */
 export async function withSessionTranscriptSourcePublication<T>(
@@ -176,6 +117,75 @@ export function getOwnedSessionTranscriptReader(scope: SessionTranscriptWriteTar
   });
   context.assertCommitAllowed?.();
   return reader;
+}
+
+function findOwnedSessionTranscriptActor(
+  scope: SessionTranscriptWriteTarget,
+): OwnedSessionTranscriptWriteContext["sessionActor"] {
+  const context = ownedTranscriptWriteContext.getStore();
+  const actor = context?.sessionActor;
+  if (!actor) {
+    return undefined;
+  }
+  if (
+    !contextMatches({ context, sessionTarget: captureWriteTarget(scope) }) ||
+    context.sessionTarget?.sessionId !== scope.sessionId ||
+    context.sessionTarget?.agentId !== scope.agentId
+  ) {
+    return undefined;
+  }
+  context.assertCommitAllowed?.();
+  actor.actor.assertCurrent();
+  return actor;
+}
+
+/** Borrow only the actor retained for this exact admitted transcript. */
+export function getOwnedSessionTranscriptActor(
+  scope: SessionTranscriptWriteTarget,
+): OwnedSessionTranscriptWriteContext["sessionActor"] {
+  const actor = findOwnedSessionTranscriptActor(scope);
+  if (!actor && ownedTranscriptWriteContext.getStore()?.sessionActor) {
+    throw new SessionTranscriptWriterClaimReboundError();
+  }
+  return actor;
+}
+
+/** Borrow committed transcript facts through the active run's existing authority. */
+export function readOwnedSessionTranscriptState(scope: SessionTranscriptWriteTarget) {
+  const binding = findOwnedSessionTranscriptActor(scope);
+  if (!binding) {
+    return undefined;
+  }
+  const assertCurrent = captureOwnedTranscriptWriteAssertion(scope);
+  const state = binding.actor.snapshot({ assertCurrent, authorize: assertCurrent });
+  return state?.entry?.sessionId === scope.sessionId ? state : undefined;
+}
+
+/** Borrow committed entry facts only while the caller holds the transcript writer FIFO. */
+export function readOwnedSessionTranscriptEntry(
+  scope: SessionTranscriptWriteTarget,
+): SessionTranscriptAnchorEntry | undefined {
+  // Reads of another session do not inherit the ambient writer's actor.
+  const binding = findOwnedSessionTranscriptActor(scope);
+  if (!binding) {
+    return undefined;
+  }
+  const assertCurrent = captureOwnedTranscriptWriteAssertion(scope);
+  const target = binding.actor.target;
+  const entry =
+    target.database.kind === "file"
+      ? readSessionActorEntryFacts({ ...target, database: target.database }, [])?.entry
+      : binding.actor.snapshot({ assertCurrent, authorize: assertCurrent })?.entry;
+  return (
+    entry && {
+      sessionId: entry.sessionId,
+      updatedAt: entry.updatedAt,
+      lifecycleRevision: entry.lifecycleRevision,
+      activeWriterRunId: entry.activeWriterRunId,
+      cliHistoryBoundary: entry.cliHistoryBoundary,
+      permissionMode: entry.permissionMode,
+    }
+  );
 }
 
 function captureWriteTarget(target: SessionTranscriptWriteTarget): SessionTranscriptWriteTarget {
@@ -361,6 +371,21 @@ export async function withOwnedSessionTranscriptWrites<T>(
   return await ownedTranscriptWriteContext.run(captureWriteContext(context), run);
 }
 
+/** Only the matching transcript owner can admit a restart's interrupted assistant row. */
+export async function withOwnedSessionRestartAbortWrite<T>(
+  scope: SessionTranscriptWriteTarget | undefined,
+  write: () => Promise<T>,
+): Promise<T> {
+  const context = ownedTranscriptWriteContext.getStore();
+  if (!scope || !context?.withRestartAbortWrite) {
+    return await write();
+  }
+  if (!contextMatches({ context, sessionTarget: captureWriteTarget(scope) })) {
+    throw new SessionTranscriptWriterClaimReboundError();
+  }
+  return await context.withRestartAbortWrite(write);
+}
+
 /** Add a caller's live capability without replacing its admitted writer or settlement owner. */
 export function withSessionTranscriptWriteAssertion<T>(
   scope: SessionTranscriptWriteTarget,
@@ -383,11 +408,6 @@ export function withSessionTranscriptWriteAssertion<T>(
     },
     run,
   );
-}
-
-/** Runs detached work without retaining an attempt-owned transcript context. */
-export function runWithoutOwnedSessionTranscriptWrites<T>(run: () => T): T {
-  return ownedTranscriptWriteContext.exit(() => runWithCliHistoryWriter(undefined, run));
 }
 
 export function bindOwnedSessionTranscriptWrites<TArgs extends unknown[], TResult>(
@@ -487,6 +507,19 @@ function assertTranscriptWriteContext(
     throw new SessionTranscriptWriterClaimReboundError();
   }
   assertSource();
+}
+
+/** A committed first-insert owner can settle through the current terminal writer. */
+export function assertSessionTranscriptInitialWriter(
+  writer: InitialSessionTranscriptWriter,
+  scope: SessionTranscriptWriteTarget,
+): void {
+  const context = ownedTranscriptWriteContext.getStore();
+  if (writer.committedFence && context?.settledInitialWriter === writer) {
+    assertTranscriptWriteContext(context, captureWriteTarget(scope));
+    return;
+  }
+  writer.assertActive();
 }
 
 /** A guarded context cannot silently become an unfenced write to another target. */

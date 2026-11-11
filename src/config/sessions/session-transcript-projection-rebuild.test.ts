@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
-import {
-  prepareMemorySessionTranscriptProjection,
-  prepareSessionTranscriptProjection,
-} from "./session-transcript-projection-rebuild.js";
+import { prepareSessionTranscriptProjection } from "./session-transcript-projection-rebuild.js";
 
 type SessionTranscriptProjectionSourceRow = { seq: number; event: unknown; createdAt: number };
 
@@ -17,23 +14,7 @@ function row(
   return { createdAt, event, seq };
 }
 
-function projection(rows: SessionTranscriptProjectionSourceRow[], source: "sqlite" | "memory") {
-  if (source === "memory") {
-    return prepareMemorySessionTranscriptProjection(
-      SESSION_ID,
-      42,
-      new Map(
-        rows.map((sourceRow) => [
-          sourceRow.seq,
-          {
-            seq: sourceRow.seq,
-            created_at: sourceRow.createdAt,
-            event_json: JSON.stringify(sourceRow.event),
-          },
-        ]),
-      ),
-    )!;
-  }
+function projection(rows: SessionTranscriptProjectionSourceRow[]) {
   const db = openNodeSqliteDatabase(":memory:");
   try {
     db.exec(`CREATE TABLE session_windows (session_id TEXT PRIMARY KEY, transcript_updated_at INTEGER);
@@ -52,180 +33,206 @@ function projection(rows: SessionTranscriptProjectionSourceRow[], source: "sqlit
     for (const sourceRow of rows) {
       insert.run(SESSION_ID, sourceRow.seq, JSON.stringify(sourceRow.event), sourceRow.createdAt);
     }
-    return prepareSessionTranscriptProjection(db, SESSION_ID)!;
+    const plan = prepareSessionTranscriptProjection(db, SESSION_ID)!;
+    return { ...plan, ftsRows: [...plan.ftsRows] };
   } finally {
     db.close();
   }
 }
 
-describe.each(["sqlite", "memory"] as const)(
-  "canonical session transcript projection (%s)",
-  (source) => {
-    it("projects one deterministic active branch for both rebuild owners", () => {
-      const result = projection(
-        [
-          row(0, { id: SESSION_ID, type: "session", version: 3 }),
-          row(1, {
-            id: "root",
-            message: { content: "root text", role: "user" },
-            parentId: null,
-            type: "message",
-          }),
-          row(2, {
-            id: "abandoned",
-            message: { content: "abandoned text", role: "assistant" },
-            parentId: "root",
-            type: "message",
-          }),
-          row(3, {
-            id: "active",
-            message: { content: "active text", role: "assistant" },
-            parentId: "root",
-            type: "message",
-          }),
-        ],
-        source,
-      );
+describe("canonical SQLite session transcript projection", () => {
+  it("projects one deterministic active branch", () => {
+    const result = projection([
+      row(0, { id: SESSION_ID, type: "session", version: 3 }),
+      row(1, {
+        id: "root",
+        message: { content: "root text", role: "user" },
+        parentId: null,
+        type: "message",
+      }),
+      row(2, {
+        id: "abandoned",
+        message: { content: "abandoned text", role: "assistant" },
+        parentId: "root",
+        type: "message",
+      }),
+      row(3, {
+        id: "active",
+        message: { content: "active text", role: "assistant" },
+        parentId: "root",
+        type: "message",
+      }),
+    ]);
 
-      expect(result).toMatchObject({
-        activeEventCount: 2,
-        activeMessageCount: 2,
-        leafEventId: "active",
-        sessionId: SESSION_ID,
-        sourceIndexedSeq: 3,
-        sourceTranscriptUpdatedAt: 42,
-      });
-      expect(result.activeRows).toEqual([
-        { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
-        { activePosition: 1, contextEligible: 1, eventSeq: 3, messagePosition: 1 },
-      ]);
-      expect(result.ftsRows).toEqual([
-        { messageId: "root", role: "user", text: "root text", timestamp: 1_000 },
-        { messageId: "active", role: "assistant", text: "active text", timestamp: 3_000 },
-      ]);
+    expect(result).toMatchObject({
+      activeEventCount: 2,
+      activeMessageCount: 2,
+      leafEventId: "active",
+      sessionId: SESSION_ID,
+      sourceIndexedSeq: 3,
+      sourceTranscriptUpdatedAt: 42,
     });
+    expect(result.activeRows).toEqual([
+      { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
+      { activePosition: 1, contextEligible: 1, eventSeq: 3, messagePosition: 1 },
+    ]);
+    expect(result.ftsRows).toEqual([
+      { messageId: "root", role: "user", text: "root text", timestamp: 1_000 },
+      { messageId: "active", role: "assistant", text: "active text", timestamp: 3_000 },
+    ]);
+  });
 
-    it("keeps persisted row timestamps for timestamp-less and invalid-timestamp messages", () => {
-      const result = projection(
-        [
-          row(0, { id: SESSION_ID, type: "session", version: 3 }),
-          row(
-            1,
-            {
-              id: "old-user",
-              message: { content: [{ text: "old content", type: "text" }], role: "user" },
-              parentId: null,
-              type: "message",
-            },
-            1_700_000_000_000,
-          ),
-          row(
-            2,
-            {
-              id: "invalid-timestamp",
-              message: { content: "still old", role: "assistant" },
-              parentId: "old-user",
-              timestamp: "not a date",
-              type: "message",
-            },
-            1_700_000_001_000,
-          ),
-        ],
-        source,
-      );
+  it("keeps persisted row timestamps for timestamp-less and invalid-timestamp messages", () => {
+    const result = projection([
+      row(0, { id: SESSION_ID, type: "session", version: 3 }),
+      row(
+        1,
+        {
+          id: "old-user",
+          message: { content: [{ text: "old content", type: "text" }], role: "user" },
+          parentId: null,
+          type: "message",
+        },
+        1_700_000_000_000,
+      ),
+      row(
+        2,
+        {
+          id: "invalid-timestamp",
+          message: { content: "still old", role: "assistant" },
+          parentId: "old-user",
+          timestamp: "not a date",
+          type: "message",
+        },
+        1_700_000_001_000,
+      ),
+    ]);
 
-      expect(result.ftsRows.map(({ messageId, timestamp }) => ({ messageId, timestamp }))).toEqual([
-        { messageId: "old-user", timestamp: 1_700_000_000_000 },
-        { messageId: "invalid-timestamp", timestamp: 1_700_000_001_000 },
-      ]);
-    });
+    expect(result.ftsRows.map(({ messageId, timestamp }) => ({ messageId, timestamp }))).toEqual([
+      { messageId: "old-user", timestamp: 1_700_000_000_000 },
+      { messageId: "invalid-timestamp", timestamp: 1_700_000_001_000 },
+    ]);
+  });
 
-    it("skips malformed content-block types without dropping neighboring text", () => {
-      const result = projection(
-        [
-          row(0, { id: SESSION_ID, type: "session", version: 3 }),
-          row(1, {
-            id: "mixed-content",
-            message: {
-              content: [
-                { text: "ignored", type: { toString: null } },
-                { text: "kept", type: "text" },
-              ],
-              role: "assistant",
-            },
-            parentId: null,
-            type: "message",
-          }),
-        ],
-        source,
-      );
+  it("skips malformed content-block types without dropping neighboring text", () => {
+    const result = projection([
+      row(0, { id: SESSION_ID, type: "session", version: 3 }),
+      row(1, {
+        id: "mixed-content",
+        message: {
+          content: [
+            { text: "ignored", type: { toString: null } },
+            { text: "kept", type: "text" },
+          ],
+          role: "assistant",
+        },
+        parentId: null,
+        type: "message",
+      }),
+    ]);
 
-      expect(result.ftsRows).toEqual([
-        { messageId: "mixed-content", role: "assistant", text: "kept", timestamp: 1_000 },
-      ]);
-    });
+    expect(result.ftsRows).toEqual([
+      { messageId: "mixed-content", role: "assistant", text: "kept", timestamp: 1_000 },
+    ]);
+  });
 
-    it("respects a leaf-control rewind without indexing the abandoned continuation", () => {
-      const result = projection(
-        [
-          row(0, { id: SESSION_ID, type: "session", version: 3 }),
-          row(1, {
-            id: "root",
-            message: { content: "keep", role: "user" },
-            parentId: null,
-            type: "message",
-          }),
-          row(2, {
-            id: "abandoned",
-            message: { content: "remove", role: "assistant" },
-            parentId: "root",
-            type: "message",
-          }),
-          row(3, {
-            appendParentId: "root",
-            id: "rewind",
-            parentId: "abandoned",
-            targetId: "root",
-            type: "leaf",
-          }),
-        ],
-        source,
-      );
+  it("respects a leaf-control rewind without indexing the abandoned continuation", () => {
+    const result = projection([
+      row(0, { id: SESSION_ID, type: "session", version: 3 }),
+      row(1, {
+        id: "root",
+        message: { content: "keep", role: "user" },
+        parentId: null,
+        type: "message",
+      }),
+      row(2, {
+        id: "abandoned",
+        message: { content: "remove", role: "assistant" },
+        parentId: "root",
+        type: "message",
+      }),
+      row(3, {
+        appendParentId: "root",
+        id: "rewind",
+        parentId: "abandoned",
+        targetId: "root",
+        type: "leaf",
+      }),
+    ]);
 
-      expect(result.leafEventId).toBe("root");
-      expect(result.activeRows).toEqual([
-        { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
-      ]);
-      expect(result.ftsRows.map((entry) => entry.messageId)).toEqual(["root"]);
-    });
+    expect(result.leafEventId).toBe("root");
+    expect(result.activeRows).toEqual([
+      { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
+    ]);
+    expect(result.ftsRows.map((entry) => entry.messageId)).toEqual(["root"]);
+  });
 
-    it("keeps legacy flat-message ordering and searchable identities", () => {
-      const result = projection(
-        [
-          row(0, { id: SESSION_ID, type: "session", version: 1 }),
-          row(1, {
-            id: "legacy-user",
-            message: { content: "first", role: "user" },
-            type: "message",
-          }),
-          row(2, {
-            id: "legacy-assistant",
-            message: { content: "second", role: "assistant" },
-            type: "message",
-          }),
-        ],
-        source,
-      );
+  it("keeps legacy flat-message ordering and searchable identities", () => {
+    const result = projection([
+      row(0, { id: SESSION_ID, type: "session", version: 1 }),
+      row(1, {
+        id: "legacy-user",
+        message: { content: "first", role: "user" },
+        type: "message",
+      }),
+      row(2, {
+        id: "legacy-assistant",
+        message: { content: "second", role: "assistant" },
+        type: "message",
+      }),
+    ]);
 
-      expect(result.activeRows).toEqual([
-        { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
-        { activePosition: 1, contextEligible: 1, eventSeq: 2, messagePosition: 1 },
-      ]);
-      expect(result.ftsRows.map((entry) => entry.messageId)).toEqual([
-        "legacy-user",
-        "legacy-assistant",
-      ]);
-      expect(result.sourceIndexedSeq).toBe(2);
-    });
-  },
-);
+    expect(result.activeRows).toEqual([
+      { activePosition: 0, contextEligible: 1, eventSeq: 1, messagePosition: 0 },
+      { activePosition: 1, contextEligible: 1, eventSeq: 2, messagePosition: 1 },
+    ]);
+    expect(result.ftsRows.map((entry) => entry.messageId)).toEqual([
+      "legacy-user",
+      "legacy-assistant",
+    ]);
+    expect(result.sourceIndexedSeq).toBe(2);
+  });
+});
+
+it("reads SQLite FTS payloads only as the consumer advances", () => {
+  const db = openNodeSqliteDatabase(":memory:");
+  let payloadReads = 0;
+  db.function("observe_payload", (value) => {
+    payloadReads += 1;
+    return value;
+  });
+  try {
+    db.exec(
+      `CREATE TABLE session_windows (session_id TEXT PRIMARY KEY, transcript_updated_at INTEGER);
+      CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT);
+      CREATE TABLE stored_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER,
+        event_zstd BLOB, event_utf8_bytes INTEGER, navigation_json TEXT, PRIMARY KEY (session_id, seq));
+      CREATE VIEW transcript_events AS SELECT session_id, seq, observe_payload(event_json) AS event_json,
+        created_at, event_zstd, event_utf8_bytes, navigation_json FROM stored_events;
+      INSERT INTO session_windows VALUES ('stream', 1);
+      INSERT INTO transcript_rewrite_watermarks VALUES ('stream', 'generation');`,
+    );
+    const ids = ["first", "second", "third"];
+    const insert = db.prepare(
+      "INSERT INTO stored_events VALUES ('stream', ?, ?, ?, NULL, NULL, ?)",
+    );
+    for (const [index, id] of ids.entries()) {
+      const navigation = { type: "message", id, parentId: ids[index - 1] ?? null };
+      const event = { ...navigation, message: { role: "user", content: id.repeat(10_000) } };
+      insert.run(index + 1, JSON.stringify(event), index + 10, JSON.stringify(navigation));
+    }
+    const plan = prepareSessionTranscriptProjection(db, "stream")!;
+    expect(plan).toMatchObject({ activeEventCount: 3, activeMessageCount: 3, sourceIndexedSeq: 3 });
+    const planningReads = payloadReads;
+    const iterator = plan.ftsRows[Symbol.iterator]();
+    expect(payloadReads).toBe(planningReads);
+    for (const [index, id] of ids.entries()) {
+      expect(iterator.next().value).toMatchObject({ messageId: id, text: id.repeat(10_000) });
+      expect(payloadReads).toBe(planningReads + index + 1);
+    }
+    expect(iterator.next().done).toBe(true);
+    expect(payloadReads).toBe(planningReads + 3);
+  } finally {
+    db.close();
+  }
+});

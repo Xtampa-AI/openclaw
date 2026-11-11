@@ -17,6 +17,7 @@ import {
 import {
   captureLaunchAgentInstallFiles,
   readExistingLaunchAgentPlist,
+  removeBootedOutLaunchAgentPlist,
   resolveLaunchAgentPlistPath,
   writeLaunchAgentPlist,
 } from "./launchd-service-files.js";
@@ -54,11 +55,12 @@ export async function uninstallLaunchAgent({
 
   const home = normalizeWindowsPathSeparators(resolveDaemonHomeDir(env));
   const trashDir = path.posix.join(home, ".Trash");
-  const dest = path.join(trashDir, `${label}.plist`);
+  const dest = path.join(trashDir, `${label}-${Date.now()}.plist`);
   try {
-    await fs.mkdir(trashDir, { recursive: true });
-    await fs.rename(plistPath, dest);
-    stdout.write(`${formatLine("Moved LaunchAgent to Trash", dest)}\n`);
+    const { trashed } = await removeBootedOutLaunchAgentPlist(plistPath, dest);
+    stdout.write(
+      `${trashed ? formatLine("Moved LaunchAgent to Trash", dest) : formatLine("Removed LaunchAgent", plistPath)}\n`,
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       try {
@@ -166,6 +168,17 @@ export async function installLaunchAgent(
       },
       async () => false,
     );
+  const bootstrap = (plistPath: string, actionHint: string) =>
+    bootstrapLaunchAgentOrThrow({
+      domain,
+      serviceTarget,
+      plistPath,
+      actionHint,
+      retryPendingTeardown: true,
+      assertCurrent: assertGatewayServiceUpdateCurrent,
+      preserveAutoStart: args.preserveAutoStart,
+      preservedEnabled: enabled,
+    });
   let activationAttempted = false;
   const install = async () => {
     const published = await writeLaunchAgentPlist(
@@ -182,16 +195,7 @@ export async function installLaunchAgent(
     if (loaded) {
       await bootoutLaunchAgent(serviceTarget);
     }
-    await bootstrapLaunchAgentOrThrow({
-      domain,
-      serviceTarget,
-      plistPath: published.plistPath,
-      actionHint: "openclaw gateway install --force",
-      retryPendingTeardown: true,
-      assertCurrent: assertGatewayServiceUpdateCurrent,
-      preserveAutoStart: args.preserveAutoStart,
-      preservedEnabled: enabled,
-    });
+    await bootstrap(published.plistPath, "openclaw gateway install --force");
     assertGatewayServiceUpdateCurrent();
     return published;
   };
@@ -217,16 +221,7 @@ export async function installLaunchAgent(
           if (activationAttempted && restoreLoaded) {
             await files.assertCurrent();
             await assertNoSystemLaunchDaemonOwnership(label);
-            await bootstrapLaunchAgentOrThrow({
-              domain,
-              serviceTarget,
-              plistPath: targetPlistPath,
-              actionHint: "openclaw gateway start",
-              retryPendingTeardown: true,
-              assertCurrent: assertGatewayServiceUpdateCurrent,
-              preserveAutoStart: args.preserveAutoStart,
-              preservedEnabled: enabled,
-            });
+            await bootstrap(targetPlistPath, "openclaw gateway start");
           }
           return restored || activationAttempted;
         });

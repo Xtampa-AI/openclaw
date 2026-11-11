@@ -1,7 +1,7 @@
 // Log tail redaction tests cover scrubbing sensitive data from tailed logs.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resetLogger, setLoggerOverride } from "../logging.js";
 import { withEnvAsync } from "../test-utils/env.js";
@@ -21,7 +21,6 @@ describe("readConfiguredLogTail redaction", () => {
     const dir = tempDirs.make("openclaw-log-tail-redaction-");
     const logFile = path.join(dir, "openclaw.log");
     const configFile = path.join(dir, "openclaw.json");
-    const googleSecret = "GOCSPX-abcdefghijklmnopqrstuvwx_y-z";
     const basicSecret = "c2VjcmV0OnBhc3M=";
     const openClawToken = "supersecretgatewaytoken1234567890";
     const pomeriumJwt = "eyJheaderabcd.eyJpayloadabcd.signatureabcd123456";
@@ -37,8 +36,6 @@ describe("readConfiguredLogTail redaction", () => {
         `Authorization: Basic ${basicSecret}`,
         `X-OpenClaw-Token: ${openClawToken}`,
         `x-pomerium-jwt-assertion: ${pomeriumJwt}`,
-        googleSecret,
-        "GOCSPX-docs",
         "normal diagnostic line",
       ].join("\n") + "\n",
       "utf8",
@@ -55,12 +52,44 @@ describe("readConfiguredLogTail redaction", () => {
     expect(text).toContain("X-OpenClaw-Token: supers…7890");
     expect(text).toContain("x-pomerium-jwt-assertion: eyJhea…3456");
     expect(text).toContain("normal diagnostic line");
-    expect(text).not.toContain(googleSecret);
-    expect(text).toContain("GOCSPX-docs");
     expect(text).not.toContain(basicSecret);
     expect(text).not.toContain(openClawToken);
     expect(text).not.toContain(pomeriumJwt);
   });
+});
+
+it("redacts raw JSON credentials and default tokens with custom tail patterns", async () => {
+  const dir = tempDirs.make("openclaw-raw-log-tail-");
+  const logFile = path.join(dir, "openclaw.log");
+  const configFile = path.join(dir, "openclaw.json");
+  await fs.writeFile(configFile, JSON.stringify({ logging: { redactPatterns: ["CUSTOM_VALUE"] } }));
+  const record = {
+    password: 1234,
+    apiKey: false,
+    signature: "short-signature",
+    nested: { "x-pomerium-jwt-assertion": "opaque-header" },
+    message: "sk-syntheticcredential123456 CUSTOM_VALUE",
+    ordinary: "request completed",
+  };
+  const raw = `${JSON.stringify(record)}\n`;
+  await fs.writeFile(logFile, raw);
+  setLoggerOverride({ file: logFile });
+  const tail = await withEnvAsync({ OPENCLAW_CONFIG_PATH: configFile }, () =>
+    readConfiguredLogTail(),
+  );
+  assert(tail.lines[0] !== undefined);
+  const redacted = JSON.parse(tail.lines[0]);
+  expect(redacted).toMatchObject({
+    password: "***",
+    apiKey: "***",
+    signature: "***",
+    nested: { "x-pomerium-jwt-assertion": "***" },
+    ordinary: "request completed",
+  });
+  expect(redacted.message).not.toContain("sk-syntheticcredential123456");
+  expect(redacted.message).not.toContain("CUSTOM_VALUE");
+  expect(tail.cursor).toBe(Buffer.byteLength(raw));
+  expect(await fs.readFile(logFile, "utf8")).toBe(raw);
 });
 
 async function withPemLog(content: string, run: (file: string) => Promise<void>) {

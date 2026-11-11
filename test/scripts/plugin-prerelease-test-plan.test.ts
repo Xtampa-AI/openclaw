@@ -249,6 +249,7 @@ describe("scripts/lib/plugin-prerelease-test-plan.mts", () => {
   it("uses kitchen-sink npm and ClawHub scenarios as the registry install canary", () => {
     const lane = getDockerLane("kitchen-sink-plugin");
     const script = readFileSync("scripts/e2e/kitchen-sink-plugin-docker.sh", "utf8");
+    const rpcScript = readFileSync("scripts/e2e/kitchen-sink-rpc-docker.sh", "utf8");
     const sweepScript = readFileSync("scripts/e2e/lib/kitchen-sink-plugin/sweep.sh", "utf8");
     const assertionsScript = readFileSync(
       "scripts/e2e/lib/kitchen-sink-plugin/assertions.mjs",
@@ -264,9 +265,29 @@ describe("scripts/lib/plugin-prerelease-test-plan.mts", () => {
       stateScenario: "empty",
       weight: 3,
     });
-    expect(script).toContain("npm:@openclaw/kitchen-sink@latest");
-    expect(script).toContain("npm-latest-conformance");
-    expect(script).toContain("npm-latest-adversarial");
+    const recordedVersion = readFileSync(
+      "scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt",
+      "utf8",
+    ).trim();
+    expect(recordedVersion).toMatch(/^\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?$/);
+    expect(script).toContain(
+      "$TARGET_ROOT_DIR/scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt",
+    );
+    expect(script).toContain(
+      "Frozen target is missing its branch-recorded Kitchen Sink npm version",
+    );
+    expect(rpcScript).toContain(
+      "$TARGET_ROOT_DIR/scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt",
+    );
+    expect(rpcScript).toContain(
+      'export OPENCLAW_KITCHEN_SINK_NPM_SPEC="npm:@openclaw/kitchen-sink@$KITCHEN_SINK_NPM_VERSION"',
+    );
+    expect(script).toContain(
+      'KITCHEN_SINK_NPM_SPEC="npm:@openclaw/kitchen-sink@$KITCHEN_SINK_NPM_VERSION"',
+    );
+    expect(script).not.toContain("npm:@openclaw/kitchen-sink@latest");
+    expect(script).toContain("npm-pinned-conformance");
+    expect(script).toContain("npm-pinned-adversarial");
     expect(script).toContain("npm:@openclaw/kitchen-sink@beta");
     expect(script).toContain("clawhub:@openclaw/kitchen-sink@latest");
     expect(script).toContain("clawhub:@openclaw/kitchen-sink@beta");
@@ -334,6 +355,12 @@ describe("scripts/lib/plugin-prerelease-test-plan.mts", () => {
       weight: 6,
     });
     expect(prereleasePlan.surfaces).toContain("external-install-boundary");
+    const bootstrapIndex = sweepScript.indexOf(
+      'run_plugins_openclaw_capture "$OPENCLAW_PLUGINS_TMP_DIR/plugins-bootstrap.json" plugins list --json',
+    );
+    const trustIndex = sweepScript.indexOf("record-fixture-plugin-trust");
+    expect(bootstrapIndex).toBeGreaterThanOrEqual(0);
+    expect(trustIndex).toBeGreaterThan(bootstrapIndex);
     expect(sweepScript).toContain("run_plugins_clawhub_scenario");
     expect(clawhubScript).toContain('plugins install "$CLAWHUB_PLUGIN_SPEC"');
     expect(assertionsScript).toContain("assertClawHubExternalInstallContract");
@@ -363,6 +390,7 @@ describe("scripts/lib/plugin-prerelease-test-plan.mts", () => {
     expect(extensionStep.env.FRV_TEST_EXCLUDE_PATHS_JSON).toBe(
       "${{ needs.preflight.outputs.extension_test_exclude_patterns_json }}",
     );
+    expect(extensionStep.env.OPENCLAW_ENABLE_PRIVATE_QA_CLI).toBe("1");
     expect(extensionStep.run).not.toContain("extensions/codex/src/app-server/run-attempt.test.ts");
   });
 

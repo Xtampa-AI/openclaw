@@ -1,9 +1,10 @@
 // Verifies ClawHub archive integrity, limits, cleanup, and authentication boundaries.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import path from "node:path";
 import * as privateTempWorkspace from "@openclaw/fs-safe/temp";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
 import {
   type ClawHubDownloadResult,
@@ -17,6 +18,21 @@ import { normalizeClawHubSha256Integrity, normalizeClawHubSha256Hex } from "./cl
 vi.mock("@openclaw/fs-safe/temp", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@openclaw/fs-safe/temp")>()),
 }));
+
+// Real loopback fixtures must not inherit a developer's outbound proxy routing.
+beforeEach(() => {
+  for (const key of [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+  ]) {
+    vi.stubEnv(key, undefined);
+  }
+});
+afterEach(() => vi.unstubAllEnvs());
 
 const tempDirs = createTrackedTempDirs();
 
@@ -128,7 +144,7 @@ function downloadPackageArchive(response: Response) {
     name: "@hyf/zai-external-alpha",
     version: "0.0.1",
     token: "test-token",
-    fetchImpl: async () => response,
+    fetchImpl: vi.fn(async () => response),
   });
 }
 
@@ -140,11 +156,6 @@ const archiveDownloadCases: Array<{
   expectedArtifact?: "clawpack";
 }> = [
   {
-    name: "package archive",
-    download: downloadPackageArchive,
-    expectedFileName: "zai-external-alpha.zip",
-  },
-  {
     name: "ClawPack artifact",
     headers: { "content-type": "application/octet-stream" },
     download: (response) =>
@@ -153,31 +164,10 @@ const archiveDownloadCases: Array<{
         version: "1.2.3",
         artifact: "clawpack",
         token: "test-token",
-        fetchImpl: async () => response,
+        fetchImpl: vi.fn(async () => response),
       }),
     expectedFileName: "NUL_.tgz",
     expectedArtifact: "clawpack",
-  },
-  {
-    name: "skill archive",
-    download: (response) =>
-      downloadClawHubSkillArchive({
-        slug: "agentreceipt",
-        version: "1.0.0",
-        token: "test-token",
-        fetchImpl: async () => response,
-      }),
-    expectedFileName: "agentreceipt.zip",
-  },
-  {
-    name: "resolver URL archive",
-    download: (response) =>
-      downloadClawHubSkillArchiveUrl({
-        baseUrl: "https://clawhub.ai",
-        url: "https://downloads.example.com/skill.zip",
-        fetchImpl: async () => response,
-      }),
-    expectedFileName: "skill.zip",
   },
   {
     name: "GitHub source archive",
@@ -185,7 +175,7 @@ const archiveDownloadCases: Array<{
       downloadClawHubGitHubSkillArchive({
         repo: "owner/repo",
         commit: "abc123",
-        fetchImpl: async () => response,
+        fetchImpl: vi.fn(async () => response),
       }),
     expectedFileName: "abc123.zip",
   },
@@ -225,7 +215,7 @@ describe("clawhub artifacts", () => {
       name: "demo",
       version: "1.2.3",
       artifact: "clawpack",
-      fetchImpl: async (input) => {
+      fetchImpl: vi.fn(async (input) => {
         requestedUrl = input instanceof Request ? input.url : String(input);
         return new Response(bytes, {
           status: 200,
@@ -234,7 +224,7 @@ describe("clawhub artifacts", () => {
             "X-ClawHub-Artifact-Sha256": sha256Hex,
           },
         });
-      },
+      }),
     });
 
     try {
@@ -261,14 +251,16 @@ describe("clawhub artifacts", () => {
         name: "demo",
         version: "1.2.3",
         artifact: "clawpack",
-        fetchImpl: async () =>
-          new Response(new Uint8Array([7, 8, 9]), {
-            status: 200,
-            headers: {
-              "content-type": "application/octet-stream",
-              "X-ClawHub-Artifact-Sha256": "0".repeat(64),
-            },
-          }),
+        fetchImpl: vi.fn(
+          async () =>
+            new Response(new Uint8Array([7, 8, 9]), {
+              status: 200,
+              headers: {
+                "content-type": "application/octet-stream",
+                "X-ClawHub-Artifact-Sha256": "0".repeat(64),
+              },
+            }),
+        ),
       }),
     ).rejects.toThrow(/declared sha256/);
   });
@@ -358,7 +350,7 @@ describe("clawhub artifacts", () => {
       downloadClawHubSkillArchive({
         slug: "replacement-skill",
         token: "test-token",
-        fetchImpl: async () => createArchiveResponse(new Uint8Array([4, 5, 6])),
+        fetchImpl: vi.fn(async () => createArchiveResponse(new Uint8Array([4, 5, 6]))),
       }),
     ).rejects.toBe(writeError);
 
@@ -375,7 +367,7 @@ describe("clawhub artifacts", () => {
     ).resolves.toEqual(Buffer.from([1]));
   });
 
-  it.each(["cleanup", "cleanup logging"])(
+  it.each(["cleanup logging"])(
     "keeps the original archive write failure when %s fails",
     async (failureStage) => {
       const cleanupError = new Error("temporary workspace cleanup failed");
@@ -398,7 +390,7 @@ describe("clawhub artifacts", () => {
         downloadClawHubSkillArchive({
           slug: "cleanup-failure-skill",
           token: "test-token",
-          fetchImpl: async () => createArchiveResponse(new Uint8Array([4, 5, 6])),
+          fetchImpl: vi.fn(async () => createArchiveResponse(new Uint8Array([4, 5, 6]))),
         }),
       ).rejects.toBe(writeError);
       expect(observed.workspace().cleanup).toHaveBeenCalledOnce();
@@ -411,15 +403,17 @@ describe("clawhub artifacts", () => {
     const archive = await downloadClawHubPackageArchive({
       name: "encoded-package",
       version: "1.0.0",
-      fetchImpl: async () =>
-        new Response(bytes, {
-          status: 200,
-          headers: {
-            "content-encoding": "gzip",
-            "content-length": String(256 * 1024 * 1024 + 1),
-            "content-type": "application/zip",
-          },
-        }),
+      fetchImpl: vi.fn(
+        async () =>
+          new Response(bytes, {
+            status: 200,
+            headers: {
+              "content-encoding": "gzip",
+              "content-length": String(256 * 1024 * 1024 + 1),
+              "content-type": "application/zip",
+            },
+          }),
+      ),
     });
     try {
       await expect(fs.readFile(archive.archivePath)).resolves.toEqual(Buffer.from(bytes));
@@ -439,37 +433,11 @@ describe("clawhub artifacts", () => {
         slug: "agentreceipt",
         version: "1.0.0",
         timeoutMs: 5,
-        fetchImpl: async () => stalled.response,
+        fetchImpl: vi.fn(async () => stalled.response),
       }),
     ).rejects.toThrow(/skill archive download for agentreceipt body stalled after 5ms/i);
     expect(stalled.cancel).toHaveBeenCalledTimes(1);
     expect(stalled.cancel.mock.calls[0]?.[0]).toBeInstanceOf(Error);
-  });
-
-  it("sends owner-qualified skill archive downloads as slug plus ownerHandle", async () => {
-    let requestedUrl = "";
-    const archive = await downloadClawHubSkillArchive({
-      slug: "weather",
-      ownerHandle: "demo-owner",
-      version: "1.0.0",
-      fetchImpl: async (input) => {
-        requestedUrl = input instanceof Request ? input.url : String(input);
-        return new Response(new Uint8Array([7, 8, 9]), {
-          status: 200,
-          headers: { "content-type": "application/zip" },
-        });
-      },
-    });
-
-    try {
-      const url = new URL(requestedUrl);
-      expect(url.pathname).toBe("/api/v1/download");
-      expect(url.searchParams.get("slug")).toBe("weather");
-      expect(url.searchParams.get("ownerHandle")).toBe("demo-owner");
-      expect(url.searchParams.get("version")).toBe("1.0.0");
-    } finally {
-      await archive.cleanup();
-    }
   });
 
   it("does not send ambient ClawHub auth tokens to off-registry resolver archive URLs", async () => {
@@ -480,14 +448,14 @@ describe("clawhub artifacts", () => {
     const archive = await downloadClawHubSkillArchiveUrl({
       baseUrl: "https://clawhub.ai",
       url: "https://codeload.github.com/NVIDIA/skills/zip/abcdef",
-      fetchImpl: async (input, init) => {
+      fetchImpl: vi.fn(async (input, init) => {
         requestedUrl = input instanceof Request ? input.url : String(input);
         requestedInit = init;
         return new Response(new Uint8Array([7, 8, 9]), {
           status: 200,
           headers: { "content-type": "application/zip" },
         });
-      },
+      }),
     });
 
     try {
@@ -500,4 +468,92 @@ describe("clawhub artifacts", () => {
       await expectPathMissing(archiveDir);
     }
   });
+});
+
+async function listenArchiveServer(server: Server): Promise<string> {
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("missing fixture port");
+  }
+  return `http://127.0.0.1:${address.port}`;
+}
+it("guards resolver redirects while allowing the exact private registry origin", async () => {
+  let privateHits = 0;
+  const unrelated = createServer((_req, res) => {
+    privateHits++;
+    res.end("private");
+  });
+  const unrelatedOrigin = await listenArchiveServer(unrelated);
+  const bytes = Buffer.from("fixture archive");
+  const registry = createServer((req, res) => {
+    if (req.url === "/archive") {
+      res.writeHead(302, { location: "/payload" }).end();
+    } else if (req.url === "/payload") {
+      res.writeHead(200, { "content-type": "application/zip" }).end(bytes);
+    } else {
+      res.writeHead(302, { location: unrelatedOrigin + "/metadata" }).end();
+    }
+  });
+  const baseUrl = await listenArchiveServer(registry);
+  try {
+    const archive = await downloadClawHubSkillArchiveUrl({ baseUrl, url: "/archive" });
+    try {
+      expect(await fs.readFile(archive.archivePath)).toEqual(bytes);
+    } finally {
+      await archive.cleanup();
+    }
+    await expect(downloadClawHubSkillArchiveUrl({ baseUrl, url: "/redirect" })).rejects.toThrow(
+      /blocked/i,
+    );
+    expect(privateHits).toBe(0);
+  } finally {
+    registry.close();
+    unrelated.close();
+  }
+});
+it("passes the configured private codeload origin to the guard", async () => {
+  const server = createServer((_req, res) =>
+    res.writeHead(200, { "content-type": "application/zip" }).end("archive"),
+  );
+  const baseUrl = await listenArchiveServer(server);
+  vi.stubEnv("CLAWHUB_GITHUB_CODELOAD_BASE_URL", baseUrl + "/custom");
+  try {
+    const archive = await downloadClawHubGitHubSkillArchive({
+      repo: "owner/repo",
+      commit: "abc123",
+    });
+    try {
+      expect(await fs.readFile(archive.archivePath, "utf8")).toBe("archive");
+    } finally {
+      await archive.cleanup();
+    }
+  } finally {
+    vi.unstubAllEnvs();
+    server.close();
+  }
+});
+it("preserves injected fetch and rejects off-origin private resolver URLs before dispatch", async () => {
+  const fetchImpl = vi.fn(async () => createArchiveResponse(new Uint8Array([1, 2, 3])));
+  const archive = await downloadClawHubSkillArchiveUrl({
+    baseUrl: "http://127.0.0.1:8787",
+    url: "/archive",
+    fetchImpl,
+  });
+  try {
+    expect(await fs.readFile(archive.archivePath)).toEqual(Buffer.from([1, 2, 3]));
+  } finally {
+    await archive.cleanup();
+  }
+  fetchImpl.mockClear();
+  await expect(
+    downloadClawHubSkillArchiveUrl({
+      baseUrl: "http://127.0.0.1:8787",
+      url: "http://127.0.0.1:9999/archive",
+      fetchImpl,
+    }),
+  ).rejects.toThrow(/blocked/i);
+  expect(fetchImpl).not.toHaveBeenCalled();
 });

@@ -13,7 +13,6 @@ import {
   runUntilCompleted,
 } from "./code-mode.test-support.js";
 import { createEditTool, createReadTool, createWriteTool } from "./sessions/index.js";
-import type { ReadToolDetails } from "./sessions/tools/index.js";
 import { createLsTool } from "./sessions/tools/ls.js";
 import { DEFAULT_MAX_BYTES } from "./sessions/tools/truncate.js";
 import { resolveToolResultBudget, toolResultFitsBudget } from "./tool-result-limits.js";
@@ -21,6 +20,15 @@ import { compactToolOutputHint } from "./tool-schema-hints.js";
 
 const ONE_PIXEL_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+type ReadPageDetails =
+  | { kind: "text"; content: string }
+  | {
+      kind: "truncated";
+      content: string;
+      continuation: { kind: string; offset?: number; cursor?: number; limit?: number };
+    }
+  | { kind: "binary" | "image" | "directory" };
 
 function expectContract(tool: AnyAgentTool, details: unknown): void {
   expect(tool.outputSchema).toBeDefined();
@@ -202,7 +210,8 @@ describe("filesystem tool output contracts", () => {
     for (let page = 0; page < 8; page++) {
       const result = await tool.execute(`read-page-${page}`, args);
       expectContract(tool, result.details);
-      const details = result.details as ReadToolDetails;
+      // SAFETY: expectContract validated details against the read tool's output schema.
+      const details = result.details as ReadPageDetails;
       if (details.kind !== "text" && details.kind !== "truncated") {
         throw new Error("Expected file text");
       }

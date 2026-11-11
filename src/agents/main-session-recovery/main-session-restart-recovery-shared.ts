@@ -21,6 +21,14 @@ export const mainSessionRecoveryLog = createSubsystemLogger("main-session-restar
 export const DEFAULT_RECOVERY_DELAY_MS = 5_000;
 export const MAX_RECOVERY_RETRIES = 3;
 export const RETRY_BACKOFF_MULTIPLIER = 2;
+export function readInterruptedRunId(entry: SessionEntry): string | undefined {
+  const runs = entry.restartRecoveryRuns;
+  if (!runs?.length) {
+    return normalizeOptionalString(entry.lifecycleRunId);
+  }
+  return runs.length === 1 ? runs[0]?.runId : undefined;
+}
+
 export type ExpectedRestartRecoveryTarget = {
   agentId?: string;
   canonicalSessionKey?: string;
@@ -135,4 +143,19 @@ export async function discoverRestartRecoveryStoreTargets(params: {
     .toSorted(
       (a, b) => a.storePath.localeCompare(b.storePath) || a.agentId.localeCompare(b.agentId),
     );
+}
+
+/** A killed row may release fences only after the store owner proves there is no live work. */
+export function isKilledMainSessionRecoveryFenceOnly(entry: SessionEntry): boolean {
+  const state = entry.mainRestartRecovery;
+  return Boolean(
+    entry.status === "killed" &&
+    entry.restartRecoveryRuns?.length &&
+    !entry.pendingFinalDelivery &&
+    !entry.restartRecoveryDeliveryRunId &&
+    !entry.restartRecoveryHarnessCompletion &&
+    !state?.reservation &&
+    !state?.foregroundClaims &&
+    !state?.tombstone,
+  );
 }

@@ -125,6 +125,7 @@ export type InternalPluginLoadOverrides = {
 function createDeferredGatewaySubagentRuntime(runtime: PluginRuntime): PluginRuntime["subagent"] {
   const subagent: PluginRuntime["subagent"] = {
     complete: (...args) => runtime.subagent.complete(...args),
+    forkSession: (...args) => runtime.subagent.forkSession(...args),
     run: (...args) => runtime.subagent.run(...args),
     waitForRun: (...args) => runtime.subagent.waitForRun(...args),
     getSessionMessages: (...args) => runtime.subagent.getSessionMessages(...args),
@@ -155,12 +156,24 @@ function createCapabilityCatalogContextResolver(
 }
 
 export function loadOpenClawPluginsCore(
+  ...args: Parameters<typeof loadOpenClawPluginsSteps>
+): PluginRegistry {
+  const steps = loadOpenClawPluginsSteps(...args);
+  let step = steps.next();
+  while (!step.done) {
+    step = steps.next();
+  }
+  return step.value;
+}
+
+/** One registration sequence, consumed synchronously by CLI/SDK callers or incrementally by hosts. */
+export function* loadOpenClawPluginsSteps(
   options: PluginLoadOptions,
   nativeBindings: NativePluginLoadBindings,
   overrides?: InternalPluginLoadOverrides,
   inspectionResources?: PluginRegistryInspectionResources,
   trackActivationCleanup?: (completion: Promise<void>) => void,
-): PluginRegistry {
+): Generator<void, PluginRegistry> {
   if (getPluginCache().retirement) {
     throw new Error("Plugin inventory has retired; begin a new plugin operation.");
   }
@@ -321,9 +334,10 @@ export function loadOpenClawPluginsCore(
       manifestRegistry.plugins.map((record) => [record.source, record]),
     );
     // Manifest selection owns duplicate precedence; runtime consumes only its winners.
-    const orderedCandidates = discovery.candidates.filter((candidate) =>
-      manifestBySource.has(candidate.source),
-    );
+    const orderedCandidates = discovery.candidates.flatMap((candidate) => {
+      const manifest = manifestBySource.get(candidate.source);
+      return manifest ? [{ candidate, manifest }] : [];
+    });
     const loaderCacheIdentity = Object.freeze({
       requestKey: context.cacheKey,
       resolvedKey: context.resolveManifestCacheKey(manifestRegistry),
@@ -340,6 +354,7 @@ export function loadOpenClawPluginsCore(
         env: context.env,
         logger,
         manifestRegistry,
+        normalizePluginId: options.normalizePluginId,
         installRecords: context.installRecords,
         preferBuiltPluginArtifacts: options.preferBuiltPluginArtifacts,
       },
@@ -359,10 +374,8 @@ export function loadOpenClawPluginsCore(
     });
     const inputs = new Map<string, PluginLoadInput>();
     const retained = new Map<string, PluginRegistry["plugins"][number]>();
-    for (const candidate of orderedCandidates) {
-      const manifest = manifestBySource.get(candidate.source);
+    for (const { candidate, manifest } of orderedCandidates) {
       if (
-        !manifest ||
         inputs.has(manifest.id) ||
         !matchesScopedPluginOrDreamingSidecar({
           onlyPluginIdSet,
@@ -485,9 +498,8 @@ export function loadOpenClawPluginsCore(
       string,
       (typeof manifestRegistry.plugins)[number]
     >();
-    for (const candidate of orderedCandidates) {
-      const record = manifestBySource.get(candidate.source);
-      if (record && !selectedMiddlewareOwnerManifests.has(record.id)) {
+    for (const { manifest: record } of orderedCandidates) {
+      if (!selectedMiddlewareOwnerManifests.has(record.id)) {
         selectedMiddlewareOwnerManifests.set(record.id, record);
       }
     }
@@ -525,11 +537,7 @@ export function loadOpenClawPluginsCore(
       pluginLoadAttemptCount: 0,
     };
     const pluginLoadStartMs = performance.now();
-    for (const candidate of orderedCandidates) {
-      const manifestRecord = manifestBySource.get(candidate.source);
-      if (!manifestRecord) {
-        continue;
-      }
+    for (const { candidate, manifest: manifestRecord } of orderedCandidates) {
       const previous = retained.get(manifestRecord.id);
       if (previous && !state.seenIds.has(manifestRecord.id)) {
         registry.plugins.push(previous);
@@ -540,6 +548,7 @@ export function loadOpenClawPluginsCore(
         }
         continue;
       }
+      const attemptedBefore = state.pluginLoadAttemptCount;
       const input = inputs.get(manifestRecord.id);
       const loadCandidate = () =>
         loadRuntimePluginCandidate({
@@ -560,6 +569,12 @@ export function loadOpenClawPluginsCore(
         withPluginRegistryPreparationScope(registry, loadCandidate);
       } else {
         loadCandidate();
+      }
+      if (state.pluginLoadAttemptCount !== attemptedBefore) {
+        yield;
+        if (getPluginCache().retirement) {
+          throw new Error("Plugin inventory has retired; begin a new plugin operation.");
+        }
       }
     }
     const pluginLoadElapsedMs = performance.now() - pluginLoadStartMs;
@@ -589,10 +604,9 @@ export function loadOpenClawPluginsCore(
         logger,
         env: context.env,
         installOwnerByPluginId: new Map(
-          orderedCandidates.flatMap((candidate) => {
-            const pluginId = manifestBySource.get(candidate.source)?.id;
+          orderedCandidates.flatMap(({ candidate, manifest }) => {
             const installOwner = resolvePluginCandidateInstallOwner(candidate);
-            return pluginId && installOwner ? [[pluginId, installOwner] as const] : [];
+            return manifest.id && installOwner ? [[manifest.id, installOwner] as const] : [];
           }),
         ),
       });

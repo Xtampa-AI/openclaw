@@ -1,5 +1,4 @@
 import path from "node:path";
-import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { expect, it, vi } from "vitest";
 import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
 import { itemNotification, turnCompleted } from "./protocol.test-helpers.js";
@@ -212,18 +211,14 @@ export function registerSettledFinalizationTests({
       }
     },
   );
-  it("captures settled evidence for a stranded-reply retry whose prompt is never mirrored", async () => {
-    // The host builds the retry with a suppressed system prompt and no transcript recorder
-    // (src/auto-reply/reply/stranded-reply-recovery.ts), so this turn has no prompt row.
-    const storePath = path.join(tempDir, "settled-stranded-retry.sqlite");
-    const sessionId = "session-settled-stranded-retry";
+  it("captures settled evidence when the internal prompt was never mirrored", async () => {
+    const storePath = path.join(tempDir, "settled-promptless.sqlite");
+    const sessionId = "session-settled-promptless";
     const sessionFile = `agent:main:${sessionId}`;
-    const workspaceDir = path.join(tempDir, "workspace-settled-stranded-retry");
+    const workspaceDir = path.join(tempDir, "workspace-settled-promptless");
+    const harness = createStartedThreadHarness();
     const params = createParams(sessionFile, workspaceDir);
-    params.registerPluginRuntimeRefreshConsumer = vi.fn();
     await attachSqliteSessionTarget(params, storePath, sessionId);
-    params.prompt =
-      "Your previous reply was not delivered because you did not call message(action=send).";
     params.suppressNextUserMessagePersistence = true;
     params.userTurnTranscriptRecorder = undefined;
     await appendSqliteHistoryMessage(
@@ -231,29 +226,24 @@ export function registerSettledFinalizationTests({
       attachCodexMirrorIdentity(userMessage("Send the update to Alice.", 1), "turn-0:prompt"),
     );
     await appendSqliteHistoryMessage(params, assistantMessage("Update: shipped.", 2));
-    const harness = createStartedThreadHarness();
-    const warn = vi.spyOn(embeddedAgentLog, "warn");
     const run = runCodexAppServerAttempt(params);
     await harness.waitForMethod("turn/start");
-    const command = {
-      type: "commandExecution",
-      id: "tool-settled",
-      command: "echo sent-to-alice",
-      cwd: workspaceDir,
-      processId: null,
-      source: "agent",
-      status: "inProgress",
-      commandActions: [],
-      aggregatedOutput: null,
-      exitCode: null,
-      durationMs: null,
-    };
     await Promise.all([
-      harness.notify(itemNotification("item/started", command)),
+      harness.notify(
+        itemNotification("item/started", {
+          type: "commandExecution",
+          id: "tool-settled",
+          command: "echo sent-to-alice",
+          cwd: workspaceDir,
+          status: "inProgress",
+        }),
+      ),
       harness.notify(
         itemNotification("item/completed", {
-          ...command,
-          processId: 42,
+          type: "commandExecution",
+          id: "tool-settled",
+          command: "echo sent-to-alice",
+          cwd: workspaceDir,
           status: "completed",
           aggregatedOutput: "sent-to-alice\n",
           exitCode: 0,
@@ -265,10 +255,6 @@ export function registerSettledFinalizationTests({
     const result = await run;
 
     expect(result.terminal).toEqual({ kind: "ok" });
-    expect(warn).not.toHaveBeenCalledWith(
-      "codex settled-turn finalization context capture failed",
-      expect.anything(),
-    );
     expect(result.settledTurnFinalizationContext).toMatchObject({
       source: "harness",
       data: [
@@ -287,6 +273,7 @@ export function registerSettledFinalizationTests({
       ],
     });
   });
+
   it("captures settled tool evidence when an active native compaction fails terminally", async () => {
     const storePath = path.join(tempDir, "settled-compaction-failure.sqlite");
     const sessionId = "session-settled-compaction-failure";

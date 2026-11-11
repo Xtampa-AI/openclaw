@@ -137,10 +137,12 @@ async function createMediaFixture(scenario: Scenario, managed = false) {
     storePath: path.join(root, "sessions.sqlite"),
   };
   params.sessionTarget = target;
-  await upsertSessionEntry({
-    ...target,
-    entry: { sessionId: params.sessionId, sessionFile: params.sessionFile, updatedAt: Date.now() },
-  });
+  const sessionEntry = {
+    sessionId: params.sessionId,
+    sessionFile: params.sessionFile,
+    updatedAt: Date.now(),
+  };
+  await upsertSessionEntry({ ...target, entry: sessionEntry });
   let persisted = false;
   const recorder = {
     message:
@@ -248,7 +250,7 @@ async function withActiveMediaTurn(
   exercise: (controller: AbortController) => Promise<void>,
 ) {
   // Drive media/closure ordering without charging filesystem setup to the run budget.
-  // Keep this media-only proof independent of unrelated turn-context handoffs.
+  // The turn-context handoff adds another native request before steering becomes active.
   fixture.params.timeoutMs = 60_000;
   vi.useFakeTimers();
   const controller = new AbortController();
@@ -403,9 +405,6 @@ describe("Codex active-run steering media", () => {
         authProfileId: null,
         config: {},
         timeoutMs: 20_000,
-      });
-      onTestFinished(async () => {
-        await client.closeAndWait();
       });
       expect(client.getServerVersion()).toBe(CODEX_APP_SERVER_VERSION);
       const nativeSteers: SteerRequest[] = [];

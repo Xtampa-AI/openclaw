@@ -345,6 +345,7 @@ type GatewaySessionLifecycleEventParams = {
   event: LifecycleEventLike;
   assertCommitAllowed?: () => void;
   expectedWriter?: {
+    requireYielded?: true;
     runId: string;
     sessionId: string;
     lifecycleRevision?: string;
@@ -440,6 +441,14 @@ async function persistPreparedGatewaySessionLifecycleEvent(
         return null;
       }
       if (
+        expected?.requireYielded &&
+        (entry.status !== undefined ||
+          !Number.isFinite(entry.endedAt) ||
+          entry.pendingFinalDelivery !== undefined)
+      ) {
+        return null;
+      }
+      if (
         exactCronRun &&
         !acceptsCronRunContinuationLifecycleEvent({ entry, event: params.event })
       ) {
@@ -500,6 +509,16 @@ async function persistPreparedGatewaySessionLifecycleEvent(
           lifecycleGeneration:
             params.event.lifecycleGeneration ?? getAgentEventLifecycleGeneration(),
         });
+        if (isAgentRunResumableToolTimeout(resolveSettledLifecycleTerminalOutcome(params.event))) {
+          patch.mainRestartRecovery = entry.mainRestartRecovery
+            ? { ...entry.mainRestartRecovery, safeToolsRequired: true }
+            : {
+                cycleId: randomUUID(),
+                revision: 1,
+                chargedAttempts: 0,
+                safeToolsRequired: true,
+              };
+        }
       }
       if (isAgentRunResumableToolTimeout(resolveSettledLifecycleTerminalOutcome(params.event))) {
         const recovery = entry.mainRestartRecovery;

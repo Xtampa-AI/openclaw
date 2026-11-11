@@ -1,5 +1,5 @@
 import type { ResolvedCliBackend } from "../cli-backends.js";
-import { resolveConversationCapabilityProfile } from "../conversation-capability-profile.js";
+import { prepareConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import { applyEmbeddedAttemptToolsAllow } from "../embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import { resolveExecConfigState } from "../exec-defaults.js";
 import { resolveEffectiveToolFsWorkspaceOnly } from "../tool-fs-policy.js";
@@ -8,13 +8,10 @@ import type { RunCliAgentParams } from "./types.js";
 
 /**
  * Translate the caller's runtime tool cap into the CLI run's exact tool availability.
- * Native CLI tools cannot enforce workspace, channel, or inherited completion caps, so those
- * runs expose their whole surface through the mediated MCP policy projection. Bundled
- * local Claude agent turns use that same mediated surface even without a cap, so a
- * completion does not replace the native tool prefix of a running session. Operator-selected
- * backend tools stay on both turn kinds for the same reason.
+ * Native CLI tools cannot enforce channel or inherited completion caps, so those
+ * runs expose their whole surface through the mediated MCP policy projection.
  */
-export function resolveCliRuntimeToolPolicy(input: {
+export async function resolveCliRuntimeToolPolicy(input: {
   params: RunCliAgentParams;
   policySessionKey: string | undefined;
   policyAgentId: string;
@@ -23,14 +20,14 @@ export function resolveCliRuntimeToolPolicy(input: {
   canEnforceExactToolAvailability: boolean;
   projectNativeToolAuthority?: ResolvedCliBackend["projectNativeToolAuthority"];
   resolveManagedNativeTools?: ResolvedCliBackend["resolveManagedNativeTools"];
+  sideQuestionToolMode?: ResolvedCliBackend["sideQuestionToolMode"];
   isSideQuestion: boolean;
-  sideQuestionToolMode?: "disabled" | "native";
   skipsTurnPreparation: boolean;
-}): {
+}): Promise<{
   params: RunCliAgentParams;
   runtimeToolsAllowPolicy: string[] | undefined;
   managedNativeTools: readonly string[];
-} {
+}> {
   let { params } = input;
   let runtimeToolsAllowPolicy: string[] | undefined;
   let managedNativeTools: string[] = [];
@@ -81,19 +78,22 @@ export function resolveCliRuntimeToolPolicy(input: {
   const requesterPolicy =
     params.disableTools === true || params.trustedInternalHandoff
       ? undefined
-      : resolveConversationCapabilityProfile({
-          ...params,
-          agentId: input.policyAgentId,
-          sessionKey: input.policySessionKey,
-          sandboxSessionKey: requesterSessionKey,
-          preparedSessionEntry:
-            params.sessionEntry && requesterSessionKey
-              ? { sessionKey: requesterSessionKey, entry: params.sessionEntry }
-              : undefined,
-          modelProvider: params.modelProvider ?? params.provider,
-          modelId: params.model,
-        }).policy;
+      : (
+          await prepareConversationCapabilityProfile({
+            ...params,
+            agentId: input.policyAgentId,
+            sessionKey: input.policySessionKey,
+            sandboxSessionKey: requesterSessionKey,
+            preparedSessionEntry:
+              params.sessionEntry && requesterSessionKey
+                ? { sessionKey: requesterSessionKey, entry: params.sessionEntry }
+                : undefined,
+            modelProvider: params.modelProvider ?? params.provider,
+            modelId: params.model,
+          })
+        ).policy;
   const senderRestricted = requesterPolicy?.inheritedToolPolicySource === "sender";
+  const delegatedExecution = Boolean(requesterPolicy?.delegatedToolPolicy);
   // Internal controls and backend-enforced tool-free questions have no file authority.
   const workspaceOnly =
     params.controlOperation === undefined &&
@@ -117,6 +117,7 @@ export function resolveCliRuntimeToolPolicy(input: {
   if (
     (params.trustedInternalHandoff ||
       senderRestricted ||
+      delegatedExecution ||
       workspaceOnly ||
       ordinaryClaudeMediation) &&
     params.disableTools !== true
@@ -129,13 +130,16 @@ export function resolveCliRuntimeToolPolicy(input: {
       params.trustedInternalHandoff?.settleBatch !== undefined
     ) {
       throw new Error(
-        `CLI backend ${input.backendId} cannot enforce ${senderRestricted ? "conversation" : "completion"} tool policy`,
+        `CLI backend ${input.backendId} cannot enforce ${senderRestricted ? "conversation" : delegatedExecution ? "delegated execution" : params.trustedInternalHandoff ? "completion" : "workspace-only"} tool policy`,
       );
     }
     // Only uncapped ordinary and verified completion turns reach this list, so both kinds
-    // launch the same native surface. Restricted and workspace-only runs keep none.
+    // launch the same native surface. Restricted, delegated, and workspace-only runs keep none.
     managedNativeTools =
-      params.cliToolAvailability === undefined && !senderRestricted && !workspaceOnly
+      params.cliToolAvailability === undefined &&
+      !senderRestricted &&
+      !delegatedExecution &&
+      !workspaceOnly
         ? [
             ...(input.resolveManagedNativeTools?.({
               config: params.config,
@@ -144,15 +148,13 @@ export function resolveCliRuntimeToolPolicy(input: {
           ]
         : [];
     const exactWorkspaceTools =
-      !params.trustedInternalHandoff &&
-      workspaceOnly &&
-      params.cliToolAvailability &&
-      runtimeToolsAllowPolicy === undefined
+      workspaceOnly && params.cliToolAvailability && runtimeToolsAllowPolicy === undefined
         ? [
             ...params.cliToolAvailability.openClaw,
             ...(input.projectNativeToolAuthority?.(params.cliToolAvailability.native) ?? []),
           ]
         : undefined;
+    // Exact selections must bypass policy expansion (for example, write -> apply_patch).
     if (exactWorkspaceTools === undefined) {
       runtimeToolsAllowPolicy ??= senderRestricted
         ? (params.cliToolAvailability?.openClaw ?? ["*"])
@@ -166,7 +168,6 @@ export function resolveCliRuntimeToolPolicy(input: {
   }
   return { params, runtimeToolsAllowPolicy, managedNativeTools };
 }
-
 /**
  * Bootstrap routing needs the run's final file access: a native file-capable
  * selection, or Claude's mediated OpenClaw read plus write tools. Managed native

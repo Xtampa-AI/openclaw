@@ -1,8 +1,10 @@
 // CLI backend live gateway tests exercise registered backend sessions, model switching, MCP loopback, and image probes.
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, onTestFinished } from "vitest";
 import {
   resolveCliBackendConfig,
@@ -12,13 +14,16 @@ import {
 import { testing as cliBackendsTesting } from "../agents/cli-backends.test-support.js";
 import { getCliLiveSessionGeneration } from "../agents/cli-runner/cli-live-session-registry.js";
 import { loadCliSessionHistoryMessages } from "../agents/cli-runner/session-history.js";
-import { isLiveTestEnabled } from "../agents/live-test-helpers.js";
+import { isLiveTestEnabled, useLiveTestRuntimeConfig } from "../agents/live-test-helpers.js";
 import { shouldSkipLiveProviderDrift } from "../agents/live-test-provider-drift.js";
 import { parseModelRef } from "../agents/model-selection.js";
 import { clearRuntimeConfigSnapshot, type OpenClawConfig } from "../config/config.js";
 import { resolveSessionTranscriptRuntimeTarget } from "../config/sessions/session-accessor.js";
 import { isTruthyEnvValue } from "../infra/env.js";
+import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
+import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { resetGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { bindInheritedNativeProcessOwner } from "../process/supervisor/inherited-process-lineage.js";
 import { setTestEnvValue } from "../test-utils/env.js";
 import {
   CLI_CACHE_AUTH_PROFILE_ID,
@@ -64,8 +69,23 @@ import {
   verifyCliCronMcpProbe,
 } from "./gateway-cli-backend.live-probe-helpers.js";
 import { startGatewayServer } from "./server.js";
-import { loadGatewaySessionEntryReadOnly } from "./session-utils.js";
+import { loadGatewaySessionEntryReadOnlyAsync } from "./session-utils.js";
 import { extractPayloadText } from "./test-helpers.agent-results.js";
+
+/**
+ * The in-process source Gateway runs under Node's TypeScript loader hook, which the Linux
+ * child subreaper refuses. Own CLI children with the built anchor, as main's source
+ * harnesses do; Bun runs the source anchor without a loader and needs no binding.
+ */
+function bindBuiltNativeProcessOwner(): () => void {
+  const owner = resolveRuntimeWorkerUrl({
+    ...runtimeProcessEntrypoints.serviceChildGroupAnchor,
+    root: process.cwd(),
+  });
+  return process.platform === "linux" && !process.versions.bun && existsSync(fileURLToPath(owner))
+    ? bindInheritedNativeProcessOwner(owner.href)
+    : () => {};
+}
 
 const LIVE = isLiveTestEnabled();
 const CLI_LIVE = isTruthyEnvValue(process.env.OPENCLAW_LIVE_CLI_BACKEND);
@@ -549,10 +569,12 @@ describeLive("gateway live (cli backend)", () => {
       const tempConfigPath = path.join(tempDir, "openclaw.json");
       await fs.writeFile(tempConfigPath, `${JSON.stringify(nextCfg, null, 2)}\n`);
       setTestEnvValue("OPENCLAW_CONFIG_PATH", tempConfigPath);
+      using _ = useLiveTestRuntimeConfig(nextCfg);
       const cacheProbeBackend = CLI_CACHE_PROBE
         ? prepareClaudeCacheProbeBackend({ config: nextCfg, liveBackend, providerId })
         : undefined;
       const deviceIdentity = await ensurePairedTestGatewayClientIdentity();
+      const releaseNativeOwner = bindBuiltNativeProcessOwner();
       let server: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
       let client: Awaited<ReturnType<typeof connectTestGatewayClient>> | undefined;
       logCliBackendLiveStep("config-written", {
@@ -729,7 +751,8 @@ describeLive("gateway live (cli backend)", () => {
             }>("chat.history", { sessionKey });
             // Imported history can be fully deduplicated against local rows; the persisted
             // binding, not imported-message metadata, owns native session continuity.
-            const { entry: continuityEntry } = loadGatewaySessionEntryReadOnly(sessionKey);
+            const { entry: continuityEntry } =
+              await loadGatewaySessionEntryReadOnlyAsync(sessionKey);
             expectedCliSessionId = continuityEntry?.cliSessionBindings?.[providerId]?.sessionId;
             expect(expectedCliSessionId).toBeTruthy();
             // Native imports must keep private runtime context out of the visible transcript,
@@ -820,8 +843,9 @@ describeLive("gateway live (cli backend)", () => {
               expectedLiveSessionGeneration,
             );
             expect(
-              loadGatewaySessionEntryReadOnly(sessionKey).entry?.cliSessionBindings?.[providerId]
-                ?.sessionId,
+              (await loadGatewaySessionEntryReadOnlyAsync(sessionKey)).entry?.cliSessionBindings?.[
+                providerId
+              ]?.sessionId,
             ).toBe(expectedCliSessionId);
           } else {
             expect(
@@ -986,13 +1010,17 @@ describeLive("gateway live (cli backend)", () => {
         try {
           logCliBackendLiveStep("cleanup:start");
           announceBarrier.release();
-          clearRuntimeConfigSnapshot();
           try {
             await client?.stopAndWait();
           } finally {
-            await server?.close();
+            try {
+              await server?.close();
+            } finally {
+              clearRuntimeConfigSnapshot();
+            }
           }
         } finally {
+          releaseNativeOwner();
           cliBackendsTesting.resetDepsForTest();
           resetGlobalHookRunner();
           await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

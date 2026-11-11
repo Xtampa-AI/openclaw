@@ -209,6 +209,31 @@ describe("trusted P qualification admission", () => {
     ).toThrow(/archive bytes/);
   });
 
+  it("accepts GitHub's empty step inventory for a successful exact producer job", () => {
+    const f = fixture();
+    expectDefined(f.jobs.jobs[0], "admission job").steps = [];
+    expect(() => f.verify()).not.toThrow();
+  });
+
+  it("accepts skewed step timestamps when the artifact remains inside the exact producer job", () => {
+    const f = fixture();
+    const upload = expectDefined(
+      expectDefined(f.jobs.jobs[0], "admission job").steps[0],
+      "admission upload step",
+    );
+    upload.started_at = "2026-09-27T23:00:01Z";
+    upload.completed_at = "2026-09-27T23:00:03Z";
+    expect(() => f.verify()).not.toThrow();
+  });
+
+  it("accepts an artifact inside the upload step when the producer job interval crosses DST", () => {
+    const f = fixture();
+    const job = expectDefined(f.jobs.jobs[0], "admission job");
+    job.started_at = "2026-09-28T01:00:00Z";
+    job.completed_at = "2026-09-28T00:00:04Z";
+    expect(() => f.verify()).not.toThrow();
+  });
+
   it.each([true])(
     "revalidates current authority without reacquiring immutable evidence (protected=%s)",
     (protectedTag) => {

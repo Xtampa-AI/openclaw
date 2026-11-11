@@ -1,9 +1,37 @@
 // Focused public test helpers for plugin runtime, registry, and setup fixtures.
 
 import type { AdmittedRunOperatorAuthority } from "../agents/admitted-run-context.js";
+import type {
+  IsolatedCompletionBoundaryFixture,
+  IsolatedCompletionBoundaryFixtureParams,
+} from "../agents/isolated-completion.adapter.test-support.js";
+import type { ReplyOperation } from "../auto-reply/reply/reply-run-registry.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayRequestContext } from "../gateway/server-methods/types.js";
 import type { PluginRuntime } from "../plugins/runtime/types.js";
+
+/** Registers a queued reply owner without starting backend execution. */
+export async function withQueuedReplyOperationForTest<T>(
+  params: {
+    sessionKey: string;
+    sessionId: string;
+    agentId?: string;
+    abortSignal?: AbortSignal;
+  },
+  run: (operation: ReplyOperation) => Promise<T>,
+): Promise<T> {
+  const { replyRunRegistry } = await import("../auto-reply/reply/reply-run-registry.js");
+  const operation = replyRunRegistry.begin({
+    ...params,
+    resetTriggered: false,
+    upstreamAbortSignal: params.abortSignal,
+  });
+  try {
+    return await run(operation);
+  } finally {
+    operation.complete();
+  }
+}
 
 /** Builds a bundled-plugin Gateway runtime backed by the real session projection and handlers. */
 export async function createTestPluginGatewayRuntime(params: {
@@ -168,6 +196,7 @@ export {
   getActivePluginRegistry,
   resetPluginRuntimeStateForTest,
   setActivePluginRegistry,
+  waitForPluginRegistryRetirement,
 } from "../plugins/runtime.js";
 export {
   listImportedBundledPluginFacadeIds,
@@ -230,6 +259,14 @@ export async function createAdmittedHostCapabilityTestFixture(
 ): ReturnType<AdmittedHostCapabilityTestFixtureFactory> {
   const fixture = await import("../agents/harness/host-capability.test-support.js");
   return fixture.createAdmittedHostCapabilityTestFixture(...args);
+}
+
+// Load the core fixture only for adapter tests that need the real isolated entrypoint.
+export async function createIsolatedCompletionBoundaryFixture(
+  params: IsolatedCompletionBoundaryFixtureParams,
+): Promise<IsolatedCompletionBoundaryFixture> {
+  const fixture = await import("../agents/isolated-completion.adapter.test-support.js");
+  return fixture.createIsolatedCompletionBoundaryFixture(params);
 }
 export async function loadWebFetchToolFactoryForTest() {
   return (await import("../agents/tools/web-fetch.js")).createWebFetchTool;

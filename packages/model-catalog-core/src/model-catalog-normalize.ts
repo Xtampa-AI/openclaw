@@ -37,7 +37,7 @@ import {
 import { normalizeProviderId } from "./provider-id.js";
 export { normalizeOpenRouterModelReasoning } from "./model-catalog-reasoning.js";
 
-const MODEL_CATALOG_INPUTS = new Set(["text", "image", "document"]);
+const MODEL_CATALOG_INPUTS = new Set(["text", "image", "video", "document"]);
 const MODEL_CATALOG_DISCOVERY_MODES = new Set(["static", "refreshable", "runtime"]);
 const MODEL_CATALOG_STATUSES = new Set(["available", "preview", "deprecated", "disabled"]);
 const MODEL_CATALOG_API_SET = new Set<string>(MODEL_CATALOG_APIS);
@@ -297,7 +297,7 @@ function normalizeModelCatalogCompat(value: unknown): ModelCatalogCompatConfig |
   }
 
   normalizeCatalogFields(
-    ["toolSchemaProfile", "toolCallArgumentsEncoding"],
+    ["toolSchemaProfile", "toolCallArgumentsEncoding", "defaultThinkingLevel"],
     (field) => normalizeOptionalString(value[field]),
     compat,
   );

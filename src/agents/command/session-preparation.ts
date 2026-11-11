@@ -49,10 +49,13 @@ export function prepareCommandSessionRecoveryEntry(
       ...params,
       hasDeliveryContext: Boolean(params.deliveryContext),
     });
-  const directOperatorSource =
-    !sourceOptions.sourceRunId &&
+  const operatorSource =
     entry.restartRecoveryDeliveryRunId !== runId &&
-    (!opts.inputProvenance || opts.inputProvenance.kind === "external_user")
+    ((!sourceOptions.sourceRunId &&
+      (!opts.inputProvenance || opts.inputProvenance.kind === "external_user")) ||
+      (sourceOptions.sourceRunId === runId &&
+        opts.inputProvenance?.kind === "inter_session" &&
+        opts.inputProvenance.sourceTool === "subagent_settle"))
       ? createRestartRecoveryOperatorSource({
           authority: opts.operatorAuthority,
           entry: { ...entry, sessionId },
@@ -90,11 +93,11 @@ export function prepareCommandSessionRecoveryEntry(
         runId,
         harnessCompletion,
         ...sourceOptions,
-        ...(directOperatorSource
+        ...(operatorSource
           ? {
-              operatorSource: directOperatorSource,
+              operatorSource,
               sourceRunId: runId,
-              sourceIngress: directOperatorSource.snapshot.sourceIngress,
+              sourceIngress: sourceOptions.sourceIngress ?? operatorSource.snapshot.sourceIngress,
             }
           : {}),
         suppressTextDelivery: opts.internalDeliverySuppressText,
@@ -153,7 +156,10 @@ export async function prepareEmbeddedSessionState(params: {
   const requestedThinkLevel = params.thinkOnce ?? params.thinkOverride ?? params.persistedThinking;
   const resolvedVerboseLevel =
     params.verboseOverride ?? params.persistedVerbose ?? params.verboseDefault;
-  const coordination = isSubagentCoordinationInputProvenance(params.opts.inputProvenance);
+  // Matches Gateway admission so re-registration cannot publish private intake.
+  const privateConversationWork =
+    params.opts.privateCompletion === true ||
+    isSubagentCoordinationInputProvenance(params.opts.inputProvenance);
 
   assertAgentRunLifecycleGenerationCurrent(params.lifecycleGeneration);
   if (params.sessionKey || params.suppressVisibleSessionEffects) {
@@ -162,10 +168,10 @@ export async function prepareEmbeddedSessionState(params: {
       agentId: params.sessionAgentId,
       lifecycleGeneration: params.lifecycleGeneration,
       verboseLevel: resolvedVerboseLevel,
-      isControlUiVisible: !params.suppressVisibleSessionEffects && !coordination,
-      ...(coordination ? { projectSessionMessages: false } : {}),
+      isControlUiVisible: !params.suppressVisibleSessionEffects && !privateConversationWork,
+      ...(privateConversationWork ? { projectSessionMessages: false } : {}),
       // Node and local command ingress may not have a separate chat activity owner.
-      projectSessionActive: !params.suppressVisibleSessionEffects && !coordination,
+      projectSessionActive: !params.suppressVisibleSessionEffects && !privateConversationWork,
     });
   }
 
@@ -174,11 +180,11 @@ export async function prepareEmbeddedSessionState(params: {
   const currentSkillsSnapshot = sessionEntry?.skillsSnapshot;
   const [
     { getRemoteSkillEligibility, resolveReusableWorkspaceSkillSnapshot },
-    { resolveNodeExecEligibility },
+    { resolveNodeExecEligibilityAsync },
   ] = await Promise.all([loadSkillsRuntime(), loadExecDefaultsRuntime()]);
-  const nodeSkillsEligibility = resolveNodeExecEligibility({
+  const nodeSkillsEligibility = await resolveNodeExecEligibilityAsync({
     cfg: params.cfg,
-    sessionEntry,
+    sessionEntry: sessionEntry ?? null,
     sessionKey: params.sessionKey,
     agentId: params.sessionAgentId,
   });

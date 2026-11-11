@@ -6,7 +6,7 @@ import { err as resultError, ok, type Result } from "@openclaw/normalization-cor
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { validRange, valid } from "semver";
 import { detectCurrentSqliteCapabilities, nodeRuntimeFailure } from "../../../node-sqlite.mjs";
-import { SUPPORTED_NODE_VERSION_RANGE } from "../../../node-version.mjs";
+import { formatNodeSecurityWarning, SUPPORTED_NODE_VERSION_RANGE } from "../../../node-version.mjs";
 import { isBunRuntime } from "../../daemon/runtime-binary.js";
 import {
   buildRuntimeProbeEnv,
@@ -24,6 +24,7 @@ import {
   type UpdateFailureFact,
 } from "../../infra/update-failure-facts.js";
 import { UPDATE_RUNNER_TIMEOUT_MS } from "../../infra/update-run-timeouts.js";
+import type { UpdateStepResult } from "../../infra/update-step-result.js";
 import { withCommandProcessScope } from "../../process/exec-spawn.js";
 import {
   createRuntimeUpdateRecoverySteps,
@@ -40,10 +41,30 @@ import type { PreManagedServiceStop } from "./update-command-service-context-typ
 import { resolveServiceRecoveryContext } from "./update-command-service-env.js";
 import {
   gatewayServiceCommandUsesRoot,
+  isGatewayServiceManagementAllowedForUpdate,
   tryRealpathOrResolve,
 } from "./update-command-service-plan.js";
 
+/** Records a nonblocking Node security recommendation as a passing preflight step. */
+export function recordNodeSecurityWarning(
+  record: (step: UpdateStepResult) => void,
+  cwd: string,
+  warning: string | undefined,
+): void {
+  if (warning) {
+    record({
+      name: "node-security-patch",
+      command: "inspect Node.js security patch level",
+      cwd,
+      durationMs: 0,
+      exitCode: 0,
+      warnings: [warning],
+    });
+  }
+}
+
 export type PackageRuntimePreflight = {
+  nodeSecurityWarning?: string;
   nodeRunner?: string;
   activationRuntime?: PackageActivationRuntime;
   replacedNodeRunner?: string;
@@ -81,7 +102,11 @@ export async function resolvePackageRuntimePreflight(params: {
         ? (params.service?.serviceNodeRunner ?? params.nodeRunner)
         : params.nodeRunner,
     );
-    const unchanged = (): PackageRuntimePreflight => (nodeRunner ? { nodeRunner } : {});
+    let nodeSecurityWarning: string | null = null;
+    const unchanged = (): PackageRuntimePreflight => ({
+      ...(nodeRunner ? { nodeRunner } : {}),
+      ...(nodeSecurityWarning ? { nodeSecurityWarning } : {}),
+    });
     let target = params.target;
     if (!target && params.installedRoot) {
       const manifest = asNullableRecord(
@@ -137,7 +162,8 @@ export async function resolvePackageRuntimePreflight(params: {
         }
         if (runtime.status !== "supported") {
           throw new Error(
-            runtime.sqliteSelectionError ?? "Bun 1.4+ with WAL-reset-safe node:sqlite is required.",
+            runtime.sqliteSelectionError ??
+              "Bun 1.4.4+ with WAL-reset-safe node:sqlite is required.",
           );
         }
         // Finalization keeps the updater runtime; service recovery cannot replace it.
@@ -155,6 +181,7 @@ export async function resolvePackageRuntimePreflight(params: {
       nodeRunner: nodeRunner ? (activationRuntime?.path ?? nodeRunner) : undefined,
       timeoutMs: params.timeoutMs,
     });
+    nodeSecurityWarning = formatNodeSecurityWarning(runtime.version);
     const satisfies =
       runtime.failure && !params.engineOnly
         ? false
@@ -168,6 +195,7 @@ export async function resolvePackageRuntimePreflight(params: {
       capturedRuntime
         ? ok({
             ...(selectedRunner ? { nodeRunner: selectedRunner } : {}),
+            ...(nodeSecurityWarning ? { nodeSecurityWarning } : {}),
             activationRuntime: capturedRuntime,
             ...(replacedNodeRunner ? { replacedNodeRunner } : {}),
             targetVersion,
@@ -178,8 +206,24 @@ export async function resolvePackageRuntimePreflight(params: {
     }
     const canRefreshCurrentService =
       params.service?.running && verdict?.kind === "owned" && verdict.refreshDefinition;
+    // Engine admission may select an existing executable, never provision one.
+    // A path match alone is not permission to rewrite a managed service.
+    const canRefreshAtAdmission =
+      !process.versions.bun &&
+      params.shouldRestart &&
+      params.service?.inspected === true &&
+      params.service.runtimeInspected &&
+      params.service.serviceMutationAllowed !== false &&
+      isGatewayServiceManagementAllowedForUpdate(params.service.serviceEnv ?? process.env) &&
+      canRefreshCurrentService &&
+      !verdict.requiresInstallRootRefresh &&
+      params.root !== undefined &&
+      (await tryRealpathOrResolve(verdict.root)) === (await tryRealpathOrResolve(params.root)) &&
+      params.service.serviceNodeRunner === nodeRunner;
     const fallbackNodeRunner = params.engineOnly
-      ? undefined
+      ? canRefreshAtAdmission
+        ? resolveNodeRunner()
+        : undefined
       : (params.fallbackNodeRunner ??
         (params.shouldRestart &&
         !process.versions.bun &&
@@ -198,19 +242,34 @@ export async function resolvePackageRuntimePreflight(params: {
       const fallbackSatisfies = fallbackRuntime.failure
         ? false
         : nodeVersionSatisfiesEngine(fallbackRuntime.version, target.nodeEngine);
-      if (fallbackSatisfies === true) {
-        return runtimeResult(fallbackActivationRuntime, fallbackNodeRunner, nodeRunner);
+      if (fallbackSatisfies === true && fallbackActivationRuntime) {
+        // A successful probe does not authorize a replaced executable.
+        const current = captureRuntime(fallbackNodeRunner);
+        if (
+          current?.path === fallbackActivationRuntime.path &&
+          current.identity === fallbackActivationRuntime.identity
+        ) {
+          nodeSecurityWarning = formatNodeSecurityWarning(fallbackRuntime.version);
+          return runtimeResult(fallbackActivationRuntime, fallbackNodeRunner, nodeRunner);
+        }
+        return resultError("Selected Node changed during target compatibility probing.");
       }
     }
     if (satisfies !== false) {
       return params.engineOnly ? ok(unchanged()) : runtimeResult(activationRuntime);
     }
-    if (!params.engineOnly && params.runtimeRecovery && target.nodeEngine) {
+    // Admission may discover an existing runtime, but never supplies install authority.
+    const recovery = params.engineOnly
+      ? canRefreshAtAdmission
+        ? { env: params.service?.serviceEnv ?? process.env }
+        : undefined
+      : params.runtimeRecovery;
+    if (recovery && target.nodeEngine) {
       const { resolveTargetNodeRuntime } =
         await import("./update-command-node-runtime-resolution.js");
       const recovered = await resolveTargetNodeRuntime({
         engine: target.nodeEngine,
-        recovery: params.runtimeRecovery,
+        recovery,
         timeoutMs: params.timeoutMs,
       });
       if (recovered) {
@@ -218,7 +277,21 @@ export async function resolvePackageRuntimePreflight(params: {
         if (!recoveredRuntime) {
           return runtimeResult(recoveredRuntime);
         }
-        return runtimeResult(recoveredRuntime, recovered, nodeRunner ?? resolveNodeRunner());
+        const probe = await resolvePackageRuntimeForPreflight({
+          nodeRunner: recoveredRuntime.path,
+          timeoutMs: params.timeoutMs,
+        });
+        const current = captureRuntime(recovered);
+        if (
+          !probe.failure &&
+          nodeVersionSatisfiesEngine(probe.version, target.nodeEngine) === true &&
+          current?.path === recoveredRuntime.path &&
+          current.identity === recoveredRuntime.identity
+        ) {
+          // Reuse the admission probe; the security recommendation never blocks recovery.
+          nodeSecurityWarning = formatNodeSecurityWarning(probe.version);
+          return runtimeResult(recoveredRuntime, recovered, nodeRunner ?? resolveNodeRunner());
+        }
       }
     }
     const runtimePath = runtime.nodeRunner ?? process.execPath;

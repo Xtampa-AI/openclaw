@@ -3,7 +3,10 @@
 // participant the same way, so both depend on deferredLaneOccupancy="release" to admit
 // later same-lane members. Cover them together — a lane regression breaks both at once.
 import path from "node:path";
-import { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  DEFAULT_INGRESS_RETRY_DEAD_LETTER_MIN_AGE_MS,
+  DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
+} from "openclaw/plugin-sdk/channel-outbound";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { MediaFetchError } from "openclaw/plugin-sdk/media-runtime";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
@@ -305,20 +308,20 @@ describe("Telegram durable ingress coalescing", () => {
     }
   });
 
-  it("keeps a later album alive and ordered behind a slowly adopting album", async () => {
+  it("keeps a later album alive and ordered behind a slowly adopting album", async ({ signal }) => {
     const { monitor } = await createMonitor({ adoptionStallTimeoutMs: 1_000 });
-    const { headDispatched, releaseHead, headFinished } = holdFirstDownstreamTurn();
+    const { headDispatched, releaseHead } = holdFirstDownstreamTurn();
     useIngressTimers();
     monitor.start();
     try {
-      await admitAlbum(monitor, "A", 1_001);
+      await withinTest(admitAlbum(monitor, "A", 1_001), signal);
       // Freeze the claim clock while dispatch finishes its real worker I/O.
-      await headDispatched.promise;
-      await admitAlbum(monitor, "B", 1_003);
-      await vi.advanceTimersByTimeAsync(3_000);
+      await withinTest(headDispatched.promise, signal);
+      await withinTest(admitAlbum(monitor, "B", 1_003), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(3_000), signal);
       expect(downstreamTurns, "Album B must wait for album A's adoption").toHaveBeenCalledOnce();
       releaseHead.resolve();
-      await monitor.waitForDeferredClaims();
+      await withinTest(monitor.waitForDeferredClaims(), signal);
       expect(downstreamTurns).toHaveBeenCalledTimes(2);
       expect(downstreamTurns.mock.calls.map(([turn]) => turn.RawBody)).toEqual([
         "Album A",
@@ -328,36 +331,51 @@ describe("Telegram durable ingress coalescing", () => {
       expect(runtimeErrors).toEqual([]);
     } finally {
       releaseHead.resolve();
-      await headFinished.promise;
       await monitor.stop();
     }
   });
 
-  it("keeps a later same-sender forward batch alive behind a deferred batch", async () => {
+  it("keeps a later same-sender forward batch alive behind a deferred batch", async ({
+    signal,
+  }) => {
     const { monitor } = await createMonitor({ adoptionStallTimeoutMs: 3_000 });
-    const { releaseHead, turnsDeferred, turnsFinished } = holdDownstreamLane();
+    const { releaseHead, turnsDeferred } = holdDownstreamLane();
     useIngressTimers();
     monitor.start();
     try {
-      await monitor.admit(forwardedTextUpdate({ updateId: 1_401, messageId: 1, text: "Batch A" }));
-      await monitor.waitForIdle();
-      await vi.advanceTimersByTimeAsync(1_000);
+      await withinTest(
+        monitor.admit(forwardedTextUpdate({ updateId: 1_401, messageId: 1, text: "Batch A" })),
+        signal,
+      );
+      await withinTest(monitor.waitForIdle(), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(1_000), signal);
       // Freeze the claim clock while each flushed turn finishes its real worker I/O.
-      await turnsDeferred[0]?.promise;
-      await monitor.admit(forwardedTextUpdate({ updateId: 1_402, messageId: 2, text: "Batch B" }));
-      await monitor.waitForIdle();
-      await vi.advanceTimersByTimeAsync(1_000);
+      await withinTest(turnsDeferred[0].promise, signal);
+      await withinTest(
+        monitor.admit(forwardedTextUpdate({ updateId: 1_402, messageId: 2, text: "Batch B" })),
+        signal,
+      );
+      await withinTest(monitor.waitForIdle(), signal);
+      await withinTest(vi.advanceTimersByTimeAsync(1_000), signal);
       // A deferred head releases the sender key; B queues behind it in the session lane.
-      await turnsDeferred[1]?.promise;
-      await vi.advanceTimersByTimeAsync(9_000);
+      await withinTest(turnsDeferred[1].promise, signal);
+      await withinTest(vi.advanceTimersByTimeAsync(9_000), signal);
       const queue = openTelegramIngressQueue({ stateDir });
-      expect(await queue.listPending({ limit: "all" }), "Batch B stalled behind A").toEqual([]);
-      expect((await queue.listClaims()).map(({ id, attempts }) => ({ id, attempts }))).toEqual([
+      expect(
+        await withinTest(queue.listPending({ limit: "all" }), signal),
+        "Batch B stalled behind A",
+      ).toEqual([]);
+      expect(
+        (await withinTest(queue.listClaims(), signal)).map(({ id, attempts }) => ({
+          id,
+          attempts,
+        })),
+      ).toEqual([
         { id: telegramQueueEventId(1_401), attempts: 0 },
         { id: telegramQueueEventId(1_402), attempts: 0 },
       ]);
       releaseHead.resolve();
-      await monitor.waitForDeferredClaims();
+      await withinTest(monitor.waitForDeferredClaims(), signal);
       expect(downstreamTurns.mock.calls.map(([turn]) => turn.RawBody)).toEqual([
         "Batch A",
         "Batch B",
@@ -366,7 +384,6 @@ describe("Telegram durable ingress coalescing", () => {
       expect(runtimeErrors).toEqual([]);
     } finally {
       releaseHead.resolve();
-      await Promise.all(turnsFinished);
       await monitor.stop();
     }
   });
@@ -1013,7 +1030,7 @@ describe("Telegram durable ingress coalescing", () => {
     }
   });
 
-  it("bounds repeated session-start conflicts and drains the next Telegram update", async () => {
+  it("dead-letters aged session-start conflicts and drains the next Telegram update", async () => {
     const poison = textUpdate({ updateId: 801, messageId: 1, text: "poison" });
     const after = textUpdate({ updateId: 802, messageId: 2, text: "after" });
     const poisonId = telegramQueueEventId(poison.update_id);
@@ -1027,7 +1044,11 @@ describe("Telegram durable ingress coalescing", () => {
       }
       return { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
     });
-    await writeTelegramSpooledUpdate({ stateDir, update: poison });
+    await writeTelegramSpooledUpdate({
+      stateDir,
+      update: poison,
+      now: Date.now() - DEFAULT_INGRESS_RETRY_DEAD_LETTER_MIN_AGE_MS,
+    });
     await writeTelegramSpooledUpdate({ stateDir, update: after });
     const queue = openTelegramIngressQueue({ stateDir });
     for (let attempt = 1; attempt < DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS; attempt += 1) {
@@ -1040,20 +1061,34 @@ describe("Telegram durable ingress coalescing", () => {
         releasedAt: Date.now() - 60 * 60 * 1_000,
       });
     }
+    const [before] = await queue.listPending({ limit: "all" });
+    expect(before).toMatchObject({
+      id: poisonId,
+      attempts: DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS - 1,
+      lastError: sessionError.message,
+    });
     const runtimeError = vi.fn();
     const { monitor, telegramTransport } = await createMonitor({ onRuntimeError: runtimeError });
 
     monitor.start();
     await monitor.waitForIdle();
     expect(await queue.listFailed?.({ limit: "all" })).toEqual([
-      expect.objectContaining({ id: poisonId, reason: "session-start-conflict-retry-limit" }),
+      expect.objectContaining({
+        id: poisonId,
+        reason: "retry-limit-exceeded",
+        // The terminal dispatch is the eighth attempt, but fail() preserves the
+        // seven recorded releases rather than recording another retry.
+        attempts: DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS - 1,
+        lastAttemptAt: before?.lastAttemptAt,
+        message: sessionError.message,
+      }),
     ]);
     expect(await queue.listPending({ limit: "all" })).toEqual([]);
+    // Exactly one final poison dispatch completes the retry budget before its
+    // follower is admitted; a skipped or additional retry must not pass.
     expect(
-      downstreamTurns.mock.calls.some(([turn]) =>
-        (turn.BodyForAgent ?? turn.Body ?? "").includes("after"),
-      ),
-    ).toBe(true);
+      downstreamTurns.mock.calls.map(([turn]) => turn.BodyForAgent ?? turn.Body ?? ""),
+    ).toEqual([expect.stringContaining("poison"), expect.stringContaining("after")]);
 
     await monitor.stop();
     await telegramTransport.close();

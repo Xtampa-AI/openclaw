@@ -45,6 +45,11 @@ vi.mock("../../config/config.js", async () => {
   return {
     ...actual,
     getRuntimeConfig: mocks.loadConfig,
+    loadConfig: mocks.loadConfig,
+    captureRuntimeConfigAsyncReader:
+      (...args: Parameters<typeof mocks.loadConfig>) =>
+      async () =>
+        mocks.loadConfig(...args),
     readConfigFileSnapshot: mocks.readConfigFileSnapshot,
     readConfigFileSnapshotForWrite: mocks.readConfigFileSnapshotForWrite,
     replaceConfigFile: mocks.replaceConfigFile,
@@ -409,6 +414,44 @@ describe("channelsCapabilitiesCommand", () => {
     expect(logs[0]?.split("\n")).toContain("Check: failed (check timed out after 1ms)");
   });
 
+  it("renders remote probe failures and diagnostics as terminal-safe text", async () => {
+    const evil = "\u001b]52;c;QQ==\u0007evil\u001b[2J\r\nforged";
+    const plugin = buildPlugin({
+      id: "telegram",
+      account: { accountId: "default", botToken: "bot-token" },
+    });
+    plugin.status = {
+      probeAccount: async () => ({ ok: false, error: evil }),
+      formatCapabilitiesProbe: () => [],
+      buildCapabilitiesDiagnostics: async () => ({
+        lines: [{ text: "Diag: " + evil, tone: "error" }, { text: evil }],
+      }),
+    };
+    mocks.resolveInstallableChannelPlugin.mockResolvedValue({
+      cfg: { channels: {} },
+      channelId: "telegram",
+      plugin,
+      configChanged: false,
+    });
+
+    await channelsCapabilitiesCommand({ channel: "telegram" }, runtime);
+
+    const output = logs.join("\n");
+    const withoutWhitespaceControl = output.replaceAll("\n", "");
+    expect(withoutWhitespaceControl).not.toMatch(/\p{Cc}/u);
+    expect(output).not.toContain("52;c;QQ==");
+    expect(output).toContain("Check: failed (evil\\r\\nforged)");
+    expect(output).toContain("Diag: evil\\r\\nforged");
+    expect(output.split("\n")).toContain("evil\\r\\nforged");
+
+    logs.length = 0;
+    await channelsCapabilitiesCommand({ channel: "telegram", json: true }, runtime);
+    expect(JSON.parse(logs[0] ?? "{}").channels[0]).toMatchObject({
+      probe: { error: evil },
+      diagnostics: { lines: [{ text: `Diag: ${evil}`, tone: "error" }, { text: evil }] },
+    });
+  });
+
   it("serializes diagnostics when capability diagnostics exceed their timeout", async () => {
     const buildCapabilitiesDiagnostics = vi.fn(
       () =>
@@ -446,47 +489,6 @@ describe("channelsCapabilitiesCommand", () => {
       ],
       details: { timedOut: true },
     });
-  });
-
-  it("prints Teams Graph permission hints when present", async () => {
-    const plugin = buildPlugin({
-      id: "msteams",
-      probe: {
-        ok: true,
-        appId: "app-id",
-        graph: {
-          ok: true,
-          roles: ["ChannelMessage.Read.All", "Files.Read.All"],
-        },
-      },
-    });
-    plugin.status = {
-      ...plugin.status,
-      formatCapabilitiesProbe: () => [
-        { text: "App: app-id" },
-        {
-          text: "Graph roles: ChannelMessage.Read.All (channel history), Files.Read.All (files (OneDrive))",
-        },
-      ],
-    };
-    mocks.resolveInstallableChannelPlugin.mockResolvedValue({
-      cfg: { channels: {} },
-      channelId: "msteams",
-      plugin,
-      configChanged: false,
-    });
-
-    await channelsCapabilitiesCommand({ channel: "msteams" }, runtime);
-
-    expect(logs).toStrictEqual([
-      [
-        "msteams:default",
-        "Support: chatTypes=direct",
-        "Actions: send, broadcast, poll",
-        "App: app-id",
-        "Graph roles: ChannelMessage.Read.All (channel history), Files.Read.All (files (OneDrive))",
-      ].join("\n"),
-    ]);
   });
 
   it("installs an explicit optional channel in the selected owner before rendering capabilities", async () => {

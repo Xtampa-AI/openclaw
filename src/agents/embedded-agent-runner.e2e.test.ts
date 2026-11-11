@@ -47,8 +47,8 @@ const resolveModelAsyncMock = vi.fn(
 );
 const ensureOpenClawModelsJsonMock = vi.fn(async () => ({ wrote: false }));
 const loggerWarnMock = vi.fn();
+const closeRuntimeAuthMock = vi.fn();
 let refreshRuntimeAuthOnFirstPromptError = false;
-let clearRuntimeConfigSnapshot: typeof import("../config/config.js").clearRuntimeConfigSnapshot;
 let setRuntimeConfigSnapshot: typeof import("../config/config.js").setRuntimeConfigSnapshot;
 let getReplyPayloadMetadata: typeof import("../auto-reply/reply-payload.js").getReplyPayloadMetadata;
 
@@ -173,6 +173,7 @@ const installRunEmbeddedMocks = () => {
           return refreshRuntimeAuthOnFirstPromptError && runtimeAuthRetry !== true;
         }),
         stopRuntimeAuthRefreshTimer: vi.fn(),
+        close: closeRuntimeAuthMock,
       }),
     };
   });
@@ -212,7 +213,7 @@ beforeAll(async () => {
   vi.resetModules();
   installRunEmbeddedMocks();
   ({ getReplyPayloadMetadata } = await import("../auto-reply/reply-payload.js"));
-  ({ clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } = await import("../config/config.js"));
+  ({ setRuntimeConfigSnapshot } = await import("../config/config.js"));
   runEmbeddedAgent = wrapRunWithTestPreparedAdmission(
     (await import("./embedded-agent-runner/run.js")).runEmbeddedAgent,
   );
@@ -232,7 +233,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   preparedPluginRegistry.agentHarnesses.length = 0;
-  clearRuntimeConfigSnapshot();
+  setRuntimeConfigSnapshot({});
   vi.useRealTimers();
   runEmbeddedAttemptMock.mockReset();
   disposeSessionMcpRuntimeMock.mockReset();
@@ -245,6 +246,7 @@ beforeEach(() => {
   ensureOpenClawModelsJsonMock.mockReset();
   ensureOpenClawModelsJsonMock.mockResolvedValue({ wrote: false });
   loggerWarnMock.mockReset();
+  closeRuntimeAuthMock.mockReset();
   refreshRuntimeAuthOnFirstPromptError = false;
   runEmbeddedAttemptMock.mockImplementation(async () => {
     throw new Error("unexpected extra runEmbeddedAttempt call");
@@ -444,6 +446,7 @@ describe("runEmbeddedAgent", () => {
       enqueue: immediateEnqueue,
     });
 
+    expect(closeRuntimeAuthMock).toHaveBeenCalledOnce();
     expect(resolveModelAsyncMock).toHaveBeenNthCalledWith(
       1,
       "openrouter",
@@ -1054,6 +1057,7 @@ describe("runEmbeddedAgent", () => {
         enqueue: immediateEnqueue,
       }),
     ).rejects.toThrow("boom");
+    expect(closeRuntimeAuthMock).toHaveBeenCalledOnce();
   });
 
   it("resolves explicit OpenAI OpenClaw runs through Codex when auth order starts with Codex OAuth", async () => {

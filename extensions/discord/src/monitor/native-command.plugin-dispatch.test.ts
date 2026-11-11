@@ -21,6 +21,7 @@ import {
   setRuntimeConfigSnapshot,
 } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import * as sessionStore from "openclaw/plugin-sdk/session-store-runtime";
+import type * as SessionTranscriptRuntime from "openclaw/plugin-sdk/session-transcript-runtime";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { installDiscordIngressTestRuntime } from "../test-support/ingress-runtime.js";
 import { defineThrowingDiscordChannelGetter } from "../test-support/partial-channel.js";
@@ -44,9 +45,15 @@ const runtimeModuleMocks = vi.hoisted(() => ({
   dispatchReplyWithDispatcher: vi.fn(),
   resolveDirectStatusReplyForSession: vi.fn(),
   getSessionEntry: vi.fn(),
+  recordDeliveredCommandExchange: vi.fn(async () => ({ ok: true })),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-transcript-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionTranscriptRuntime>()),
+  recordDeliveredCommandExchange: runtimeModuleMocks.recordDeliveredCommandExchange,
 }));
 let observedNativeTurnDispatcher: unknown;
-const getSessionEntry = sessionStore.getSessionEntry;
+const getSessionEntry = sessionStore.getSessionEntryAsync;
 
 const dispatchChannelInboundTurnForTest: typeof channelInbound.dispatchChannelInboundTurn = async (
   plan,
@@ -336,6 +343,7 @@ describe("Discord native plugin command dispatch", () => {
     });
     runtimeModuleMocks.getSessionEntry.mockReset();
     runtimeModuleMocks.getSessionEntry.mockReturnValue(undefined);
+    runtimeModuleMocks.recordDeliveredCommandExchange.mockClear();
     vi.spyOn(channelInbound, "dispatchChannelInboundTurn").mockImplementation(
       dispatchChannelInboundTurnForTest,
     );
@@ -351,10 +359,13 @@ describe("Discord native plugin command dispatch", () => {
           accountId: params.accountId,
         }),
     );
-    vi.spyOn(sessionStore, "getSessionEntry").mockImplementation((params) =>
+    vi.spyOn(sessionStore, "getSessionEntryAsync").mockImplementation(async (params) =>
       params.agentId !== undefined
         ? runtimeModuleMocks.getSessionEntry(params)
         : getSessionEntry(params),
+    );
+    vi.spyOn(sessionStore, "getSessionEntryAsync").mockImplementation(async (params) =>
+      runtimeModuleMocks.getSessionEntry(params),
     );
   });
 
@@ -520,6 +531,15 @@ describe("Discord native plugin command dispatch", () => {
       agentId: "codex",
       sessionKey: pluginSessionKey,
     });
+    expect(runtimeModuleMocks.recordDeliveredCommandExchange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "codex",
+        sessionKey: pluginSessionKey,
+        expectedSessionId: "codex-session",
+        commandText: "/pair now",
+        replyText: "paired:now",
+      }),
+    );
   });
 
   it.each([

@@ -11,6 +11,7 @@ import * as embeddedAgent from "../agents/embedded-agent.js";
 import { withFullRuntimeReplyConfig } from "../auto-reply/reply/get-reply-fast-path.js";
 import { getReplyFromConfig } from "../auto-reply/reply/get-reply.js";
 import { finalizeInboundContext } from "../auto-reply/reply/inbound-context.js";
+import { setRuntimeConfigSnapshot } from "../config/io.js";
 import * as sessionAccessor from "../config/sessions/session-accessor.js";
 import { resetCronActiveJobs } from "../cron/active-jobs.js";
 import { canRequesterAbortChatRun } from "../gateway/server-methods/chat-abort-authorization.js";
@@ -75,6 +76,7 @@ async function createHeartbeatScenario(target: "none" | "telegram" = "none") {
     session: { store: storePath },
   });
   await state.writeConfig(cfg);
+  setRuntimeConfigSnapshot(cfg);
   const sessionKey = await seedMainSessionStore(storePath, cfg, {
     lastChannel: "telegram",
     lastProvider: "telegram",
@@ -167,7 +169,10 @@ it.for(["stopped", "failed"] as const)(
       enqueueSystemEventEntry(completionText, withExecRequestOwners({ sessionKey }, [owner])),
       "command completion occurrence",
     );
-    const peers = ["First unrelated notification", "Second unrelated notification"].map((text) =>
+    const peers = [
+      "Reminder: investigate heartbeat wake failures",
+      "Reminder: review heartbeat poll results",
+    ].map((text) =>
       expectDefined(enqueueSystemEventEntry(text, { sessionKey }), "generic occurrence"),
     );
     const entered = createDeferred();
@@ -226,7 +231,7 @@ it.for(["stopped", "failed"] as const)(
       const cancellation = captureExecRequestCancellation(identity);
       expect(cancellation.requestRunIds).toEqual([identity.runId, input.runId]);
       for (const peer of peers) {
-        expect(input.currentInboundContext?.text).toContain(peer.text);
+        expect(input.currentInboundContext?.text ?? "").toContain(peer.text);
       }
       const late = expectDefined(
         enqueueSystemEventEntry("Late unrelated notification", { sessionKey }),
@@ -280,7 +285,7 @@ it.for(["stopped", "failed"] as const)(
       expect(next.prompt).toContain(nextBody);
       expect(next.prompt).not.toContain(completionText);
       for (const peer of [...peers, late]) {
-        expect(next.currentInboundContext?.text).toContain(peer.text);
+        expect(next.currentInboundContext?.text ?? "").toContain(peer.text);
       }
       expect(peekSystemEventEntries(sessionKey)).toEqual([]);
     } finally {

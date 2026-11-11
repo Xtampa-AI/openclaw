@@ -2,7 +2,11 @@
 import path from "node:path";
 import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness";
 import { AUTH_PROFILE_RUNTIME_CONTRACT } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { seedRunSessionOwnerForTest } from "./run-attempt-session-owners.test-support.js";
 import {
   createAppServerHarness,
@@ -19,7 +23,7 @@ import {
   readCodexAppServerBinding,
   writeCodexAppServerBinding as writeRawCodexAppServerBinding,
 } from "./session-binding.test-helpers.js";
-import type { CodexAppServerClientOptions } from "./shared-client.js";
+import type { CodexAppServerClientOptions } from "./shared-client-options.js";
 import { createCodexTestOAuthProfile } from "./test-support.js";
 
 /** Keeps native Codex bindings reusable while omitting OpenClaw tools and search. */
@@ -56,7 +60,9 @@ function runCodexAppServerAttempt(
   params: EmbeddedRunAttemptParams,
   options: Parameters<typeof runSharedCodexAppServerAttempt>[1] = {},
 ) {
-  return runSharedCodexAppServerAttempt(withPersistentCodexTestToolPolicy(params), options);
+  const prepared = withPersistentCodexTestToolPolicy(params);
+  setRuntimeConfigSnapshot(prepared.config ?? {});
+  return runSharedCodexAppServerAttempt(prepared, options);
 }
 
 function createParams(sessionFile: string, workspaceDir: string): EmbeddedRunAttemptParams {
@@ -153,6 +159,9 @@ function createCodexAuthProfileHarness(params: {
       if (method === "turn/start") {
         return turnStartResult("turn-auth-contract");
       }
+      if (method === "thread/inject_items") {
+        return {};
+      }
       throw new Error(`unexpected method: ${method}`);
     },
     {
@@ -179,6 +188,7 @@ function createCodexAuthProfileHarness(params: {
 }
 
 setupRunAttemptTestHooks();
+afterEach(() => clearRuntimeConfigSnapshot());
 
 describe("Auth profile runtime contract - Codex app-server adapter", () => {
   let tmpDir: string;

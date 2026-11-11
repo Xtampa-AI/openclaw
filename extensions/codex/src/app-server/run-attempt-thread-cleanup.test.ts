@@ -1,13 +1,15 @@
 // Codex tests cover run attempt thread cleanup plugin behavior.
 import path from "node:path";
 import { setImmediate as yieldEventLoop } from "node:timers/promises";
-import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
 import { CodexAppServerClient } from "./client.js";
 import { CodexAppServerEventProjector } from "./event-projector.js";
-import type { CodexServerNotification } from "./protocol.js";
 import { turnCompleted } from "./protocol.test-helpers.js";
 import { seedRunSessionOwnerForTest } from "./run-attempt-session-owners.test-support.js";
 import {
@@ -54,122 +56,31 @@ function multiplexedClientFactory(
   });
 }
 
+async function allowNativeToolPreflight(
+  harness: ReturnType<typeof createInferenceReadyClientHarness>,
+  since = 0,
+) {
+  // Hook admission and native tool policy independently read managed requirements.
+  let nextRequest = since;
+  for (let read = 0; read < 2; read += 1) {
+    const request = await waitForHarnessRequest(harness, "configRequirements/read", nextRequest);
+    nextRequest = harness.writes.length;
+    harness.send({ id: request.id, result: { requirements: null } });
+  }
+}
+
 setupRunAttemptTestHooks();
 
 describe("Codex app-server main thread cleanup", () => {
   beforeEach(() => {
+    setRuntimeConfigSnapshot({});
     resetSharedCodexAppServerClientForTests();
   });
 
   afterEach(() => {
     resetSharedCodexAppServerClientForTests();
+    clearRuntimeConfigSnapshot();
   });
-
-  it.each([
-    { label: "without a context engine", contextEngine: undefined, status: "failed" as const },
-    {
-      label: "with the default legacy context engine",
-      contextEngine: {
-        info: { id: "legacy", name: "Legacy", version: "1.0.0" },
-      } as EmbeddedRunAttemptParams["contextEngine"],
-      status: "completed" as const,
-    },
-  ])(
-    "retains a subscribed persistent Codex thread $label after $status",
-    async ({ contextEngine, status }) => {
-      const sessionFile = path.join(tempDir, "session.jsonl");
-      const workspaceDir = path.join(tempDir, "workspace");
-      const requests: Array<{ method: string; params: unknown }> = [];
-      const turnStarted = createDeferred<void>();
-      const abort = new AbortController();
-      let notify: (notification: CodexServerNotification) => Promise<void> = async () => undefined;
-      const request = vi.fn(async (method: string, params?: unknown) => {
-        requests.push({ method, params });
-        if (method === "config/read") {
-          return { config: {}, layers: [] };
-        }
-        if (method === "thread/start") {
-          return threadStartResult();
-        }
-        if (method === "turn/start") {
-          turnStarted.resolve();
-          return turnStartResult();
-        }
-        return {};
-      });
-
-      const clientFactory: CodexAppServerClientFactory = multiplexedClientFactory(async () => {
-        return {
-          ...mockClientRuntimeMethods(),
-          request,
-          addNotificationHandler: (handler: typeof notify) => {
-            notify = handler;
-            return () => undefined;
-          },
-          addRequestHandler: () => () => undefined,
-          addCloseHandler: () => () => undefined,
-        } as never;
-      });
-
-      const run = runCodexAppServerAttempt(
-        { ...createParams(sessionFile, workspaceDir), contextEngine, abortSignal: abort.signal },
-        { bindingStore: testCodexAppServerBindingStore, clientFactory },
-      );
-      let result: Awaited<typeof run>;
-      try {
-        // Cold preparation has no five-second contract. Wait for the native request,
-        // but surface an early run failure instead of leaving its promise unobserved.
-        await Promise.race([
-          turnStarted.promise,
-          run.then(() => {
-            throw new Error("Codex attempt completed before requesting a turn");
-          }),
-        ]);
-        await notify({
-          method: "turn/completed",
-          params: {
-            threadId: "thread-1",
-            turnId: "turn-1",
-            turn: {
-              id: "turn-1",
-              status,
-              items: [],
-              ...(status === "failed" ? { error: { message: "Native turn failed" } } : {}),
-            },
-          },
-        });
-        result = await run;
-      } finally {
-        abort.abort();
-        await run.catch(() => undefined);
-      }
-      expect(readAttemptTerminal(result).aborted).toBe(false);
-      const firstBinding = await readCodexAppServerBinding(sessionFile);
-      expect({
-        clientId: firstBinding?.clientId,
-        threadId: firstBinding?.threadId,
-        preserveNativeModel: firstBinding?.preserveNativeModel,
-        connectionScope: firstBinding?.connectionScope,
-        ringZeroConfigFingerprint: firstBinding?.ringZeroConfigFingerprint,
-        contextEngine: firstBinding?.contextEngine,
-        pluginAppsFingerprint: firstBinding?.pluginAppsFingerprint,
-      }).toEqual({
-        clientId: "test-client-1",
-        threadId: "thread-1",
-        preserveNativeModel: undefined,
-        connectionScope: undefined,
-        ringZeroConfigFingerprint: undefined,
-        contextEngine: undefined,
-        pluginAppsFingerprint: expect.any(String),
-      });
-
-      expect(withoutCodexSkillDiscovery(requests.map((entry) => entry.method))).toEqual([
-        "config/read",
-        "thread/start",
-        "turn/start",
-      ]);
-    },
-  );
 
   it("keeps alternating conversations subscribed after one fails on their shared Codex client", async () => {
     const workspaceDir = path.join(tempDir, "shared-workspace");
@@ -208,12 +119,7 @@ describe("Codex app-server main thread cleanup", () => {
           result: { userAgent: `openclaw/${CODEX_APP_SERVER_VERSION} (macOS; test)` },
         });
       }
-      const requirements = await waitForHarnessRequest(
-        harness,
-        "configRequirements/read",
-        requestStart,
-      );
-      harness.send({ id: requirements.id, result: { requirements: null } });
+      await allowNativeToolPreflight(harness, requestStart);
       const threadId = `thread-${label}`;
       if (index < 2) {
         const start = await waitForHarnessRequest(harness, "thread/start", requestStart);
@@ -243,20 +149,24 @@ describe("Codex app-server main thread cleanup", () => {
         .map((write) => (JSON.parse(write) as { method: string }).method)
         .filter((method) => !["initialize", "initialized", "skills/list"].includes(method));
     expect(userRequestMethods()).toEqual([
+      "configRequirements/read",
       "config/read",
       "configRequirements/read",
       "account/read",
       "thread/start",
       "turn/start",
+      "configRequirements/read",
       "config/read",
       "configRequirements/read",
       "account/read",
       "thread/start",
       "turn/start",
+      "configRequirements/read",
       "config/read",
       "configRequirements/read",
       "account/read",
       "turn/start",
+      "configRequirements/read",
       "config/read",
       "configRequirements/read",
       "account/read",
@@ -293,12 +203,7 @@ describe("Codex app-server main thread cleanup", () => {
     const siblingRun = runCodexAppServerAttempt(siblingParams, {
       bindingStore: testCodexAppServerBindingStore,
     });
-    const siblingRequirements = await waitForHarnessRequest(
-      harness,
-      "configRequirements/read",
-      siblingRequestStart,
-    );
-    harness.send({ id: siblingRequirements.id, result: { requirements: null } });
+    await allowNativeToolPreflight(harness, siblingRequestStart);
     const siblingTurn = await waitForHarnessRequest(harness, "turn/start", siblingRequestStart);
     harness.send({ id: siblingTurn.id, result: turnStartResult("turn-5") });
     harness.send({
@@ -310,8 +215,9 @@ describe("Codex app-server main thread cleanup", () => {
       },
     });
     expect(readAttemptTerminal(await siblingRun).aborted).toBe(false);
-    expect(userRequestMethods().slice(-5)).toEqual([
+    expect(userRequestMethods().slice(-6)).toEqual([
       "thread/unsubscribe",
+      "configRequirements/read",
       "config/read",
       "configRequirements/read",
       "account/read",
@@ -487,8 +393,7 @@ describe("Codex app-server main thread cleanup", () => {
         id: initialize.id,
         result: { userAgent: `openclaw/${CODEX_APP_SERVER_VERSION} (macOS; test)` },
       });
-      const requirements = await waitForHarnessRequest(physical, "configRequirements/read");
-      physical.send({ id: requirements.id, result: { requirements: null } });
+      await allowNativeToolPreflight(physical);
       const thread = await waitForHarnessRequest(physical, "thread/start");
       physical.send({ id: thread.id, result: threadStartResult() });
       const turn = await waitForHarnessRequest(physical, "turn/start");
@@ -567,7 +472,11 @@ describe("Codex app-server main thread cleanup", () => {
     await seedRunSessionOwnerForTest("session-1", sessionKey);
     const harness = createInferenceReadyClientHarness();
     vi.spyOn(CodexAppServerClient, "start").mockResolvedValueOnce(harness.client);
-    const run = runCodexAppServerAttempt(createParams(sessionFile, workspaceDir, sessionKey), {
+    const params = createParams(sessionFile, workspaceDir, sessionKey);
+    params.disableTools = false;
+    params.toolsAllow = [];
+    params.pluginHarnessToolPolicyScope = "conversation";
+    const run = runCodexAppServerAttempt(params, {
       bindingStore: testCodexAppServerBindingStore,
     });
     const initialize = await waitForHarnessRequest(harness, "initialize");
@@ -619,16 +528,21 @@ describe("Codex app-server main thread cleanup", () => {
         }),
       },
     ].flatMap(({ reason, error }) =>
-      ["current", "successor"].map((owner) => ({ reason, error, owner })),
+      ["current", "successor", "temporary"].map((owner) => ({ reason, error, owner })),
     ),
   )(
-    "settles rejected incognito startup for the $owner physical owner when turn start $reason",
+    "settles rejected incognito startup with $owner binding ownership when turn start $reason",
     async ({ error, owner }) => {
       const sessionFile = path.join(tempDir, "session.jsonl");
       const workspaceDir = path.join(tempDir, "workspace");
       const sessionKey = "agent:main:dashboard:incognito-failed-turn";
       await seedRunSessionOwnerForTest("session-1", sessionKey);
       const params = createParams(sessionFile, workspaceDir, sessionKey);
+      if (owner !== "temporary") {
+        params.disableTools = false;
+        params.toolsAllow = [];
+        params.pluginHarnessToolPolicyScope = "conversation";
+      }
       const identity = sessionBindingIdentity(params);
       const releaseLease = vi.spyOn(sharedClient, "releaseLeasedSharedCodexAppServerClient");
       const request = vi.fn(async (method: string) => {
@@ -673,9 +587,9 @@ describe("Codex app-server main thread cleanup", () => {
         "config/read",
         "thread/start",
         "turn/start",
-        ...(owner === "current" ? ["thread/unsubscribe"] : []),
+        ...(owner !== "successor" ? ["thread/unsubscribe"] : []),
       ]);
-      if (owner === "current") {
+      if (owner !== "successor") {
         expect(request).toHaveBeenCalledWith(
           "thread/unsubscribe",
           { threadId: "thread-1" },

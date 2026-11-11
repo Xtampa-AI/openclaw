@@ -1,12 +1,11 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { sleepWithAbort } from "@openclaw/retry";
 import type {
   SessionsAssignOwnerResult,
   SessionsPatchResult,
 } from "../../../packages/gateway-protocol/src/index.js";
 import { resolveAgentMainSessionKey } from "../../config/sessions/main-session.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
-import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
+import { readSessionEntryReadOnlyInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { GatewayTransportError } from "../../gateway/call.js";
 import { withAgentSessionModelPatchOrigin } from "../../gateway/session-model-patch-origin.js";
@@ -61,14 +60,11 @@ import {
 } from "./sessions-tool-patch.js";
 import {
   SessionControlToolSchema,
-  SessionOwnerToolSchema,
-  SessionRenameOwnerToolSchema,
   SessionRenameToolSchema,
   resolveSessionsToolSchema,
 } from "./sessions-tool-schema.js";
 
 const GROUP_NAME_MAX_LENGTH = 512;
-const SELF_ARCHIVE_MAX_RETRY_DELAY_MS = 5_000;
 const log = createSubsystemLogger("agents/sessions");
 
 type SessionsToolOptions = {
@@ -207,22 +203,14 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
   return {
     label: "Sessions",
     name: "sessions",
+    // Only session-stable facts pick the definition, so every turn of a session
+    // offers the same tool; per-turn authority is enforced when it runs.
     description: sandboxRenameOnly
-      ? "Rename a session created by the requesting operator with patch and label (empty string clears it). Default target: current session. Another session requires sessionKey and expectedSessionId from sessions_list. No other session actions or settings."
-      : assignmentOnly
-        ? "Assign responsibility for a visible session to a human or agent with assign_owner, ownerType, and ownerId. Default target: current session. Does not change creator attribution or access."
-        : renameOnly
-          ? "Rename a session created by the requesting operator: use patch with label (empty string clears it). Default target: current session; another session requires sessionKey and expectedSessionId from sessions_list. assign_owner assigns responsibility for a visible session to a human or agent. No other settings or session controls."
-          : controlOnly
-            ? `Rename sessions created by the requesting operator with patch and label. Archive or restore sessions created by the requesting operator requires operator.write. Use patch with archived=true/false; self-archive waits until this run finishes. ${stopAllowed ? "Stop targets another session created by or assigned to the operator; runId optionally selects one active run. " : ""}assign_owner assigns responsibility for a visible session to a human or agent. No deletion, other settings, batch, or global group changes.`
-            : `cloud_profiles lists configured cloud profiles; pass profileId for their OS and machine choices. Session settings, ownership, ${stopAllowed ? "stop, " : ""}reset, delete, and custom sidebar groups: patch label/icon/group/status, pin, archive/restore, model/thinking override. patch with group files sessions into a group; targets applies the same patch to up to 100 visible sessions; group_list shows the catalog; group_set replaces the whole ordered catalog; group_rename/group_delete change one group everywhere. assign_owner hands responsibility to a human or agent; reset/delete visible sessions.`,
+      ? "Rename a session created by the requesting operator with patch and label (empty string clears it). Default target: current session. Another session requires sessionKey and expectedSessionId from sessions_list. Archive and restore are unavailable in this authority context. No other session actions or settings."
+      : `cloud_profiles lists configured cloud profiles; pass profileId for their OS and machine choices. Session settings, ownership, ${stopAllowed ? "stop, " : ""}reset, delete, and custom sidebar groups: patch label/icon/group/status, pin, archive/restore, model/thinking override. patch with group files sessions into a group; targets applies the same patch to up to 100 visible sessions; group_list shows the catalog; group_set replaces the whole ordered catalog; group_rename/group_delete change one group everywhere. assign_owner hands responsibility to a human or agent; reset/delete visible sessions. Turns without owner authority are limited when the action runs.`,
     parameters: sandboxRenameOnly
       ? SessionRenameToolSchema
-      : assignmentOnly
-        ? SessionOwnerToolSchema
-        : renameOnly
-          ? SessionRenameOwnerToolSchema
-          : resolveSessionsToolSchema(controlOnly, stopAllowed, renameAllowed),
+      : resolveSessionsToolSchema(stopAllowed),
     execute: wrapGatewayPersonalToolExecution(async (_toolCallId, rawArgs, signal) => {
       let params = rawArgs as Record<string, unknown>;
       const action = readToolStringParam(params, "action", { required: true });
@@ -526,7 +514,11 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
       if (patch.archived === true && isRequesterSession && key !== "global") {
         if (key !== resolveAgentMainSessionKey({ cfg, agentId })) {
           const storePath = resolveSessionStorePathCore(cfg.session?.store, { agentId });
-          const currentEntry = loadSessionEntry({ agentId, sessionKey: key, storePath });
+          const currentEntry = await readSessionEntryReadOnlyInWorker({
+            agentId,
+            sessionKey: key,
+            storePath,
+          });
           const released = getSessionWorkAdmissionRelease({
             scope: storePath,
             identities: [key, currentEntry?.sessionId],
@@ -571,20 +563,12 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
                   archived: true,
                   ...expectedSessionIdentity,
                 };
-                let unobservedRunRetries = 0;
-
                 while (true) {
-                  const latestEntry = loadSessionEntry({ agentId, sessionKey: key, storePath });
-                  if (latestEntry?.sessionId !== expectedSessionIdentity.expectedSessionId) {
-                    return;
-                  }
-
                   const competingRelease = getSessionWorkAdmissionRelease({
                     scope: storePath,
                     identities: archiveIdentities,
                   });
                   if (competingRelease) {
-                    unobservedRunRetries = 0;
                     await competingRelease;
                     continue;
                   }
@@ -595,10 +579,8 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
                       : callGateway("sessions.patch", archivePatch));
                     return;
                   } catch (error) {
-                    // A new turn can enter after the idle check. Wait for that
-                    // admitted owner, or retry a transient gateway disconnect,
-                    // instead of losing an archive that was already scheduled.
-                    const message = formatErrorMessage(error);
+                    // A tracked competing turn can delay archival. Untracked
+                    // races and transport failures are best effort: warn below.
                     const retryableGatewayFailure =
                       error instanceof GatewayTransportError ||
                       isTransientNetworkError(error) ||
@@ -609,27 +591,14 @@ export function createSessionsTool(opts: SessionsToolOptions = {}): AnyAgentTool
                     if (!retryableGatewayFailure) {
                       throw error;
                     }
-                    log.warn(`retrying deferred self-archive for ${key}: ${message}`);
                     const retryAfterRelease = getSessionWorkAdmissionRelease({
                       scope: storePath,
                       identities: archiveIdentities,
                     });
-                    if (retryAfterRelease) {
-                      unobservedRunRetries = 0;
-                      await retryAfterRelease;
-                    } else {
-                      // Projected work can outlive local admission tracking.
-                      // Cap the interval, not the archive, so it cannot spin or
-                      // abandon a session whose remote turn is still running.
-                      const retryDelayMs = Math.min(
-                        25 * 2 ** Math.min(unobservedRunRetries, 8),
-                        SELF_ARCHIVE_MAX_RETRY_DELAY_MS,
-                      );
-                      // A pending self-archive must not keep a shutting-down
-                      // gateway alive solely to retry its own transport.
-                      await sleepWithAbort(retryDelayMs, undefined, { ref: false });
-                      unobservedRunRetries = Math.min(unobservedRunRetries + 1, 8);
+                    if (!retryAfterRelease) {
+                      throw error;
                     }
+                    await retryAfterRelease;
                   }
                 }
               }),

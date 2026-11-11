@@ -28,7 +28,6 @@ import { normalizeIMessageMessageId } from "./message-guid.js";
 import { describeIMessageMessageTool } from "./message-tool-api.js";
 import {
   findLatestIMessageEntryForChat,
-  isIMessageCurrentMessageInChat,
   isIMessageCurrentMessageInChatAsync,
   rememberIMessageReplyCache,
   type IMessageChatContext,
@@ -36,6 +35,7 @@ import {
 import { imessageRpcSupportsMethod } from "./private-api-status.js";
 import { getCachedIMessagePrivateApiStatus, probeIMessagePrivateApi } from "./probe.js";
 import { resolveIMessageRemoteHost } from "./remote-host.js";
+import { clearIMessageSendFailure, withIMessageSendFailureStatus } from "./send-status.js";
 import { parseIMessageTarget, type IMessageService, type IMessageTarget } from "./targets.js";
 
 const loadIMessageActionsRuntime = createLazyRuntimeNamedExport(
@@ -134,10 +134,6 @@ function createIMessageTargetAliases(resourceAliases: string[] = []) {
     deliveryTargetAliases: [...IMESSAGE_DELIVERY_TARGET_ALIASES],
     resolveDeliveryTarget: ({ args }: { args: Record<string, unknown> }) =>
       resolveIMessageDeliveryTarget(args),
-    matchesCurrentConversation: (params: Parameters<typeof currentConversationMatchParams>[0]) => {
-      const match = currentConversationMatchParams(params);
-      return match ? isIMessageCurrentMessageInChat(match) : false;
-    },
     matchesCurrentConversationAsync: async (
       params: Parameters<typeof currentConversationMatchParams>[0],
     ) => {
@@ -330,7 +326,7 @@ function effectIdFromParam(raw?: string): string | undefined {
   throw new Error(
     `iMessage sendWithEffect rejected unknown effect "${raw}". ` +
       "Use one of: slam, loud, gentle, invisibleink, confetti, lasers, fireworks, balloon, heart, " +
-      "echo, happybirthday, shootingstar, sparkles, spotlight (or the canonical com.apple.MobileSMS.expressivesend.* / com.apple.messages.effect.* identifier).",
+      "echo, happybirthday, shootingstar, sparkles, spotlight (or the full com.apple.MobileSMS.expressivesend.* / com.apple.messages.effect.* identifier).",
   );
 }
 
@@ -486,6 +482,9 @@ export const imessageMessageActions: ChannelMessageActionAdapter = {
           timestamp: Date.now(),
           isFromMe: true,
         });
+      }
+      if (result.messageId !== "unknown") {
+        clearIMessageSendFailure(account.accountId);
       }
       return jsonResult({ ok: true, messageId: result.messageId, ...details });
     };
@@ -671,13 +670,15 @@ export const imessageMessageActions: ChannelMessageActionAdapter = {
       const filename = readStringParam(params, "filename", { required: true });
       const asVoice = readBooleanParam(params, "asVoice");
       const resolvedChatGuid = await chatGuid();
-      const result = await runtime.sendAttachment({
-        chatGuid: resolvedChatGuid,
-        buffer: decodeBase64Buffer(params, action),
-        filename,
-        asVoice: asVoice ?? undefined,
-        options: opts,
-      });
+      const result = await withIMessageSendFailureStatus(account.accountId, () =>
+        runtime.sendAttachment({
+          chatGuid: resolvedChatGuid,
+          buffer: decodeBase64Buffer(params, action),
+          filename,
+          asVoice: asVoice ?? undefined,
+          options: opts,
+        }),
+      );
       return await completeOutboundBridgeMessage(result, resolvedChatGuid);
     }
 

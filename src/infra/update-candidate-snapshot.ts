@@ -14,6 +14,7 @@ import { hasNodeErrorCode } from "./path-guards.js";
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
 import { createPrivateSqliteTempDirectory } from "./sqlite-private-directory.js";
+import { resolveSqliteInspectionBudget } from "./sqlite-readonly-worker.js";
 import { measureUpdateStateFiles, withUpdateCandidateIoBudget } from "./update-candidate-io.js";
 import {
   readUpdateCandidatePluginCodeLinks,
@@ -116,6 +117,21 @@ async function measureInitialUpdateSnapshotState(params: InitialSnapshotParams) 
     capacity: measureSnapshotCapacity(params.stateDir, { ...size, pluginBytes: null }, params.env),
     families: size.families,
   };
+}
+
+/**
+ * Candidate admission inspects these stores from a staged package, so its allowance follows
+ * measured state like the rehearsal's checks. The update step deadline stays the outer bound.
+ */
+export async function resolveUpdateCandidateAdmissionTimeoutMs(
+  params: InitialSnapshotParams & { stepTimeoutMs: number },
+): Promise<number> {
+  const bytes = await measureInitialUpdateSnapshotState(params).then(
+    ({ capacity }) => capacity.sqliteBytes,
+    () => 0,
+  );
+  const { timeoutMs } = resolveSqliteInspectionBudget("update admission", params.stateDir, bytes);
+  return Math.min(params.stepTimeoutMs, timeoutMs);
 }
 
 export async function assessInitialUpdateSnapshotCapacity(
@@ -272,6 +288,8 @@ export async function prepareUpdateCandidateStateSnapshot(params: {
     const workerEnv = params.workerEnv(directory);
     const outputController = new AbortController();
     let progressPending = Promise.resolve();
+    let progressWriting = false;
+    let nextProgress: UpdateRunStep | undefined;
     let progressFailure: { error: unknown } | undefined;
     const failProgress = (error: unknown) => {
       if (!progressFailure) {
@@ -331,19 +349,28 @@ export async function prepareUpdateCandidateStateSnapshot(params: {
           { env: params.env, stateDir: params.stateDir },
           { maxLength: UPDATE_RUN_TEXT_LIMIT },
         );
-        try {
-          // Invoke at emission so the writer captures this source before it yields.
-          const recording = Promise.resolve(
-            params.onProgress?.({
-              step: "candidate-state-snapshot",
-              status: "in_progress",
-              startedAtMs,
-              detail,
-            }),
-          ).catch(failProgress);
-          progressPending = Promise.all([progressPending, recording]).then(() => {});
-        } catch (error) {
-          failProgress(error);
+        nextProgress = {
+          step: "candidate-state-snapshot",
+          status: "in_progress",
+          startedAtMs,
+          detail,
+        };
+        if (!progressWriting && !progressFailure) {
+          progressWriting = true;
+          progressPending = (async () => {
+            try {
+              // Keep one write in flight and only the latest advisory observation behind it.
+              while (nextProgress) {
+                const step = nextProgress;
+                nextProgress = undefined;
+                await params.onProgress?.(step);
+              }
+            } catch (error) {
+              failProgress(error);
+            } finally {
+              progressWriting = false;
+            }
+          })();
         }
         if (
           snapshot.status === "completed" &&

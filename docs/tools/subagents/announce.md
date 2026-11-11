@@ -22,6 +22,16 @@ By default, delivery depends on requester depth:
 - Nested requester subagent sessions receive an internal follow-up injection (`deliver=false`) so the orchestrator can synthesize child results in-session.
 - If a nested requester subagent session is gone, OpenClaw falls back to that session's requester when available.
 
+Model fallback and other model-routing updates do not invalidate prepared
+completion or child follow-up authority. Changes to session identity, lifecycle,
+spawn lineage, tool policy, sandbox, or execution host still reject stale work.
+
+New-turn capability preparation refreshes stale inherited session metadata once
+per affected lookup before evaluating current policy again. This lets ordinary
+metadata updates coexist with child follow-ups and completion turns. It does not
+renew an active turn's retained authority: session replacement, policy revocation,
+and closed owners still fail their existing checks.
+
 The requester turn's captured origin owns completion routing, including after
 `sessions_yield` and for child pause notices. A WebChat origin does not inherit a
 previous external destination from the session. Without a captured origin, the
@@ -49,6 +59,16 @@ Completion inputs retain their own turn identity across compaction and runtime
 context messages. If transcript persistence rejects a completion because its
 keyed input belongs to a closed turn, delivery records a permanent failure with
 the error. It does not retry other models or keep scheduling the same completion.
+
+Blocked completion warnings identify the child run and retain the concrete delivery
+error across retries. A confirmed handoff remains delivered even if its receipt
+callback fails; cleanup must not replay an already consumed result. Failures before
+a delivery result is reported follow the same retryability policy as direct sends.
+
+Transcript writer-claim changes remain retryable when no send is confirmed. If
+local retries are exhausted, the completion stays eligible for bounded requester
+recovery. Permanent delivery rejections still stop recovery, including when they
+are wrapped by a writer-claim error.
 
 If a chunk in a direct-message text fallback fails or is aborted after earlier
 chunks were sent, OpenClaw records an incomplete delivery. It stops automatic
@@ -180,14 +200,17 @@ keeps the same input:
 Internal metadata is meant for orchestration only; user-facing replies
 should be rewritten in normal assistant voice.
 
+Usage is read once after the child settles. If usage has not been recorded yet,
+the stats line says `tokens unknown`; completion delivery does not wait for it.
+
 ### Why prefer `sessions_history`
 
 `sessions_history` is the safer orchestration path for reading a child's
 transcript from within an agent turn:
 
-- Redacts credential/token-like text even when general-purpose log redaction is disabled.
+- Preserves text, including credentials, without secret masking.
 - Truncates long text blocks (4000 chars per block) and drops thinking signatures, reasoning replay payloads, and inline image data.
 - Caps returned messages at 80 KB; older rows can be dropped or an oversized row replaced with `[sessions_history omitted: message too large]`.
 - Use `nextOffset` when present to page backward through older transcript windows.
-- Returns structured history rather than `/subagents log`'s plain chat lines. Reasoning tags, `<relevant-memories>` / `<relevant_memories>` scaffolding, and tool-call XML can remain in message text: `sessions_history` does not apply the log command's assistant prose sanitizer. See [Session tools](/concepts/session-tool#listing-and-reading-sessions) for the recall guarantees.
+- Returns structured history rather than `/subagents log`'s plain chat lines. Reasoning tags, `<relevant-memories>` / `<relevant_memories>` wrappers, and tool-call XML can remain in message text: `sessions_history` does not apply the log command's assistant prose sanitizer. See [Session tools](/concepts/session-tool#listing-and-reading-sessions) for the recall guarantees.
 - Raw on-disk transcript inspection is the fallback when you need the full byte-for-byte transcript.

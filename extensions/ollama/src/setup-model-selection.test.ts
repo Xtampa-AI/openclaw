@@ -3,6 +3,7 @@ import type { WizardPrompter } from "openclaw/plugin-sdk/setup";
 import { requestBodyText, requestUrl } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  buildOllamaModelsConfig,
   discoverOllamaModelsForSetup,
   selectAppGuidedOllamaModelFromDiscovery,
 } from "./setup-model-selection.js";
@@ -21,6 +22,29 @@ function pendingAbortableResponse(signal: AbortSignal | null | undefined): Promi
 }
 
 describe("Ollama onboarding model selection", () => {
+  it.each([
+    ["local", undefined, 16384],
+    ["minimax-m3", "https://ollama.com", 131072],
+    ["remote-alias", "https://ollama.com", 262144],
+  ] as const)(
+    "preserves the discovered %s output budget in setup",
+    (name, remote_host, expected) => {
+      const models = new Map([
+        [name, { name, contextWindow: 262144, ...(remote_host ? { remote_host } : {}) }],
+      ]);
+      expect(buildOllamaModelsConfig([name], models)[0]).toMatchObject({ maxTokens: expected });
+    },
+  );
+
+  it("uses the hosted route for bare models without remote tag metadata", () => {
+    expect(buildOllamaModelsConfig(["glm-5.2"], undefined, "https://ollama.com")[0]).toMatchObject({
+      maxTokens: 131_072,
+    });
+    expect(
+      buildOllamaModelsConfig(["glm-5.2"], undefined, "http://localhost:11434")[0],
+    ).toMatchObject({ maxTokens: 16_384 });
+  });
+
   it("selects a deterministic tools-capable model with enough context", () => {
     expect(
       selectAppGuidedOllamaModelFromDiscovery([
@@ -246,10 +270,14 @@ describe("Ollama onboarding model selection", () => {
         expect(configured?.filter((name) => name.startsWith("remote-"))).toEqual([]);
       } else {
         expect(inspected).toContain(remoteModels[0]?.name);
-        expect(configured).toEqual(expect.arrayContaining(remoteModels.map((model) => model.name)));
         if (remoteCapability === "embedding") {
           expect(inspected).toContain("local-chat:latest");
           expect(result.defaultModel).toBe("ollama/local-chat:latest");
+          expect(configured?.filter((name) => name.startsWith("remote-"))).toEqual([]);
+        } else {
+          expect(configured).toEqual(
+            expect.arrayContaining(remoteModels.map((model) => model.name)),
+          );
         }
       }
     },
@@ -257,8 +285,8 @@ describe("Ollama onboarding model selection", () => {
 
   describe.each(["interactive", "non-interactive"] as const)("%s defaults", (mode) => {
     it.each([
-      ["embedding-only", ["embedding"], undefined, false, false],
-      ["embedding with advertised tools", ["embedding", "tools"], undefined, false, true],
+      ["embedding-only", ["embedding"], undefined, false, undefined],
+      ["embedding with advertised tools", ["embedding", "tools"], undefined, false, undefined],
       ["completion and embedding", ["completion", "embedding"], undefined, true, true],
       ["unknown remote capabilities", [], undefined, true, true],
       ["authoritative empty inspection", ["completion", "tools"], [], false, false],
@@ -311,12 +339,14 @@ describe("Ollama onboarding model selection", () => {
           });
           expect(config.agents?.defaults?.model).toEqual({ primary: expectedDefault });
         }
-        expect(config.models?.providers?.ollama?.models).toContainEqual(
-          expect.objectContaining({
-            id: remoteName,
-            compat: expect.objectContaining({ supportsTools }),
-          }),
-        );
+        const configured = config.models?.providers?.ollama?.models;
+        expect(configured).toContainEqual(expect.objectContaining({ id: localName }));
+        const remote = configured?.find((model) => model.id === remoteName);
+        if (supportsTools === undefined) {
+          expect(remote).toBeUndefined();
+        } else {
+          expect(remote).toMatchObject({ id: remoteName, compat: { supportsTools } });
+        }
       },
     );
   });

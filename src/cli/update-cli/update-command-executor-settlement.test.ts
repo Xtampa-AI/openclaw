@@ -238,7 +238,7 @@ it.each([
 ] as const)(
   "cancels the admitted $kind child at its activation deadline and joins $cleanupResult cleanup",
   async ({ kind, cleanupResult }) => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     const admitted = createDeferredCore();
     const cancelled = createDeferredCore();
     const cleanup = createDeferredCore<"forced" | "uncertain">();
@@ -315,7 +315,7 @@ afterEach(() => {
 it.each(["direct", "delegated"] as const)(
   "delivers a bounded %s timeout while its callback remains pending",
   async (kind) => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     const admitted = createDeferredCore();
     const finish = createDeferredCore();
     let signal: AbortSignal | undefined;
@@ -513,7 +513,7 @@ it.each(["forced", "uncertain"] as const)(
 );
 
 it("preserves activation timeout provenance without a cause cycle after uncertain cleanup", async () => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
   const deadline = createUpdateOperationDeadline();
   const admitted = createDeferredCore();
   const cancelled = createDeferredCore();

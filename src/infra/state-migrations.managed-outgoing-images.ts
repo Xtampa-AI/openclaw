@@ -2,7 +2,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import { asSafeIntegerInRange } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { readNonBlankString as optionalNonEmptyString } from "@openclaw/normalization-core/string-coerce";
@@ -24,6 +23,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
 } from "./kysely-sync.js";
+import type { EngineConnection } from "./sql-connection.js";
 import { assertAllowedJsonFields } from "./state-migrations.json-fields.js";
 import {
   legacyMigrationSourceSnapshotsMatch as sourceSnapshotsMatch,
@@ -31,6 +31,7 @@ import {
   type LegacyMigrationSourceSnapshot as LegacySourceSnapshot,
 } from "./state-migrations.source-snapshot.js";
 import type { LegacyStateDetection, MigrationMessages } from "./state-migrations.types.js";
+import { Utf8InputError } from "./utf8-input.js";
 
 const LEGACY_RECORD_MAX_BYTES = 1024 * 1024;
 const DEFAULT_TRANSIENT_TTL_MS = 15 * 60 * 1000;
@@ -309,7 +310,7 @@ function isExpiredTransient(record: ManagedImageRecord, nowMs: number) {
   return record.messageId === null && nowMs - createdAtMs >= DEFAULT_TRANSIENT_TTL_MS;
 }
 
-function readManagedImageRow(db: DatabaseSync, attachmentId: string) {
+function readManagedImageRow(db: EngineConnection, attachmentId: string) {
   return executeSqliteQueryTakeFirstSync(
     db,
     getNodeSqliteKysely<ManagedImageRecordDatabase>(db)
@@ -386,7 +387,11 @@ export function migrateLegacyManagedOutgoingImages(params: {
       );
   } catch (error) {
     warnings.push(`Failed reading legacy managed outgoing image state: ${String(error)}`);
-    return { changes, warnings };
+    return {
+      changes,
+      warnings,
+      ...(error instanceof Utf8InputError ? { warningDisposition: "recoverable" as const } : {}),
+    };
   }
 
   const nowMs = params.nowMs ?? Date.now();

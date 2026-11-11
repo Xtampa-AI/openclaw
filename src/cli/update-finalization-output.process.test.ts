@@ -112,9 +112,9 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
         "dev",
         ...(scenario === "human-recovery-plugin-error" ? [] : ["--yes"]),
         "--no-restart",
-        // The fixture overrides the blocked phase to 1s; recovery keeps a separate explicit budget.
+        // The slow fixture phase gets its own budget; Doctor admission keeps the normal budget.
         "--timeout",
-        scenario === "borrowed-phase" ? "1" : "9",
+        "9",
         ...(json && scenario !== "inherited-json" ? ["--json"] : []),
       ];
       const readRun = () =>
@@ -128,6 +128,27 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
               interact: (child: import("node:child_process").ChildProcessWithoutNullStreams) => {
                 tracedChildPid = child.pid;
                 child.stdin.end();
+              },
+            }
+          : {}),
+        ...(scenario === "handle-hang"
+          ? {
+              interact: async (
+                child: import("node:child_process").ChildProcessWithoutNullStreams,
+              ) => {
+                try {
+                  await waitForCliProcessStderrMarker(
+                    child,
+                    "Process still alive after terminal output:",
+                  );
+                  const pid = Number(
+                    await fs.readFile(path.join(root, "blocked-child.pid"), "utf8"),
+                  );
+                  expect(isPidAlive(pid)).toBe(true);
+                  expect(child.exitCode).toBeNull();
+                } finally {
+                  child.stdin.end();
+                }
               },
             }
           : {}),
@@ -364,6 +385,7 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
           command: expect.stringMatching(/^node(?:\.exe)?$/u),
         });
         expect(payload.unsettledDisposers, failure).toContain("fixture-stdin-child");
+        expect(isPidAlive(pid), failure).toBe(false);
         expect(result.stdout + result.stderr, failure).not.toContain("fixture-private-argument");
         expect(readRun()).toMatchObject({
           status: "succeeded",
@@ -408,14 +430,15 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
             { phase: "exit-listeners-return", pid: tracedChildPid, exitCode: 1 },
           ]);
           const nativeExit = `(node:${tracedChildPid}) WARNING: Exited the environment with code 1`;
-          const nativeExitLine = stderrLines.findIndex((line) => line.includes(nativeExit));
-          for (const boundary of exitBoundaries) {
-            expect(nativeExitLine, failure).toBeGreaterThan(boundary.lineIndex);
-          }
+          // Listener ordering still must be complete; normal completion must not
+          // invoke process.exit merely to produce Node's --trace-exit diagnostic.
+          expect(exitBoundaries, failure).toHaveLength(2);
+          expect(result.stderr, failure).not.toContain(nativeExit);
         }
         return;
       }
-      const triageNotice = "Update failed. Preparing triage diagnostics...";
+      const triageNotice = "Preparing triage diagnostics...";
+      const triageCompleted = "Triage diagnostics saved; no repair agent was started.";
       if (!scenario.endsWith("error")) {
         expect(result.stdout + result.stderr, failure).not.toContain(triageNotice);
         expect(result.stdout + result.stderr, failure).not.toContain("triage-fixture-prompt.md");
@@ -435,7 +458,7 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
           expect(triageIndex, failure).toBeGreaterThan(result.stdout.indexOf(terminal));
           expect(promptIndex, failure).toBeGreaterThan(triageIndex);
           expect(guidanceIndex, failure).toBeGreaterThan(promptIndex);
-          expect(result.stdout.trimEnd().endsWith("openclaw triage --run"), failure).toBe(true);
+          expect(result.stdout.trimEnd().endsWith(triageCompleted), failure).toBe(true);
         } else {
           expect(result.stdout.trimEnd().endsWith(terminal), failure).toBe(true);
         }
@@ -446,6 +469,7 @@ describe.each(["repair", "finalize"])("update %s process output", (command) => {
       if (scenario.endsWith("error")) {
         expect(result.stderr, failure).not.toContain("Process still alive after terminal output");
         expect(result.stderr, failure).toContain(triageNotice);
+        expect(result.stderr, failure).toContain(triageCompleted);
         expect(result.stderr, failure).toContain('"promptPath":');
         expect(result.stderr, failure).toContain("triage-fixture-prompt.md");
         expect(result.stderr, failure).not.toContain("Triage could not complete:");

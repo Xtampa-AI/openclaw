@@ -7,7 +7,6 @@ import {
   assertLiveImageProbeReply,
   buildLiveCronProbeMessage,
   createLiveCronProbeSpec,
-  isClaudeLikeLiveAgent,
   resolveOpenClawCliProcessArgs,
   shouldRunLiveImageProbe,
 } from "./live-agent-probes.js";
@@ -24,15 +23,6 @@ describe("live-agent-probes", () => {
       "cron",
       "list",
     ]);
-  });
-
-  it("only special-cases Claude-like retry prompts", () => {
-    expect(isClaudeLikeLiveAgent("claude")).toBe(true);
-    expect(isClaudeLikeLiveAgent("claude-cli")).toBe(true);
-    expect(isClaudeLikeLiveAgent("codex")).toBe(false);
-    expect(isClaudeLikeLiveAgent("google-gemini-cli")).toBe(false);
-    expect(isClaudeLikeLiveAgent("opencode-ai")).toBe(false);
-    expect(isClaudeLikeLiveAgent("future-agent")).toBe(false);
   });
 
   it("accepts only cat for the shared image probe reply", () => {
@@ -57,6 +47,7 @@ describe("live-agent-probes", () => {
     const spec = createLiveCronProbeSpec({
       agentId: "codex",
       sessionKey: "agent:codex:acp:test",
+      model: "openai/gpt-5.6-luna@openai:manual",
     });
     const claudeRetryPrompt = buildLiveCronProbeMessage({
       agent: "claude-cli",
@@ -95,12 +86,14 @@ describe("live-agent-probes", () => {
         agentId?: string;
         sessionKey?: string;
         delivery?: { mode?: string };
+        payload?: { model?: string };
       };
     };
     expect(args.job?.sessionTarget).toBe("session:agent:codex:acp:test");
     expect(args.job?.agentId).toBe("codex");
     expect(args.job?.sessionKey).toBe("agent:codex:acp:test");
     expect(args.job?.delivery).toEqual({ mode: "none" });
+    expect(args.job?.payload?.model).toBe("openai/gpt-5.6-luna@openai:manual");
   });
 
   it("builds a cron probe spec when the process clock is outside the Date range", () => {

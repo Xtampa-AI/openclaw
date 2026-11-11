@@ -27,6 +27,7 @@ import {
 } from "./markdown.js";
 import { resolveMemoryWikiTimestamp } from "./time.js";
 import {
+  readExistingWikiPage,
   readExistingWikiPageUtf8,
   readWikiPageStat,
   writeGuardedVaultPage,
@@ -323,7 +324,12 @@ async function writeOkfConceptPage(params: {
 }): Promise<{ changed: boolean; created: boolean }> {
   const vault = await fsRoot(params.vaultRoot);
   const pageStat = await readWikiPageStat(vault, params.pagePath);
-  const existing = pageStat ? await readExistingWikiPageUtf8(vault, params.pagePath, () => "") : "";
+  const existing = pageStat
+    ? await readExistingWikiPage(
+        () => vault.readText(params.pagePath),
+        (error) => error instanceof FsSafeError && error.code === "not-found",
+      )
+    : "";
   const nextRendered = preserveHumanNotesBlock(params.content, existing, {
     producerMarkdown: true,
   });

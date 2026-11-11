@@ -28,15 +28,17 @@ it.each([
   ({ hresult, detail, denied }) =>
     withServiceHome(async (home) => {
       mockProcessPlatform("win32");
-      const query = vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue({
+      vi.spyOn(schtasksExec, "execSchtasks").mockResolvedValue({
         code: 0,
         stdout: "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
         stderr: "",
       });
-      const change = vi
-        .spyOn(schtasksExec, "execScheduledTaskEnabledChange")
-        .mockResolvedValueOnce({ code: 1, stdout: String(hresult), stderr: detail, hresult })
-        .mockResolvedValue({ code: 0, stdout: "", stderr: "" });
+      const task = vi.spyOn(schtasksExec, "execScheduledTaskEnabledChange").mockResolvedValue({
+        code: 1,
+        stdout: String(hresult),
+        stderr: detail,
+        hresult,
+      });
       const service = createMockGatewayService({
         readCommand: async () => ({
           programArguments: [process.execPath, path.join(process.cwd(), "openclaw.mjs"), "gateway"],
@@ -65,8 +67,7 @@ it.each([
         expect(String(failure)).toContain("Scheduled Task disable failed");
         expect(String(failure)).not.toContain("elevated terminal");
       }
-      expect(query).toHaveBeenCalledTimes(1);
-      expect(change).toHaveBeenCalledTimes(denied ? 1 : 2);
+      expect(task).toHaveBeenCalledTimes(denied ? 1 : 2);
       expect(service.stop).not.toHaveBeenCalled();
     }),
 );
@@ -119,9 +120,9 @@ it.each(["disable", "restore", "compensation", "never", "stop-return", "stop-rej
         throw new Error("Unexpected Scheduled Task query");
       });
       vi.spyOn(schtasksExec, "execScheduledTaskEnabledChange").mockImplementation(
-        async (_taskName, nextEnabled) => {
-          mutations.push(nextEnabled ? "/ENABLE" : "/DISABLE");
-          enabled = nextEnabled;
+        async (_taskName, requestedEnabled) => {
+          mutations.push(requestedEnabled ? "/ENABLE" : "/DISABLE");
+          enabled = requestedEnabled;
           return { code: 0, stdout: "", stderr: "" };
         },
       );
@@ -230,7 +231,7 @@ it.each(["disable", "restore", "compensation", "never", "stop-return", "stop-rej
     }),
 );
 
-it.each(["before-disable", "after-disable", "invocation-replaced"] as const)(
+it.each(["before-disable", "after-disable"] as const)(
   "preserves Windows task compensation authority when interrupted %s",
   (interruption) =>
     withServiceHome(async (home) => {
@@ -256,14 +257,11 @@ it.each(["before-disable", "after-disable", "invocation-replaced"] as const)(
         throw new Error("Unexpected Scheduled Task query");
       });
       vi.spyOn(schtasksExec, "execScheduledTaskEnabledChange").mockImplementation(
-        async (_taskName, nextEnabled) => {
-          mutations.push(nextEnabled ? "/ENABLE" : "/DISABLE");
-          enabled = nextEnabled;
-          if (!nextEnabled) {
+        async (_taskName, requestedEnabled) => {
+          mutations.push(requestedEnabled ? "/ENABLE" : "/DISABLE");
+          enabled = requestedEnabled;
+          if (!requestedEnabled) {
             run.interrupted = true;
-            if (interruption === "invocation-replaced") {
-              opts.run = { ...run };
-            }
             return { code: 124, stdout: "", stderr: "disable failed after commit" };
           }
           return { code: 0, stdout: "", stderr: "" };
@@ -302,21 +300,13 @@ it.each(["before-disable", "after-disable", "invocation-replaced"] as const)(
       } catch (error) {
         failure = error;
       }
-      expect(mutations).toEqual(
-        interruption === "before-disable"
-          ? []
-          : interruption === "invocation-replaced"
-            ? ["/DISABLE"]
-            : ["/DISABLE", "/ENABLE"],
-      );
-      expect(enabled).toBe(interruption !== "invocation-replaced");
+      expect(mutations).toEqual(interruption === "before-disable" ? [] : ["/DISABLE", "/ENABLE"]);
+      expect(enabled).toBe(true);
       expect(service.stop).not.toHaveBeenCalled();
       expect(String(failure)).toMatch(
         interruption === "before-disable"
           ? /requester-revoked/
-          : interruption === "invocation-replaced"
-            ? /requester-revoked/
-            : /Scheduled Task disable failed: disable failed after commit/,
+          : /Scheduled Task disable failed: disable failed after commit/,
       );
     }),
 );

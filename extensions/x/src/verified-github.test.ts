@@ -51,7 +51,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function githubFixture(dailyUsd = 1) {
+function githubFixture(dailyUsd = 1, rejectRefresh = false) {
   const cfg: OpenClawConfig = {
     ...config,
     channels: {
@@ -110,6 +110,12 @@ function githubFixture(dailyUsd = 1) {
     fetch: async (input) => {
       const url = new URL(input);
       if (url.pathname === "/2/oauth2/token") {
+        if (rejectRefresh) {
+          return Response.json(
+            { error: "invalid_grant", error_description: "private provider details" },
+            { status: 400 },
+          );
+        }
         return Response.json({ access_token: "synthetic-access" });
       }
       expect(url.pathname).toBe("/2/users/by");
@@ -136,6 +142,31 @@ function githubFixture(dailyUsd = 1) {
       assertCurrent: () => abort.signal.throwIfAborted(),
     });
   return { ...host, cfg, source, ids, lookups, spend, account, sync };
+}
+
+async function withService(
+  test: ReturnType<typeof githubFixture>,
+  cfg: OpenClawConfig,
+  run: (clock: ReturnType<typeof createGatewaySchedulerClock>) => Promise<void>,
+) {
+  const clock = createGatewaySchedulerClock(Date.now());
+  const gateway = createTestGatewayScheduler(clock.clock);
+  const scheduler = createTestPluginServiceScheduler(gateway);
+  const service = createXGitHubService({ runtime: test.runtime });
+  const context: OpenClawPluginServiceContextV2 = {
+    config: cfg,
+    stateDir: test.runtime.state.resolveStateDir(),
+    logger: test.logger,
+    scheduler,
+  };
+  try {
+    await service.start(context);
+    await run(clock);
+  } finally {
+    await scheduler.stop();
+    await service.stop?.(context);
+    await gateway.stop();
+  }
 }
 
 describe("X GitHub verification sync", () => {
@@ -253,16 +284,6 @@ describe("X GitHub verification sync", () => {
     }
   });
 
-  it("preserves the completed snapshot if the spend gate blocks a newly declared user", async () => {
-    const test = githubFixture(0.01);
-    await test.sync();
-    const previous = await getXGitHubStatus(test.runtime, test.account);
-    test.source.people.push({ login: "second", handle: "bob" });
-    await expect(test.sync()).rejects.toBeInstanceOf(XBudgetExceededError);
-    expect(test.lookups).toEqual([["alice"]]);
-    expect(await getXGitHubStatus(test.runtime, test.account)).toEqual(previous);
-  });
-
   it("resumes a paid batch from persisted lookups after the daily budget resets", async () => {
     const test = githubFixture(1);
     const handles = Array.from({ length: 101 }, (_, index) => `writer${index}`);
@@ -319,6 +340,18 @@ async function withService(
 }
 
 describe("X GitHub verification service", () => {
+  it("names reauthorization when the X refresh token is rejected", async () => {
+    const test = githubFixture(1, true);
+    await withService(test, test.cfg, async (clock) => {
+      await clock.wake();
+      expect(await getXGitHubStatus(test.runtime, test.account)).toMatchObject({
+        stale: true,
+        message: expect.stringContaining("reauthorize the X account"),
+      });
+      expect(test.logger.warn.mock.calls[0]?.[0]).not.toContain("private provider details");
+    });
+  });
+
   it("schedules no work when the feature is absent", async () => {
     const host = fixture({ posts: [] });
     const clock = createGatewaySchedulerClock(Date.now());

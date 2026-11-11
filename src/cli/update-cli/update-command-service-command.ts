@@ -10,13 +10,10 @@ import { resolveUpdateInstallRoot } from "../../infra/update-install-root.js";
 import type { UpdateRecoveryFence } from "../../infra/update-run-recovery.js";
 import { UPDATE_RUNNER_TIMEOUT_MS } from "../../infra/update-run-timeouts.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
+import type { UpdateStepResult } from "../../infra/update-step-result.js";
 import { CommandProcessCleanupError } from "../../process/exec-result.js";
 import { runCommandWithTimeout, type CommandOptions } from "../../process/exec.js";
 import { resolveNodeRunner, type UpdateCommandOptions } from "./shared.js";
-import {
-  assertCurrentCoreRecoveryRisk,
-  type CurrentCoreRecoveryRisk,
-} from "./update-command-current-core-recovery.js";
 import {
   requiresRetainedUpdateCommandOwner,
   withUpdateCommandExecutorChild,
@@ -81,7 +78,6 @@ export async function isUpdatedInstallGatewayExecutorSupported(params: {
   signal?: AbortSignal;
   onDefinitionBackupCapability?: (supported: boolean) => void;
   requireOriginalDefinitionBinding?: boolean;
-  requireCurrentCoreRiskGuard?: boolean;
 }): Promise<boolean> {
   params.signal?.throwIfAborted();
   params.executor.assertCurrent();
@@ -133,8 +129,7 @@ export async function isUpdatedInstallGatewayExecutorSupported(params: {
     (!params.requireOriginalDefinitionBinding ||
       (capability.originalDefinitionBinding === true &&
         capability.originalRuntimePinBinding === true)) &&
-    (!requiresRetainedOwner || capability.retainedOwnerBinding === true) &&
-    (!params.requireCurrentCoreRiskGuard || capability.currentCoreRecoveryRiskGuard === true);
+    (!requiresRetainedOwner || capability.retainedOwnerBinding === true);
   params.onDefinitionBackupCapability?.(supported && capability?.definitionBackup === true);
   return supported;
 }
@@ -143,7 +138,6 @@ export async function isUpdatedInstallGatewayExecutorSupported(params: {
 // Candidate version/preservation guards reject older targets before repair, without retry.
 export async function runUpdatedInstallGatewayCommand(
   params: {
-    currentCoreRisk?: CurrentCoreRecoveryRisk;
     result: Partial<Pick<UpdateRunResult, "root" | "mode">>;
     opts: Pick<UpdateCommandOptions, "run">;
     invocationEnv: NodeJS.ProcessEnv;
@@ -157,6 +151,8 @@ export async function runUpdatedInstallGatewayCommand(
     assertCurrent?: () => void;
     definitionRecovery?: UpdateServiceDefinitionRecovery;
     onWarnings?: (warnings: string[]) => void;
+    /** Receives each completed probe or child phase with its measured wall time. */
+    onTimedStep?: (step: UpdateStepResult) => void;
     onGatewayStartAttempted?: (action?: "install" | "restart") => void;
     originalManagedServiceRuntime?: OriginalManagedServiceRuntime;
   },
@@ -165,23 +161,15 @@ export async function runUpdatedInstallGatewayCommand(
   const run = params.opts.run;
   const executor = run?.executorFence;
   const assertCurrent = () => {
+    run?.deadline?.signal.throwIfAborted();
     params.signal?.throwIfAborted();
     if (params.opts.run !== run || run?.executorFence !== executor) {
       throw new Error("Native command lost its original update executor.");
     }
     executor?.assertCurrent();
     params.assertCurrent?.();
-    if (params.currentCoreRisk) {
-      assertCurrentCoreRecoveryRisk(params.currentCoreRisk);
-    }
   };
   assertCurrent();
-  if (
-    params.currentCoreRisk &&
-    (!executor || action !== "restart" || params.currentCoreRisk.runId !== run?.runId)
-  ) {
-    throw new Error("Current-core risk restriction requires its original restart executor.");
-  }
   const installing = action === "install";
   const entrypoint = await resolveGatewayInstallEntrypoint(params.result.root);
   assertCurrent();
@@ -221,6 +209,7 @@ export async function runUpdatedInstallGatewayCommand(
   }
   if (executor) {
     let definitionBackupSupported = false;
+    const checkStartedAtMs = Date.now();
     if (
       !params.result.root ||
       !(await isUpdatedInstallGatewayExecutorSupported({
@@ -233,7 +222,6 @@ export async function runUpdatedInstallGatewayCommand(
         onDefinitionBackupCapability: (supported) => {
           definitionBackupSupported = supported;
         },
-        requireCurrentCoreRiskGuard: Boolean(params.currentCoreRisk),
         requireOriginalDefinitionBinding:
           installing && Boolean(params.originalManagedServiceRuntime),
       }))
@@ -248,6 +236,13 @@ export async function runUpdatedInstallGatewayCommand(
       );
     }
     assertCurrent();
+    params.onTimedStep?.({
+      name: "managed-service-executor-check",
+      command: "openclaw gateway install --update-executor check --json",
+      cwd: params.result.root,
+      durationMs: Math.max(0, Date.now() - checkStartedAtMs),
+      exitCode: 0,
+    });
     if (installing && params.definitionRecovery && !definitionBackupSupported) {
       params.definitionRecovery.preserved = true;
       const message =
@@ -266,11 +261,6 @@ export async function runUpdatedInstallGatewayCommand(
     bindChild?: (pid: number, argv?: readonly string[]) => void,
   ) => {
     const argv = [nodeRunner, entrypoint, ...args, ...(grant ? ["--update-executor", "run"] : [])];
-    // The parent executor is suspended while its child grant is active. The
-    // child owner retains custody; re-read only the independent risk restriction.
-    if (params.currentCoreRisk) {
-      assertCurrentCoreRecoveryRisk(params.currentCoreRisk);
-    }
     params.onGatewayStartAttempted?.(action);
     return await runSettledGatewayCommand(argv, {
       ...(grant
@@ -278,7 +268,6 @@ export async function runUpdatedInstallGatewayCommand(
             input: JSON.stringify({
               executor: grant,
               action,
-              ...(params.currentCoreRisk ? { currentCoreRisk: params.currentCoreRisk } : {}),
               ...(installing && params.originalManagedServiceRuntime
                 ? {
                     originalDefinition: params.originalManagedServiceRuntime.definition.fingerprint,
@@ -288,30 +277,31 @@ export async function runUpdatedInstallGatewayCommand(
                 : {}),
               targetRoot: resolveUpdateInstallRoot(params.result.root!),
             }),
-            beforeInput: (pid, childArgv) => {
-              if (params.currentCoreRisk) {
-                assertCurrentCoreRecoveryRisk(params.currentCoreRisk);
-              }
-              bindChild?.(pid, childArgv);
-            },
+            beforeInput: bindChild,
           }
         : {}),
       cwd: params.result.root,
       env: commandEnv,
-      timeoutMs: installing ? installTimeoutMs : params.timeoutMs,
+      timeoutMs: run?.deadline?.remainingMs() ?? (installing ? installTimeoutMs : params.timeoutMs),
       ...(params.signal ? { signal: params.signal } : {}),
     });
   };
+  const childStartedAtMs = Date.now();
   const res = executor
     ? await withUpdateCommandExecutorChild(executor, params.result.root!, runChild)
     : await runChild();
-  // Preserve the receiver's failure before a later risk can mask its cause.
-  // Successful native effects still require the complete post-effect fence.
-  if (!params.currentCoreRisk) {
-    assertCurrent();
-  }
+  assertCurrent();
   const exited = res.termination === "exit" && res.signal === null && !res.killed;
   const complete = !res.stdoutTruncatedBytes && !res.outputLimitExceeded && !res.outputErrorStream;
+  if (exited && res.code === 0) {
+    params.onTimedStep?.({
+      name: `managed-service-${action}`,
+      command: ["openclaw", ...args].join(" "),
+      cwd: params.result.root ?? "",
+      durationMs: Math.max(0, Date.now() - childStartedAtMs),
+      exitCode: 0,
+    });
+  }
   const response = complete ? safeParseJsonRecord(res.stdout) : undefined;
   if (installing && response) {
     const warnings = Array.isArray(response.warnings)
@@ -368,9 +358,6 @@ export async function runUpdatedInstallGatewayCommand(
     }
   }
   if (exited && res.code === 0) {
-    if (params.currentCoreRisk) {
-      assertCurrent();
-    }
     return response?.action === action &&
       response.ok === true &&
       action === "restart" &&
@@ -379,7 +366,7 @@ export async function runUpdatedInstallGatewayCommand(
       : "unverified";
   }
   const operation = installing ? "refresh" : action;
-  const message = `updated install ${operation} failed (${entrypoint}): ${formatCommandFailure(res.stdout, res.stderr)}`;
+  const message = `updated install ${operation} failed: ${formatCommandFailure(res.stdout, res.stderr)} (${entrypoint})`;
   if (
     exited &&
     res.code === 1 &&
@@ -426,6 +413,7 @@ export async function restartRetainedUpdateGatewayService(params: {
         },
         preserveDefinition: true,
         preserveAutoStart: true,
+        deadline: params.run.deadline,
       });
     }),
   );

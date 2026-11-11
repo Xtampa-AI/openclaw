@@ -1,5 +1,6 @@
 import { normalizeUpstreamModelPricing } from "@openclaw/model-catalog-core/model-catalog-pricing";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { resolveDefaultModelMaxTokens } from "../agents/defaults.js";
 import type { ModelDefinitionConfig, ModelProviderConfig } from "./provider-model-shared.js";
 
 export type UpstreamProviderCatalogModel = Record<string, unknown> & {
@@ -27,6 +28,10 @@ export function readLiveModelCatalogId(row: unknown): string | undefined {
     return undefined;
   }
   return readLiveModelCatalogStringField(record, "id");
+}
+
+export function readOpenAICompatibleLiveModelId(row: unknown): string | undefined {
+  return readLiveModelCatalogStringField(row, ["id", "model", "model_name", "modelName"]);
 }
 
 export function readLiveModelCatalogStringField(
@@ -241,7 +246,7 @@ function buildOpenAICompatibleLiveModel(
   acceptUnknownModel?: (params: { id: string; record: Record<string, unknown> }) => boolean,
 ): ModelDefinitionConfig | undefined {
   const record = asOptionalRecord(row);
-  const id = readLiveModelCatalogStringField(record, ["id", "model", "model_name", "modelName"]);
+  const id = readOpenAICompatibleLiveModelId(record);
   if (!record || !id || !isSafeLiveModelId(id)) {
     return undefined;
   }
@@ -307,7 +312,7 @@ function buildOpenAICompatibleLiveModel(
     ) ??
     fallback.maxTokens ??
     template?.maxTokens ??
-    Math.min(contextWindow, 8192);
+    resolveDefaultModelMaxTokens(contextWindow);
   const explicitReasoning = readLiveModelCatalogBooleanField(record, [
     "reasoning",
     "supports_reasoning",

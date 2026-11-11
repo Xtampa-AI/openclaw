@@ -1,5 +1,9 @@
 // Private completion batches: session binding and yielded-final delivery policy.
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../../config/runtime-snapshot.js";
 import {
   registryRuntimeMock,
   setSessionStore,
@@ -14,11 +18,20 @@ import {
   completeBatchSpy,
   deliveredCallArg,
 } from "./subagent-announce.requester-settle-wake.test-support.js";
+import { getRuntimeConfig } from "./subagent-announce.runtime.js";
 
 const { maybeWakeRequesterAfterAllChildrenSettled } =
   await import("./subagent-announce.requester-settle-wake.js");
 
 describe("maybeWakeRequesterAfterAllChildrenSettled private batches", () => {
+  beforeEach(() => {
+    setRuntimeConfigSnapshot(getRuntimeConfig());
+  });
+
+  afterEach(() => {
+    clearRuntimeConfigSnapshot();
+  });
+
   const settledPrivateChildren = ({
     mixed,
     yielded,
@@ -33,6 +46,8 @@ describe("maybeWakeRequesterAfterAllChildrenSettled private batches", () => {
     (single ? ["run-b"] : ["run-a", "run-b"]).map((runId, index) =>
       makeSettledChild({
         runId,
+        // These findings have not been individually delivered to the requester.
+        delivery: { status: "pending" },
         ...(!mixed || index === 0
           ? { completionTarget: "parent" as const, completionRequesterSessionId: "sess-main" }
           : {}),
@@ -56,8 +71,8 @@ describe("maybeWakeRequesterAfterAllChildrenSettled private batches", () => {
     );
 
   it.each([
-    { name: "delivered private pair", mixed: false, single: false, yielded: false },
-    { name: "delivered mixed pair", mixed: true, single: false, yielded: false },
+    { name: "pending private pair", mixed: false, single: false, yielded: false },
+    { name: "pending mixed pair", mixed: true, single: false, yielded: false },
     { name: "yielded private child", mixed: false, single: true, yielded: true },
     { name: "yielded mixed pair", mixed: true, single: false, yielded: true },
   ])("preserves the admitted reply policy: $name", async ({ mixed, single, yielded }) => {

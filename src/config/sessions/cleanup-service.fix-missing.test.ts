@@ -13,14 +13,16 @@ import * as cleanupReads from "./cleanup-service-read.js";
 import { setCleanupDeleteFault } from "./cleanup-service.delete-fault.test-support.js";
 import { runSessionsCleanup } from "./cleanup-service.js";
 import {
-  appendTranscriptEventSync,
   appendTranscriptMessageSync,
   inspectTranscriptEventsSync,
   loadSessionEntry,
   replaceSessionEntry,
-  replaceTranscriptEventsSync,
 } from "./session-accessor.js";
 import { prunePublishedSessionArchivesByRetention } from "./session-accessor.sqlite-archive-store.js";
+import {
+  appendTranscriptEventSync,
+  replaceTranscriptEventsSync,
+} from "./session-accessor.sqlite-transcript-write.test-support.js";
 import * as entryReaders from "./session-entry-read-runtime.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
@@ -90,42 +92,49 @@ describe("sessions cleanup --fix-missing", () => {
     });
   });
 
-  it("preserves readable session state when a later transcript row is malformed", async () => {
-    const sessionKey = "agent:main:malformed-after-message";
-    const sessionId = "malformed-after-message";
-    const scope = { sessionKey, sessionId, storePath };
-    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
-    appendTranscriptMessageSync(scope, {
-      eventId: "readable-user-message",
-      message: { role: "user", content: [{ type: "text", text: "keep this conversation" }] },
-    });
-    appendTranscriptEventSync(scope, { type: "proof", id: "row-to-corrupt" });
+  it.each([true, false])(
+    "preserves session state when a transcript row is malformed (message=%s)",
+    async (readableMessage) => {
+      const sessionKey = "agent:main:malformed-after-message";
+      const sessionId = "malformed-after-message";
+      const scope = { sessionKey, sessionId, storePath };
+      await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
+      if (readableMessage) {
+        appendTranscriptMessageSync(scope, {
+          eventId: "readable-user-message",
+          message: { role: "user", content: [{ type: "text", text: "keep this conversation" }] },
+        });
+      }
+      appendTranscriptEventSync(scope, { type: "proof", id: "row-to-corrupt" });
 
-    const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path;
-    if (!sqlitePath) {
-      throw new Error("expected SQLite session store");
-    }
-    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
-    database.db
-      .prepare(
-        `UPDATE transcript_events
+      const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, {
+        agentId: "main",
+      }).path;
+      if (!sqlitePath) {
+        throw new Error("expected SQLite session store");
+      }
+      const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
+      database.db
+        .prepare(
+          `UPDATE transcript_events
          SET event_json = '{malformed'
          WHERE session_id = ? AND seq = (
            SELECT MAX(seq) FROM transcript_events WHERE session_id = ?
          )`,
-      )
-      .run(sessionId, sessionId);
+        )
+        .run(sessionId, sessionId);
 
-    const result = await runSessionsCleanup({
-      cfg: {},
-      opts: { enforce: true, fixMissing: true },
-      targets: [{ agentId: "main", storePath }],
-    });
+      const result = await runSessionsCleanup({
+        cfg: {},
+        opts: { enforce: true, fixMissing: true },
+        targets: [{ agentId: "main", storePath }],
+      });
 
-    expect(result.appliedSummaries[0]?.missing).toBe(0);
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({ sessionId });
-    expect(listDeletedArchives(path.dirname(storePath))).toEqual([]);
-  });
+      expect(result.appliedSummaries[0]?.missing).toBe(0);
+      expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({ sessionId });
+      expect(listDeletedArchives(path.dirname(storePath))).toEqual([]);
+    },
+  );
 
   it("recreates every derived file from pending canonical archives after commit", async () => {
     const sessionIds = Array.from({ length: 6 }, (_, index) => `pending-export-${index}`);
@@ -293,7 +302,7 @@ describe("sessions cleanup --fix-missing", () => {
               ...owner,
               read: async (fixMissing) => {
                 const result = await owner.read(fixMissing);
-                if (fixMissing && ++classified === 2) {
+                if (fixMissing && ++classified === 1) {
                   appendTranscriptMessageSync(scope, {
                     eventId: "foreign-message-after-inspection",
                     message: {
@@ -315,7 +324,7 @@ describe("sessions cleanup --fix-missing", () => {
       targets: [{ agentId: "main", storePath }],
     });
 
-    expect(classified).toBe(2);
+    expect(classified).toBe(1);
     expect(result.appliedSummaries[0]?.missing).toBe(0);
     expect(inspectTranscriptEventsSync(scope).events).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: "foreign-message-after-inspection" })]),
@@ -362,7 +371,7 @@ describe("sessions cleanup --fix-missing", () => {
   });
 
   it.each([false, true])(
-    "refuses physical replacement between cleanup preview and apply (initially absent=%s)",
+    "refuses physical replacement after cleanup classification (initially absent=%s)",
     async (initiallyAbsent) => {
       const scope = {
         sessionKey: "agent:main:replaced-cleanup",
@@ -404,17 +413,26 @@ describe("sessions cleanup --fix-missing", () => {
       let replaced = false;
       let replacementBytes: Buffer | undefined;
       vi.spyOn(cleanupReads, "withSessionCleanupStore").mockImplementation(
-        async (target, consume, options) => {
-          const result = await readStore(target, consume, options);
-          if (!replaced) {
-            expect(result).toMatchObject({ result: { summary: { beforeCount: 1, missing: 1 } } });
-            fs.renameSync(sqlitePath, savedPath);
-            fs.copyFileSync(savedPath, sqlitePath);
-            replacementBytes = fs.readFileSync(sqlitePath);
-            replaced = true;
-          }
-          return result;
-        },
+        (target, consume, options) =>
+          readStore(
+            target,
+            (owner) =>
+              consume({
+                ...owner,
+                read: async (fixMissing) => {
+                  const snapshot = await owner.read(fixMissing);
+                  if (!replaced) {
+                    expect(snapshot.missing).toHaveLength(1);
+                    fs.renameSync(sqlitePath, savedPath);
+                    fs.copyFileSync(savedPath, sqlitePath);
+                    replacementBytes = fs.readFileSync(sqlitePath);
+                    replaced = true;
+                  }
+                  return snapshot;
+                },
+              }),
+            options,
+          ),
       );
       try {
         await expect(

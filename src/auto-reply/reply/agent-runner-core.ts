@@ -340,6 +340,7 @@ export async function handleReplyAgentRunError(
     resolveVisibleReplyDelivery: () => Promise<boolean>;
     isHeartbeat: boolean;
     replyExpectation: ReplyExpectation;
+    userTurnAccepted?: boolean;
     isRestartRecoveryArmed: () => Promise<boolean>;
     replyOperation: ReplyOperation;
     resolvedVerboseLevel: VerboseLevel;
@@ -367,10 +368,8 @@ export async function handleReplyAgentRunError(
   ) {
     return returnWithQueuedFollowupDrain({ text: SILENT_REPLY_TOKEN });
   }
-  if (
-    replyOperation.result?.kind === "aborted" &&
-    replyOperation.result.code === "aborted_for_restart"
-  ) {
+  if (resolveReplyOperationAbortReason(replyOperation, error) === "restart") {
+    replyOperation.abortForRestart();
     if (
       (await isRestartRecoveryArmed()) ||
       isReplyOperationSuperseded(replyOperation) ||
@@ -413,7 +412,11 @@ export async function handleReplyAgentRunError(
     return returnWithQueuedFollowupDrain(knownFailurePayload);
   }
   const visibleReplyDelivered = await resolveVisibleReplyDelivery();
-  if (!isHeartbeat && visibleReplyDelivered && !replyOperation.abortSignal.aborted) {
+  if (
+    !isHeartbeat &&
+    (visibleReplyDelivered || context.userTurnAccepted) &&
+    !replyOperation.abortSignal.aborted
+  ) {
     replyOperation.fail("run_failed", error);
     return returnWithQueuedFollowupDrain(
       buildTerminalAgentRunFailureReplyPayload({ replyExpectation, visibleReplyDelivered }),
@@ -489,7 +492,7 @@ export type RunReplyAgentParams = ReplyAgentTurnContext & {
   shouldFollowup: boolean;
   hasQueuedFollowups?: boolean;
   isActive: boolean;
-  isRunActive?: () => boolean;
+  isRunActive?: () => boolean | Promise<boolean>;
   typing: TypingController;
   sessionEntry?: SessionEntry;
   sessionStore?: Record<string, SessionEntry>;

@@ -9,13 +9,12 @@ import { runIsolatedCompletion } from "../../agents/isolated-completion.js";
 import { splitTrailingAuthProfile } from "../../agents/model-ref-profile.js";
 import { resolveCompatibleAgentRuntimeForProvider } from "../../agents/session-runtime-compat.js";
 import { resolveSimpleCompletionSelectionForAgent } from "../../agents/simple-completion-runtime.js";
+import { resolveAutomaticUtilityRuntimeOverride } from "../../agents/utility-model.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createDedupeCache } from "../../infra/dedupe.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 
 const DEFAULT_MAX_LABEL_LENGTH = 128;
-// Reasoning models spend output tokens before emitting the short visible label.
-const CONVERSATION_LABEL_MAX_TOKENS = 4_096;
 const TIMEOUT_MS = 15_000;
 const log = createSubsystemLogger("conversation-label");
 const failureWarnings = createDedupeCache({ ttlMs: 60_000, maxSize: 128 });
@@ -134,11 +133,21 @@ async function runLabelAttempts(
       assertOperatorModelAllowed(params.operatorAuthority, model);
       // The session's runtime override was resolved for its primary provider; a
       // utility model on another provider cannot run through that harness.
-      const agentHarnessRuntimeOverride = resolveCompatibleAgentRuntimeForProvider({
+      const selectedRuntime = resolveCompatibleAgentRuntimeForProvider({
         provider: selection.provider,
         runtime: params.agentHarnessRuntimeOverride,
         cfg: params.cfg,
       });
+      const automaticRuntime = selectedRuntime
+        ? undefined
+        : resolveAutomaticUtilityRuntimeOverride({
+            cfg: params.cfg,
+            agentId: params.agentId,
+            utilityProvider: selection.provider,
+            utilityModelId: selection.modelId,
+          });
+      const agentHarnessRuntimeOverride =
+        selectedRuntime ?? (automaticRuntime === "claude-cli" ? automaticRuntime : undefined);
       const completion = await runIsolatedCompletion({
         purpose: "conversation-label",
         config: params.cfg,
@@ -163,7 +172,7 @@ async function runLabelAttempts(
         ...(params.operatorAuthority ? { operatorAuthority: params.operatorAuthority } : {}),
         outputTextPolicy: "strict-visible",
         thinkLevel: "off",
-        streamParams: { maxTokens: CONVERSATION_LABEL_MAX_TOKENS },
+        answerTokenBudget: 4_096,
       });
       assertCurrent();
       const partitioner = createReasoningTagTextPartitioner();
@@ -172,10 +181,12 @@ async function runLabelAttempts(
         .flatMap((delta) => (delta.kind === "text" ? [delta.text] : []))
         .join("")
         .trim();
-      const label = truncateUtf16Safe(visibleText, maxLength) || null;
-      const normalized = label && params.normalizeLabel ? params.normalizeLabel(label) : label;
-      if (normalized) {
-        return normalized;
+      // Normalize the whole answer: a model may put its title after a leading explanation.
+      const normalized =
+        visibleText && params.normalizeLabel ? params.normalizeLabel(visibleText) : visibleText;
+      const label = truncateUtf16Safe(normalized ?? "", maxLength) || null;
+      if (label) {
+        return label;
       }
     } catch {
       assertCurrent();

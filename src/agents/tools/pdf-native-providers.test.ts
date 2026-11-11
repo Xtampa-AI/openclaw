@@ -194,6 +194,38 @@ describe("native PDF provider API calls", () => {
     expect(headers.has("x-app")).toBe(false);
   });
 
+  it.each(["test-key", "sk-ant-oat01-fixture-token"])(
+    "preserves explicit empty auth and final header overrides for %s",
+    async (apiKey) => {
+      const fetchMock = mockFetchResponse(
+        jsonResponse({ content: [{ type: "text", text: "Analysis" }] }),
+      );
+      await pdfNativeProviders.anthropicAnalyzePdf(
+        makeAnthropicAnalyzeParams({
+          apiKey,
+          requestConfig: {
+            headers: { "X-Custom": "configured" },
+            request: {
+              headers: {
+                "x-api-key": "",
+                Authorization: "",
+                "anthropic-version": "custom-version",
+                "anthropic-beta": "custom-beta",
+                "X-Custom": "override",
+              },
+            },
+          },
+        }),
+      );
+      const headers = (firstFetchCall(fetchMock) as [string, { headers: Headers }])[1].headers;
+      expect(headers.get("x-api-key")).toBe("");
+      expect(headers.get("Authorization")).toBe("");
+      expect(headers.get("anthropic-version")).toBe("custom-version");
+      expect(headers.get("anthropic-beta")).toBe("custom-beta");
+      expect(headers.get("X-Custom")).toBe("override");
+    },
+  );
+
   it("cancels Anthropic API error bodies that exactly fill the byte cap", async () => {
     let canceled = false;
     const body = new ReadableStream<Uint8Array>({

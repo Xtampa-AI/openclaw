@@ -131,26 +131,26 @@ describe("settled post-tool turn finalization context", () => {
       for (const messages of finalizerContexts) {
         expect(messages).toContainEqual(expect.objectContaining(toolResult));
       }
-      const userMessages = manager
+      const persistedUsers = manager
         .buildSessionContext()
         .messages.filter((message) => message.role === "user");
-      expect(userMessages).toHaveLength(3);
-      expect(userMessages[0]?.content).toBe("hello");
-      expect(userMessages[0]).not.toHaveProperty("display", false);
-      for (const message of userMessages.slice(1)) {
-        expect(message).toMatchObject({
-          content: expect.stringContaining("final user-visible answer"),
-          display: false,
-          provenance: { kind: "internal_system" },
-        });
+      const isHiddenInternalPrompt = (message: unknown) =>
+        (message as { provenance?: { kind?: string } }).provenance?.kind === "internal_system";
+      expect(
+        persistedUsers
+          .filter((message) => !isHiddenInternalPrompt(message))
+          .map((message) => message.content),
+      ).toEqual(["hello"]);
+      const hiddenFinalizationPrompts = persistedUsers.filter(isHiddenInternalPrompt);
+      expect(hiddenFinalizationPrompts).toHaveLength(2);
+      for (const message of hiddenFinalizationPrompts) {
+        expect(message).toMatchObject({ display: false, provenance: { kind: "internal_system" } });
       }
       const genuineUser = { role: "user" as const, content: "Read the next file", timestamp: 5 };
       manager.appendMessage(genuineUser);
       expect(manager.buildSessionContext().messages).toContainEqual(
         expect.objectContaining(genuineUser),
       );
-      expect(genuineUser).not.toHaveProperty("display", false);
-      expect(genuineUser).not.toHaveProperty("provenance");
     } finally {
       admission.close();
     }

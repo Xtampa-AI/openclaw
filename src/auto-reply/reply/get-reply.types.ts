@@ -4,7 +4,11 @@ import {
   type AdmittedRunOperatorAuthority,
 } from "../../agents/admitted-run-context.js";
 import type { CronCreatorAuthorityCapability } from "../../agents/cron-creator-authority-context.js";
-import type { ReplyDeliveryObserver } from "../../agents/reply-completion.js";
+import type {
+  ReplyDeliveryFactsObserver,
+  ReplyDeliveryObserver,
+} from "../../agents/reply-completion.js";
+import type { SessionEntryCreationCommit } from "../../config/sessions/session-entry-creation.types.js";
 import type { PrepareAssistantTranscriptMessage } from "../../config/sessions/transcript-assistant-delivery.js";
 import type { SessionEntry, SessionToolOverrides } from "../../config/sessions/types.js";
 // Shared get-reply type contracts for command, directive, and runtime layers.
@@ -12,6 +16,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { DashboardMessageReadAdmission } from "../../gateway/message-action-turn-capability.js";
 import type { ExtractedFileImage } from "../../media-understanding/extracted-file-images.js";
 import type { PluginCommandReplyOptions } from "../../plugins/plugin-command-dispatch-contract.js";
+import type { AgentDatabaseRequestExecutionSource } from "../../state/openclaw-agent-execution-admission-contract.js";
 import type { PreparedTtsPreferences } from "../../tts/tts-preferences.js";
 import { getCommandOwnerAuthority } from "../command-owner-authority.js";
 import type { GetReplyOptions } from "../get-reply-options.types.js";
@@ -24,7 +29,10 @@ import type { FollowupQueueDisposition, QueuedFollowupReplyDelivery } from "./qu
 import type { ReplyOptionsWithAdmissionTicket } from "./reply-admission-ticket.js";
 import type { ReplyOptionsWithOperationRunState } from "./reply-operation-run-state.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
-import type { SessionEventExecution } from "./session-event-contract.js";
+import type {
+  ScheduledSessionAutomation,
+  SessionEventExecution,
+} from "./session-event-contract.js";
 
 export type ReplySessionBinding = {
   sessionKey?: string;
@@ -43,6 +51,12 @@ export type ReplyRunVerbosity = {
 };
 
 type InternalReplySessionOptions = {
+  /** Per-occurrence model override selected by a trusted scheduled source. */
+  modelOverride?: string;
+  /** Cron-owned execution context carried through ordinary session admission. */
+  scheduledAutomation?: ScheduledSessionAutomation;
+  /** Settles attribution before tool effects; model preparation may run concurrently. */
+  awaitSessionDiffBaseline?: () => Promise<void>;
   /** Producer callbacks follow this occurrence through queueing and delivery. */
   internalEventExecution?: SessionEventExecution;
   /** Source-owned cancellation retained when dispatch borrows an active lane for queued followups. */
@@ -66,6 +80,8 @@ type InternalReplySessionOptions = {
   /** Current external dashboard turn only; never persisted or inherited by another run. */
   dashboardReadAdmission?: DashboardMessageReadAdmission;
   expectedExistingSessionId?: string;
+  /** Activity committed with this input before ACK; initialization reuses its timestamp. */
+  recordedSessionActivity?: { sessionId: string; sessionKey: string; at: number };
   /** Retained predecessor evidence; reply admission must verify its session lineage and store. */
   expectedActiveReplyOperation?: ReplyOperation;
   /** First dispatch only: admission created this exact pinned session before reply initialization. */
@@ -73,10 +89,21 @@ type InternalReplySessionOptions = {
   onDeliberateSilentTerminalReply?: () => void;
   /** Source-specific final delivery, e.g. a committed answer in the current WebChat history. */
   resolveReplyDelivery?: ReplyDeliveryObserver;
+  /** Distinguishes committed source-tool custody from ordinary transcript presentation. */
+  resolveReplyDeliveryFacts?: ReplyDeliveryFactsObserver;
+  /** Heartbeat-owner policy: only an admitted current source permits implicit message replies. */
+  requireExplicitMessageTarget?: boolean;
   /** Retire the run's bundle MCP runtime at settlement. Set by one-shot isolated runs (isolated heartbeats) whose session ID is never reused. */
   cleanupBundleMcpOnRunEnd?: boolean;
   /** Defers the child-completion wake until the visible waiting status is delivered. */
   onPendingContinuation?: (settlement?: PendingContinuationSettlement) => void;
+  bindSessionCreation?: SessionEventExecution["bindSessionCreation"];
+  /** Follow the admitted turn's own first-store registration in its retained request facts. */
+  onDatabaseRegistration?: AgentDatabaseRequestExecutionSource["onRegistryChange"];
+  onSessionCreated?: (created: SessionEntryCreationCommit) => void;
+
+  /** Receives the LLM's own final response text — pre-delivery-normalization, sentinels included. */
+  onRawLlmResponse?: (response: string) => void;
   onSessionPrepared?: (binding: ReplySessionBinding) => void;
   /** Observes one transcript-start reader preparation; completion cannot control the run. */
   onTranscriptStartPreparation?: () => (() => void) | undefined;

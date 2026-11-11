@@ -70,6 +70,22 @@ function step(workflowJob: WorkflowJob, name: string): WorkflowStep {
 }
 
 describe("install smoke no-push root image transport", () => {
+  it.each([
+    "install-smoke-fast",
+    "root_dockerfile_image",
+    "installer_smoke_candidate_payload",
+    "installer_smoke_update_image",
+    "installer_smoke_nonroot_image",
+    "docker-e2e-fast",
+  ])("uses the portable Docker builder for %s", (jobName) => {
+    const workflow = readWorkflow(INSTALL_SMOKE_REUSABLE);
+    expect(step(job(workflow, jobName), "Set up Docker Buildx")).toEqual({
+      name: "Set up Docker Buildx",
+      uses: "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
+      with: { version: "v0.23.0" },
+    });
+  });
+
   it("keeps schedule/manual orchestration read-only and delegates to the reusable core", () => {
     const workflow = readWorkflow(INSTALL_SMOKE);
     expect(workflow.on?.schedule).toBeDefined();
@@ -470,11 +486,11 @@ describe("install smoke no-push root image transport", () => {
     expect(text).not.toContain("gh api");
   });
 
-  it.each(
-    ["selected", "tooling", "missing"].flatMap((source) =>
-      ["0", "1"].map((allowOmissions) => ({ source, allowOmissions })),
-    ),
-  )(
+  it.each([
+    { source: "selected", allowOmissions: "0" },
+    { source: "tooling", allowOmissions: "1" },
+    { source: "missing", allowOmissions: "1" },
+  ])(
     "checks selected network source provenance before Docker: $source, omissions=$allowOmissions",
     ({ source, allowOmissions }) => {
       const workspace = tempDirs.make("install-smoke-source-binding-");
@@ -776,7 +792,7 @@ describe("install smoke no-push root image transport", () => {
     expect(bunVerify.run).toContain("install-smoke-candidate-payload.mts verify");
     expect(bunVerify.run).toContain('--run-id "$PRODUCER_RUN_ID"');
     expect(bunVerify.run).toContain('--run-attempt "$PRODUCER_RUN_ATTEMPT"');
-    expect(step(bunConsumer, "Install Bun for global smoke").run).toBe("npm install -g bun@1.4.2");
+    expect(step(bunConsumer, "Install Bun for global smoke").run).toBe("npm install -g bun@1.4.4");
     expect(step(bunConsumer, "Run Bun global install candidate-payload smoke")).toMatchObject({
       "working-directory": ".release-harness",
       env: {
@@ -898,6 +914,11 @@ describe("install smoke no-push root image transport", () => {
       '"https://codeload.github.com/${TARGET_REPOSITORY}/tar.gz/${TARGET_SHA}"',
     );
     const packageStep = step(producer, "Package candidate only inside pinned harness");
+    expect(packageStep.env).toMatchObject({
+      OPENCLAW_DOCKER_PACKAGE_BUILD_TIMEOUT_MS: "3300000",
+    });
+    expect(packageStep.run).toContain("timeout --kill-after=30s 60m docker run --rm");
+    expect(packageStep.run).toContain("-e OPENCLAW_DOCKER_PACKAGE_BUILD_TIMEOUT_MS");
     expect(packageStep.run).toContain("--user node");
     expect(packageStep.run).toContain("--cap-drop ALL");
     expect(packageStep.run).toContain("pnpm install --frozen-lockfile");

@@ -18,7 +18,11 @@ import {
   type ContextEngineLogicalTurnLease,
 } from "./harness/context-engine-logical-turn.js";
 import { shellQuoteArgs } from "./harness/native-hook-relay-utils.js";
-import { isLiveTestEnabled, logLiveProgress } from "./live-test-helpers.js";
+import {
+  isLiveTestEnabled,
+  logLiveProgress,
+  useLiveTestRuntimeConfig,
+} from "./live-test-helpers.js";
 import { SessionManager } from "./sessions/session-manager.js";
 
 const describeLive =
@@ -75,6 +79,7 @@ describeLive("embedded Responses output-limit recovery live", () => {
       const modelId = process.env.OPENCLAW_LIVE_RESPONSES_MODEL || "gpt-5.6-luna";
       const receiptPath = path.join(state.workspaceDir, "receipts.txt");
       const unfinishedPath = path.join(state.workspaceDir, "unfinished.txt");
+      const unfinishedContent = "0123456789".repeat(4000);
       const scriptPath = path.join(state.workspaceDir, "record-receipt.cjs");
       await fs.writeFile(
         scriptPath,
@@ -117,6 +122,7 @@ describeLive("embedded Responses output-limit recovery live", () => {
         plugins: { allow: ["openai"], slots: { memory: "none" } },
       } satisfies OpenClawConfig;
       await state.writeConfig(config);
+      using _ = useLiveTestRuntimeConfig(config);
       const sessionManager = SessionManager.inMemory(state.workspaceDir);
       const events: EmbeddedAgentEvent[] = [];
       const requests: ResponseCreateParamsStreaming[] = [];
@@ -154,6 +160,25 @@ describeLive("embedded Responses output-limit recovery live", () => {
             request.parallel_tool_calls = false;
             request.max_output_tokens = requestNumber === 2 ? 256 : 1024;
             if (requestNumber === 2) {
+              // Constrain the real provider to the requested literal. Prompt-only
+              // repetition can produce a short, valid write instead of truncating.
+              request.tools = request.tools?.map((tool) =>
+                tool.type === "function" && tool.name === "write"
+                  ? {
+                      ...tool,
+                      strict: true,
+                      parameters: {
+                        type: "object",
+                        properties: {
+                          path: { type: "string", enum: [unfinishedPath] },
+                          content: { type: "string", enum: [unfinishedContent] },
+                        },
+                        required: ["path", "content"],
+                        additionalProperties: false,
+                      },
+                    }
+                  : tool,
+              );
               // Spend the small cap on function arguments, not a reasoning-only turn.
               request.reasoning = { effort: "none" };
             }
@@ -211,12 +236,6 @@ describeLive("embedded Responses output-limit recovery live", () => {
           },
         });
 
-        const receipts = (await fs.readFile(receiptPath, "utf8")).trim().split("\n");
-        expect(receipts).toHaveLength(1);
-        const receipt = receipts[0];
-        expect(receipt).toMatch(/^RECEIPT_[0-9a-f-]{36}$/);
-        await expect(fs.stat(unfinishedPath)).rejects.toMatchObject({ code: "ENOENT" });
-        expect(requests).toHaveLength(3);
         const terminalFacts = responses.map((response) => ({
           status: response.status,
           incompleteReason: response.incomplete_details?.reason,
@@ -226,6 +245,13 @@ describeLive("embedded Responses output-limit recovery live", () => {
           })),
         }));
         logLiveProgress(`Responses terminal facts: ${JSON.stringify(terminalFacts)}`);
+
+        const receipts = (await fs.readFile(receiptPath, "utf8")).trim().split("\n");
+        expect(receipts).toHaveLength(1);
+        const receipt = receipts[0];
+        expect(receipt).toMatch(/^RECEIPT_[0-9a-f-]{36}$/);
+        await expect(fs.stat(unfinishedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(requests).toHaveLength(3);
         expect(terminalFacts).toHaveLength(3);
         expect(terminalFacts[1]).toMatchObject({
           status: "incomplete",
@@ -236,7 +262,7 @@ describeLive("embedded Responses output-limit recovery live", () => {
         // The latter deliberately omits previous_response_id, so prove the receipt survived instead.
         expect(JSON.stringify(requests[2]?.input)).toContain(receipt);
         expect(JSON.stringify(requests[2]?.input)).toContain(
-          "Split the remaining work into smaller tool calls",
+          "Split the remaining work into smaller tool calls with shorter arguments only if the original request allows continuing that work. Use recorded tool results to determine what completed",
         );
         expect(JSON.stringify(requests[2]?.input)).toContain("max_output_tokens");
         expect(result.payloads?.map((payload) => payload.text ?? "").join("\n")).toContain(receipt);
@@ -258,7 +284,6 @@ describeLive("embedded Responses output-limit recovery live", () => {
         expect(failures).toEqual([
           expect.objectContaining({
             stopReason: "error",
-            usage: expect.objectContaining({ output: 256 }),
             diagnostics: expect.arrayContaining([
               expect.objectContaining({
                 type: "openai_responses_terminal",
@@ -270,6 +295,13 @@ describeLive("embedded Responses output-limit recovery live", () => {
             ]),
           }),
         ]);
+        // OpenAI can report a few tokens past max_output_tokens on a truncated response (260 for 256).
+        const [failure] = failures;
+        if (failure?.role !== "assistant") {
+          throw new Error("Expected one incomplete assistant tool-call failure");
+        }
+        expect(failure.usage.output).toBeGreaterThanOrEqual(256);
+        expect(failure.usage.output).toBeLessThanOrEqual(256 + 32);
         expect(
           messages.filter(
             (message) => message.role === "toolResult" && message.toolName === "exec",

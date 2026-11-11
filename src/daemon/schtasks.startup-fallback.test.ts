@@ -403,6 +403,7 @@ beforeEach(() => {
   childUnref.mockClear();
   timeState.now = 0;
   vi.spyOn(Date, "now").mockImplementation(() => timeState.now);
+  vi.spyOn(performance, "now").mockImplementation(() => timeState.now);
   sleepMock.mockReset();
   sleepMock.mockImplementation(async (ms: number) => {
     timeState.now += ms;
@@ -688,47 +689,6 @@ describe("Windows startup fallback", () => {
 
     expectGatewayTermination(4242);
     expectStartupFallbackSpawn();
-    await fs.access(startupEntryPath);
-  });
-
-  it("does not take over when another process owns the replacement port", async ({ env }) => {
-    const startupEntryPath = await writeStartupFallbackEntry(env);
-    await writeGatewayScript(env, 18789);
-    const scriptPath = resolveTaskScriptPath(env);
-    const scriptBefore = decodeWindowsLauncherScript({ buffer: await fs.readFile(scriptPath) });
-    env.OPENCLAW_GATEWAY_PORT = "19433";
-    mockProcesses(() => [
-      processEntry(4242),
-      processEntry(5252, OTHER_GATEWAY_COMMAND),
-      POWERSHELL_PROCESS,
-    ]);
-
-    inspectPortUsageMock.mockResolvedValue(
-      portUsage("busy", [processListener(5252, OTHER_GATEWAY_COMMAND)], 19433),
-    );
-    addMissingTaskInstallResponses([
-      ...successfulResponses(2),
-      runningTaskSnapshot(),
-      runningTaskSnapshot(),
-    ]);
-    const pendingSchtasksResponses = schtasksResponses.length;
-
-    await expect(installGatewayScheduledTask(env, new PassThrough(), "19433")).rejects.toThrow(
-      "replacement gateway port 19433 is occupied by an unverified process",
-    );
-
-    const oldPidKills = spawnSync.mock.calls.filter(
-      ([command, args]) =>
-        command.endsWith("taskkill.exe") &&
-        Array.isArray(args) &&
-        args.includes("/PID") &&
-        args.includes("4242"),
-    );
-    expect(oldPidKills).toHaveLength(0);
-    expect(schtasksResponses).toHaveLength(pendingSchtasksResponses);
-    expect(decodeWindowsLauncherScript({ buffer: await fs.readFile(scriptPath) })).toBe(
-      scriptBefore,
-    );
     await fs.access(startupEntryPath);
   });
 

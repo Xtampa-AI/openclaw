@@ -41,12 +41,14 @@ it("recovers legacy dist/index.js Doctor before refusing its unsupported Node", 
        fs.writeFileSync(${JSON.stringify(calls)}, JSON.stringify({ command, args, stdio: options.stdio, marker: options.env.OPENCLAW_NODE_UPDATE_RESPAWNED }));
        const child = new EventEmitter();
        child.kill = () => true;
-       setImmediate(() => child.emit("exit", 23, null));
+       setImmediate(() => { child.emit("exit", 23, null); child.emit("close", 23, null); });
        return child;
      };
      syncBuiltinESMExports();`,
   );
   instance.env.NODE_OPTIONS = `--import=${pathToFileURL(preload).href}`;
+  instance.env.NODE_DISABLE_COMPILE_CACHE = "1";
+  delete instance.env.NODE_COMPILE_CACHE;
   delete instance.env.OPENCLAW_NODE_UPDATE_RESPAWNED;
   const result = await instance.cli(["doctor", "--non-interactive", "--fix"], {
     execPath: nodeExecPath,
@@ -121,7 +123,7 @@ it.each([
          startupMarker: options.env.OPENCLAW_NODE_OPTIONS_READY };
        const child = new EventEmitter();
        child.kill = () => true;
-       setImmediate(() => child.emit("exit", 23, null));
+       setImmediate(() => { child.emit("exit", 23, null); child.emit("close", 23, null); });
        return child;
      };
      process.on("exit", () => fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({
@@ -174,9 +176,9 @@ it.each([
         expect(result.status, result.stdout + result.stderr).toBe(23);
         expect(observed.child.nvm).toBeUndefined();
         expect(observed.child.fnm).toBeUndefined();
-        if (source === "compile-cache") {
-          expect(observed.child.cacheMarker).toBe("1");
-        } else if (process.platform === "win32") {
+        // Compiled entries keep the build-scoped cache; only source entries disable it.
+        expect(observed.child.cacheMarker).toBeUndefined();
+        if (process.platform === "win32") {
           expect(observed.child.args).toContain("--stack-size=8192");
         } else {
           expect(observed.child.startupMarker).toBe("1");

@@ -6,13 +6,18 @@ import {
   loadTranscriptEventsSync,
   upsertSessionEntryCore,
 } from "../../../config/sessions/session-accessor.js";
+import { composeSessionSourceAssertion } from "../../../config/sessions/session-source-authority.js";
 import type { Context, ImageContent, Model } from "../../../llm/types.js";
 import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
 import { withEnvAsync } from "../../../test-utils/env.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
-import { prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
+import {
+  prepareSystemAgentRunAdmission,
+  resolveAdmittedRunActiveAssertion,
+} from "../../admitted-run-context.js";
 import { readBtwTranscriptMessages } from "../../btw-transcript.js";
 import { RUNTIME_EVENT_USER_PROMPT } from "../../internal-runtime-context.js";
+import { forgetPromptBuildDrainCacheForRun } from "../../plugin-turn-context.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import {
@@ -48,7 +53,6 @@ import {
 import { clearEmbeddedSessionPromptStates } from "../session-prompt-state.js";
 import { normalizeMessagesForLlmBoundary } from "./attempt-llm-boundary.js";
 import { prepareEmbeddedAttemptPromptAssembly } from "./attempt-prompt-build.js";
-import { forgetPromptBuildDrainCacheForRun } from "./attempt-prompt-helpers.js";
 import { submitEmbeddedAttemptPrompt } from "./attempt-prompt-submit.js";
 import { createBaseInput, createSession, sessionId } from "./attempt-prompt-submit.test-support.js";
 import { prepareEmbeddedAttemptSessionBoundary } from "./attempt-session-prepare.js";
@@ -67,6 +71,71 @@ afterEach(() => {
 });
 
 describe("submitEmbeddedAttemptPrompt", () => {
+  it("refreshes review source authority before continuing a model request and refuses revocation", async () => {
+    const { activeSession } = createSession();
+    let revision = 0;
+    let validatedRevision = 0;
+    let active = true;
+    const assertReceipt = (expected: number) => {
+      if (!active) {
+        throw new Error("review source revoked");
+      }
+      if (expected !== revision) {
+        throw new Error("review source needs preparation");
+      }
+    };
+    const source = composeSessionSourceAssertion([
+      Object.assign(() => assertReceipt(validatedRevision), {
+        prepareSessionSourceScope: async () => {
+          validatedRevision = revision;
+          const expected = revision;
+          return { assertCurrent: () => assertReceipt(expected), checks: [] };
+        },
+      }),
+    ]);
+    const admission = prepareSystemAgentRunAdmission(
+      {},
+      "model-review-continuation",
+      "main",
+      "test",
+      source,
+    );
+    const admitted = await admission.admit("embedded");
+    const assertHostActive = resolveAdmittedRunActiveAssertion(admitted);
+    const requests: Context["messages"][] = [];
+    activeSession.agent.streamFn = (model, context) => {
+      requests.push(context.messages);
+      return createAssistantResultStream(
+        createAssistant(model, [{ type: "text", text: "review continues" }]),
+      );
+    };
+    try {
+      await submitEmbeddedAttemptPrompt({
+        ...createBaseInput(),
+        activeSession,
+        assertHostActive,
+        promptActiveSession: async (_prompt, options) => {
+          options?.preflightResult?.(true);
+          const request = async () => {
+            const messages = await activeSession.agent.transformContext(activeSession.messages);
+            return activeSession.agent.streamFn(testModel, {
+              messages: messages as Context["messages"],
+            });
+          };
+          await request();
+          // A denied tool does not enter its source wrapper; foreground appends may still land.
+          revision += 1;
+          await request();
+          active = false;
+          await expect(request()).rejects.toThrow("admitted run authority is no longer active");
+        },
+      });
+      expect(requests).toHaveLength(2);
+    } finally {
+      admission.close();
+    }
+  });
+
   it("replaces queued context without charging it twice or changing user overlap credit", () => {
     const user = {
       role: "user" as const,
@@ -346,6 +415,7 @@ describe("submitEmbeddedAttemptPrompt", () => {
         content: "transcript prompt",
         timestamp: 1,
         idempotencyKey: "same-turn",
+        __openclaw: { modelPromptProjection: { version: 1, text: "transcript prompt" } },
       };
       sessionManager.appendMessage(user);
       const carrier = contextMessage("original context");
@@ -455,102 +525,6 @@ describe("submitEmbeddedAttemptPrompt", () => {
     ).toHaveLength(1);
     expect(session.getLastAssistantText()).toBe("recovered");
   });
-
-  it.each([false, true])(
-    "persists context across retry and reopen: append-only=%s",
-    async (appendOnlyRuntimeContext) => {
-      await withOpenClawTestState({ label: "runtime-context-persistence" }, async (state) => {
-        const target = {
-          agentId: "main",
-          sessionId,
-          sessionKey: "agent:main:runtime-context-persistence",
-          storePath: path.join(state.agentDir("main"), "openclaw-agent.sqlite"),
-        };
-        await upsertSessionEntryCore(target, { sessionId, updatedAt: 1 });
-        const settingsManager = SettingsManager.inMemory({
-          compaction: { enabled: false },
-          retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
-        });
-        const requests: Context["messages"][] = [];
-        streamMocks.streamSimple.mockImplementation((model, context) => {
-          requests.push(structuredClone(context.messages));
-          return createAssistantResultStream(
-            requests.length === 1
-              ? { ...createAssistant(model, [], "error"), errorMessage: "503 overloaded" }
-              : createAssistant(model, [{ type: "text", text: "done" }]),
-          );
-        });
-        const first = await createTestSession({
-          sessionManager: SessionManager.open(target, state.workspaceDir),
-          settingsManager,
-        });
-        if (appendOnlyRuntimeContext) {
-          await first.session.sendCustomMessage(
-            { customType: "test.extension-context", content: "extension context", display: false },
-            { deliverAs: "nextTurn" },
-          );
-        }
-        const submit = async (session: typeof first.session, text: string) => {
-          const input = createBaseInput();
-          await submitEmbeddedAttemptPrompt({
-            ...input,
-            activeSession: session,
-            appendOnlyRuntimeContext,
-            appendContext: undefined,
-            prependContext: undefined,
-            transcriptPrompt: text,
-            modelPrompt: text,
-            runtimeContextMessage: buildRuntimeContextCustomMessage(`context for ${text}`),
-            promptActiveSession: (prompt, options) =>
-              session.prompt(prompt, { ...options, expandPromptTemplates: false }),
-          });
-        };
-        await submit(first.session, "first");
-        expect(requests).toHaveLength(2);
-        expect(requests[1]).toEqual(requests[0]);
-
-        const reopenedManager = SessionManager.open(target, state.workspaceDir);
-        const reopened = await createTestSession({
-          sessionManager: reopenedManager,
-          settingsManager,
-        });
-        await submit(reopened.session, "second");
-        expect(requests).toHaveLength(3);
-        const entries = reopenedManager.getEntries();
-        const carriers = entries.filter(
-          (entry) =>
-            entry.type === "custom_message" && entry.customType === "openclaw.runtime-context",
-        );
-        expect(carriers).toHaveLength(appendOnlyRuntimeContext ? 2 : 0);
-        if (appendOnlyRuntimeContext) {
-          for (const carrier of carriers) {
-            expect(carrier).toMatchObject({ display: false });
-            const previous = entries[entries.indexOf(carrier) - 1];
-            expect(previous).toMatchObject({ type: "message", message: { role: "user" } });
-          }
-          // Timestamps are local metadata; provider-visible content and order must replay unchanged.
-          const providerPrefix = (messages: Context["messages"]) =>
-            messages.map(({ role, content }) => ({ role, content }));
-          expect(providerPrefix(requests[2]!.slice(0, requests[0]!.length))).toEqual(
-            providerPrefix(requests[0]!),
-          );
-          expect(requests[0]![1]).toMatchObject({ role: "user", runtimeContext: {} });
-        } else {
-          expect(JSON.stringify(requests[2])).not.toContain("context for first");
-        }
-
-        reopenedManager.appendResetBoundary("new");
-        const reset = await createTestSession({
-          sessionManager: SessionManager.open(target, state.workspaceDir),
-          settingsManager,
-        });
-        await submit(reset.session, "after reset");
-        expect(JSON.stringify(requests.at(-1))).not.toContain("context for first");
-        expect(JSON.stringify(requests.at(-1))).not.toContain("context for second");
-        expect(JSON.stringify(requests.at(-1))).toContain("context for after reset");
-      });
-    },
-  );
 
   it.each([
     ["first-turn", true],

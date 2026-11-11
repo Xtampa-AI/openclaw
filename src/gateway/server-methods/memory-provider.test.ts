@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { MemoryProviderHandle } from "../../plugins/memory-provider-types.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { createRemoteControlUiIngressTestContext } from "../remote-control-ui.test-support.js";
 import type { GatewayRequestContext, GatewayRequestHandlerOptions } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
@@ -14,6 +15,10 @@ vi.mock("../../plugins/memory-runtime.js", () => ({
   getActiveMemoryProviderCore: mocks.acquire,
   getActiveMemorySearchManagerCore: mocks.legacy,
   resolveActiveMemoryBackendConfig: mocks.resolveBackend,
+}));
+// mock-isolation: a single-user Gateway; shared-Gateway policy is covered by the authority test.
+vi.mock("../../state/user-profile-list.js", () => ({
+  hasMultipleResidentSessionSharingIdentities: () => false,
 }));
 vi.mock("../operator-run-authority.js", () => ({
   captureGatewayOperatorRunAuthority: mocks.capture,
@@ -182,30 +187,42 @@ describe("provider-neutral memory RPC", () => {
     expect(mocks.acquire).not.toHaveBeenCalled();
   });
 
-  it("does not release a late result after an agent run's operator authority is revoked", async () => {
-    const pending = createDeferredCore<{ status: "ready" }>();
-    provider.health.mockImplementation(() => pending.promise);
-    const options = request("memory.status", {}, syntheticClient());
-    const entered = createDeferredCore();
-    mocks.acquire.mockImplementation(async () => {
-      entered.resolve();
-      return { provider, providerId: "records" };
-    });
-    const result = invoke("memory.status", options);
-    await entered.promise;
-    assertCurrent.mockImplementation(() => {
-      throw new Error("operator revoked");
-    });
-    pending.resolve({ status: "ready" });
-    await result;
-    expect(options.respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ message: "operator revoked" }),
-    );
-    expect(provider.close).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledOnce();
-  });
+  it.each(["agent", "ingress"] as const)(
+    "does not release a late result after an %s operator authority is revoked",
+    async (caller) => {
+      const pending = createDeferredCore<{ status: "ready" }>();
+      provider.health.mockImplementation(() => pending.promise);
+      const client = syntheticClient();
+      if (caller === "ingress") {
+        delete client.connId;
+        const principal = createRemoteControlUiIngressTestContext().resolvePrincipal();
+        client.internal = {
+          remoteIngressPrincipal: principal,
+          operatorRoleActor: principal.operatorRoleActor,
+        };
+      }
+      const options = request("memory.status", {}, client);
+      const entered = createDeferredCore();
+      mocks.acquire.mockImplementation(async () => {
+        entered.resolve();
+        return { provider, providerId: "records" };
+      });
+      const result = invoke("memory.status", options);
+      await entered.promise;
+      assertCurrent.mockImplementation(() => {
+        throw new Error("operator revoked");
+      });
+      pending.resolve({ status: "ready" });
+      await result;
+      expect(options.respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({ message: "operator revoked" }),
+      );
+      expect(provider.close).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each([
     ["an unauthenticated caller", null],

@@ -34,11 +34,17 @@ openclaw status --usage --agent work
 | `--timeout <ms>`        | Check timeout in milliseconds (default: `60000`).                                                               |
 | `--verbose` / `--debug` | Also print the raw Gateway target resolution before the report.                                                 |
 
+Gateway log diagnostics skip missing files and unsupported sources such as FIFOs
+without a writer, while retaining evidence from the other regular log. Symlinks
+to regular logs remain supported; skipped log paths are not replaced or removed.
+
 Status starts one monotonic check deadline when the command begins. Local readiness, Gateway status, provider usage, and deep health consume the remaining allowance. Remote targets and explicit Gateway URLs skip local readiness but keep the same deadline. Local checks report the observed startup phase while waiting. If the Gateway is still starting when the budget expires, status reports “still starting” instead of unreachable and skips deep channel checks. JSON keeps the status report and adds `gateway.readiness: "still-starting"` and `gateway.startupPhase`. An explicit `--timeout` limits that shared allowance.
 
 When no matching Gateway service or live foreground owner exists and its port is
 free, status checks directly instead of waiting for a Gateway startup. Local-only
-agent environments therefore report an unavailable Gateway promptly. Observed startup
+agent environments therefore report an unavailable Gateway promptly. A listener positively
+identified as another process reports a port conflict with diagnostic guidance instead
+of waiting for the readiness budget. Unknown listener attribution keeps startup grace. Observed startup
 migrations retain startup grace across the handoff to Gateway ownership; unverifiable
 ownership also retains that grace. Lock and native process inspection consume the
 same remaining check allowance.

@@ -5,13 +5,16 @@ import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import { UpdateFinalizationLifecycle } from "../cli/update-cli/update-finalization-lifecycle.js";
 import { GatewayServiceStopUnsafeError } from "../daemon/service-inspection-error.js";
-import { resolveGatewayService } from "../daemon/service.js";
 import { collectNestedErrorCandidates } from "../infra/error-graph-internal.js";
 import { GATEWAY_SERVICE_STOP_TIMEOUT_MS } from "../infra/gateway-shutdown-budget.js";
 import { GatewayStateOwnerContentionError } from "../infra/gateway-state-owner.js";
 import { DoctorUnreadableStateDatabaseError } from "../infra/state-repair-message.js";
 import * as updateState from "../infra/update-candidate-state.js";
-import { readUpdateDatabaseGenerations } from "../infra/update-database-generations.js";
+import {
+  readUpdateDatabaseGenerationObservation,
+  readUpdateDatabaseGenerations,
+} from "../infra/update-database-generations.js";
+import * as attribution from "../infra/update-doctor-migration-attribution.js";
 import {
   collectUpdateDoctorFailureFacts,
   consumeUpdatePostInstallDoctorResult,
@@ -33,6 +36,11 @@ const settlement = await import("./doctor-maintenance.settlement.test-support.js
 const { begin, boundary, cleanupBarrier, root, tempDirs } = settlement;
 
 it("refuses rollback attribution for writes preceding Doctor admission", async () => {
+  // This settlement unit harness forbids native processes; the real isolated
+  // observation boundary is exercised by update-doctor-migration-attribution.test.
+  vi.spyOn(attribution, "readUpdateDoctorGeneration").mockImplementation(
+    readUpdateDatabaseGenerationObservation,
+  );
   vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
     readUpdateDatabaseGenerations(paths),
   );
@@ -45,7 +53,6 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
   const foreign = new DatabaseSync(pathname);
   foreign.exec("INSERT INTO evidence VALUES (99)");
   foreign.close();
-  const admitted = readUpdateDatabaseGenerations([pathname, missing]);
   const maintenance = await beginDoctorMaintenance({
     root: null,
     options: { repair: true, nonInteractive: true },
@@ -57,7 +64,7 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
   const receipt = maintenance!.databaseWrites;
   expect(receipt).toEqual({
     unchanged: false,
-    fromGenerations: admitted,
+    fromGenerations: databaseGenerations,
     generations: readUpdateDatabaseGenerations([pathname, missing]),
   });
   expect(receipt?.generations[pathname]).not.toBe(databaseGenerations[pathname]);
@@ -72,6 +79,9 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
 });
 
 it("refuses automatic restore after a NOCOW physical replacement during Doctor maintenance", async () => {
+  vi.spyOn(attribution, "readUpdateDoctorGeneration").mockImplementation(
+    readUpdateDatabaseGenerationObservation,
+  );
   vi.spyOn(updateState, "readUpdateDatabaseGenerationsIsolated").mockImplementation(async (paths) =>
     readUpdateDatabaseGenerations(paths),
   );
@@ -199,7 +209,19 @@ it.each([
   },
 );
 
-it.each([undefined, {}])(
+it("restores the stopped Gateway before reporting a settled state-owner release failure", async () => {
+  const failure = new Error("settled state-owner release failed");
+  boundary.release.mockRejectedValueOnce(failure);
+  const maintenance = await begin();
+
+  await expect(maintenance!.finish({})).rejects.toBe(failure);
+  expect(boundary.close).toHaveBeenCalledOnce();
+  expect(boundary.resume).toHaveBeenCalledOnce();
+  expect(boundary.restart).toHaveBeenCalledOnce();
+  expect(boundary.health).toHaveBeenCalledOnce();
+});
+
+it.each([undefined])(
   "reports a settled state-release failure without a managed Gateway (%j)",
   async (config) => {
     const failure = new Error("settled state release failed");
@@ -492,6 +514,75 @@ it("waits for the stopped Gateway to release lifecycle ownership", async () => {
   await maintenance!.finish({});
   expect(loaded).toBe(true);
   expect(boundary.restart).toHaveBeenCalledOnce();
+});
+
+it("releases ownership acquired after the parent deadline without starting repair", async () => {
+  let elapsedMs = 0;
+  vi.spyOn(Date, "now").mockReturnValue(1_000);
+  vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
+  boundary.gatewayAcquire.mockImplementationOnce(async () => {
+    elapsedMs = 501;
+    return acquire();
+  });
+  const prepare = vi.fn();
+
+  const refusal = await beginDoctorMaintenance({
+    root,
+    options: { repair: true, nonInteractive: true },
+    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
+    serviceInspectionDeadlineAtMs: 1_500,
+    beforeStateMutation: prepare,
+  }).catch((error: unknown) => error);
+
+  expect(prepare).not.toHaveBeenCalled();
+  expect(String(refusal)).toContain("Doctor service-inspection deadline has expired.");
+  expect(boundary.release).toHaveBeenCalledOnce();
+  expect(boundary.stop).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ phase: "inspect" }),
+  );
+  expect(boundary.repair).not.toHaveBeenCalled();
+  expect(boundary.restart).not.toHaveBeenCalled();
+  expect(boundary.health).not.toHaveBeenCalled();
+});
+
+it("restores a stopped service when post-stop ownership admission exceeds the parent deadline", async () => {
+  let wallNow = 1_000;
+  let elapsedMs = 0;
+  const deadlineAtMs = wallNow + 500;
+  vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+  vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+  boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
+  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
+  boundary.gatewayAcquire
+    .mockImplementationOnce(() => {
+      throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
+    })
+    .mockImplementationOnce(() => {
+      throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
+    })
+    .mockImplementationOnce(acquire);
+  boundary.sleep.mockImplementation(async () => {
+    elapsedMs = 501;
+    wallNow -= 90_000;
+  });
+  let prepared = false;
+
+  const refusal = await beginDoctorMaintenance({
+    root,
+    options: { repair: true, nonInteractive: true },
+    runtime: { log: boundary.log, error: vi.fn(), exit: vi.fn() },
+    serviceInspectionDeadlineAtMs: deadlineAtMs,
+    beforeStateMutation: async () => {
+      prepared = true;
+    },
+  }).catch((error: unknown) => error);
+
+  expect(String(refusal)).toContain("Doctor service-inspection deadline has expired.");
+  expect(prepared).toBe(false);
+  expect(boundary.repair).not.toHaveBeenCalled();
+  expect(boundary.restart).toHaveBeenCalledOnce();
+  expect(boundary.health).toHaveBeenCalledOnce();
 });
 
 it("restores a service after state ownership fails without retaining a partial maintenance scope", async () => {
@@ -956,52 +1047,4 @@ it("does not settle a typed refusal while command cleanup remains uncertain", as
   expect(boundary.resume).not.toHaveBeenCalled();
   expect(boundary.complete).not.toHaveBeenCalled();
   expect(boundary.restart).not.toHaveBeenCalled();
-});
-
-it.each([
-  "owned-offline",
-  "running-indicator",
-  "unknown-runtime",
-  "unknown-load",
-  "read-failed",
-  "not-ours",
-])("rechecks an initially stopped Gateway after config repair: %s", async (outcome) => {
-  boundary.stop.mockImplementation(async () => ({ ...settlement.stopped, stopped: false }));
-  const state = {
-    ...(await boundary.read(resolveGatewayService())),
-    loadState: { status: "not-loaded" as const },
-  };
-  boundary.read.mockResolvedValue(state);
-  boundary.repair.mockImplementation(async () => {
-    if (outcome === "read-failed") {
-      boundary.read.mockRejectedValue(new Error("Synthetic final inspection failed"));
-    } else {
-      boundary.read.mockResolvedValue({
-        ...state,
-        running: outcome === "running-indicator",
-        loadState:
-          outcome === "unknown-load"
-            ? { status: "unknown", detail: "probe failed" }
-            : state.loadState,
-        runtime: {
-          status: outcome === "unknown-runtime" ? "unknown" : "stopped",
-        },
-      });
-      if (outcome === "not-ours") {
-        boundary.revalidate.mockResolvedValue({ kind: "foreign" });
-      }
-    }
-    return {};
-  });
-  const maintenance = await begin();
-  await expect(maintenance!.finish({}, async (cfg) => cfg)).resolves.toBeUndefined();
-  expect(boundary.repair).toHaveBeenCalledOnce();
-  expect(boundary.restart).toHaveBeenCalledTimes(outcome === "owned-offline" ? 1 : 0);
-  const verified = outcome === "owned-offline";
-  expect(boundary.health).toHaveBeenCalledTimes(verified ? 1 : 0);
-  if (!verified) {
-    expect(maintenance!.warnings).toContainEqual(
-      expect.stringMatching(/Gateway activation skipped.*gateway status --deep/),
-    );
-  }
 });

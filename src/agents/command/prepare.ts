@@ -14,7 +14,7 @@ import { assertAgentRunLifecycleGenerationCurrent } from "../../infra/agent-even
 import { resolveAgentExplicitRecipientSession } from "../../infra/outbound/agent-delivery.js";
 import { buildOutboundSessionContext } from "../../infra/outbound/session-context.js";
 import { labelRuntimeContextText } from "../../llm/types.js";
-import { resolvePluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.js";
+import { resolvePluginMetadataSnapshotAsync } from "../../plugins/plugin-metadata-snapshot.js";
 import {
   classifySessionKeyShape,
   isUnscopedSessionKeySentinel,
@@ -236,6 +236,7 @@ export async function prepareAgentCommandExecution(
     storePath,
     isNewSession,
     previousSessionId,
+    automaticReset,
     persistedThinking,
     persistedVerbose,
   } = sessionResolution;
@@ -287,7 +288,7 @@ export async function prepareAgentCommandExecution(
   const preparedMetadataSnapshot = runtimeContext?.pluginGeneration.pluginMetadataSnapshot;
   const manifestMetadataSnapshot = pluginsEnabled
     ? (preparedMetadataSnapshot ??
-      resolvePluginMetadataSnapshot({ config: cfg, env: process.env, workspaceDir }))
+      (await resolvePluginMetadataSnapshotAsync({ config: cfg, env: process.env, workspaceDir })))
     : undefined;
   const modelManifestContext = {
     manifestPlugins: manifestMetadataSnapshot ?? [],
@@ -313,8 +314,9 @@ export async function prepareAgentCommandExecution(
     sessionKey,
     sessionEntry: sessionEntryRaw,
   });
-  const sessionStableReplyMode = resolveSessionStableReplyMode({
+  const sessionStableReplyMode = await resolveSessionStableReplyMode({
     cfg,
+    metadataSnapshot: manifestMetadataSnapshot,
     ctx: { CommandAuthorized: false },
     sessionEntry: sessionEntryRaw,
     sessionAgentId,
@@ -457,6 +459,7 @@ export async function prepareAgentCommandExecution(
       storePath,
       isNewSession,
       previousSessionId,
+      ...(automaticReset ? { automaticReset } : {}),
       persistedThinking,
       persistedVerbose,
       sessionAgentId,

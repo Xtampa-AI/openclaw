@@ -1,6 +1,10 @@
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/config.js";
+import {
+  attachRuntimeConfigWriteApplication,
+  createRuntimeConfigWriteApplication,
+} from "../config/runtime-write-application.js";
 import { PluginHostCleanupTimeoutError } from "../plugins/host-hook-cleanup-timeout.js";
 import { getPluginRuntimeGeneration, PluginRuntimeApplicationError } from "../plugins/lifecycle.js";
 import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
@@ -20,6 +24,7 @@ import {
   flushReload,
   flushWatcherChange,
   makeSnapshot,
+  makeWrite,
   makeZeroDebounceHookWrite,
   prepareConfigReloadTest,
 } from "./config-reload.test-support.js";
@@ -85,25 +90,20 @@ describe("plugin drain recovery", () => {
       ...initialConfig,
       plugins: { entries: { codex: codex("workspace-write") } },
     };
-    // This Gateway's Codex generation holds admitted work, as during a long agent turn, while
-    // another Gateway in the process owns the default registry with an idle Codex.
-    const registryOwners: ReturnType<typeof createPluginRegistryOwner>[] = [];
-    const [instance, otherGatewayInstance] = [0, 1].map(() => {
-      const builder = createTestPluginRegistry();
-      const record = createPluginRecord({ id: "codex", source: "/synthetic/codex.ts" });
-      builder.registry.plugins.push(record);
-      builder.createApi(record, { config: {} });
-      setActivePluginRegistry(builder.registry);
-      registryOwners.push(createPluginRegistryOwner(builder.registry));
-      const pluginInstance = getPluginInstance(record);
-      assert(pluginInstance);
-      return pluginInstance;
-    });
-    assert(instance && otherGatewayInstance !== instance);
+    let configHash = "initial";
+    const application = createRuntimeConfigWriteApplication();
+    const builder = createTestPluginRegistry();
+    const record = createPluginRecord({ id: "codex", source: "/synthetic/codex.ts" });
+    builder.registry.plugins.push(record);
+    builder.createApi(record, { config: {} });
+    setActivePluginRegistry(builder.registry);
+    const registryOwner = createPluginRegistryOwner(builder.registry);
+    const instance = getPluginInstance(record);
+    assert(instance);
     const releaseWork = instance.retainWork();
     const cleanup = createDeferredCore();
     let cleanupCall: Promise<void> | undefined;
-    const harness = createReloaderHarness(async () => makeSnapshot({ config }), {
+    const harness = createReloaderHarness(async () => makeSnapshot({ config, hash: configHash }), {
       initialConfig,
       // Stands in for the reload owner's 60s pre-stop drain expiring on the held work.
       onHotReload: async (plan) => {
@@ -140,7 +140,13 @@ describe("plugin drain recovery", () => {
     });
     try {
       await harness.reloader.ready;
-      await flushWatcherChange(harness);
+      configHash = "plugin-change";
+      application.recordConfigChange(initialConfig, config);
+      harness.emitWrite(
+        attachRuntimeConfigWriteApplication(makeWrite(config, configHash), application),
+      );
+      await flushReload(harness.reloader);
+      await expect(application.result).resolves.toBe("failed");
       config = { ...config, agents: { entries: { main: { skills: [] } } } };
       await flushWatcherChange(harness);
       expect(harness.onHotReload).toHaveBeenCalledOnce();
@@ -168,9 +174,7 @@ describe("plugin drain recovery", () => {
       releaseWork();
       cleanup.resolve();
       await cleanupCall;
-      for (const owner of registryOwners.toReversed()) {
-        await owner.close();
-      }
+      await registryOwner.close();
     }
   });
 

@@ -33,7 +33,48 @@ import { installConnectedControlUiServerSuite } from "./test-with-server.js";
 const runtime = vi.hoisted(() => ({
   runTurn: vi.fn(),
   rejectTranscript: false,
+  terminalBarrier: undefined as
+    | { runId: string; entered: Deferred; joined: Deferred; release: Deferred }
+    | undefined,
 }));
+
+vi.mock("./session-lifecycle-state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-lifecycle-state.js")>();
+  return {
+    ...actual,
+    prepareGatewaySessionLifecycleEvent: (
+      params: Parameters<typeof actual.prepareGatewaySessionLifecycleEvent>[0],
+    ) => {
+      const persist = actual.prepareGatewaySessionLifecycleEvent(params);
+      const barrier = runtime.terminalBarrier;
+      if (
+        !barrier ||
+        barrier.runId !== params.event.runId ||
+        !["end", "error"].includes(String(params.event.data?.phase))
+      ) {
+        return persist;
+      }
+      return async () => {
+        barrier.entered.resolve();
+        await barrier.release.promise;
+        await persist();
+      };
+    },
+  };
+});
+
+vi.mock("./chat-abort-lifecycle-internal.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat-abort-lifecycle-internal.js")>();
+  return {
+    ...actual,
+    waitForChatAbortTerminalPersistence: (
+      entry: Parameters<typeof actual.waitForChatAbortTerminalPersistence>[0],
+    ) => {
+      runtime.terminalBarrier?.joined.resolve();
+      return actual.waitForChatAbortTerminalPersistence(entry);
+    },
+  };
+});
 
 vi.mock("../auto-reply/reply/dispatch-acp-transcript.runtime.js", async (importOriginal) => {
   const { persistAcpDispatchTranscript } =
@@ -93,6 +134,7 @@ describe("Gateway ACP completion ownership", () => {
     dispatchInboundMessageMock.mockReset();
     runtime.runTurn.mockReset();
     runtime.rejectTranscript = false;
+    runtime.terminalBarrier = undefined;
     testState.sessionStorePath = undefined;
     vi.restoreAllMocks();
   });
@@ -323,6 +365,7 @@ describe("Gateway ACP completion ownership", () => {
         errorKind?: string;
       };
     }> = [];
+    let lifecycleStarted = createDeferred();
     let lifecycleDelivered = createDeferred();
     const capture = (data: Buffer) => {
       const frame: (typeof frames)[number] = JSON.parse(data.toString());
@@ -330,10 +373,13 @@ describe("Gateway ACP completion ownership", () => {
       if (
         frame.event === "agent" &&
         frame.payload?.runId === activeRunId &&
-        frame.payload.stream === "lifecycle" &&
-        (frame.payload.data?.phase === "end" || frame.payload.data?.phase === "error")
+        frame.payload.stream === "lifecycle"
       ) {
-        lifecycleDelivered.resolve();
+        if (frame.payload.data?.phase === "start") {
+          lifecycleStarted.resolve();
+        } else if (frame.payload.data?.phase === "end" || frame.payload.data?.phase === "error") {
+          lifecycleDelivered.resolve();
+        }
       }
     };
     ws.on("message", capture);
@@ -347,6 +393,7 @@ describe("Gateway ACP completion ownership", () => {
         dispatchAdmissions.set(runId, admissionCapture);
         turnStarted = createDeferred();
         releaseTurn = createDeferred();
+        lifecycleStarted = createDeferred();
         lifecycleDelivered = createDeferred();
         const expectedState = scenario.rpcAbort
           ? "aborted"
@@ -367,10 +414,20 @@ describe("Gateway ACP completion ownership", () => {
           message: `request ${temperature}`,
           idempotencyKey: runId,
         };
+        runtime.terminalBarrier = scenario.rpcAbort
+          ? undefined
+          : {
+              runId,
+              entered: createDeferred(),
+              joined: createDeferred(),
+              release: createDeferred(),
+            };
         const accepted = await rpcReq(ws, "chat.send", sendParameters);
-        expect(accepted.ok).toBe(true);
+        expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
         if (scenario.rpcAbort) {
           await turnStarted.promise;
+          // Stop suppresses a start still awaiting publication; this case aborts after start.
+          await withinTest(lifecycleStarted.promise, signal);
           const aborted = await rpcReq(ws, "chat.abort", { sessionKey, runId });
           expect(aborted.payload).toMatchObject({ aborted: true, runIds: [runId] });
           releaseTurn.resolve();
@@ -378,6 +435,18 @@ describe("Gateway ACP completion ownership", () => {
         const admitted = await admissionCapture.promise;
         expect(admitted.runId).toBe(runId);
         expect(admitted.release).toBeDefined();
+        const barrier = runtime.terminalBarrier;
+        if (barrier) {
+          await withinTest(Promise.all([barrier.entered.promise, barrier.joined.promise]), signal);
+          // The real lifecycle writer is held after capture, before its durable commit.
+          // Even once dispatch has joined that receipt, neither RPC may expose completion.
+          const pendingReplay = await rpcReq(ws, "chat.send", sendParameters);
+          expect.soft(pendingReplay.payload).toMatchObject({ runId, status: "in_flight" });
+          const pendingWait = await rpcReq(ws, "agent.wait", { runId, timeoutMs: 0 });
+          expect.soft(pendingWait.payload).toMatchObject({ status: "timeout" });
+          expect.soft(asOptionalRecord(pendingWait.payload)?.endedAt).toBeUndefined();
+          barrier.release.resolve();
+        }
         // Notifications coalesce; the captured owner releases only after post-dispatch cleanup.
         await admitted.release;
         let replayPayload: unknown;
@@ -589,6 +658,7 @@ describe("Gateway ACP completion ownership", () => {
         }
       }
     } finally {
+      runtime.terminalBarrier?.release.resolve();
       releaseTurn.resolve();
       await Promise.all(admittedReleases);
       ws.off("message", capture);

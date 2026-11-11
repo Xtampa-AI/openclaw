@@ -3,7 +3,6 @@ import path from "node:path";
 import type { Worker } from "node:worker_threads";
 import { normalizeAgentId } from "@openclaw/normalization-core/agent-id";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { markWorkerRetirement } from "../../infra/worker-cpu.js";
 import { runInDetachedAsyncContext } from "../../shared/detached-async-context.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
@@ -26,8 +25,6 @@ type ArchiveConnection = {
   worker: Worker;
   exited: Promise<void>;
   didExit: boolean;
-  // The worker validates a strictly increasing sequence for its whole lifetime, across scopes.
-  operationId: number;
   idleTimer?: NodeJS.Timeout;
   failure?: Error;
   retiring?: Promise<void>;
@@ -35,7 +32,6 @@ type ArchiveConnection = {
 
 // An idle carrier keeps its loaded heap; release it once archive work stops.
 const ARCHIVE_WORKER_IDLE_MS = 5 * 60_000;
-
 function clearIdle(connection: ArchiveConnection | undefined): void {
   if (connection) {
     clearTimeout(connection.idleTimer);
@@ -184,38 +180,16 @@ class ArchiveSession {
     this.assertCurrent();
     const connection = (this.connection ??= this.start(createWorker));
     sessions.warm = this;
-    const operationId = ++connection.operationId;
     connection.worker.ref();
     const dispatched = new Promise<SqliteArchiveSessionResponse>((resolve, reject) => {
       const cleanup = () => {
         connection.worker.off("message", receive);
         connection.worker.off("exit", exit);
       };
-      const receive = (response: unknown) => {
-        const expectedType =
-          request.operation === "materialize"
-            ? "done"
-            : request.operation === "publish"
-              ? "published"
-              : request.operation === "read-page"
-                ? "page-read"
-                : "final-read";
-        if (
-          !isRecord(response) ||
-          response.type !== expectedType ||
-          response.operationId !== operationId ||
-          response.settled !== true ||
-          !Array.isArray(response.results)
-        ) {
-          connection.failure = new Error(
-            "SQLite archive Worker returned an invalid operation result",
-          );
-          void connection.worker.terminate();
-          return;
-        }
+      // The FIFO has one request in flight on this private, paired worker port.
+      const receive = (response: SqliteArchiveSessionResponse) => {
         cleanup();
-        // SAFETY: the paired Worker owns result values; the operation identity and envelope match.
-        resolve(response as SqliteArchiveSessionResponse);
+        resolve(response);
       };
       const exit = () => {
         cleanup();
@@ -235,7 +209,6 @@ class ArchiveSession {
           {
             ...request,
             type: "archive-operation",
-            operationId,
           } satisfies SqliteArchiveSessionRequest,
           [],
         );
@@ -298,12 +271,7 @@ class ArchiveSession {
       operation: "archive-session",
       env: this.options.env,
     });
-    const connection: ArchiveConnection = {
-      worker,
-      didExit: false,
-      exited: Promise.resolve(),
-      operationId: 0,
-    };
+    const connection: ArchiveConnection = { worker, didExit: false, exited: Promise.resolve() };
     worker.on("error", (error) => {
       connection.failure ??= toStringifiedError(error);
     });

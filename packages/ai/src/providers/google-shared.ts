@@ -51,6 +51,7 @@ type GoogleThinkingOptions = {
 };
 
 export type GoogleProviderOptions = StreamOptions & {
+  topP?: number;
   toolChoice?: GoogleToolChoice;
   thinking?: GoogleThinkingOptions;
 };
@@ -134,6 +135,7 @@ export function buildGoogleGenerateContentParams<T extends GoogleApiType>(
 
   const config: GenerateContentConfig = {
     ...(options.temperature !== undefined && { temperature: options.temperature }),
+    ...(options.topP !== undefined && { topP: options.topP }),
     ...(options.maxTokens !== undefined && { maxOutputTokens: options.maxTokens }),
     ...(options.stop !== undefined && options.stop.length > 0 && { stopSequences: options.stop }),
     ...(context.systemPrompt && {
@@ -185,12 +187,20 @@ function isAdaptiveGoogleReasoningLevel(value: unknown): value is "adaptive" {
   return value === "adaptive";
 }
 
-export function buildGoogleSimpleThinking<T extends GoogleApiType>(
+function buildGoogleThinking<T extends GoogleApiType>(
   model: Model<T>,
   options: SimpleStreamOptions | undefined,
+  interactions: boolean,
 ): GoogleThinkingOptions {
+  const disabled = (): GoogleThinkingOptions => {
+    const level =
+      interactions && model.reasoning
+        ? getDisabledGoogleThinkingConfig(model).thinkingLevel
+        : undefined;
+    return { enabled: false, ...(level ? { level } : {}) };
+  };
   if (!options?.reasoning || options.reasoning === "off") {
-    return { enabled: false };
+    return disabled();
   }
   if (isAdaptiveGoogleReasoningLevel(options.reasoning)) {
     if (!model.reasoning) {
@@ -206,13 +216,13 @@ export function buildGoogleSimpleThinking<T extends GoogleApiType>(
 
   const clampedReasoning = clampThinkingLevel(model, options.reasoning);
   if (clampedReasoning === "off") {
-    return { enabled: false };
+    return disabled();
   }
   const effort = (
     clampedReasoning === "max" ? "high" : clampedReasoning
   ) as ClampedGoogleThinkingLevel;
 
-  if (isGoogleGemini3ThinkingLevelModel(model.id) || isGemma4Model(model)) {
+  if (interactions || isGoogleGemini3ThinkingLevelModel(model.id) || isGemma4Model(model)) {
     return {
       enabled: true,
       level: getGoogleThinkingLevel(effort, model),
@@ -225,37 +235,18 @@ export function buildGoogleSimpleThinking<T extends GoogleApiType>(
   };
 }
 
+export function buildGoogleSimpleThinking<T extends GoogleApiType>(
+  model: Model<T>,
+  options: SimpleStreamOptions | undefined,
+): GoogleThinkingOptions {
+  return buildGoogleThinking(model, options, false);
+}
+
 export function buildGoogleInteractionsSimpleThinking<T extends GoogleApiType>(
   model: Model<T>,
   options: SimpleStreamOptions | undefined,
 ): GoogleThinkingOptions {
-  const thinking = buildGoogleSimpleThinking(model, options);
-  if (!thinking.enabled) {
-    if (!model.reasoning) {
-      return thinking;
-    }
-    const disabled = getDisabledGoogleThinkingConfig(model);
-    return {
-      enabled: false,
-      ...(disabled.thinkingLevel ? { level: disabled.thinkingLevel } : {}),
-    };
-  }
-  if (
-    thinking.level !== undefined ||
-    !options?.reasoning ||
-    isAdaptiveGoogleReasoningLevel(options.reasoning)
-  ) {
-    return thinking;
-  }
-
-  const clampedReasoning = clampThinkingLevel(model, options.reasoning);
-  if (clampedReasoning === "off") {
-    return { enabled: false };
-  }
-  if (clampedReasoning === "xhigh" || clampedReasoning === "max") {
-    return { enabled: true, level: getGoogleThinkingLevel("high", model) };
-  }
-  return { enabled: true, level: getGoogleThinkingLevel(clampedReasoning, model) };
+  return buildGoogleThinking(model, options, true);
 }
 
 function getDisabledGoogleThinkingConfig<T extends GoogleApiType>(model: Model<T>): ThinkingConfig {

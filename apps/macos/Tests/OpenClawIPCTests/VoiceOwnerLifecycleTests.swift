@@ -60,7 +60,10 @@ struct VoiceOwnerLifecycleTests {
             await wake.pauseForPushToTalk(lease: second)
             do {
                 try await wake.startDiagnostic(
-                    id: first, triggers: ["openclaw"], micID: nil, localeID: nil,
+                    id: first,
+                    triggers: ["openclaw"],
+                    micID: nil,
+                    localeID: nil,
                     onUpdate: { _ in Issue.record("A diagnostic cannot acquire an occupied microphone") })
                 Issue.record("A diagnostic cannot steal a Talk or push-to-talk lease")
             } catch {
@@ -84,7 +87,10 @@ struct VoiceOwnerLifecycleTests {
                 withUnsafeCurrentTask { $0?.cancel() }
                 await #expect(throws: CancellationError.self) {
                     try await state.voiceRuntime.wake.startDiagnostic(
-                        id: UUID(), triggers: ["openclaw"], micID: nil, localeID: nil,
+                        id: UUID(),
+                        triggers: ["openclaw"],
+                        micID: nil,
+                        localeID: nil,
                         onUpdate: { _ in Issue.record("Cancelled diagnostic published a result") })
                 }
             }
@@ -236,18 +242,25 @@ struct VoiceOwnerLifecycleTests {
         }
     }
 
-    @Test func `overlay send uses owned coordinator and originating completion`() async throws {
+    @Test(.testWaitLimit) func `overlay send uses owned coordinator and originating completion`() async throws {
         try await withVoiceOwnerFixture(activate: false) { fixture, state, _ in
             let voice = state.voiceRuntime
             let celebration = state.sendCelebrationTick
+            let lease = UUID()
+            await voice.wake.pauseForPushToTalk(lease: lease)
+            await fixture.sendPreparation.hold()
             let token = voice.sessions.startSession(source: .pushToTalk, text: "owned transcript")
             voice.overlay.updateText("edited owned transcript")
             #expect(voice.sessions.snapshot().text == "edited owned transcript")
             voice.overlay.requestSend(token: token)
-            try await waitForVoiceOwner("owned forward and send dismissal") { [log = fixture.log] in
-                log.count("forward:edited owned transcript") == 1 && log.count("overlay.request:\(token)") == 1
-            }
-            #expect(voice.sessions.snapshot().token == token)
+            // Ordinary PTT lease release refreshes Wake while route preparation is pending.
+            await voice.wake.resumeAfterPushToTalk(lease: lease)
+            await fixture.sendPreparation.releaseAll()
+            try await fixture.log.wait(for: "forward:edited owned transcript")
+            try await fixture.log.wait(for: "overlay.request:\(token)")
+            #expect(fixture.log.count("forward:edited owned transcript") == 1)
+            #expect(fixture.log.count("overlay.request:\(token)") == 1)
+            #expect(voice.sessions.snapshot().token == nil)
             fixture.completeDismissal(token)
             #expect(voice.sessions.snapshot().token == nil)
             #expect(!voice.overlay.isVisible)

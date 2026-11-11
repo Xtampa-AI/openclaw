@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { Locator } from "playwright";
+import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
 import {
   createOpenClawTestInstance,
@@ -9,6 +9,7 @@ import {
 } from "../../../test/helpers/openclaw-test-instance.ts";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { getControlUiContextHandle } from "../test-helpers/control-ui-e2e-context.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
 import {
   takeControlUiViewportScreenshot,
@@ -117,15 +118,38 @@ suite.define(() => {
       expect(result.code, result.stderr).toBe(0);
       return result.stdout;
     };
-    const publish = (nextModels: typeof models) =>
-      cli([
-        "config",
-        "set",
-        "models.providers.fixture.models",
-        JSON.stringify(nextModels),
-        "--strict-json",
-        "--replace",
-      ]);
+    const publish = async (page: Page, nextModels: typeof models) => {
+      const applicationHandle = await getControlUiContextHandle(page);
+      try {
+        const publication = await applicationHandle.evaluateHandle((application) => {
+          const observed = { committed: false };
+          const stop = application.gateway.subscribeEvents((event) => {
+            if (event.event === "config.changed") {
+              observed.committed = true;
+            }
+          });
+          return { observed, stop };
+        });
+        try {
+          await cli([
+            "config",
+            "set",
+            "models.providers.fixture.models",
+            JSON.stringify(nextModels),
+            "--strict-json",
+            "--replace",
+          ]);
+          await expect
+            .poll(() => publication.evaluate(({ observed }) => observed.committed))
+            .toBe(true);
+        } finally {
+          await publication.evaluate(({ stop }) => stop());
+          await publication.dispose();
+        }
+      } finally {
+        await applicationHandle.dispose();
+      }
+    };
     const handoff = record(JSON.parse(await cli(["dashboard", "--json"])));
     if (typeof handoff.browserUrl !== "string") {
       throw new Error("Dashboard browser handoff missing");
@@ -212,9 +236,7 @@ suite.define(() => {
                 },
                 expanded: element.querySelector("button")?.getAttribute("aria-expanded"),
                 query: element.querySelector<HTMLInputElement>(".picker-select__search")?.value,
-                placement: element
-                  .querySelector("wa-popup")
-                  ?.getAttribute("data-current-placement"),
+                placement: rect.bottom <= triggerBounds.top ? "top" : "bottom",
                 menu: {
                   x: rect.x,
                   y: rect.y,
@@ -287,7 +309,7 @@ suite.define(() => {
           await picker.locator('[data-value=""]').click();
           expect(await pickerValue(picker)).toBe("");
 
-          await publish(models);
+          await publish(page, models);
           await expect
             .poll(() => picker.locator('[data-value="fixture/aurora-large"]').count())
             .toBe(1);
@@ -331,7 +353,10 @@ suite.define(() => {
           await search.fill("granite");
           expect(await picker.locator('[data-value="fixture/granite"]').count()).toBe(1);
           await capture("before-catalog-removal", picker);
-          await publish(models.filter((model) => model.id !== "granite"));
+          await publish(
+            page,
+            models.filter((model) => model.id !== "granite"),
+          );
           await expect.poll(() => picker.locator('[data-value="fixture/granite"]').count()).toBe(0);
           expect(await search.inputValue()).toBe("granite");
           await press("Enter");
@@ -350,9 +375,18 @@ suite.define(() => {
           await page.mouse.wheel(0, topAnchor.y - 530);
           await expect.poll(async () => (await trigger.boundingBox())?.y).toBeGreaterThan(500);
           await press("ArrowDown");
+          await picker.locator(".picker-select__menu").waitFor({ state: "visible" });
           await expect
-            .poll(() => picker.locator("wa-popup").getAttribute("data-current-placement"))
-            .toMatch(/^top-/u);
+            .poll(() =>
+              picker.evaluate((element) => {
+                const menu = element.querySelector(".picker-select__menu")!.getBoundingClientRect();
+                const pickerTriggerBounds = element
+                  .querySelector(".picker-select__trigger")!
+                  .getBoundingClientRect();
+                return menu.bottom <= pickerTriggerBounds.top;
+              }),
+            )
+            .toBe(true);
           await capture("draft-top-opening", picker);
           await press("Escape");
           await page.setViewportSize({ width: 390, height: 844 });

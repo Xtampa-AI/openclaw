@@ -2,7 +2,11 @@ import { spawnSync } from "node:child_process";
 import { accessSync, constants, readFileSync, realpathSync, rmSync } from "node:fs";
 import { posix, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
-import { isNodeVersionAtLeast, parseNodeReleaseVersion } from "../node-version.mjs";
+import {
+  isNodeVersionAtLeast,
+  MINIMUM_BUN_VERSION,
+  parseNodeReleaseVersion,
+} from "../node-version.mjs";
 import { LEGACY_PACKAGE_INSTALL_GUARD_RELATIVE_PATH } from "./lib/package-lifecycle-marker.mjs";
 
 const allowedLifecyclePackageManagers = new Set(["pnpm", "npm", "yarn", "bun"]);
@@ -128,11 +132,11 @@ function isStableAbsolutePath(value, pathApi, platform) {
   return root !== "\\" && root !== "/";
 }
 
-function stripBunLifecyclePathPrefix(pathEntries, cwd, pathApi, platform) {
-  const expectedPrefix = [];
+function stripBunLifecyclePaths(pathEntries, cwd, pathApi, platform, dependencyLifecycle) {
+  const lifecyclePaths = [];
   let directory = pathApi.resolve(cwd);
   while (true) {
-    expectedPrefix.push(pathApi.join(directory, "node_modules", ".bin"));
+    lifecyclePaths.push(pathApi.join(directory, "node_modules", ".bin"));
     const parent = pathApi.dirname(directory);
     if (parent === directory) {
       break;
@@ -140,18 +144,75 @@ function stripBunLifecyclePathPrefix(pathEntries, cwd, pathApi, platform) {
     directory = parent;
   }
 
-  if (pathEntries.length < expectedPrefix.length) {
+  if (pathEntries.length < lifecyclePaths.length) {
     return null;
   }
-  for (const [index, expected] of expectedPrefix.entries()) {
+  const matches = (entry, expected) =>
+    normalizePathForComparison(entry, pathApi, platform) ===
+    normalizePathForComparison(expected, pathApi, platform);
+  for (
+    let prefixLength = dependencyLifecycle ? 1 : lifecyclePaths.length;
+    prefixLength <= lifecyclePaths.length;
+    prefixLength++
+  ) {
     if (
-      normalizePathForComparison(pathEntries[index], pathApi, platform) !==
+      !lifecyclePaths
+        .slice(0, prefixLength)
+        .every((expected, index) => matches(pathEntries[index], expected))
+    ) {
+      return null;
+    }
+    const suffixStart = pathEntries.length - (lifecyclePaths.length - prefixLength);
+    const suffixMatches = lifecyclePaths
+      .slice(prefixLength)
+      .every((expected, index) => matches(pathEntries[suffixStart + index], expected));
+    if (suffixMatches) {
+      // Dependency lifecycles can include private-store bins before inherited PATH.
+      return pathEntries.slice(prefixLength, suffixStart);
+    }
+  }
+  return null;
+}
+
+function stripBunPostinstallPathLayout(pathEntries, cwd, pathApi, platform) {
+  const resolvedCwd = pathApi.resolve(cwd);
+  const firstExpected = pathApi.join(resolvedCwd, "node_modules", ".bin");
+  if (
+    normalizePathForComparison(pathEntries[0] ?? "", pathApi, platform) !==
+    normalizePathForComparison(firstExpected, pathApi, platform)
+  ) {
+    return null;
+  }
+
+  const expectedSuffix = [];
+  for (let directory = pathApi.dirname(resolvedCwd); ; directory = pathApi.dirname(directory)) {
+    expectedSuffix.push(pathApi.join(directory, "node_modules", ".bin"));
+    if (pathApi.dirname(directory) === directory) {
+      break;
+    }
+  }
+  const bunShimIndex = pathEntries.length - expectedSuffix.length - 1;
+  const nodeGypIndex = bunShimIndex - 1;
+  if (nodeGypIndex <= 0) {
+    return null;
+  }
+  for (const [index, expected] of expectedSuffix.entries()) {
+    if (
+      normalizePathForComparison(pathEntries[bunShimIndex + 1 + index] ?? "", pathApi, platform) !==
       normalizePathForComparison(expected, pathApi, platform)
     ) {
       return null;
     }
   }
-  return pathEntries.slice(expectedPrefix.length);
+  if (
+    !/^bun-node-(?:[0-9a-f]+|[0-9]+-(?:[0-9a-f]+|debug)(?:-[0-9a-f]{16})?)$/u.test(
+      pathApi.basename(pathEntries[bunShimIndex] ?? ""),
+    ) ||
+    !/^\.[0-9a-f]+-[0-9]+\.node-gyp$/u.test(pathApi.basename(pathEntries[nodeGypIndex] ?? ""))
+  ) {
+    return null;
+  }
+  return pathEntries.slice(1, nodeGypIndex);
 }
 
 /**
@@ -163,9 +224,11 @@ function stripBunLifecyclePathPrefix(pathEntries, cwd, pathApi, platform) {
  *   platform?: NodeJS.Platform;
  *   cwd?: string;
  *   execPath?: string;
+ *   bunVersion?: string | null;
  *   access?: (path: string, mode: number) => void;
  *   realpath?: (path: string) => string;
  *   run?: PackageCliNodeProbeRun;
+ *   allowUnavailableNodeFallback?: boolean;
  * }} [options]
  * @returns {PackageCliNodeRuntime | null}
  */
@@ -176,17 +239,40 @@ export function probePackageCliNodeRuntime(options = {}) {
     platform = process.platform,
     cwd = process.cwd(),
     execPath = process.execPath,
+    bunVersion = process.versions.bun ?? null,
     access = accessSync,
     realpath = realpathSync,
     run = spawnSync,
+    allowUnavailableNodeFallback = false,
   } = options;
   const pathApi = platform === "win32" ? win32 : posix;
   const delimiter = platform === "win32" ? ";" : ":";
   const executableName = platform === "win32" ? "node.exe" : "node";
   const seen = new Set();
-  // Bun prepends one cwd-to-root node_modules/.bin path per ancestor before
-  // the original PATH. Strip only that exact prefix; anything else persists.
-  const pathEntries = stripBunLifecyclePathPrefix(pathEnv.split(delimiter), cwd, pathApi, platform);
+  // Bun 1.4.4 moved dependency ancestor bins after inherited PATH. Root scripts
+  // and older Bun keep the full prefix. PATH alone cannot distinguish them when
+  // inherited entries also name ancestor bins; use the runtime and package root.
+  const reorderedLifecycle = isNodeVersionAtLeast(parseNodeReleaseVersion(bunVersion), {
+    major: 1,
+    minor: 4,
+    patch: 4,
+  });
+  const localPrefix = normalizeEnvValue(env.npm_config_local_prefix);
+  const validLocalPrefix = isStableAbsolutePath(localPrefix, pathApi, platform);
+  if (reorderedLifecycle && !validLocalPrefix && !allowUnavailableNodeFallback) {
+    return null;
+  }
+  const dependencyLifecycle =
+    reorderedLifecycle &&
+    validLocalPrefix &&
+    normalizePathForComparison(localPrefix, pathApi, platform) !==
+      normalizePathForComparison(pathApi.resolve(cwd), pathApi, platform);
+  const rawPathEntries = pathEnv.split(delimiter);
+  const pathEntries =
+    stripBunLifecyclePaths(rawPathEntries, cwd, pathApi, platform, dependencyLifecycle) ??
+    (allowUnavailableNodeFallback
+      ? stripBunPostinstallPathLayout(rawPathEntries, cwd, pathApi, platform)
+      : null);
   if (!pathEntries) {
     return null;
   }
@@ -249,6 +335,9 @@ export function probePackageCliNodeRuntime(options = {}) {
       continue;
     }
     if (result?.status !== 0) {
+      if (allowUnavailableNodeFallback) {
+        continue;
+      }
       return null;
     }
 
@@ -277,6 +366,7 @@ export function probePackageCliNodeRuntime(options = {}) {
  *   bunVersion?: string | null;
  *   engine?: string | null;
  *   execPath?: string | null;
+ *   bunLauncher?: string | null;
  *   probeNodeRuntime?: () => PackageCliNodeRuntime | null;
  * }} [options]
  * @param {(...data: unknown[]) => void} [reportError]
@@ -288,25 +378,27 @@ export function enforceSupportedNodeRuntime(
     bunVersion = process.versions.bun ?? null,
     engine = readPackageNodeEngine(),
     execPath = process.execPath,
+    bunLauncher = process.env.OPENCLAW_PACKAGE_BUN_LAUNCHER ?? null,
     probeNodeRuntime = probePackageCliNodeRuntime,
   } = {},
   reportError = console.error,
 ) {
-  const detectedRuntime = normalizeEnvValue(bunVersion)
-    ? probeNodeRuntime()
+  const activeBunVersion = normalizeEnvValue(bunVersion);
+  const normalizedExecPath = normalizeEnvValue(execPath);
+  const canonicalBunLauncher = normalizeEnvValue(bunLauncher);
+  const detectedRuntime = activeBunVersion
+    ? canonicalBunLauncher && canonicalBunLauncher === normalizedExecPath
+      ? { version: null, bunVersion: activeBunVersion, execPath: normalizedExecPath }
+      : probeNodeRuntime()
     : { version, execPath };
   if (detectedRuntime?.bunVersion) {
     if (
-      isNodeVersionAtLeast(parseNodeReleaseVersion(detectedRuntime.bunVersion), {
-        major: 1,
-        minor: 4,
-        patch: 0,
-      })
+      isNodeVersionAtLeast(parseNodeReleaseVersion(detectedRuntime.bunVersion), MINIMUM_BUN_VERSION)
     ) {
       return true;
     }
     reportError(
-      `[openclaw] error: Bun launcher ${detectedRuntime.execPath ?? execPath} requires Bun 1.4+ (detected ${detectedRuntime.bunVersion}).`,
+      `[openclaw] error: Bun launcher ${detectedRuntime.execPath ?? execPath} requires Bun 1.4.4+ (detected ${detectedRuntime.bunVersion}).`,
     );
     return false;
   }

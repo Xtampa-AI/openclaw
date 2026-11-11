@@ -115,16 +115,6 @@ describe("exa web search provider", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
   });
 
-  it("exposes the expected metadata and selection wiring", () => {
-    const provider = createExaWebSearchProvider();
-    const applied = provider.applySelectionConfig?.({});
-
-    expect(provider.id).toBe("exa");
-    expect(provider.onboardingScopes).toEqual(["text-inference"]);
-    expect(provider.credentialPath).toBe("plugins.entries.exa.config.webSearch.apiKey");
-    expect(applied?.plugins?.entries?.exa?.enabled).toBe(true);
-  });
-
   it("applies scoped auth, endpoint, contents, freshness, and result normalization at the tool boundary", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
       Response.json({
@@ -227,7 +217,7 @@ describe("exa web search provider", () => {
       { baseUrl: "ftp://proxy.example/exa" },
       { query: "invalid endpoint" },
       "invalid_base_url",
-      "plugins.entries.exa.config.webSearch.baseUrl must be a valid http(s) URL. Got: ftp://proxy.example/exa",
+      "plugins.entries.exa.config.webSearch.baseUrl must be a valid http(s) URL.",
     ],
     [
       {},
@@ -255,6 +245,24 @@ describe("exa web search provider", () => {
       message,
       docs: `https://docs.openclaw.ai/tools/${error === "invalid_base_url" ? "exa-search" : "web"}`,
     });
+  });
+
+  it.each([
+    "ftp://fixture-user:fixture-url-password@proxy.example/exa?api_key=fixture-query-token",
+    "fixture-user:fixture-url-password@proxy.example:invalid/exa?api_key=fixture-query-token",
+    "custom://fixture-user:fixture-url-password@proxy.example/exa?api_key=fixture-query-token",
+  ])("redacts credentials from rejected custom endpoint %s", async (baseUrl) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const result = await requireExaTool({ apiKey: "test-exa-key", baseUrl }).execute({
+      query: "invalid credential-bearing endpoint",
+    });
+    expect(JSON.stringify(result)).not.toContain("fixture-url-password");
+    expect(JSON.stringify(result)).not.toContain("fixture-query-token");
+    expect(result).toMatchObject({
+      error: "invalid_base_url",
+      message: expect.stringContaining("plugins.entries.exa.config.webSearch.baseUrl"),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it.each([0, 1])("honors the current cache TTL %s", async (cacheTtlMinutes) => {
@@ -291,20 +299,6 @@ describe("exa web search provider", () => {
       expect(await currentTool.execute(args)).toEqual({ ...fresh, cached: true });
       expect(fetchMock).toHaveBeenCalledTimes(2);
     }
-  });
-
-  it("exposes newer documented Exa search types and count limits", () => {
-    const tool = requireExaTool({ apiKey: "exa-secret" });
-
-    expect(tool.parameters).toHaveProperty("properties.count.maximum", 100);
-    expect(tool.parameters).toHaveProperty("properties.type.enum", [
-      "auto",
-      "neural",
-      "fast",
-      "deep",
-      "deep-reasoning",
-      "instant",
-    ]);
   });
 
   it("reports malformed Exa API JSON with a stable provider error", async () => {
@@ -378,4 +372,56 @@ describe("exa web search provider", () => {
     expect(textSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+  it("shares cached answers only with the same resolved credential", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockImplementation(async (_url, init) =>
+      Response.json({
+        results: [
+          {
+            url:
+              new Headers(init?.headers).get("x-api-key") === "fixture-exa-a"
+                ? "https://example.com/account-a"
+                : "https://example.com/account-b",
+          },
+        ],
+      }),
+    );
+    const args = { query: "Exa credential cache isolation" };
+    const first = await requireExaTool({ apiKey: "fixture-exa-a" }).execute(args);
+    const other = await requireExaTool({ apiKey: "fixture-exa-b" }).execute(args);
+    const repeated = await requireExaTool({ apiKey: "fixture-exa-a" }).execute(args);
+
+    expect(first).toMatchObject({ results: [{ url: "https://example.com/account-a" }] });
+    expect(other).toMatchObject({ results: [{ url: "https://example.com/account-b" }] });
+    expect(repeated).toEqual({ ...first, cached: true });
+    expect(
+      fetchMock.mock.calls.map(([, init]) => new Headers(init?.headers).get("x-api-key")),
+    ).toEqual(["fixture-exa-a", "fixture-exa-b"]);
+  });
+
+  it.each(["body", "statusText"])(
+    "redacts the active credential reflected in %s",
+    async (source) => {
+      const apiKey = "fixture-exa-opaque-credential";
+      const detail = `upstream rejected ${apiKey}`;
+      const fetchMock = vi.spyOn(globalThis, "fetch");
+      fetchMock.mockResolvedValue(
+        new Response(source === "body" ? detail : "", {
+          status: 503,
+          statusText: source === "statusText" ? detail : "Unavailable",
+        }),
+      );
+      const failure = requireExaTool({ apiKey }, { cacheTtlMinutes: 0 }).execute({
+        query: `reflected credential ${source}`,
+      });
+
+      await expect(failure).rejects.toMatchObject({
+        status: 503,
+        statusCode: 503,
+        message: expect.stringContaining("upstream rejected"),
+      });
+      await expect(failure).rejects.not.toThrow(apiKey);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
 });

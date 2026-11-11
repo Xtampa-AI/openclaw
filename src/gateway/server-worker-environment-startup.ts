@@ -22,6 +22,7 @@ import type { DesktopSessionRegistry } from "./desktop/session-registry.js";
 import type { NodeWorkerSupervisorTransport } from "./node-registry-private.js";
 import type { GatewayContextResolver, GatewayRequestContext } from "./server-methods/types.js";
 import { createWorkerRuntimeInstallProgressPublisher } from "./server-worker-runtime-install-progress.js";
+import { retryGatewayWorkerStartupRecovery } from "./server-worker-startup-recovery.js";
 import type { ArtifactTransferHttpCallback } from "./worker-environments/artifact-transfer-http.js";
 import type { WorkerBundleProducer, WorkerNpmArtifact } from "./worker-environments/bundle.js";
 import {
@@ -78,9 +79,6 @@ export type GatewayWorkerEnvironmentRuntime = {
 
 const loadWorkerEnvironmentRuntimeModule = createLazyRuntimeModule(
   () => import("./worker-environments/runtime.js"),
-);
-const loadWorkerInferenceRuntimeModule = createLazyRuntimeModule(
-  () => import("./worker-environments/inference-runtime.js"),
 );
 const loadWorkerSessionToolExecutorModule = createLazyRuntimeModule(
   () => import("./worker-environments/worker-session-tool-executor.js"),
@@ -173,18 +171,22 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
   // process are gone. Resolve their ambiguous effects before placement
   // reconciliation attempts to release the owning worker claims.
   await params.startup.placementStore.recoverWorkerSessionToolOperationsAfterRestart();
+  const workerEnvironmentLog = params.log.child("worker-environments");
   // A crashed gateway can leak local turn claims; drop them before workers re-admit turns.
-  params.startup.placementStore.clearLocalTurnClaimsAfterRestart();
+  await retryGatewayWorkerStartupRecovery({
+    operation: "Worker startup local turn-claim recovery",
+    run: () => params.startup.placementStore.clearLocalTurnClaimsAfterRestartAsync(),
+    warn: (message) => workerEnvironmentLog.warn(message),
+  });
   const placementGate = createWorkerSessionPlacementGate(params.startup.placementStore, {
     // Claims loaded before this Gateway acquired the state lock remain usable only by
     // workspace recovery. Worker authority is minted from claims created in this lifecycle.
-    rejectExistingWorkerClaims: true,
+    recoveryPlacements: await params.startup.placementStore.listAsync(),
   });
-  const workerEnvironmentLog = params.log.child("worker-environments");
-  const listRetainedBundleHashes = () =>
+  const listRetainedBundleHashes = async () =>
     listRetainedWorkerBundleHashes({
       environments: params.startup.store.list(),
-      placements: params.startup.placementStore.list(),
+      placements: await params.startup.placementStore.listAsync(),
     });
   let workerBundleProducer: WorkerBundleProducer | undefined;
   let workerNpmArtifact: Promise<WorkerNpmArtifact> | undefined;
@@ -528,10 +530,6 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
     applyTranscriptCommit: createWorkerTranscriptCommitter({
       getConfig: getRuntimeConfig,
     }).commit,
-    executeInference: async (inferenceParams) => {
-      const workerInferenceRuntime = await loadWorkerInferenceRuntimeModule();
-      return await workerInferenceRuntime.executeWorkerInference(inferenceParams);
-    },
     placementStore: placementGate,
     createGatewayTools: (request) => createGatewayTools(request),
     liveEvents: workerLiveEvents,

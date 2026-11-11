@@ -3,16 +3,21 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, expect, it, vi } from "vitest";
+import {
+  ensureMemoryChunkFtsSchema,
+  ensureMemoryPathFtsSchema,
+} from "../../packages/memory-host-sdk/src/host/memory-schema-fts.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { AGENT_FTS_SCHEMAS } from "../state/openclaw-agent-fts-schema.js";
-import {
-  corruptSqliteIndexKey,
-  installSqliteFtsTokenizerMismatch,
-} from "./sqlite-index-corruption.test-support.js";
+import { readSqliteDatabaseIntegrityVerification } from "./sqlite-database-admission.js";
+import { installSqliteFtsTokenizerMismatch } from "./sqlite-index-corruption.test-support.js";
 import { repairDoctorSqliteIndexCorruption } from "./sqlite-index-recovery.js";
 import { repairSqliteIndexCorruption } from "./sqlite-index-schema.js";
-import { classifySqliteFtsIntegrityFindings } from "./sqlite-integrity.js";
-import { createVerifiedSqliteSnapshot } from "./sqlite-snapshot.js";
+import {
+  assertSqliteIntegrity,
+  classifySqliteFtsIntegrityFindings,
+  SqliteIntegrityError,
+} from "./sqlite-integrity.js";
 
 const roots = useAutoCleanupTempDirTracker(afterEach);
 
@@ -119,95 +124,73 @@ it("rolls an FTS rebuild back when commit authority is lost", () => {
   expect(db.prepare("PRAGMA integrity_check").all()).toEqual(findings);
 });
 
-it.each(["unowned", "mixed"] as const)(
-  "refuses real %s corruption without backup or mutation",
-  (kind) => {
-    const pathname = fixture();
-    {
-      using seed = new DatabaseSync(pathname);
-      if (kind === "unowned") {
-        seed.exec(
-          "CREATE VIRTUAL TABLE unowned USING fts5(text); INSERT INTO unowned VALUES ('ab'||char(65534)||'cd');",
-        );
-      } else {
-        seed.exec(
-          "CREATE TABLE retained(id INTEGER PRIMARY KEY, value TEXT); CREATE INDEX idx_retained ON retained(value); INSERT INTO retained VALUES (1, 'unique-retained-key');",
-        );
-      }
-    }
-    if (kind === "unowned") {
-      installSqliteFtsTokenizerMismatch(pathname, "unowned");
-    } else {
-      corruptSqliteIndexKey(pathname, "idx_retained", "unique-retained-key", "unique-corruptedkey");
-    }
-    using db = new DatabaseSync(pathname);
-    const before = db.prepare("PRAGMA integrity_check(2147483647)").all();
-    expect(before.length).toBeGreaterThan(2);
-    const backup = vi.fn();
-    expect(() =>
-      repairSqliteIndexCorruption(db, pathname, {
-        ftsSchemas: AGENT_FTS_SCHEMAS,
-        backup,
-        assertCurrent: () => {},
-      }),
-    ).toThrow(/Unrecognized SQLite integrity finding/);
-    expect(backup).not.toHaveBeenCalled();
-    expect(db.prepare("PRAGMA integrity_check(2147483647)").all()).toEqual(before);
-  },
-);
+it("does not publish a healthy integrity admission for tolerated stale FTS", () => {
+  const pathname = fixture();
+  using db = new DatabaseSync(pathname);
+  expect(() =>
+    assertSqliteIntegrity(db, pathname, { ftsSchemas: AGENT_FTS_SCHEMAS }),
+  ).not.toThrow();
+  expect(readSqliteDatabaseIntegrityVerification(db)).toBeUndefined();
+  expect(() => assertSqliteIntegrity(db, pathname)).toThrow("integrity_check failed");
+});
 
-it.each(["owned", "unowned", "unopted", "mixed", "foreign-key"] as const)(
-  "update snapshots copy %s stale FTS indexes only when they are owned and opted in",
-  async (kind) => {
-    const pathname = fixture();
-    if (kind === "unowned") {
-      {
-        using db = new DatabaseSync(pathname);
-        db.exec(`CREATE VIRTUAL TABLE unowned_fts USING fts5(text);
-          INSERT INTO unowned_fts(text) VALUES ('ab'||char(65534)||'cd');`);
-      }
-      installSqliteFtsTokenizerMismatch(pathname, "unowned_fts");
-    }
-    if (kind === "mixed") {
-      {
-        using db = new DatabaseSync(pathname);
-        db.exec(
-          "CREATE TABLE retained(id INTEGER PRIMARY KEY, value TEXT); CREATE INDEX idx_retained ON retained(value); INSERT INTO retained VALUES (1, 'unique-retained-key');",
-        );
-      }
-      corruptSqliteIndexKey(pathname, "idx_retained", "unique-retained-key", "unique-corruptedkey");
-    }
-    if (kind === "foreign-key") {
-      using db = new DatabaseSync(pathname);
-      db.exec(
-        "PRAGMA foreign_keys=OFF; CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(parent_id INTEGER REFERENCES parent(id)); INSERT INTO child VALUES (7);",
-      );
-    }
-    const original = fs.readFileSync(pathname);
-    const targetPath = path.join(roots.make("fts-snapshot-"), "copy.sqlite");
-    const snapshot = createVerifiedSqliteSnapshot({
-      sourcePath: pathname,
-      targetPath,
-      preserveRowIds: true,
-      ...(kind === "unopted" ? {} : { ftsSchemas: AGENT_FTS_SCHEMAS }),
-    });
-    if (kind !== "owned") {
-      await expect(snapshot).rejects.toThrow(
-        kind === "foreign-key" ? /foreign.key/u : /malformed inverted index/u,
-      );
-      expect(fs.existsSync(targetPath)).toBe(false);
-      return;
-    }
-    await snapshot;
-    using copy = new DatabaseSync(targetPath, { readOnly: true });
-    // The runtime that admits the copy owns the rebuild; the copy keeps the old index bytes.
-    expect(copy.prepare("PRAGMA integrity_check").all()).toEqual([
-      { integrity_check: "malformed inverted index for FTS5 table main.memory_index_chunks_fts" },
-      { integrity_check: "malformed inverted index for FTS5 table main.session_transcript_fts" },
-    ]);
-    expect(copy.prepare("SELECT text FROM session_transcript_fts").all()).toEqual([
-      { text: "ab\ufffecd" },
-    ]);
-    expect(fs.readFileSync(pathname)).toEqual(original);
-  },
-);
+it("still refuses foreign-key damage when FTS findings are tolerated", () => {
+  const pathname = fixture();
+  using db = new DatabaseSync(pathname);
+  db.exec(
+    "PRAGMA foreign_keys=OFF; CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(parent INTEGER REFERENCES parent(id)); INSERT INTO child VALUES(123)",
+  );
+  expect(() => assertSqliteIntegrity(db, pathname, { ftsSchemas: AGENT_FTS_SCHEMAS })).toThrow(
+    "foreign_key_check failed",
+  );
+  expect(readSqliteDatabaseIntegrityVerification(db)).toBeUndefined();
+});
+
+it("reads beyond 100 findings and refuses late genuine corruption with stale FTS", () => {
+  const pathname = fixture();
+  using db = new DatabaseSync(pathname);
+  db.exec(
+    "CREATE TABLE late_damage(value INTEGER CHECK(value > 0)); PRAGMA ignore_check_constraints=ON; WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<105) INSERT INTO late_damage SELECT -n FROM rows; PRAGMA ignore_check_constraints=OFF;",
+  );
+  let failure: unknown;
+  try {
+    assertSqliteIntegrity(db, pathname, { ftsSchemas: AGENT_FTS_SCHEMAS });
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(SqliteIntegrityError);
+  expect((failure as SqliteIntegrityError).findings).toHaveLength(107);
+  expect((failure as SqliteIntegrityError).findings?.slice(100)).toContain(
+    "CHECK constraint failed in late_damage",
+  );
+  expect(readSqliteDatabaseIntegrityVerification(db)).toBeUndefined();
+});
+
+it.each([
+  "",
+  ", tokenize='unicode61'",
+  ', tokenize="unicode61"',
+  ", tokenize='trigram case_sensitive 0'",
+])("recognizes deployed lazy body and path FTS schemas with tokenizer %s", (tokenizer) => {
+  using db = new DatabaseSync(":memory:");
+  // Exercise the existing lazy owner, not a copy of the accepted schema list.
+  db.exec(
+    "CREATE TABLE memory_index_sources(id INTEGER PRIMARY KEY, path TEXT, source TEXT); CREATE TABLE memory_index_chunks(chunk_rowid INTEGER PRIMARY KEY, text TEXT, id TEXT, path TEXT, source TEXT, model TEXT, start_line INTEGER, end_line INTEGER)",
+  );
+  ensureMemoryChunkFtsSchema({
+    db,
+    ftsTable: "memory_index_chunks_fts",
+    tokenizeClause: tokenizer,
+  });
+  ensureMemoryPathFtsSchema({ db, tokenizeClause: tokenizer });
+  expect(
+    classifySqliteFtsIntegrityFindings(
+      db,
+      [
+        "malformed inverted index for FTS5 table main.memory_index_chunks_fts",
+        "malformed inverted index for FTS5 table main.memory_index_paths_fts",
+      ],
+      AGENT_FTS_SCHEMAS,
+    ),
+  ).toEqual(["memory_index_chunks_fts", "memory_index_paths_fts"]);
+});

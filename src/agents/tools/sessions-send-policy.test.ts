@@ -38,6 +38,7 @@ const sessions = [
   { key: requesterKey, agentId: "main", sessionId: "requester-session" },
   { key: subagentRequesterKey, agentId: "main", sessionId: "subagent-requester-session" },
   { key: workerKey, agentId: "worker", sessionId: workerSessionId, label: "delegation-worker" },
+  { key: "global", agentId: "worker", sessionId: "raw-worker-session", label: "raw-worker" },
   { key: "agent:stranger:main", agentId: "stranger", sessionId: "stranger-session" },
   {
     key: nativeChildKey,
@@ -112,9 +113,8 @@ function expectNoDispatch() {
 }
 
 describe("sessions_send directed policy at the tool boundary", () => {
+  let expectedReplyHistoryReads = 0;
   let state: OpenClawTestState;
-  // Only the reply-recovery cases may read the accepted run's history.
-  let historyReadExpected = false;
   let originalRegistry: ReturnType<typeof captureActivePluginRegistrySnapshot>;
 
   beforeAll(async () => {
@@ -131,6 +131,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   beforeEach(() => {
+    expectedReplyHistoryReads = 0;
     // Model only the Gateway transport: resolution returns inventory facts, never policy decisions.
     callGateway.mockReset();
     callGateway.mockImplementation(
@@ -229,10 +230,13 @@ describe("sessions_send directed policy at the tool boundary", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    if (!historyReadExpected) {
-      expect(gatewayMethods()).not.toContain("chat.history");
+    const historyReads = callGateway.mock.calls.filter(
+      ([request]) => request.method === "chat.history",
+    );
+    expect(historyReads).toHaveLength(expectedReplyHistoryReads);
+    for (const [request] of historyReads) {
+      expect(request.params).toEqual({ sessionKey: workerKey, agentId: "worker", limit: 50 });
     }
-    historyReadExpected = false;
   });
 
   afterAll(async () => {
@@ -277,7 +281,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
   ])(
     "returns the accepted run's full $name with explicit tool-budget truncation",
     async ({ full, preview }) => {
-      historyReadExpected = true;
+      expectedReplyHistoryReads = 1;
       const transport = callGateway.getMockImplementation()!;
       callGateway.mockImplementation(
         async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
@@ -324,9 +328,6 @@ describe("sessions_send directed policy at the tool boundary", () => {
         },
         16_000,
       );
-      if (projected.role !== "toolResult") {
-        throw new Error("expected a projected tool result");
-      }
       const text = projected.content.find((block) => block.type === "text")?.text;
       if (full.length > 16_000) {
         expect(text).toMatch(/\d+ more characters truncated/);
@@ -339,7 +340,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
   );
 
   it("reports a truncated preview when the accepted run's full reply is unavailable", async () => {
-    historyReadExpected = true;
+    expectedReplyHistoryReads = 1;
     const preview = `${"a".repeat(4_095)}…`;
     const transport = callGateway.getMockImplementation()!;
     callGateway.mockImplementation(
@@ -429,6 +430,22 @@ describe("sessions_send directed policy at the tool boundary", () => {
     });
     expect(result.details).toMatchObject({ status: "ok", reply: replyText, watched: true });
     expect(watch).toHaveBeenCalledOnce();
+  });
+
+  it("reports a raw-target watch refusal without misreporting an accepted send", async () => {
+    const result = await send(configFor({ send: ["worker"], visibility: "all" }), {
+      label: "raw-worker",
+      agentId: "worker",
+      watch: true,
+    });
+    expect(result.details).toMatchObject({
+      status: "ok",
+      reply: replyText,
+      watched: false,
+      watchError: expect.stringContaining("agent-qualified"),
+    });
+    expect(gatewayMethods()).toContain("agent");
+    expect(gatewayMethods()).toContain("agent.wait");
   });
 
   it.each([requesterKey, subagentRequesterKey])(

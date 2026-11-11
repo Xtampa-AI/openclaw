@@ -91,6 +91,14 @@ export async function preparePluginUpdateConfigMigration(params: {
         restoreDoctorConfigEnvRefs(
           migrated.config,
           prepareDoctorConfigReferenceSource(params.snapshot),
+          undefined,
+          {
+            // Policy migration must not send reference replay to the prior package generation.
+            pluginCompatibility: {
+              pluginIds: [...selectedIds],
+              manifestRegistry: metadata.manifestRegistry,
+            },
+          },
         ),
       );
       return { config, selectedIds, selectedPending, inspected };
@@ -100,6 +108,7 @@ export async function preparePluginUpdateConfigMigration(params: {
     let activationWarning: string | undefined;
     return {
       config,
+      deferredPluginMigrations: pending,
       changed: selectedPending.length > 0 || !isDeepStrictEqual(config, params.config),
       get activationWarning() {
         return activationWarning;

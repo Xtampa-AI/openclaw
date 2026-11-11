@@ -47,6 +47,33 @@ export type GatewayCall = {
   onAccepted?: (payload: unknown) => void;
 };
 
+/** End through the real lifecycle and wait for the persisted terminal registry row. */
+export async function endChildRun(
+  runId: string,
+  childSessionKey: string,
+  terminalReply: { disposition: "visible"; text: string },
+) {
+  let stop = () => {};
+  const ended = new Promise<void>((resolve) => {
+    stop = subscribeSubagentRunChanges("persistence", () => {
+      if (getSubagentRunByRunId(runId)?.execution.endedAt !== undefined) {
+        resolve();
+      }
+    });
+  });
+  emitAgentEvent({
+    runId,
+    sessionKey: childSessionKey,
+    stream: "lifecycle",
+    data: { phase: "end", endedAt: Date.now(), terminalReply },
+  });
+  try {
+    await ended;
+  } finally {
+    stop();
+  }
+}
+
 /** Reuse the coordination suite's transport and state fixture for post-commit retirement. */
 export function registerSessionsSendRequesterRetirementTests({
   config,
@@ -130,6 +157,8 @@ export function registerSessionsSendRequesterRetirementTests({
         await registerSubagentRun({
           runId,
           childSessionKey,
+          childAgentId: "main",
+          sessionEntry: { sessionId: childSessionId },
           requesterSessionKey,
           requesterDisplayKey: requesterSessionKey,
           requesterAgentId: "main",

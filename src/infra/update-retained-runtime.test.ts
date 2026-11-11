@@ -75,6 +75,8 @@ it.for([false, true])(
     const original = new Error("original update failure");
     const entered = createDeferred();
     const release = createDeferred();
+    const nativeEntered = createDeferred();
+    const nativeRelease = createDeferred();
     const removed = vi.spyOn(fs, "rm");
     const reportRetained = vi.spyOn(temporaryArtifacts, "reportRetainedUpdateRuntime");
     vi.spyOn(os, "tmpdir").mockReturnValue(base);
@@ -116,7 +118,11 @@ it.for([false, true])(
       source.runtimeGeneration.retain({}, async () => {
         entered.resolve();
         await release.promise;
-        resourcesSettled = true;
+        return async () => {
+          nativeEntered.resolve();
+          await nativeRelease.promise;
+          resourcesSettled = true;
+        };
       });
       acceptedWrite = store.execute({ type: "append", input: "accepted before exit" });
       void acceptedWrite.catch(() => undefined);
@@ -144,8 +150,27 @@ it.for([false, true])(
       expect(assertResourcesSettled).not.toHaveBeenCalled();
       assert.ok(directory);
       expect((await stat(directory)).isDirectory()).toBe(true);
+      release.resolve();
+      await withinTest(
+        awaitGateBeforeSettlement(
+          nativeEntered.promise,
+          settled,
+          "Updater returned before native retirement",
+        ),
+        signal,
+      );
+      expect(await maintain()).toContainEqual(
+        expect.stringContaining("the creating update still owns this runtime"),
+      );
+      expect(assertResourcesSettled).not.toHaveBeenCalled();
+      expect(reportRetained).not.toHaveBeenCalledWith(
+        directory,
+        expect.stringContaining("worker generation settled; cleanup deferred"),
+      );
+      expect((await stat(directory)).isDirectory()).toBe(true);
     } finally {
       release.resolve();
+      nativeRelease.resolve();
       await settled;
     }
     expect(await settled).toEqual(failed ? { error: original } : { value: receipt.metrics });
@@ -901,7 +926,6 @@ it("falls back when the runtime sibling is read-only", async () => {
     });
     assert.ok(retained && generation);
     expect(await readFile(retained, "utf8")).toBe(backend);
-    expect(() => generation!.resolve(pathToFileURL(retained!))).toThrow("generation is closing");
   } finally {
     allocation.mockRestore();
     temporaryRoot.mockRestore();

@@ -98,6 +98,7 @@ export async function prepareCodexAttemptContext(
   };
   const hookContext = {
     runId: params.runId,
+    config: params.config,
     agentId: sessionAgentId,
     sessionKey: contextSessionKey,
     sessionId: params.sessionId,
@@ -192,7 +193,9 @@ export async function prepareCodexAttemptContext(
     ) || undefined;
   const baseDeveloperInstructions = joinPresentSections(
     buildDeveloperInstructions(runtimeParams, {
-      dynamicTools: toolBridge.availableSpecs,
+      // Only a selected relay may carry transient context outside creation policy.
+      omitConversationTurnContext: true,
+      dynamicTools: toolBridge.specs,
       nativeCodeModeOnlyEnabled:
         runtime.nativeToolSurfaceEnabled && connection.appServer.codeModeOnly,
     }),

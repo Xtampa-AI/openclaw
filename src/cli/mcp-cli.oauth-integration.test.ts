@@ -12,12 +12,15 @@ import { readMcpOAuthPendingAuthorization } from "../agents/mcp-oauth-store.js";
 import { readMcpOAuthCredentialsStatus } from "../agents/mcp-oauth.js";
 import { seedMcpOAuthStoreForTest } from "../agents/mcp-oauth.test-support.js";
 import { withTempHome } from "../config/home-env.test-harness.js";
+import * as gatewayLock from "../infra/gateway-lock.js";
+import { captureGatewayStateOwner } from "../infra/gateway-state-owner.js";
 import { defaultRuntime } from "../runtime.js";
 import { withOpenClawStateDatabaseReadOnly } from "../state/openclaw-state-db-readonly.js";
 import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
 } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { getFreePort } from "../test-utils/ports.js";
 import { registerMcpCli } from "./mcp-cli.js";
 
@@ -217,6 +220,7 @@ async function startOAuthFixture() {
 afterEach(async () => {
   await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -227,7 +231,7 @@ describe("mcp login OAuth integration", () => {
       const json: unknown[] = [];
       vi.spyOn(defaultRuntime, "log").mockImplementation((line) => logs.push(String(line)));
       vi.spyOn(defaultRuntime, "writeJson").mockImplementation((value) => json.push(value));
-      vi.spyOn(defaultRuntime, "exit").mockImplementation(() => undefined);
+      const exit = vi.spyOn(defaultRuntime, "exit").mockImplementation(() => undefined);
       const program = new Command().exitOverride();
       registerMcpCli(program);
       await program.parseAsync(
@@ -256,7 +260,9 @@ describe("mcp login OAuth integration", () => {
       json.length = 0;
       await expect(
         program.parseAsync(["mcp", "doctor", "--probe", "--json"], { from: "user" }),
-      ).rejects.toThrow("MCP doctor found errors");
+      ).rejects.toMatchObject({ code: 1 });
+      expect(exit).not.toHaveBeenCalled();
+      expect(captureGatewayStateOwner(resolveOpenClawStateSqlitePath())).toBeUndefined();
       expect(json.at(-1)).toMatchObject({ servers: [{ name: "fixture" }] });
       withOpenClawStateDatabaseReadOnly(({ db }) => {
         expect(db.prepare("SELECT count(*) AS count FROM mcp_oauth_stores").get()).toEqual({
@@ -330,6 +336,9 @@ describe("mcp login OAuth integration", () => {
   });
 
   it("logs in and probes through the CLI with a portless loopback registration", async () => {
+    // The issuer and callback are local fixtures, not ambient proxy destinations.
+    vi.stubEnv("NO_PROXY", "127.0.0.1");
+    vi.stubEnv("no_proxy", "127.0.0.1");
     await withTempHome(`openclaw-mcp-login-${randomUUID()}-`, async () => {
       const fixture = await startOAuthFixture();
       try {
@@ -414,6 +423,48 @@ describe("mcp login OAuth integration", () => {
           "Bearer fixture-refreshed-access-token",
           "Bearer fixture-refreshed-access-token",
         ]);
+        // A live owner must keep this CLI from refreshing or clearing its credentials.
+        const discover = vi.spyOn(gatewayLock, "readActiveGatewayLockIdentity").mockResolvedValue({
+          pid: process.pid,
+          ownerId: "synthetic-other-process-owner",
+          createdAt: new Date(0).toISOString(),
+          port: 1,
+        });
+        const requestCount = fixture.mcpRequests().length;
+        try {
+          for (const args of [
+            ["login", "fixture", "--code", "fixture-code"],
+            ["logout", "fixture"],
+            ["probe", "fixture"],
+            ["doctor", "fixture", "--probe"],
+            ["set", "fixture", '{"url":"https://replacement.example.com"}'],
+            ["configure", "fixture", "--clear-auth"],
+            ["tools", "fixture", "--clear"],
+            ["unset", "fixture"],
+          ]) {
+            await expect(
+              program.parseAsync(["mcp", ...args], { from: "user" }),
+            ).rejects.toMatchObject({
+              code: "OWNER_UNAVAILABLE",
+              message: expect.stringContaining("stop the Gateway"),
+            });
+          }
+          expect(fixture.mcpRequests()).toHaveLength(requestCount);
+          await expect(
+            readMcpOAuthCredentialsStatus(
+              operatorMcpOAuthIdentity("fixture", `${fixture.issuer}/mcp`),
+            ),
+          ).resolves.toMatchObject({ state: "authorized" });
+          await program.parseAsync(["mcp", "doctor", "fixture"], { from: "user" });
+        } finally {
+          discover.mockRestore();
+        }
+        await program.parseAsync(["mcp", "logout", "fixture"], { from: "user" });
+        await expect(
+          readMcpOAuthCredentialsStatus(
+            operatorMcpOAuthIdentity("fixture", `${fixture.issuer}/mcp`),
+          ),
+        ).resolves.toMatchObject({ state: "unauthenticated" });
         await expect(fetch(redirectUrl)).rejects.toThrow();
       } finally {
         await fixture.close();

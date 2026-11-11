@@ -441,7 +441,7 @@ export function createAttemptTranscriptJournal(params: {
     }
     if (firstFailure) {
       const error = new Error(
-        `[copilot-attempt] canonical transcript persistence failed: ${firstFailure.message}`,
+        `[copilot-attempt] saved transcript persistence failed: ${firstFailure.message}`,
         { cause: firstFailure },
       ) as Error & { code?: string };
       error.code = "transcript_persistence_failed";
@@ -693,7 +693,7 @@ function resolveTranscriptTarget(attempt: AttemptParamsLike): SessionTranscriptT
   const storePath = normalizeOptionalString(attempt.sessionTarget?.storePath);
   if (!sessionId || !sessionKey || !storePath) {
     const error = new Error(
-      "[copilot-attempt] canonical transcript persistence requires an exact runtime session target",
+      "[copilot-attempt] saved transcript persistence requires an exact runtime session target",
     ) as Error & { code?: string };
     error.code = "transcript_persistence_failed";
     throw error;

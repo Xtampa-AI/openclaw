@@ -26,9 +26,14 @@ export function applyCompletionsReasoningAndRouting(
       params.enable_thinking = enabled;
       allowScalarEffort = false;
     } else if (compat.thinkingFormat === "qwen-chat-template") {
+      const chatTemplateReasoningEffort =
+        enabled && reasoning.thinkingExplicit && model.compat?.supportedReasoningEfforts?.length
+          ? reasoning.effort
+          : undefined;
       params.chat_template_kwargs = {
         enable_thinking: enabled,
         ...(direct ? { preserve_thinking: true } : {}),
+        ...(chatTemplateReasoningEffort ? { reasoning_effort: chatTemplateReasoningEffort } : {}),
       };
       allowScalarEffort = false;
     } else if (

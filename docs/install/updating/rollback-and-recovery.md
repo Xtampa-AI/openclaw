@@ -31,6 +31,14 @@ or database migrations. Once state has migrated beyond the older release's
 supported format, the supported recovery is to restore a verified pre-update
 backup with its matching OpenClaw release.
 
+When an older Gateway service refuses newer-written config, run the newer
+OpenClaw binary or reinstall the service from that newer installation. Service
+startup ignores `OPENCLAW_ALLOW_OLDER_BINARY_DESTRUCTIVE_ACTIONS=1`, including
+values set in systemd's environment or unit drop-ins. For an intentional
+downgrade, restore the verified pre-update backup with its matching release as
+described below. The override is for intentional CLI recovery actions; it does
+not reverse migrations or bypass database compatibility checks.
+
 <Warning>
 Fresh shared-state databases created after tenant-container management was retired
 omit `fleet_cells`. Older revisions that require this table can reject them even
@@ -48,7 +56,8 @@ workflow; use `openclaw update` or [create a backup first](#before-updating-crea
 
 The updater retains the previous package during activation and keeps it when
 failed recovery cannot prove a working installation. Migration recovery originals
-remain until explicit [update cleanup](/cli/update#update-cleanup). These are
+and original-state update captures remain until explicit
+[update cleanup](/cli/update#update-cleanup). These are
 separate recovery mechanisms: cleanup does not manage package or Git runtime
 backups, and retained migration originals are not a full pre-update backup.
 Preserve every recovery location named in the update report until you have
@@ -150,8 +159,10 @@ openclaw update cleanup --dry-run
 ### Full-state recovery requires a backup
 
 Package updates keep pre-migration SQLite snapshots alongside the package
-backup until verified successful activation removes them with that backup.
-Rollback, failed or unverified completion, and refused restoration retain them.
+backup until verified successful activation removes restorable snapshots with that backup.
+Snapshots whose source write generations could not be sealed remain available
+for manual recovery even after successful activation. Rollback, failed or
+unverified completion, and refused restoration also retain snapshots.
 If cleanup cannot finish, the update reports a maintenance warning with the
 retained path. Older snapshot directories are not automatically removed: their
 ownership and successful outcome cannot be proven from existing receipts.
@@ -397,9 +408,10 @@ and use of your own account/tokens. Only an affirmative Yes proceeds. Enter, `n`
 cancellation, or 30 seconds without an answer skips the launch, prints a manual
 recovery command, and preserves diagnostics and the failed update's exit status.
 Explicit `openclaw triage` does not ask for this confirmation.
-JSON, `--yes`, and non-interactive update invocations can start one owned automatic
-repair after an eligible failure; other failures retain diagnostics and handoff
-commands. For diagnostic collection
+JSON, `--yes`, and update invocations without a TTY never start a repair agent.
+They save diagnostics and print `openclaw triage --run --update-result <path>`
+for explicit opt-in repair. Managed handoffs and foreground `gateway run` startup
+failures also collect diagnostics only. For diagnostic collection
 alone, use `openclaw triage --non-interactive`; add `--update-result <path>` to
 include a saved update-failure artifact. See [Triage](/cli/triage) for command
 formatting and installation targeting.

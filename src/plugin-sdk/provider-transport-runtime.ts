@@ -7,6 +7,7 @@ export { buildAssistantMessage } from "../agents/stream-message-shared.js";
 export {
   sortPromptCacheToolsByName,
   splitSystemPromptCacheBoundary,
+  splitSystemPromptRelocatableBoundary,
   stripSystemPromptCacheBoundary,
 } from "@openclaw/ai/internal/shared";
 export { transformTransportMessages } from "../agents/transport-message-transform.js";
@@ -21,6 +22,10 @@ export {
   coerceTransportToolCallArguments,
   consumeGoogleGenerateContentStream,
   convertGoogleTools,
+  createGoogleVideoPlaceholder,
+  GOOGLE_VIDEO_SLOT_OMISSION,
+  materializeGoogleVideoSlots,
+  type GoogleVideoSlots,
   projectGoogleMessages,
   requiresGoogleToolCallId,
   type GoogleStreamChunk,

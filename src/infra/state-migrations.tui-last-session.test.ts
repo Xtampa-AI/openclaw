@@ -3,12 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { readConfigMachineStateWithMetadata } from "../state/config-machine-state.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
   closeOpenClawStateDatabaseForTest,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import { readConfigMachineStateWithMetadata } from "../test-utils/config-machine-state.js";
 import { readTuiLastSessionKey } from "../tui/tui-last-session.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
 import {
@@ -78,6 +78,21 @@ afterEach(() => {
 });
 
 describe("legacy TUI last-session migration", () => {
+  it("retains malformed UTF-8 without importing replacement characters", async () => {
+    const stateDir = tempDirs.make("tui-invalid-utf8-");
+    const sourcePath = writeLegacyStore(stateDir, {
+      terminal: { sessionKey: "utf8-marker", updatedAt: 1 },
+    });
+    const bytes = fs.readFileSync(sourcePath);
+    bytes[bytes.indexOf("utf8-marker")] = 0xff;
+    fs.writeFileSync(sourcePath, bytes);
+    const result = migrate(stateDir);
+    expect(result.warnings.join("\n")).toContain("must be valid UTF-8");
+    expect(result.warningDisposition).toBe("recoverable");
+    expect(fs.readFileSync(sourcePath)).toEqual(bytes);
+    await expect(readTuiLastSessionKey({ scopeKey: "terminal", stateDir })).resolves.toBeNull();
+  });
+
   it("runs only through explicit doctor detection and discards heartbeat pointers", async () => {
     const stateDir = tempDirs.make("openclaw-tui-migration-");
     const sourcePath = writeLegacyStore(stateDir, {

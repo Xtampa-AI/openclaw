@@ -715,7 +715,7 @@ describe("original publication admission reader", () => {
       writeFileSync(
         pendingGh,
         `#!${process.execPath}
-const fs = require("node:fs");
+import fs from "node:fs";
 const receipts = fs.openSync(${JSON.stringify(receipts)}, "w");
 const parent = process.ppid;
 process.once("exit", () => {
@@ -987,7 +987,7 @@ try {
     writeFileSync(
       gh,
       `#!${process.execPath}
-const fs = require("node:fs");
+import fs from "node:fs";
 const args = process.argv.slice(2), endpoint = args[1];
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + "\\n");
 if (args[0] !== "api") throw new Error("unexpected non-read");
@@ -2097,8 +2097,19 @@ describe("release CI summary child correlation", () => {
     };
     const getRun = async (id: string) =>
       structuredClone(id === "81" ? producer : fixture.client.getRun(id));
-    const rerunFailed = vi.fn(async (id: string) => {
-      expect(id).toBe("81");
+    const producerJob = {
+      ...fixture.parentJob,
+      id: 8101,
+      name: "Build npm artifacts",
+      run_id: 81,
+      run_attempt: 1,
+      status: "completed",
+      conclusion: "failure",
+    };
+    const getAttemptJobs = async (id: string) =>
+      id === "81" ? [producerJob] : fixture.client.getRunAttemptJobs(id);
+    const rerunJob = vi.fn(async (id: number) => {
+      expect(id).toBe(producerJob.id);
       producer.run_attempt = 2;
       producer.conclusion = "success";
     });
@@ -2142,7 +2153,7 @@ describe("release CI summary child correlation", () => {
         repository,
         getRun,
         getRunAttempt: async (id: string) => (id === fixture.runId ? originalParent : getRun(id)),
-        getAttemptJobs: async (id: string) => fixture.client.getRunAttemptJobs(id),
+        getAttemptJobs,
         getParentJobs: async () => [
           ...sourceJobs,
           ...[
@@ -2162,12 +2173,12 @@ describe("release CI summary child correlation", () => {
           getWorkflowSource: () =>
             'env:\n  FULL_RELEASE_ARTIFACT_RECOVERY_CONTRACT: "1"\njobs:\n  npm_artifacts:\n    name: Prepare release npm artifacts\n    env:\n      CHILD_WORKFLOW_KIND: artifact-npm\n    steps: []\n',
         }),
-        rerunFailed,
+        rerunJob,
         rerunParent,
         verify,
       }),
     ).resolves.toMatchObject({ action: "reran-parent" });
-    expect(rerunFailed).toHaveBeenCalledExactlyOnceWith("81");
+    expect(rerunJob).toHaveBeenCalledExactlyOnceWith(producerJob.id);
     expect(rerunParent).toHaveBeenCalledExactlyOnceWith(fixture.runId);
     expect((await verify.mock.results[0]!.value).children).toHaveLength(5);
   });
@@ -2907,6 +2918,65 @@ describe("release CI summary child correlation", () => {
         : originalClient.getParentJobs(requestedRunId);
 
     await expect(verifyFixture(fixture)).rejects.toThrow("does not pass release policy");
+  });
+
+  it("admits only Windows-node preview failures at the live release-evidence boundary", async () => {
+    const fixture = trustedMainNpmFixture();
+    const selected = expectDefined(
+      fixture.executionPlan.children.find((entry) => entry.key === "releaseChecksCandidate"),
+      "candidate release checks",
+    );
+    const run = expectDefined(
+      fixture.runs.find((entry) => String(entry.id) === selected.runId),
+      "candidate run",
+    );
+    run.conclusion = "failure";
+    const jobs = [
+      {
+        name: "Run Windows-node main E2E / Setup, connect, and invoke candidate gateway",
+        conclusion: "failure",
+      },
+      {
+        name: "Run Windows-node stable E2E / Setup, connect, and invoke candidate gateway",
+        conclusion: "success",
+      },
+      { name: "Verify release checks", conclusion: "success" },
+    ].map((entry, index) => Object.assign({}, fixture.parentJob, entry, { id: 1501 + index }));
+    const composite = composeReleaseAttemptJobs([{ jobs, runAttempt: 1 }], {
+      effectiveRunAttempt: 1,
+      plannedRunAttempt: 1,
+    });
+    Object.assign(
+      expectDefined(fixture.manifest.childEvidence.releaseChecksCandidate, "candidate evidence"),
+      {
+        jobs: composite.jobs,
+        compositeJobsSha256: composite.sha256,
+      },
+    );
+    const advisory = {
+      class: "windows-node-preview",
+      child: "releaseChecksCandidate",
+      job: "Run Windows-node main E2E / Setup, connect, and invoke candidate gateway",
+      conclusion: "failure",
+      runId: selected.runId,
+      url: "",
+    };
+    Object.assign(fixture.manifest, { advisoryJobs: [advisory] });
+    const originalJobs = expectDefined(
+      fixture.client.getRunAttemptJobs.getMockImplementation(),
+      "job reader",
+    );
+    fixture.client.getRunAttemptJobs.mockImplementation((runId) =>
+      runId === selected.runId ? jobs : originalJobs(runId),
+    );
+    const evidence = await verifyFixture(fixture);
+    expect(evidence.valid).toBe(true);
+    expect(
+      evidence.children.find((entry: { role: string }) => entry.role === "releaseChecksCandidate"),
+    ).toMatchObject({
+      conclusion: "failure",
+      advisoryJobs: [advisory],
+    });
   });
 
   it("rejects a failed Windows Node shard at the live release-evidence boundary", async () => {
@@ -3843,6 +3913,8 @@ describe("release CI summary child correlation", () => {
     expect(() => requiredChildKeysForRerunGroup("qa")).toThrow(
       "release validation manifest rerun group is invalid: qa",
     );
+    const qualified = requiredChildKeysForRerunGroup("qualified-package", {}, 3);
+    expect(qualified).toEqual(new Set(["releaseChecksCandidate"]));
     const focused = validateParentManifest(
       {
         ...rawManifest({ rerunGroup: "npm-telegram" }),

@@ -1,6 +1,9 @@
 import { createChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
+import {
+  formatErrorMessage,
+  PlatformMessageNotDispatchedError,
+} from "openclaw/plugin-sdk/error-runtime";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { ResolvedGoogleChatAccount } from "./accounts.js";
@@ -10,7 +13,7 @@ import {
   sendGoogleChatMessage,
   updateGoogleChatMessage,
 } from "./api.js";
-import { formatGoogleChatMediaText } from "./format.js";
+import { formatGoogleChatMediaText, formatGoogleChatTextChunks } from "./format.js";
 import type { GoogleChatCoreRuntime, GoogleChatRuntimeEnv } from "./monitor-types.js";
 
 export type GoogleChatTypingMessage = ReturnType<typeof createGoogleChatTypingMessage>;
@@ -84,10 +87,25 @@ export async function deliverGoogleChatReply(params: {
     deliveryThreadName = typingMessage.deliveredThreadName;
   }
 
-  let text: string;
+  let text = reply.text;
+  let mediaError: unknown;
   try {
     text = formatGoogleChatMediaText(reply.text, reply.mediaUrls);
-  } catch (cause) {
+  } catch (error) {
+    mediaError = error;
+  }
+
+  const chunkLimit = account.config.textChunkLimit ?? 4000;
+  const chunkMode = core.channel.text.resolveChunkMode(config, "googlechat", account.accountId);
+  const chunks = formatGoogleChatTextChunks(text, chunkLimit).flatMap((chunk) =>
+    core.channel.text.chunkMarkdownTextWithMode(chunk, chunkLimit, chunkMode),
+  );
+  const rejection = mediaError
+    ? formatErrorMessage(mediaError)
+    : text && !chunks.some((chunk) => chunk)
+      ? "Google Chat reply has no visible text after formatting."
+      : undefined;
+  if (rejection) {
     try {
       if (typingMessage) {
         await deleteGoogleChatMessage({ account, messageName: typingMessage.name });
@@ -97,14 +115,9 @@ export async function deliverGoogleChatReply(params: {
     }
     // Permanent policy rejection before any recipient-visible send; the typed
     // contract keeps delivery custody from recording a false ambiguous attempt.
-    throw new PlatformMessageNotDispatchedError(
-      cause instanceof Error ? cause.message : String(cause),
-      { cause, retryable: false },
-    );
+    throw new PlatformMessageNotDispatchedError(rejection, { cause: mediaError, retryable: false });
   }
 
-  const chunkLimit = account.config.textChunkLimit ?? 4000;
-  const chunkMode = core.channel.text.resolveChunkMode(config, "googlechat", account.accountId);
   const recordOutboundStatus = () => {
     try {
       statusSink?.({ lastOutboundAt: Date.now() });
@@ -128,7 +141,6 @@ export async function deliverGoogleChatReply(params: {
       deliveryThreadName = sent?.threadName?.trim() || deliveryThreadName;
     }
   };
-  const chunks = core.channel.text.chunkMarkdownTextWithMode(text, chunkLimit, chunkMode);
   for (const chunk of chunks) {
     if (!chunk) {
       continue;

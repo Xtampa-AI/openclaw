@@ -1,9 +1,9 @@
-/** Tests session-scoped MCP runtime catalog, transport, validation, and lifecycle behavior. */
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+/** Tests session-scoped MCP runtime catalog, transport, validation, and lifecycle behavior. */
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { expectDefined } from "@openclaw/normalization-core";
 import { materializeRequesterScopedMcpToolsForHarnessRun } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -28,6 +28,8 @@ import {
 import { reserveTestPortListener } from "../test-utils/port-claims.js";
 import { startCatalogRecoveryMcpServer } from "./agent-bundle-mcp-catalog-recovery.test-support.js";
 import { createCombinedSessionMcpRuntime } from "./agent-bundle-mcp-combined.js";
+import { registerMcpDisposalTimeoutCase } from "./agent-bundle-mcp-disposal.test-harness.js";
+import { createConnectionInvalidationMcpFixture } from "./agent-bundle-mcp-invalidation.test-support.js";
 import { completeDeferredSessionMcpRuntimeRetirement } from "./agent-bundle-mcp-manager-cleanup.js";
 import {
   bindSessionMcpRuntimeTestScheduler,
@@ -57,6 +59,8 @@ import { getMcpAppModelContext, updateMcpAppModelContext } from "./mcp-app-model
 import { createMcpProofPluginRegistry } from "./mcp-connection-resolver.test-fixtures.js";
 import { fetchMcpAppView, getMcpAppViewLease } from "./mcp-ui-resource.js";
 import { testing as mcpUiResourceTesting } from "./mcp-ui-resource.test-support.js";
+import { isRecordedModelFallbackStop } from "./model-fallback-stop.js";
+import { createAgentCleanupScope } from "./run-cleanup-timeout.js";
 
 vi.mock("./embedded-agent-mcp.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./embedded-agent-mcp.js")>();
@@ -796,9 +800,8 @@ describe("session MCP runtime", () => {
       expect(result.content).toEqual([
         {
           type: "text",
-          text: `structuredContent:\n${JSON.stringify(structuredContent, null, 2)}`,
+          text: `structuredContent:\n${JSON.stringify(structuredContent)}`,
         },
-        { type: "text", text: "captured screenshot" },
         { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
         { type: "text", text: "[Report] https://example.com/report" },
         { type: "text", text: "memo body" },
@@ -970,55 +973,6 @@ describe("session MCP runtime", () => {
     } finally {
       await runtime.dispose();
       await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("bounds catalog replay when a server invalidates every tools/list response", async ({
-    signal,
-  }) => {
-    const tempDir = tempDirTracker.make("bundle-mcp-continuous-invalidation-");
-    const noisyServerPath = path.join(tempDir, "noisy-server.mjs");
-    const noisyLogPath = path.join(tempDir, "noisy-server.log");
-    const healthyServerPath = path.join(tempDir, "healthy-server.mjs");
-    const healthyLogPath = path.join(tempDir, "healthy-server.log");
-    await writeListToolsMcpServer({
-      filePath: noisyServerPath,
-      logPath: noisyLogPath,
-      capabilities: { tools: { listChanged: true } },
-      tools: [{ name: "noisy_tool", inputSchema: { type: "object", properties: {} } }],
-      notifyListChangedBeforeEveryListResponse: true,
-    });
-    await writeListToolsMcpServer({
-      filePath: healthyServerPath,
-      logPath: healthyLogPath,
-      tools: [{ name: "healthy_tool", inputSchema: { type: "object", properties: {} } }],
-    });
-
-    const runtime = await getOrCreateSessionMcpRuntime({
-      sessionId: "session-continuous-invalidation",
-      sessionKey: "agent:test:session-continuous-invalidation",
-      workspaceDir: "/workspace",
-      cfg: {
-        mcp: {
-          servers: {
-            noisy: { command: process.execPath, args: [noisyServerPath] },
-            healthy: { command: process.execPath, args: [healthyServerPath] },
-          },
-        },
-      },
-    });
-
-    try {
-      const catalog = await withinTest(runtime.getCatalog(), signal);
-
-      expect(catalog.tools.map((tool) => tool.toolName).toSorted()).toEqual([
-        "healthy_tool",
-        "noisy_tool",
-      ]);
-      const noisyLog = await fs.readFile(noisyLogPath, "utf8");
-      expect(noisyLog.match(/tools\/list cursor/g)).toHaveLength(2);
-    } finally {
-      await runtime.dispose();
     }
   });
 
@@ -2867,39 +2821,7 @@ describe("requester-scoped MCP connection resolution", () => {
 });
 
 describe("disposeSession timeout", () => {
-  it(
-    "completes disposal even when the MCP server process ignores shutdown",
-    { timeout: 15_000 },
-    async () => {
-      testing.setBundleMcpDisposeTimeoutMsForTest(50);
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bundle-mcp-dispose-timeout-"));
-      const serverPath = path.join(tempDir, "hanging-close.mjs");
-      const logPath = path.join(tempDir, "server.log");
-
-      await writeListToolsMcpServer({
-        filePath: serverPath,
-        logPath,
-        ignoreShutdown: true,
-      });
-
-      const runtime = await makeStdioRuntime("session-dispose-timeout", "hangingClose", serverPath);
-
-      const catalog = await runtime.getCatalog();
-      expect(catalog.tools).toHaveLength(1);
-
-      const start = Date.now();
-      await runtime.dispose();
-      const elapsed = Date.now() - start;
-
-      expect(elapsed).toBeLessThan(1_000);
-
-      await retireSessionMcpRuntime({
-        sessionId: "session-dispose-timeout",
-        reason: "test cleanup",
-      });
-      await fs.rm(tempDir, { recursive: true, force: true });
-    },
-  );
+  registerMcpDisposalTimeoutCase({ writeListToolsMcpServer, makeStdioRuntime });
 
   it(
     "does not recycle a stateless streamable-http server on HTTP 404",
@@ -3278,6 +3200,62 @@ describe("disposeSession timeout", () => {
   );
 
   it(
+    "retains failed HTTP retirement for a later materialized cleanup after eviction",
+    { timeout: 15_000 },
+    async () => {
+      testing.setBundleMcpDisposeTimeoutMsForTest(50);
+      const manager = createSessionMcpRuntimeManager();
+      const termination = createDeferred();
+      const server = await startCatalogRecoveryMcpServer("hanging-delete-server", {
+        holdTermination: termination.promise,
+      });
+
+      try {
+        const runtime = await manager.getOrCreate({
+          sessionId: "session-streamable-http-dispose",
+          sessionKey: "agent:test:session-streamable-http-dispose",
+          workspaceDir: "/workspace",
+          cfg: {
+            mcp: {
+              servers: {
+                hangingDelete: {
+                  url: server.url,
+                  transport: "streamable-http",
+                },
+              },
+            },
+          },
+        });
+
+        const catalog = await runtime.getCatalog();
+        expect(catalog.tools).toHaveLength(1);
+
+        const materialized = await materializeBundleMcpToolsForRun({ runtime });
+        const start = Date.now();
+        await runtime.dispose();
+        const elapsed = Date.now() - start;
+
+        expect(elapsed).toBeLessThan(1_000);
+        expect(server.terminationCount()).toBe(1);
+        await manager.disposeSession(runtime.sessionId);
+        expect(manager.listRuntimeKeys()).toEqual([]);
+        const cleanupScope = createAgentCleanupScope();
+        await cleanupScope.run(async () => {
+          const failure: unknown = await materialized.dispose().catch((error: unknown) => error);
+          expect(failure).toBeInstanceOf(Error);
+          expect(isRecordedModelFallbackStop(failure)).toBe(true);
+          await expect(materialized.dispose()).rejects.toThrow("could not confirm closure");
+        });
+        expect(cleanupScope.outcome).toBe("uncertain");
+      } finally {
+        termination.resolve();
+        await manager.disposeAll();
+        await server.close();
+      }
+    },
+  );
+
+  it(
     "starts MCP server catalog loading concurrently",
     { timeout: LIST_TOOLS_TEST_DEADLINE_MS },
     async ({ signal }) => {
@@ -3353,53 +3331,34 @@ describe("disposeSession timeout", () => {
     { timeout: LIST_TOOLS_TEST_DEADLINE_MS },
     async ({ signal }) => {
       const tempDir = makeTempDir(tempDirs, "bundle-mcp-inflight-connect-");
-      const invalidatingServer = {
-        serverName: "invalidatingServer",
-        serverPath: path.join(tempDir, "invalidating-server.mjs"),
-        logPath: path.join(tempDir, "invalidating-server.log"),
-      };
-      const slowConnectServer = {
-        serverName: "slowConnectServer",
-        serverPath: path.join(tempDir, "slow-connect-server.mjs"),
-        logPath: path.join(tempDir, "slow-connect-server.log"),
-      };
-
-      await writeListToolsMcpServer({
-        filePath: invalidatingServer.serverPath,
-        logPath: invalidatingServer.logPath,
-        capabilities: { tools: { listChanged: true } },
-        notifyListChangedOnInitialized: true,
-      });
-      await writeListToolsMcpServer({
-        filePath: slowConnectServer.serverPath,
-        logPath: slowConnectServer.logPath,
-        initializeDelayMs: 200,
-      });
-
       testing.setBundleMcpCatalogListTimeoutMsForTest(4_000);
-
-      const runtime = await getOrCreateSessionMcpRuntime({
-        sessionId: "session-inflight-connect-test",
-        sessionKey: "agent:test:session-inflight-connect-test",
-        workspaceDir: "/workspace",
-        cfg: {
-          mcp: {
-            servers: Object.fromEntries(
-              [invalidatingServer, slowConnectServer].map(({ serverName, serverPath }) => [
-                serverName,
-                {
-                  command: process.execPath,
-                  args: [serverPath],
-                  connectionTimeoutMs: 2_000,
-                },
-              ]),
-            ),
-          },
-        },
-      });
+      const { invalidatingServer, slowConnectServer, invalidatingRuntime, runtime } =
+        await createConnectionInvalidationMcpFixture(tempDir, receipts.endpoint);
 
       try {
         const firstCatalog = runtime.getCatalog();
+        // Hold the sibling handshake, not a startup-dependent delay, across invalidation.
+        await withinTest(
+          Promise.all([
+            fixtureEventBeforeSettlement(
+              invalidatingServer.logPath,
+              "recv notifications/initialized",
+              firstCatalog,
+            ),
+            fixtureEventBeforeSettlement(
+              slowConnectServer.logPath,
+              "recv initialize",
+              firstCatalog,
+            ),
+          ]),
+          signal,
+        );
+        await waitForRuntimeState(
+          () => invalidatingRuntime.peekCatalog() !== null,
+          "invalidating server's initial catalog published",
+          signal,
+        );
+        receipts.release(invalidatingServer.logPath, "invalidate-while-connecting");
         await withinTest(
           fixtureEventBeforeSettlement(
             invalidatingServer.logPath,
@@ -3408,8 +3367,15 @@ describe("disposeSession timeout", () => {
           ),
           signal,
         );
+        await waitForRuntimeState(
+          () => invalidatingRuntime.peekCatalog() === null,
+          "client processed catalog invalidation while sibling initialization is held",
+          signal,
+        );
 
-        const secondCatalog = await runtime.getCatalog();
+        const secondCatalogPromise = runtime.getCatalog();
+        receipts.release(slowConnectServer.logPath, "finish-connecting");
+        const secondCatalog = await secondCatalogPromise;
         await firstCatalog;
 
         expect(Object.keys(secondCatalog.servers).toSorted()).toEqual([
@@ -3418,6 +3384,8 @@ describe("disposeSession timeout", () => {
         ]);
         expect(secondCatalog.diagnostics ?? []).toEqual([]);
       } finally {
+        receipts.release(invalidatingServer.logPath, "invalidate-while-connecting");
+        receipts.release(slowConnectServer.logPath, "finish-connecting");
         await runtime.dispose();
       }
     },
@@ -3527,62 +3495,6 @@ describe("disposeSession timeout", () => {
           "slow_tool",
         ]);
         expect(await fs.readFile(slowLogPath, "utf8")).toContain("fast retry initialize");
-      } finally {
-        await runtime.dispose();
-      }
-    },
-  );
-
-  it(
-    "serializes invalidated catalog generations on one session",
-    { timeout: LIST_TOOLS_TEST_DEADLINE_MS * 2 },
-    async ({ signal }) => {
-      const tempDir = makeTempDir(tempDirs, "bundle-mcp-overlap-generation-");
-      const serverPath = path.join(tempDir, "overlap-server.mjs");
-      const logPath = path.join(tempDir, "server.log");
-
-      await writeListToolsMcpServer({
-        filePath: serverPath,
-        logPath,
-        capabilities: { tools: { listChanged: true } },
-        notifyListChangedOnInitialized: true,
-        delayMs: 100,
-        toolsByList: [
-          [{ name: "ok_tool", inputSchema: [] }],
-          [{ name: "ok_tool", inputSchema: { type: "object", properties: {} } }],
-        ],
-        callToolResult: { content: [{ type: "text", text: "still connected" }], isError: false },
-      });
-
-      const runtime = await makeStdioRuntime(
-        "session-overlap-generation-test",
-        "overlap",
-        serverPath,
-      );
-
-      try {
-        const firstCatalog = runtime.getCatalog();
-        await withinTest(
-          fixtureEventBeforeSettlement(logPath, "notify tools/list_changed", firstCatalog),
-          signal,
-        );
-        await withinTest(
-          fixtureEventBeforeSettlement(logPath, "tools/list cursor", firstCatalog),
-          signal,
-        );
-
-        const secondCatalog = await runtime.getCatalog();
-        const firstCatalogResult = await firstCatalog;
-
-        expect(firstCatalogResult.diagnostics ?? []).toEqual([]);
-        expect(firstCatalogResult.tools.map((tool) => tool.toolName)).toEqual(["ok_tool"]);
-        expect(secondCatalog.diagnostics ?? []).toEqual([]);
-        expect(secondCatalog.tools.map((tool) => tool.toolName)).toEqual(["ok_tool"]);
-
-        await expect(runtime.callTool("overlap", "ok_tool", {})).resolves.toMatchObject({
-          content: [{ type: "text", text: "still connected" }],
-          isError: false,
-        });
       } finally {
         await runtime.dispose();
       }

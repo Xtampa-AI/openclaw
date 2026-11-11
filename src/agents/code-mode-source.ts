@@ -1,4 +1,5 @@
 /** Validate guest JavaScript before execution. */
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { parseCodeModeScriptSyntax } from "./code-mode-script-syntax.js";
 import {
   CODE_MODE_SHELL_SOURCE_ERROR,
@@ -7,10 +8,7 @@ import {
 import { ToolInputError } from "./tool-input-error.js";
 
 function isModuleLoaderCallee(callee: import("acorn").Expression | import("acorn").Super): boolean {
-  if (callee.type === "ParenthesizedExpression") {
-    return isModuleLoaderCallee(callee.expression);
-  }
-  if (callee.type === "ChainExpression") {
+  if (callee.type === "ParenthesizedExpression" || callee.type === "ChainExpression") {
     return isModuleLoaderCallee(callee.expression);
   }
   if (callee.type === "SequenceExpression") {
@@ -59,7 +57,7 @@ export function prepareSource(code: string): string {
   }
   if (!parsed.ok) {
     // Keep parser text bounded: some diagnostics include a user-sized identifier.
-    const message = parsed.message.slice(0, 240);
+    const message = truncateUtf16Safe(parsed.message, 240);
     throw new ToolInputError(
       `SyntaxError at openclaw-code-mode:user.js:${parsed.line}:${parsed.column + 1}: ${message}. No tools were dispatched; correct the JavaScript source and submit it again.`,
     );

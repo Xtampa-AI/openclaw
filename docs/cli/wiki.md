@@ -163,7 +163,7 @@ Use `wiki search` for wiki-specific ranking and provenance. For one broad shared
 
 Search modes:
 
-- `find-person`: aliases, handles, socials, canonical IDs, and person pages
+- `find-person`: aliases, handles, socials, primary IDs, and person pages
 - `route-question`: ask-for/best-used-for hints and relationship context
 - `source-evidence`: source pages and structured evidence fields
 - `raw-claim`: structured claim text with claim/evidence metadata
@@ -182,7 +182,7 @@ Text output includes `Claim:` and `Evidence:` lines when a result matches a stru
 ### `wiki get <lookup>`
 
 Read a wiki page by id or relative path. Compiled claim IDs are resolved first.
-After vault activation, an existing, visible canonical Markdown path reads only
+After vault activation, an existing, visible Markdown path reads only
 the requested page. A fresh CLI process still validates the compiled snapshot
 against the vault; missing indexes or snapshots can trigger automatic compilation.
 Missing or invalid candidates, extensionless paths, basenames, and page IDs
@@ -230,6 +230,10 @@ openclaw wiki chatgpt import --export ./conversations.json --dry-run
 | `--dry-run`       | `false`    | Preview created/updated/skipped counts without writing pages. |
 
 A non-dry-run import that changes any page records an import run id, printed in the summary, needed for rollback.
+
+Export files and existing source pages must resolve to regular files. Named pipes
+and other special files are rejected without waiting for data. Replace the affected
+path with a regular file and retry.
 
 ### `wiki chatgpt rollback <run-id>`
 

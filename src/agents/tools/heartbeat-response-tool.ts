@@ -12,11 +12,13 @@ import {
   HEARTBEAT_TOOL_PRIORITIES,
   normalizeHeartbeatToolResponse,
 } from "../../auto-reply/heartbeat-tool-response.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { assertCronJobScratchContent } from "../../cron/scratch-contract.js";
+import { isHeartbeatEnabledForAgent } from "../../infra/heartbeat-summary.js";
 import { readSnakeCaseParamRaw } from "../../param-key.js";
 import { optionalStringEnum, stringEnum } from "../schema/string-enum.js";
 import type { AnyAgentTool } from "./common.js";
-import { jsonResult, textResult, ToolInputError } from "./common.js";
+import { textResult, ToolInputError } from "./common.js";
 
 const HeartbeatResponseToolSchema = Type.Object(
   {
@@ -37,7 +39,45 @@ const HeartbeatResponseToolSchema = Type.Object(
 );
 
 /** Creates the one-shot heartbeat response tool for an auto-reply turn. */
-export function createHeartbeatResponseTool(): AnyAgentTool {
+/**
+ * A heartbeat-enabled agent offers the tool on every turn, so heartbeat turns keep the
+ * session's tool definitions; only a heartbeat run accepts a response.
+ */
+export function resolveHeartbeatTools(
+  options:
+    | {
+        enableHeartbeatTool?: boolean;
+        forceHeartbeatTool?: boolean;
+        trigger?: string;
+        config?: OpenClawConfig;
+      }
+    | undefined,
+  agentId?: string,
+): { enableHeartbeatTool: boolean; offerHeartbeatTool: boolean } {
+  const enableHeartbeatTool =
+    options?.enableHeartbeatTool === true ||
+    (options?.trigger === "heartbeat" &&
+      options?.config?.messages?.visibleReplies === "message_tool");
+  return {
+    enableHeartbeatTool,
+    offerHeartbeatTool:
+      enableHeartbeatTool ||
+      options?.forceHeartbeatTool === true ||
+      (options?.config !== undefined && isHeartbeatEnabledForAgent(options.config, agentId)),
+  };
+}
+
+/** Every turn of a heartbeat-enabled session offers the tool; only a heartbeat run accepts it. */
+export function resolveHeartbeatResponseTool(options?: {
+  enableHeartbeatTool?: boolean;
+  offerHeartbeatTool?: boolean;
+}): AnyAgentTool | null {
+  return options?.enableHeartbeatTool || options?.offerHeartbeatTool
+    ? createHeartbeatResponseTool({ acceptsResponses: options.enableHeartbeatTool === true })
+    : null;
+}
+
+function createHeartbeatResponseTool(options: { acceptsResponses?: boolean } = {}): AnyAgentTool {
   let recorded = false;
   return {
     label: "Heartbeat",
@@ -50,17 +90,8 @@ export function createHeartbeatResponseTool(): AnyAgentTool {
       "Accept heartbeat result for post-turn handling. `notify=false` no visible send. `notify=true` needs concise notificationText. Scratch is monitor prose only.",
     parameters: HeartbeatResponseToolSchema,
     execute: async (_toolCallId, args) => {
-      if (recorded) {
-        // Ignore duplicate arguments, including scratch and changed notify decisions.
-        return {
-          ...jsonResult({
-            status: "already_accepted",
-            tool: HEARTBEAT_RESPONSE_TOOL_NAME,
-            message:
-              "The heartbeat response for this turn was already accepted. Do not call heartbeat_respond again; end the turn.",
-          }),
-          terminate: true,
-        };
+      if (options.acceptsResponses === false) {
+        throw new ToolInputError("heartbeat_respond is only accepted during a heartbeat run");
       }
       if (!isRecord(args)) {
         throw new ToolInputError("Heartbeat response arguments required");
@@ -81,6 +112,11 @@ export function createHeartbeatResponseTool(): AnyAgentTool {
           "Invalid heartbeat response. Provide outcome, notify, and non-empty summary.",
         );
       }
+      if (recorded) {
+        // One heartbeat turn should produce one decision; repeated calls can
+        // otherwise overwrite the notify/no-notify choice.
+        throw new ToolInputError("heartbeat_respond already accepted for this turn");
+      }
       recorded = true;
       const { scratch, ...publicResponse } = response;
       const details = { status: "accepted" as const, ...publicResponse } as typeof response & {
@@ -91,28 +127,25 @@ export function createHeartbeatResponseTool(): AnyAgentTool {
         // the runner receives it through the internal result details only.
         Object.defineProperty(details, "scratch", { value: scratch, enumerable: false });
       }
-      return {
-        ...textResult(
-          JSON.stringify(
-            {
-              status: "accepted",
-              ...publicResponse,
-              ...(scratch !== undefined
-                ? {
-                    // Persistence is a runner-side CAS after the turn; do not claim
-                    // success here. A lost race is logged and retryable next beat.
-                    scratchPending: true,
-                    scratchBytes: Buffer.byteLength(scratch, "utf8"),
-                  }
-                : {}),
-            },
-            null,
-            2,
-          ),
-          details,
+      return textResult(
+        JSON.stringify(
+          {
+            status: "accepted",
+            ...publicResponse,
+            ...(scratch !== undefined
+              ? {
+                  // Persistence is a runner-side CAS after the turn; do not claim
+                  // success here. A lost race is logged and retryable next beat.
+                  scratchPending: true,
+                  scratchBytes: Buffer.byteLength(scratch, "utf8"),
+                }
+              : {}),
+          },
+          null,
+          2,
         ),
-        terminate: true,
-      };
+        details,
+      );
     },
   };
 }

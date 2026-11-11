@@ -11,10 +11,6 @@ import type { UpdateRunResult } from "./update-runner-types.js";
 
 const testNodeExecPath = resolveTestNodeExecPath();
 
-export function isManagedServiceInspectionCommand(command: string): boolean {
-  return /^(?:--user )?(?:show|print) /.test(command);
-}
-
 type ManagedSystemdPostExitState = {
   activeState: string;
   generation?: "cleared" | "parked" | "replacement";
@@ -29,7 +25,7 @@ export type ManagedServiceManagerBoundaryOptions = {
   rollbackRestoration?: boolean;
   cancelAfterPark?: boolean;
   parentExitTimeoutMs?: number;
-  launchdFault?: "wrong-parent" | "missing-restored-pid" | "dead-restored-pid";
+  launchdFault?: "wrong-parent" | "missing-restored-pid" | "dead-restored-pid" | "stopped-loaded";
   launchdTeardown?: {
     bootoutDelayMs?: number;
     clockEachCommandMs?: number;
@@ -46,6 +42,7 @@ export type ManagedServiceManagerBoundaryOptions = {
   expireParentWhileStopPending?: boolean;
   originalRecovery?: UpdateRunResult["recovery"];
   revokeOwner?: boolean;
+  disableChannelOnRevoke?: true;
   requester?: UpdateRequester;
   updaterExitCode?: number;
   recoveryExitCode?: number;
@@ -74,6 +71,7 @@ export type ManagedServiceCommandTiming = {
 };
 
 export type ManagedServiceManagerBoundaryResult = {
+  publication?: { installedVersion: string; launcher: string; publicationPending: boolean };
   run?: UpdateRunRecord;
   commands: string[];
   parentSignal: NodeJS.Signals | null;
@@ -320,7 +318,15 @@ void (async () => {
     sleep(${options?.systemdStopDelayMs ?? 0});
     ${managedServiceStateUpdateScript(
       statePath,
-      `${options?.revokeOwner ? `fs.writeFileSync(${JSON.stringify(params.configPath)}, JSON.stringify({ commands: { ownerAllowFrom: [] } })); state.ownerRevokedAfterExit = true;` : ""}
+      `${
+        options?.revokeOwner
+          ? `const config = JSON.parse(fs.readFileSync(${JSON.stringify(params.configPath)}, "utf8"));
+          config.commands = { ...config.commands, ownerAllowFrom: [] };
+          ${options?.disableChannelOnRevoke ? "config.channels = { ...config.channels, slack: { ...config.channels?.slack, enabled: false } };" : ""}
+          fs.writeFileSync(${JSON.stringify(params.configPath)}, JSON.stringify(config));
+          state.ownerRevokedAfterExit = true;`
+          : ""
+      }
       state.stopCompleted = true`,
     )};
     return;
@@ -402,6 +408,11 @@ if (${JSON.stringify(kind)} === "systemd") {
         state.loadedPrintsObserved = (state.loadedPrintsObserved || 0) + 1;
       } else {
         state.unloaded = true;
+        if (${JSON.stringify(options?.launchdFault)} === "stopped-loaded" &&
+            fs.existsSync(${JSON.stringify(path.join(path.dirname(statePath), "updater-ran"))})) {
+          process.stdout.write(args[1] + " = {\\n\\tstate = waiting\\n}\\n");
+          return state;
+        }
         process.stderr.write("Could not find service\\n");
         process.exitCode = 113;
         return state;
@@ -676,9 +687,11 @@ export function registerManagedHandoffOwnerTests(
   itUnix: ReturnType<typeof import("vitest").it.runIf>,
   expect: typeof import("vitest").expect,
 ): void {
-  itUnix.each(["revoked", "unchanged", "internal", "channel-less"] as const)(
+  const allowedRequesters = ["unchanged", "internal", "channel-less"] as const;
+  itUnix.each(["revoked", "revoked with disabled channel", ...allowedRequesters] as const)(
     "rechecks the %s requester after helper readiness and parent exit",
     async (owner) => {
+      const revoked = owner === "revoked" || owner === "revoked with disabled channel";
       const { state, sentinel, log, sensitiveFilesRemoved } =
         await runManagedServiceManagerBoundary("systemd", {
           requester: {
@@ -687,16 +700,15 @@ export function registerManagedHandoffOwnerTests(
             accountId: "primary",
             senderId: "owner",
           },
-          revokeOwner: owner === "revoked",
-          helperExitCode: owner === "revoked" ? 1 : 0,
+          revokeOwner: revoked,
+          ...(owner === "revoked with disabled channel" ? { disableChannelOnRevoke: true } : {}),
+          helperExitCode: revoked ? 1 : 0,
           updaterExitCode: 0,
           updaterResult: { status: "ok", mode: "npm" },
         });
       expect(state).toMatchObject({ parked: true, stopCompleted: true });
-      expect(state.ownerChecked).toBe(
-        owner === "revoked" || owner === "unchanged" ? true : undefined,
-      );
-      if (owner === "revoked") {
+      expect(state.ownerChecked).toBe(revoked || owner === "unchanged" ? true : undefined);
+      if (revoked) {
         expect(state).toMatchObject({
           ownerRevokedAfterExit: true,
           restored: true,

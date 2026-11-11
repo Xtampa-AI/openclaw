@@ -1,6 +1,10 @@
 import path from "node:path";
 import { setImmediate, setTimeout as delay } from "node:timers/promises";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   claimCodexAppServerLiveThread,
@@ -52,6 +56,7 @@ beforeEach(() => {
   directory = tempDirs.make("codex-compact-owner-");
   agentDir = path.join(directory, "agent");
   sessionFile = path.join(directory, "session.jsonl");
+  setRuntimeConfigSnapshot({});
   runtime = resolveCodexAppServerRuntimeOptions({
     pluginConfig,
     codexConfigToml: null,
@@ -64,6 +69,7 @@ afterEach(async () => {
   await Promise.all(transports.splice(0).map(({ client }) => client.closeAndWait()));
   resetCodexTestBindingStore();
   resetThreadLifecycleTestFixtures();
+  clearRuntimeConfigSnapshot();
   vi.restoreAllMocks();
 });
 
@@ -310,6 +316,8 @@ it.each([
     const ownerClaimed = subscription === "claimed";
     const ownerWrites = subscription === "untracked" ? [0, 0] : [0, 0, 0];
     let ownerExited = false;
+    let retirementReleased = false;
+    const retiredOwnerRead = createDeferred<void>();
     const resumes: number[] = [];
     const compactStarted = createDeferred<{
       id: number;
@@ -321,9 +329,19 @@ it.each([
         const result = threadStartResult(request.params?.threadId ?? threadId, directory);
         result.thread.sessionId = "session-final-owner";
         if (request.method === "thread/read") {
-          // The original owner keeps the thread loaded until its process exits.
-          const status = index === 0 && !ownerExited ? { type: "idle" } : { type: "notLoaded" };
-          send({ id: request.id, result: { thread: { ...result.thread, status } } });
+          send({
+            id: request.id,
+            result: {
+              thread: {
+                ...result.thread,
+                // A live writer cannot also report that its thread has unloaded.
+                status: { type: index === 0 && !ownerExited ? "idle" : "notLoaded" },
+              },
+            },
+          });
+          if (index === 0 && retirementReleased) {
+            retiredOwnerRead.resolve();
+          }
           return;
         }
         if (request.method === "thread/resume" || request.method === "thread/start") {
@@ -363,6 +381,7 @@ it.each([
         client,
         params: {
           ...createParams(sessionFile, directory),
+          disableTools: false,
           sessionId: "session-final-owner",
           sessionKey,
           agentDir,
@@ -433,6 +452,7 @@ it.each([
           const release = lease.release;
           vi.spyOn(lease, "release").mockImplementation((wait) => {
             const exit = release(wait);
+            retirementReleased = true;
             released.resolve();
             return exit;
           });
@@ -463,6 +483,9 @@ it.each([
         expect(acquired).toBe(lateRelease === "during-resume");
         if (lateRelease === "during-resume") {
           await released.promise;
+          if (!ownerClaimed) {
+            await retiredOwnerRead.promise;
+          }
           await setImmediate();
           if (ownerClaimed) {
             expect(

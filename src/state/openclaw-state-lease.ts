@@ -1,7 +1,7 @@
 // Host-owned SQLite leases serialize trusted work across processes.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
+import type { EngineConnection } from "../infra/sql-connection.js";
 import { isSqliteLockError } from "../infra/sqlite-error-diagnostics.js";
 import { createSqliteLifecycleAggregateError } from "../infra/sqlite-lifecycle-errors.js";
 import type { DatabasePathIdentity } from "../infra/sqlite-worker-identity.js";
@@ -243,6 +243,7 @@ async function runStateLeaseOwnerInScope<T>(
     context: invocation.kind === "worker" ? invocation.context : undefined,
     nativeIdentity: () => nativeLeaseSource?.identity,
     workerOwner: () => workerOperations,
+    retryDeadline: () => confirmedExpiresAt,
     revoke() {
       closed = true;
       abortLost(new Error("State lease resource owner is closing"));
@@ -403,7 +404,7 @@ async function runStateLeaseOwnerInScope<T>(
       }
     };
 
-    const assertOperationOwned = (transaction?: DatabaseSync) => {
+    const assertOperationOwned = (transaction?: EngineConnection) => {
       assertActive();
       const params = { ...identity, database: validated.database, transaction };
       const expiresAt = verifyLeaseOwnership(params);

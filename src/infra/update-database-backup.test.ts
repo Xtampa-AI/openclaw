@@ -5,9 +5,11 @@ import { rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { configureFsSafeNative, getFsSafeNativeConfig } from "@openclaw/fs-safe/config";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { parseUpdateRecoveryBackupManifest } from "../commands/backup-verify-manifest.js";
+import { AGENT_FTS_SCHEMAS } from "../state/openclaw-agent-fts-schema.js";
 import { createOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
 import { admitOpenClawMaintenanceLiveAuthorityReads } from "../state/openclaw-state-maintenance-context.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
@@ -15,6 +17,8 @@ import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import * as diskSpace from "./disk-space.js";
 import * as fileDescriptor from "./file-descriptor.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
+import { installSqliteFtsTokenizerMismatch } from "./sqlite-index-corruption.test-support.js";
+import * as sqliteIntegrity from "./sqlite-integrity.js";
 import * as sqliteSnapshot from "./sqlite-snapshot.js";
 import * as inspection from "./update-candidate-state.inspection.js";
 import { discoverUpdateStateSchemaInspectionInProcess } from "./update-candidate-state.js";
@@ -125,6 +129,58 @@ it.each(["legacy", "current"] as const)(
     expect(await fs.readFile(f.shared)).toEqual(before);
   },
 );
+
+it.each(["auto", "off"] as const)(
+  "captures stopped databases without a payload audit (native copy %s)",
+  async (mode) => {
+    const f = await fixture(true);
+    const previous = getFsSafeNativeConfig();
+    const audit = vi.spyOn(sqliteIntegrity, "assertSqliteIntegrity");
+    try {
+      configureFsSafeNative({ mode });
+      const backup = await createUpdateDatabaseBackupInProcess({
+        ...f.input,
+        inspectionPlan: f.inspectionPlan,
+        stopped: true,
+      });
+      expect(audit).not.toHaveBeenCalled();
+      expect(backup.databases).toHaveLength(3);
+      for (const entry of backup.databases) {
+        const bytes = await fs.readFile(entry.snapshotPath);
+        expect(entry).toMatchObject({
+          userVersion: 17,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          sizeBytes: bytes.length,
+        });
+        const source = new DatabaseSync(entry.path);
+        source.exec("DELETE FROM payload");
+        source.close();
+        using retained = new DatabaseSync(entry.snapshotPath, { readOnly: true });
+        expect(retained.prepare("SELECT rowid FROM payload").all()).toEqual([{ rowid: 42 }]);
+      }
+    } finally {
+      configureFsSafeNative(previous);
+    }
+  },
+);
+
+it("preserves stopped source WAL bookkeeping during the final inventory check", async () => {
+  const f = await fixture();
+  using database = new DatabaseSync(f.shared);
+  database.exec("PRAGMA journal_mode=WAL; INSERT INTO payload VALUES ('checkpoint pending');");
+  const before = await fs.readFile(`${f.shared}-wal`);
+  const backup = await createUpdateDatabaseBackupInProcess({
+    ...f.input,
+    inspectionPlan: f.inspectionPlan,
+    stopped: true,
+  });
+  expect(await fs.readFile(`${f.shared}-wal`)).toEqual(before);
+  using retained = new DatabaseSync(backup.databases[0]!.snapshotPath, { readOnly: true });
+  expect(retained.prepare("SELECT value FROM payload ORDER BY rowid").all()).toEqual([
+    { value: "retained" },
+    { value: "checkpoint pending" },
+  ]);
+});
 
 it("keeps the verified digest when a snapshot is replaced before backup metadata is recorded", async () => {
   const f = await fixture();
@@ -237,6 +293,7 @@ it.each([
     const capture = createUpdateDatabaseBackupInProcess({
       ...f.input,
       inspectionPlan: f.inspectionPlan,
+      stopped: true,
       onProgress: ({ phase, path: source }) => {
         if (phase !== "pre-migration database backup" || source !== f.shared) {
           return;
@@ -269,15 +326,8 @@ it.each([
     });
     if (!reader) {
       // Writes are never accepted as a sealed generation.
-      await capture.then(
-        (backup) =>
-          expect(backup.warnings).toContainEqual(
-            expect.stringContaining(`Database changed during capture`),
-          ),
-        (error: unknown) =>
-          expect(String(error)).toMatch(
-            /Update database file changed during backup: .*openclaw\.sqlite(?:-wal)?\./u,
-          ),
+      await expect(capture).rejects.toThrow(
+        /Update database (?:file|journal state) changed during (?:stopped )?backup: .*openclaw\.sqlite(?:-wal)?\./u,
       );
       return;
     }
@@ -891,5 +941,48 @@ it.each(["insufficient", "unknown"] as const)(
     expect(await Promise.all([f.shared, ...f.external].map((file) => fs.readFile(file)))).toEqual(
       originals,
     );
+  },
+);
+
+it.each(["owned", "unowned", "shared"] as const)(
+  "keeps stale FTS snapshot permission restricted to an explicit agent owner (%s)",
+  async (ownership) => {
+    const f = await fixture(ownership !== "shared");
+    const source = ownership === "shared" ? f.shared : f.external[0]!;
+    {
+      using db = new DatabaseSync(source);
+      const schema = AGENT_FTS_SCHEMAS.join("\n").match(
+        /CREATE VIRTUAL TABLE IF NOT EXISTS session_transcript_fts[\s\S]*?;/u,
+      )?.[0];
+      expect(schema).toBeDefined();
+      db.exec(schema!);
+      db.exec("INSERT INTO session_transcript_fts(text) VALUES ('ab'||char(65534)||'cd')");
+    }
+    installSqliteFtsTokenizerMismatch(source, "session_transcript_fts");
+    if (ownership === "owned") {
+      using shared = new DatabaseSync(f.shared);
+      shared.exec(
+        "ALTER TABLE agent_databases ADD COLUMN agent_id TEXT; UPDATE agent_databases SET agent_id='main'",
+      );
+    }
+    const before = await fs.readFile(source);
+    const inspectionPlan = await discoverUpdateStateSchemaInspectionInProcess(f.input);
+    const capturing = createUpdateDatabaseBackupInProcess({ ...f.input, inspectionPlan });
+    if (ownership !== "owned") {
+      await expect(capturing).rejects.toThrow(
+        /cannot be snapshotted safely.*malformed inverted index/su,
+      );
+    } else {
+      const backup = await capturing;
+      const entry = backup.databases.find((candidate) => candidate.path === source)!;
+      using copy = new DatabaseSync(entry.snapshotPath, { readOnly: true });
+      expect(copy.prepare("PRAGMA integrity_check").all()).toEqual([
+        { integrity_check: "malformed inverted index for FTS5 table main.session_transcript_fts" },
+      ]);
+      expect(copy.prepare("SELECT text FROM session_transcript_fts").all()).toEqual([
+        { text: "ab\ufffecd" },
+      ]);
+    }
+    expect(await fs.readFile(source)).toEqual(before);
   },
 );

@@ -47,7 +47,8 @@ export type PreparedModelsConfigContext = Readonly<{
   pluginMetadataSnapshot?: Pick<
     PluginMetadataSnapshot,
     "index" | "manifestRegistry" | "owners" | "pluginIds"
-  >;
+  > &
+    Partial<Pick<PluginMetadataSnapshot, "normalizePluginId">>;
   preparedStaticProviderCatalog?: PreparedProviderStaticCatalog;
   providerDiscoveryProviderIds?: readonly string[];
   providerDiscoveryTimeoutMs?: number;
@@ -256,7 +257,7 @@ export async function planOpenClawModelsJson(params: {
       ? context.pluginMetadataSnapshot?.manifestRegistry
       : undefined;
   const normalizedProviders =
-    normalizeProviders({
+    (await normalizeProviders({
       providers,
       agentDir,
       env,
@@ -266,7 +267,7 @@ export async function planOpenClawModelsJson(params: {
       ...(providerPolicyManifestRegistry
         ? { manifestRegistry: providerPolicyManifestRegistry }
         : {}),
-    }) ?? providers;
+    })) ?? providers;
   const mergedProviders = resolveProvidersForMode({
     mode,
     existingParsed: {

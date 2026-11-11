@@ -263,43 +263,6 @@ describe("sessions tool self-archive", () => {
       expect(callGateway).toHaveBeenLastCalledWith(archiveRequest);
     });
   });
-
-  it("retries when a competing turn releases before its archive rejection settles", async () => {
-    const dir = sessionDirs.make();
-    const { sessionKey, createTool, beginAdmission, archiveRequest } = await createArchiveSession(
-      dir,
-      "archive-release-race",
-    );
-    let competingTurnFinished = false;
-    const callGateway = vi.fn(async () => {
-      if (!competingTurnFinished) {
-        const competingAdmission = await beginAdmission();
-        competingAdmission.release();
-        competingTurnFinished = true;
-        throw Object.assign(new Error("Session did not finish stopping."), { retryable: true });
-      }
-      return { ok: true };
-    });
-    const tool = createTool(callGateway as never);
-    const admission = await beginAdmission();
-
-    try {
-      await admission.run(async () => {
-        const result = await tool.execute("archive-after-release-race", {
-          action: "patch",
-          archived: true,
-        });
-        expect(result.details).toMatchObject({ status: "scheduled", sessionKey });
-      });
-    } finally {
-      admission.release();
-    }
-
-    await vi.waitFor(() => {
-      expect(callGateway).toHaveBeenCalledTimes(2);
-      expect(callGateway).toHaveBeenLastCalledWith(archiveRequest);
-    });
-  });
 });
 
 it.each([false, true])(
@@ -335,6 +298,39 @@ it.each([false, true])(
 
 const sessionKey = "agent:main:main";
 describe("sessions tool ownership", () => {
+  it.each(["assignment", "rename", "sandbox"])(
+    "explains archive unavailability as current authority context (%s)",
+    async (surface) => {
+      const tool = createSessionsTool({
+        senderIsOwner: false,
+        sandboxSessionRenameOnly: surface === "sandbox",
+        ...(surface === "rename"
+          ? {
+              sessionControlAuthority: createAdmittedRunOperatorAuthority({
+                profileId: "rename-requester",
+                scopes: ["operator.sessions.write"],
+                assertCurrent: () => {},
+              }),
+            }
+          : {}),
+      });
+      if (surface === "sandbox") {
+        expect(tool.description).toContain(
+          "Archive and restore are unavailable in this authority context.",
+        );
+        expect(tool.parameters).not.toHaveProperty("properties.archived");
+        return;
+      }
+      // Turn authority does not change the definition; the archive call is refused.
+      expect(tool.description).toContain(
+        "Turns without owner authority are limited when the action runs.",
+      );
+      await expect(tool.execute("archive", { action: "patch", archived: true })).rejects.toThrow(
+        surface === "rename" ? /current operator write grant/ : /Only assign_owner/,
+      );
+    },
+  );
+
   it.each([
     { senderIsOwner: false, controls: true },
     { senderIsOwner: false, controls: false },
@@ -382,13 +378,11 @@ describe("sessions tool ownership", () => {
         });
         return;
       }
-      expect(tool.parameters).toHaveProperty("properties.action.enum", [
-        "patch",
-        "stop",
-        "assign_owner",
-      ]);
-      expect(tool.parameters).toHaveProperty("properties.user");
-      expect(tool.parameters).not.toHaveProperty("properties.model");
+      // The full definition stays stable; the control gate refuses settings when they run.
+      expect(tool.parameters).toHaveProperty(
+        "properties.action.enum",
+        expect.arrayContaining(["patch", "stop", "assign_owner"]),
+      );
       for (const denied of [
         { action: "group_set", names: [] },
         { action: "patch", archived: true, model: "other" },

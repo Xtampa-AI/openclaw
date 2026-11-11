@@ -64,6 +64,7 @@ import {
   type NodeInvokeProgressParams,
   type NodeInvokeResultParams,
   type PendingInvoke,
+  type PendingSystemRunEvent,
 } from "./node-registry.invoke-stream.js";
 import {
   updateNodePresenceActivity,
@@ -75,9 +76,6 @@ import {
 import {
   authorizedSystemRunEventExpiresAt,
   authorizedSystemRunEventKey,
-  finalizeAuthorizedSystemRunEvent,
-  type AuthorizedSystemRunEvent,
-  type AuthorizedSystemRunEventState,
 } from "./node-registry.system-run.js";
 import { isNodeWorkerHostClientId } from "./node-runner-inventory-runtime.js";
 import type { NodeSession } from "./node-session.types.js";
@@ -128,6 +126,14 @@ const NODE_SESSION_POLICIES = new WeakMap<object, NodeSessionPolicy>();
 export function readNodeSessionWithheldCommands(node: object): readonly string[] {
   return NODE_SESSION_POLICIES.get(node)?.withheldCommands ?? [];
 }
+
+/** Authorized system.run event window bound to one node connection. */
+type AuthorizedSystemRunEvent = PendingSystemRunEvent & {
+  nodeId: string;
+  connId: string;
+  expiresAtMs: number | null;
+  resultDelivered?: boolean;
+};
 
 export type NodeConnectivityResult =
   | { ok: true }
@@ -211,9 +217,9 @@ export class NodeRegistry {
           })
         : false;
     },
-    onFailedResult: (pending) => {
+    onSettledResult: (pending, delivered) => {
       if (pending.systemRunEvent) {
-        this.forgetAuthorizedSystemRunEvent({
+        this.settleAuthorizedSystemRunEvent(delivered, {
           nodeId: pending.nodeId,
           connId: pending.connId,
           ...pending.systemRunEvent,
@@ -1097,7 +1103,12 @@ export class NodeRegistry {
     runId?: string;
     sessionKey: string;
     terminal: boolean;
-  }): AuthorizedSystemRunEventState | null {
+  }):
+    | (Pick<PendingSystemRunEvent, "invocationDeliveryContext"> & {
+        holdNotice?: (notify: () => void) => void;
+        resultDelivered?: true;
+      })
+    | null {
     if (!params.connId || !params.sessionKey) {
       return null;
     }
@@ -1121,14 +1132,40 @@ export class NodeRegistry {
     if (match === null) {
       return null;
     }
-    return finalizeAuthorizedSystemRunEvent({
-      event: this.authorizedSystemRunEvents.get(match),
-      terminal: params.terminal,
-      consume: () => this.authorizedSystemRunEvents.delete(match),
-      pendingInvokes: this.pendingInvokes.values(),
-      nodeId: params.nodeId,
-      connId,
-    });
+    const event = this.authorizedSystemRunEvents.get(match);
+    const source = event?.invocationDeliveryContext;
+    let waiting: PendingInvoke | undefined;
+    if (params.terminal) {
+      this.authorizedSystemRunEvents.delete(match);
+    }
+    if (event?.resultDelivered) {
+      return { resultDelivered: true };
+    }
+    if (params.terminal) {
+      // The node reports completion before its result; a still-waiting caller receives that output.
+      waiting = [...this.pendingInvokes.values()].find(
+        (pending) =>
+          pending.nodeId === params.nodeId &&
+          pending.connId === connId &&
+          pending.systemRunEvent?.runId === event?.runId,
+      );
+    }
+    return {
+      ...(source ? { invocationDeliveryContext: { ...source } } : {}),
+      ...(waiting
+        ? {
+            holdNotice: (notify: () => void) => {
+              const resolve = waiting.resolve;
+              waiting.resolve = (value) => {
+                resolve(value);
+                if (!value.ok) {
+                  notify();
+                }
+              };
+            },
+          }
+        : {}),
+    };
   }
 
   private rememberAuthorizedSystemRunEvent(
@@ -1140,6 +1177,22 @@ export class NodeRegistry {
       expiresAtMs: authorizedSystemRunEventExpiresAt(event.timeoutMs),
     };
     this.authorizedSystemRunEvents.set(authorizedSystemRunEventKey(authorized), authorized);
+  }
+
+  /** A bridged node may report completion after the caller already received its result. */
+  private settleAuthorizedSystemRunEvent(
+    delivered: boolean,
+    event: Omit<AuthorizedSystemRunEvent, "expiresAtMs">,
+  ): void {
+    if (!delivered) {
+      this.forgetAuthorizedSystemRunEvent(event);
+      return;
+    }
+    const authorized = this.authorizedSystemRunEvents.get(authorizedSystemRunEventKey(event));
+    if (authorized) {
+      // Retain correlation until the terminal event or normal expiry, not another notice.
+      authorized.resultDelivered = true;
+    }
   }
 
   private forgetAuthorizedSystemRunEvent(

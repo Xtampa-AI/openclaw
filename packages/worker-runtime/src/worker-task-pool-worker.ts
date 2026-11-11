@@ -31,6 +31,7 @@ function postWorkerTaskInput<Input, Output>(
 }
 
 export function sendWorkerTaskInput<Input, Output>(params: {
+  workerUrl: URL;
   slot: Slot<Input, Output>;
   task: Task<Input, Output>;
   input: Input;
@@ -45,6 +46,7 @@ export function sendWorkerTaskInput<Input, Output>(params: {
   if (task.done) {
     return;
   }
+  task.diagnosticLabel = params.host.describeTask?.(params.workerUrl, input);
   task.preparedAt = performance.now();
   const bootstrapError = params.bootstrapError();
   if (bootstrapError && !slot.worker) {
@@ -66,13 +68,14 @@ export function sendWorkerTaskInput<Input, Output>(params: {
     }
     const transferList = task.options.transferList?.(input);
     if (!task.done) {
+      const context = params.host.captureTaskContext(worker);
       postWorkerTaskInput(
         worker,
         slot,
         task,
         input,
-        transferList,
-        params.host.captureTaskContext(),
+        [...(transferList ?? []), ...(params.host.taskContextTransferList?.(context) ?? [])],
+        context,
       );
     }
   } catch (error) {
@@ -87,7 +90,7 @@ export function createWorkerTaskPoolWorker<Input, Output>(params: {
   host: WorkerTaskHost;
   bootstrapError: () => Error | undefined;
   runInContext: <T>(operation: () => T) => T;
-  unavailableError: (message: string) => Error;
+  unavailableError: (message: string, cause?: unknown) => Error;
   onStarted: (worker: WorkerLifecycle) => void;
   onMessage: (message: unknown) => void;
   onFailure: (error: Error, nativeFailure?: true) => void;
@@ -170,8 +173,12 @@ export function createWorkerTaskPoolWorker<Input, Output>(params: {
       params.onMessage(message);
     }
   });
-  worker.on("error", (error) => params.onFailure(params.unavailableError(String(error)), true));
-  worker.on("messageerror", (error) => params.onFailure(params.unavailableError(String(error))));
+  worker.on("error", (error) =>
+    params.onFailure(params.unavailableError(String(error), error), true),
+  );
+  worker.on("messageerror", (error) =>
+    params.onFailure(params.unavailableError(String(error), error)),
+  );
   worker.once("exit", (code) => {
     releaseWorkerNativeSectionsOnExit(slot.nativeSections);
     const wasCounted = counted;

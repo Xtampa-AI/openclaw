@@ -1,9 +1,9 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import JSZip from "jszip";
+import { visitQaSqliteTranscriptEvents } from "openclaw/plugin-sdk/qa-runtime";
 import { resolveStorePath, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import { appendSessionTranscriptMessageByIdentity } from "openclaw/plugin-sdk/session-transcript-runtime";
-import { openNodeSqliteDatabase } from "openclaw/plugin-sdk/sqlite-runtime";
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { expect, it } from "vitest";
 import { transformMessages } from "../../../packages/ai/src/transcript-transform.ts";
@@ -14,7 +14,6 @@ import {
   controlUiSessionUrl,
   navigateToControlUiSession,
 } from "../../../ui/src/test-helpers/control-ui-e2e.ts";
-import { resolveQaGatewayChildCommand } from "./gateway-child-command.ts";
 import { createQaLiveLaneGateway } from "./live-transports/shared/live-gateway.runtime.ts";
 
 const suite = createControlUiE2eSuite({
@@ -80,26 +79,18 @@ function imageInHistory(history: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function readRawAssistantMessages(stateDir: string): PersistedAssistantMessage[] {
-  const database = openNodeSqliteDatabase(
+async function readRawAssistantMessages(stateDir: string): Promise<PersistedAssistantMessage[]> {
+  const messages: PersistedAssistantMessage[] = [];
+  await visitQaSqliteTranscriptEvents(
     path.join(stateDir, "agents", "qa", "agent", "openclaw-agent.sqlite"),
-    { readOnly: true },
+    (eventJson) => {
+      const message = asOptionalRecord(JSON.parse(eventJson))?.message;
+      if (asOptionalRecord(message)?.role === "assistant") {
+        messages.push(message as PersistedAssistantMessage);
+      }
+    },
   );
-  try {
-    const rows = database
-      .prepare("SELECT event_json FROM transcript_events ORDER BY seq")
-      .all() as Array<{ event_json: string }>;
-    return rows.flatMap(({ event_json }) => {
-      const message = (JSON.parse(event_json) as { message?: unknown }).message;
-      return message &&
-        typeof message === "object" &&
-        (message as { role?: unknown }).role === "assistant"
-        ? [message as PersistedAssistantMessage]
-        : [];
-    });
-  } finally {
-    database.close();
-  }
+  return messages;
 }
 
 function readModelReplayError(messages: AssistantMessage[]): string | null {
@@ -117,7 +108,10 @@ suite.define(() => {
     const gateway = await gatewayOwner.start({
       repoRoot: process.cwd(),
       command: {
-        ...resolveQaGatewayChildCommand(process.cwd()),
+        executablePath: process.execPath,
+        // The test runner prepares this runtime once; restarts must not rebuild the dirty checkout.
+        argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
+        cwd: process.cwd(),
         usePackagedPlugins: false,
       },
       providerMode: "mock-openai",
@@ -356,13 +350,27 @@ suite.define(() => {
     "delivers PowerPoint and keeps persisted attachment failures replay-safe",
     { timeout: 180_000 },
     async () => {
+      const startedAt = performance.now();
+      // A suite deadline can expire without a Playwright locator stack.
+      const reportPhase = (phase: string) => {
+        console.info("[media-transcript]", {
+          phase,
+          elapsedMs: Math.round(performance.now() - startedAt),
+        });
+      };
       const gatewayOwner = createQaLiveLaneGateway();
       const proofDir = suite.artifactDir;
       const errors: unknown[] = [];
       try {
+        reportPhase("gateway-starting");
         const gateway = await gatewayOwner.start({
           repoRoot: process.cwd(),
-          command: resolveQaGatewayChildCommand(process.cwd()),
+          command: {
+            executablePath: process.execPath,
+            argsPrefix: [path.join(process.cwd(), "openclaw.mjs")],
+            cwd: process.cwd(),
+            usePackagedPlugins: true,
+          },
           providerMode: "mock-openai",
           primaryModel: "mock-openai/gpt-5.6-luna",
           alternateModel: "mock-openai/gpt-5.6-luna-alt",
@@ -371,6 +379,7 @@ suite.define(() => {
           controlUiAllowedOrigins: [new URL(suite.server.baseUrl).origin],
           controlUiEnabled: false,
         });
+        reportPhase("gateway-ready");
         await writeFile(path.join(gateway.gateway.workspaceDir, "slides.pptx"), await createPptx());
         expect(await gateway.gateway.call("config.get", {})).toMatchObject({
           config: {
@@ -381,6 +390,7 @@ suite.define(() => {
             },
           },
         });
+        reportPhase("fixture-ready");
 
         await suite.withPage(
           {
@@ -404,6 +414,7 @@ suite.define(() => {
             );
             await page.goto(controlUiSessionUrl(suite.server.baseUrl, "agent:qa:main"));
             await waitForControlUiGatewayReady(page);
+            reportPhase("page-connected");
             // Exercise media delivery only after the target session owns its composer;
             // cold startup can still replace the initial empty draft before this point.
             await page.waitForFunction(() => {
@@ -418,14 +429,17 @@ suite.define(() => {
                 !pane.state.chatLoading
               );
             });
+            reportPhase("composer-ready");
             const composer = page.locator(".agent-chat__composer-combobox textarea");
             await composer.fill("Reply exactly `Slides ready\nMEDIA:./slides.pptx`");
             await page.getByRole("button", { name: "Send message" }).click();
+            reportPhase("powerpoint-request-sent");
             const card = page.locator(".chat-assistant-attachment-card", {
               hasText: "slides.pptx",
             });
             await card.waitFor();
             const firstCardText = (await card.textContent()) ?? "";
+            reportPhase("powerpoint-card-visible");
             if (captureUiProof) {
               await page.screenshot({ path: path.join(proofDir, "01-pptx-result.png") });
             }
@@ -433,9 +447,11 @@ suite.define(() => {
               sessionKey: "agent:qa:main",
               limit: 20,
             });
+            reportPhase("powerpoint-history-read");
 
             await composer.fill("Reply exactly `Session healthy`");
             await page.getByRole("button", { name: "Send message" }).click();
+            reportPhase("success-replay-request-sent");
             let successPathHealthy = false;
             try {
               await expect
@@ -452,18 +468,22 @@ suite.define(() => {
                 .toBe(true);
               successPathHealthy = true;
             } catch {}
+            reportPhase("success-replay-checked");
             let failureCardVisible = firstCardText.includes("Not sent");
             let failurePathHealthy = false;
             if (successPathHealthy) {
               await composer.fill("Reply exactly `Missing file\nMEDIA:./missing-proof.txt`");
               await page.getByRole("button", { name: "Send message" }).click();
+              reportPhase("missing-file-request-sent");
               const failureCard = page.locator(".chat-assistant-attachment-card", {
                 hasText: "missing-proof.txt",
               });
               await failureCard.waitFor();
               failureCardVisible = ((await failureCard.textContent()) ?? "").includes("Not sent");
+              reportPhase("missing-file-card-visible");
               await composer.fill("Reply exactly `Session recovered`");
               await page.getByRole("button", { name: "Send message" }).click();
+              reportPhase("failure-replay-request-sent");
               try {
                 await expect
                   .poll(
@@ -479,16 +499,19 @@ suite.define(() => {
                   .toBe(true);
                 failurePathHealthy = true;
               } catch {}
+              reportPhase("failure-replay-checked");
             }
             const secondHistory = await gateway.gateway.call("chat.history", {
               sessionKey: "agent:qa:main",
               limit: 30,
             });
+            reportPhase("final-history-read");
             const stateDir = gateway.gateway.runtimeEnv.OPENCLAW_STATE_DIR;
             if (!stateDir) {
               throw new Error("QA Gateway state directory is unavailable");
             }
-            const rawAssistantMessages = readRawAssistantMessages(stateDir);
+            const rawAssistantMessages = await readRawAssistantMessages(stateDir);
+            reportPhase("persisted-transcript-read");
             const rawModelContent = rawAssistantMessages.flatMap((message) =>
               Array.isArray(message.content) ? message.content : [],
             );
@@ -525,12 +548,15 @@ suite.define(() => {
               pptxDelivered: true,
               successPathHealthy: true,
             });
+            reportPhase("verdict-checked");
           },
         );
       } catch (error) {
         errors.push(error);
       }
+      reportPhase("gateway-stopping");
       const stopped = await gatewayOwner.stop({ preserveToDir: path.join(proofDir, "gateway") });
+      reportPhase("gateway-stopped");
       errors.push(...stopped.errors);
       if (errors.length > 0) {
         throw new AggregateError(errors, "Control UI media transcript proof failed");

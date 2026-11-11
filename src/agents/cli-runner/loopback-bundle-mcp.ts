@@ -91,6 +91,7 @@ export async function prepareCliLoopbackBundleMcp(params: {
       ...mcpConfig,
       sessionId: run.sessionId,
       sessionKey: run.sessionKey,
+      agentId: params.agentId,
       agentDir: params.agentDir,
       // The catalog must not depend on which turn asks for it. Requester-scoped
       // servers need a verified sender, which completions and automations lack.

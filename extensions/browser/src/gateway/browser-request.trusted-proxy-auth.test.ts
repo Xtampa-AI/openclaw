@@ -25,7 +25,7 @@ const { stopBrowserControlService } = await import("../control-service.js");
 const { startBrowserControlServerFromConfig, stopBrowserControlServer } =
   await import("../server.js");
 const { getBridgeAuthForPort } = await import("../browser/bridge-auth-registry.js");
-const { clearConfigCache, clearRuntimeConfigSnapshot } =
+const { captureRuntimeConfigAsyncReader, clearConfigCache, clearRuntimeConfigSnapshot } =
   await import("openclaw/plugin-sdk/runtime-config-snapshot");
 
 type Request = Parameters<typeof handleBrowserGatewayRequest>[0];
@@ -92,6 +92,7 @@ beforeEach(async () => {
   vi.stubEnv("VITEST", "0");
   clearConfigCache();
   clearRuntimeConfigSnapshot();
+  await captureRuntimeConfigAsyncReader()();
 });
 
 afterEach(async () => {

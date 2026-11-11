@@ -4,13 +4,15 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { createOpenClawCodingTools } from "../../agents/agent-tools.js";
+import { persistAuthProfileBatch } from "../../agents/auth-profiles/upsert-with-lock.js";
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
+import { createEmbeddedAgentRunnerOpenAiConfig } from "../../agents/test-helpers/embedded-agent-runner-e2e-fixtures.js";
 import { AUTOMATIONS_TOOL_NAME } from "../../agents/tools/automations-tool-name.js";
 import {
   createAdmittedGatewayToolCallerIdentity,
   withGatewayToolCallerIdentity,
 } from "../../agents/tools/gateway-caller-context.js";
-import { hasLiveWorktreeRunLease } from "../../agents/worktrees/run-lease.js";
+import { hasLiveWorktreeRunLease } from "../../agents/worktrees/run-lease.test-support.js";
 import {
   materializeManagedWorktreeFixture,
   useManagedWorktreeTestRepository,
@@ -38,6 +40,7 @@ import {
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { CronService } from "../service.js";
 import { createNoopLogger } from "../service.test-harness.js";
+import { runCronSessionTurn } from "../session-run.js";
 import { resolveCronSessionTargetSessionKey } from "../session-target.js";
 import {
   ensureAgentWorkspaceMock,
@@ -47,15 +50,31 @@ import {
   patchSessionEntryMock,
   resetRunCronIsolatedAgentTurnHarness,
   resolveCronDeliveryPlanMock,
+  resolveConfiguredModelRefMock,
   resolveCronSessionMock,
   runEmbeddedAgentMock,
 } from "./run.test-harness.js";
 
+const sessionRunner = vi.hoisted(() => ({
+  runEmbedded: vi.fn<typeof import("../../agents/embedded-agent-runner/run.js").runEmbeddedAgent>(),
+}));
+// mock-isolation: Only model execution is synthetic; session admission and filesystem tools stay real.
+vi.mock("../../agents/embedded-agent-runner/run.js", () => ({
+  runEmbeddedAgent: sessionRunner.runEmbedded,
+}));
+
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
+const { resolveAgentDir } = await import("./run.runtime.js");
 const session = await vi.importActual<typeof import("./session.js")>("./session.js");
 const accessor = await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
   "../../config/sessions/session-accessor.js",
 );
+await Promise.all([
+  import("../../auto-reply/dispatch.js"),
+  import("../../auto-reply/reply/get-reply-from-config.runtime.js").then((runtime) =>
+    runtime.prewarmConfigDrivenReplyRuntime(),
+  ),
+]);
 installRequesterCronAuthorityTestHooks();
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const createRepo = useManagedWorktreeTestRepository();
@@ -69,6 +88,9 @@ beforeEach(() => {
   ensureAgentWorkspaceMock.mockImplementation(async ({ dir }: { dir: string }) => ({ dir }));
   resolveCronDeliveryPlanMock.mockReturnValue({ requested: false, mode: "none" });
   mockRunCronFallbackPassthrough();
+  sessionRunner.runEmbedded
+    .mockReset()
+    .mockImplementation((params) => runEmbeddedAgentMock(params));
 });
 
 describe("scheduled workspace authority through creator, storage, scheduler and file tools", () => {
@@ -84,15 +106,33 @@ describe("scheduled workspace authority through creator, storage, scheduler and 
     const foreignWorkspace = tempDirs.make("cron-foreign-workspace-");
     const foreignKey = "agent:main:dashboard:another-person";
     const targetKey = scenario === "foreign" || scenario === "operator" ? foreignKey : SESSION;
+    const agentDir = path.join(stateDir, "agents", "main", "agent");
     const config: OpenClawConfig = {
       ...cfg,
+      models: createEmbeddedAgentRunnerOpenAiConfig(["gpt-4.1"]).models,
       agents: {
-        defaults: { skipBootstrap: true, workspace: stateDir },
-        entries: { main: { workspace: stateDir } },
+        defaults: { skipBootstrap: true, workspace: stateDir, model: "openai/gpt-4.1" },
+        entries: { main: { agentDir, workspace: stateDir } },
+      },
+      auth: {
+        profiles: { "openai:cron-fixture": { provider: "openai", mode: "api_key" } },
+        order: { openai: ["openai:cron-fixture"] },
       },
       tools: { allow: [AUTOMATIONS_TOOL_NAME, "read", "write"], fs: { workspaceOnly: true } },
     };
     setRuntimeConfigSnapshot(config);
+    // Capture and execution must address the same canonical credential owner.
+    vi.mocked(resolveAgentDir).mockReturnValue(agentDir);
+    resolveConfiguredModelRefMock.mockReturnValue({ provider: "openai", model: "gpt-4.1" });
+    await persistAuthProfileBatch({
+      stateDir,
+      profiles: [
+        {
+          profileId: "openai:cron-fixture",
+          credential: { type: "api_key", provider: "openai", key: "gpt-4.1-key" },
+        },
+      ],
+    });
     const managedRoot = scenario.startsWith("managed")
       ? tempDirs.make("cron-managed-workspace-")
       : undefined;
@@ -200,6 +240,9 @@ describe("scheduled workspace authority through creator, storage, scheduler and 
         sessionKey: targetKey,
       });
       return withGatewayToolCallerIdentity(caller, async () => {
+        params.onExecutionPhase?.({ phase: "model_call_started" });
+        await params.onExecutionStarted?.();
+        await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
         const tools = createOpenClawCodingTools({
           config: params.config,
           agentId: "main",
@@ -244,6 +287,16 @@ describe("scheduled workspace authority through creator, storage, scheduler and 
       log: createNoopLogger(),
       enqueueSystemEvent: vi.fn(),
       requestHeartbeat: vi.fn(),
+      runSessionEvent: (request) =>
+        runCronSessionTurn({
+          ...request,
+          cfg: config,
+          agentId: "main",
+          sessionKey: expectDefined(
+            resolveCronSessionTargetSessionKey(request.job.sessionTarget),
+            "explicit workspace session target",
+          ),
+        }),
       runIsolatedAgentJob: (request) =>
         runCronIsolatedAgentTurn({
           ...request,
@@ -260,9 +313,18 @@ describe("scheduled workspace authority through creator, storage, scheduler and 
       await execution.run(job.id, "force");
       if (scenario === "foreign" || scenario === "archived" || scenario.startsWith("managed-")) {
         expect(reads).toEqual([]);
-        expect(execution.getJob(job.id)?.state.lastRunStatus).toBe("error");
+        const result = execution.getJob(job.id)?.state;
+        expect(result?.lastRunStatus).toBe("error");
+        expect(result?.lastError).toMatch(
+          scenario === "foreign"
+            ? /only use its owning conversation’s workspace/
+            : scenario === "archived"
+              ? /is archived/
+              : /worktree is missing, retired, or mismatched/,
+        );
       } else {
-        expect(execution.getJob(job.id)?.state.lastRunStatus).toBe("ok");
+        const result = execution.getJob(job.id)?.state;
+        expect(result?.lastRunStatus, result?.lastError).toBe("ok");
         expect(reads).toHaveLength(1);
         expect(reads[0]).toContain(scenario === "operator" ? "FOREIGN_WORKSPACE" : "OWN_WORKSPACE");
       }

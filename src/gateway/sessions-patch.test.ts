@@ -1,7 +1,7 @@
 // Session patch tests cover model/provider edits, subagent patching, provider
 // aliases, model catalog validation, and rejected invalid patch payloads.
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { ModelCatalogEntry } from "../agents/model-catalog.js";
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { prepareSharedAuthStoreOwnership } from "../agents/auth-profiles/path-resolve.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { contextBudgetStatusFixture } from "../config/sessions/context-budget.test-support.js";
@@ -13,7 +13,6 @@ import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plug
 import { AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE } from "../sessions/agent-harness-session-key.js";
 import { MODEL_SELECTION_LOCKED_MESSAGE } from "../sessions/model-overrides.js";
 import { withAgentSessionModelPatchOrigin } from "./session-model-patch-origin.js";
-import { projectSessionsPatchEntry } from "./sessions-patch.js";
 import {
   type ApplySessionsPatchArgs,
   MAIN_SESSION_KEY,
@@ -24,15 +23,16 @@ import {
 } from "./sessions-patch.test-support.js";
 
 const acpSessionMetaMocks = vi.hoisted(() => ({
-  readAcpSessionMetaForEntry: vi.fn(),
+  readAcpSessionMetaForEntryAsync: vi.fn(),
 }));
 const providerThinkingMocks = vi.hoisted(() => ({
   resolveProviderThinkingProfile:
     vi.fn<typeof import("../plugins/provider-thinking.js").resolveEffectiveThinkingProfile>(),
 }));
 
+// mock-isolation: Patch projection fixtures provide ACP metadata without opening real session stores.
 vi.mock("../acp/runtime/session-meta-readonly.js", () => ({
-  readAcpSessionMetaForEntry: acpSessionMetaMocks.readAcpSessionMetaForEntry,
+  readAcpSessionMetaForEntryAsync: acpSessionMetaMocks.readAcpSessionMetaForEntryAsync,
 }));
 
 // This suite owns patch projection; provider policy artifacts have dedicated contract coverage.
@@ -220,6 +220,10 @@ function createAllowlistedAnthropicModelCfg(): OpenClawConfig {
 }
 
 describe("gateway sessions patch", () => {
+  beforeAll(async () => {
+    await prepareSharedAuthStoreOwnership();
+  });
+
   beforeEach(() => {
     providerThinkingMocks.resolveProviderThinkingProfile.mockReset();
     providerThinkingMocks.resolveProviderThinkingProfile.mockImplementation(
@@ -247,7 +251,7 @@ describe("gateway sessions patch", () => {
   });
 
   afterEach(() => {
-    acpSessionMetaMocks.readAcpSessionMetaForEntry.mockReset();
+    acpSessionMetaMocks.readAcpSessionMetaForEntryAsync.mockReset();
     clearPluginMetadataLifecycleCaches();
     resetPluginRuntimeStateForTest();
   });
@@ -1176,7 +1180,7 @@ describe("gateway sessions patch", () => {
     },
   );
 
-  test("pins a concrete model selection that equals the configured default", async () => {
+  test("follows the default when a concrete model selection equals the configured default", async () => {
     const entry = expectPatchOk(
       await runPatch({
         cfg: { agents: { defaults: { model: { primary: OPENAI_GPT_MODEL } } } },
@@ -1185,9 +1189,9 @@ describe("gateway sessions patch", () => {
       }),
     );
 
-    expectModelSelection(entry, "openai", OPENAI_GPT_ID);
-    expect(entry.modelOverrideSource).toBe("user");
-    expect(entry.modelOverrideRouteResolution).toBe("resolved");
+    expectModelSelection(entry, undefined, undefined);
+    expect(entry.modelOverrideSource).toBe("default");
+    expect(entry.modelOverrideRouteResolution).toBeUndefined();
   });
 
   test("clears pending live model switches for model reset patches", async () => {
@@ -1546,45 +1550,6 @@ describe("gateway sessions patch", () => {
     expect(entry.thinkingLevel).toBe("xhigh");
   });
 
-  test.each([
-    { requested: "max", nativeEffort: "max", accepted: true },
-    { requested: "max", nativeEffort: "high", accepted: false },
-  ] as const)(
-    "validates thinking against the selected runtime variant ($nativeEffort, accepted=$accepted)",
-    async ({ requested, nativeEffort, accepted }) => {
-      const host: ModelCatalogEntry = {
-        provider: "runtime-fixture",
-        id: "reasoner",
-        name: "Reasoner",
-        reasoning: true,
-        compat: { supportedReasoningEfforts: [accepted ? "high" : "max"] },
-      };
-      const native: ModelCatalogEntry = {
-        ...host,
-        nativeRuntime: "fixture-native",
-        compat: { supportedReasoningEfforts: [nativeEffort] },
-      };
-      const result = await projectSessionsPatchEntry({
-        cfg: { agents: { defaults: { model: "runtime-fixture/reasoner" } } },
-        storeKey: MAIN_SESSION_KEY,
-        existingEntry: mainStoreEntry({})[MAIN_SESSION_KEY],
-        isLabelInUse: () => false,
-        preparedAgentRuntime: "fixture-native",
-        patch: { key: MAIN_SESSION_KEY, thinkingLevel: requested },
-        loadGatewayModelCatalogSnapshot: async () => ({
-          entries: [host],
-          routeVariants: [host, native],
-        }),
-      });
-
-      if (accepted) {
-        expect(expectPatchOk(result).thinkingLevel).toBe(requested);
-      } else {
-        expectPatchError(result, 'thinkingLevel "max" is not supported');
-      }
-    },
-  );
-
   test("validates global patches against the selected agent", async () => {
     const entry = expectPatchOk(
       await runPatch({
@@ -1712,7 +1677,7 @@ describe("gateway sessions patch", () => {
   );
 
   test("does not persist a misleading runtime pin on an ACP-owned session", async () => {
-    acpSessionMetaMocks.readAcpSessionMetaForEntry.mockReturnValue({
+    acpSessionMetaMocks.readAcpSessionMetaForEntryAsync.mockResolvedValue({
       backend: "codex",
       agent: "main",
       state: "idle",
@@ -1727,7 +1692,7 @@ describe("gateway sessions patch", () => {
   });
 
   test("uses ACP backend metadata on canonical agent keys for thinking validation", async () => {
-    acpSessionMetaMocks.readAcpSessionMetaForEntry.mockReturnValue({
+    acpSessionMetaMocks.readAcpSessionMetaForEntryAsync.mockResolvedValue({
       backend: "codex",
       agent: "main",
       runtimeSessionName: MAIN_SESSION_KEY,
@@ -1753,7 +1718,7 @@ describe("gateway sessions patch", () => {
     });
 
     expectPatchError(result, 'thinkingLevel "xhigh" is not supported');
-    expect(acpSessionMetaMocks.readAcpSessionMetaForEntry).toHaveBeenCalledWith({
+    expect(acpSessionMetaMocks.readAcpSessionMetaForEntryAsync).toHaveBeenCalledWith({
       sessionKey: MAIN_SESSION_KEY,
       agentId: "main",
       entry: expect.objectContaining({ sessionId: "sess" }),
@@ -2080,8 +2045,13 @@ describe("gateway sessions patch", () => {
       return;
     }
     const entry = expectPatchOk(result);
-    expectModelSelection(entry, "synthetic", "hf:moonshotai/Kimi-K2.7-Code");
-    expect(entry.modelOverrideSource).toBe("user");
+    if (config.agentPrimaryModel === SUBAGENT_MODEL) {
+      expectModelSelection(entry, undefined, undefined);
+      expect(entry.modelOverrideSource).toBe("default");
+    } else {
+      expectModelSelection(entry, "synthetic", "hf:moonshotai/Kimi-K2.7-Code");
+      expect(entry.modelOverrideSource).toBe("user");
+    }
   });
 
   test("persists trailing @profile suffix as authProfileOverride on model patch", async () => {

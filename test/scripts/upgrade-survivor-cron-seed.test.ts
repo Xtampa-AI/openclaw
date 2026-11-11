@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { assertLegacyOperatorCronOwners } from "../../scripts/e2e/lib/upgrade-survivor/legacy-operator-state.mjs";
@@ -69,8 +69,8 @@ export async function loadCronStore(storePath) {
     writeFileSync(
       path.join(binDir, "getent"),
       `#!/bin/sh\nprintf 'fixture:x:1000:1000:Fixture:%s:/bin/sh\\n' "$FIXTURE_ACCOUNT_HOME"\n`,
+      { mode: 0o755 },
     );
-    chmodSync(path.join(binDir, "getent"), 0o755);
     writeFileSync(
       probePath,
       `#!${process.execPath}
@@ -216,13 +216,13 @@ if (args[0] === "config") {
   fs.writeFileSync(path.join(process.env.FIXTURE_ROOT, "updated"), "complete");
 }
 `,
+      { mode: 0o755 },
     );
-    chmodSync(probePath, 0o755);
     writeFileSync(
       path.join(binDir, "systemctl"),
       `#!/bin/sh\nexec "${process.execPath}" "$FIXTURE_PROBE" fixture-systemctl "$@"\n`,
+      { mode: 0o755 },
     );
-    chmodSync(path.join(binDir, "systemctl"), 0o755);
     const source = readFileSync("scripts/e2e/lib/upgrade-survivor/run.sh", "utf8");
     const phaseStart = source.indexOf("phase storage-preflight");
     const updatePhase = "phase update-candidate update_candidate";

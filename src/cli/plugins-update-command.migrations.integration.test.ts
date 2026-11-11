@@ -16,7 +16,7 @@ import {
 import { selectInstallMutationWriteOptions } from "../plugins/install-config-mutation.js";
 import { persistPluginInstall } from "../plugins/install-persistence.js";
 import { resolvePluginInstallTransactionRequest } from "../plugins/install-transaction.js";
-import { readPersistedInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
+import { readPersistedInstalledPluginIndexInstallRecordsAsync } from "../plugins/installed-plugin-index-records.js";
 import { PluginInstallPersistedError } from "../plugins/lifecycle.js";
 import { PLUGIN_LIFECYCLE_LEASE_IDENTITY } from "../plugins/plugin-lifecycle-lease-identity.js";
 import { seedInstalledPluginIndex } from "../plugins/test-helpers/installed-plugin-index.js";
@@ -34,9 +34,10 @@ vi.mock("../plugins/update.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../plugins/update.js")>()),
   updateNpmInstalledPlugins: vi.fn(),
 }));
-const gateway = vi.hoisted(() => ({ online: false, call: vi.fn() }));
-vi.mock("./plugins-lifecycle-client.js", () => ({
-  resolvePluginLifecycleGateway: async () => (gateway.online ? gateway.call : null),
+const gateway = vi.hoisted(() => ({ call: vi.fn() }));
+vi.mock("./plugins-lifecycle-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./plugins-lifecycle-client.js")>()),
+  resolvePluginLifecycleGateway: async () => gateway.call,
 }));
 afterEach(() => vi.restoreAllMocks());
 
@@ -162,7 +163,9 @@ describe("installed plugin update config migration", () => {
                     ? { listener: { port: 57597, host: "${LISTENER_HOST}" } }
                     : { oldPort: 57597 }),
                   label: "kept",
-                  ...(scenario === "env-reference" ? { oldHost: "${LISTENER_HOST}" } : {}),
+                  ...(scenario === "env-reference" || scenario === "include"
+                    ? { oldHost: "${LISTENER_HOST}" }
+                    : {}),
                 },
               },
             },
@@ -409,25 +412,7 @@ describe("installed plugin update config migration", () => {
           "write-failure",
           "revoked",
         ].includes(scenario);
-        gateway.online =
-          failure ||
-          acceptedFailure ||
-          pendingState ||
-          scenario === "unchanged" ||
-          scenario === "partial-update";
-        gateway.call.mockReset().mockImplementation(async (method: string) => {
-          if (method === "plugins.refresh") {
-            const current = JSON.parse(fs.readFileSync(state.configPath, "utf8"));
-            expect(current.plugins.entries[pluginId].config).toEqual({
-              listener: { port: 57597 },
-              label: "kept",
-            });
-            expect(readDeferredPluginMigrations({ env: state.env })).toEqual(
-              retainsOther ? [unrelated] : [],
-            );
-          }
-          return { runtime: { generation: 1 } };
-        });
+        gateway.call.mockReset();
         if (scenario === "write-failure") {
           vi.spyOn(configIo, "replaceConfigFile").mockRejectedValueOnce(
             new Error("fixture publication refused"),
@@ -633,14 +618,12 @@ describe("installed plugin update config migration", () => {
             JSON.parse(fs.readFileSync(state.configPath, "utf8")).plugins.entries[pluginId].config,
           ).toEqual({ listener: { port: 57597 }, label: "kept" });
           expect(readDeferredPluginMigrations({ env: state.env })).toEqual([]);
-          expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual(
-            superseded ? newerRecords : nextRecords,
-          );
+          expect(
+            await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+          ).toEqual(superseded ? newerRecords : nextRecords);
           expect(payload.commit).toHaveBeenCalledTimes(1);
           expect(payload.rollback).not.toHaveBeenCalled();
-          expect(gateway.call.mock.calls.map(([method]) => method)).toEqual(
-            installScenario ? [] : ["plugins.list"],
-          );
+          expect(gateway.call).not.toHaveBeenCalled();
           expect(log).not.toHaveBeenCalledWith(
             "Updates saved; they will load on the next Gateway start.",
           );
@@ -690,12 +673,14 @@ describe("installed plugin update config migration", () => {
           expect(readDeferredPluginMigrations({ env: state.env })).toEqual(
             scenario === "rollback-generation-conflict" ? [newerPending] : beforePending,
           );
-          expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual(
+          expect(
+            await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+          ).toEqual(
             scenario === "revoked" || scenario === "include-post-publish-failure" || afterCompletion
               ? nextRecords
               : previousRecords,
           );
-          expect(gateway.call.mock.calls.map(([method]) => method)).toEqual(["plugins.list"]);
+          expect(gateway.call).not.toHaveBeenCalled();
           expect(log).not.toHaveBeenCalledWith(
             "Updates saved; they will load on the next Gateway start.",
           );
@@ -706,6 +691,7 @@ describe("installed plugin update config migration", () => {
         } else {
           await command;
         }
+        expect(gateway.call).not.toHaveBeenCalled();
         const saved = JSON.parse(fs.readFileSync(state.configPath, "utf8"));
         if (scenario === "unrelated-core-legacy") {
           expect(saved.memory).toEqual({ search: { provider: "auto" } });
@@ -721,7 +707,9 @@ describe("installed plugin update config migration", () => {
           ...(inactive || pendingState ? { oldPort: 57597 } : {}),
           listener: {
             port: 57597,
-            ...(scenario === "env-reference" || ready ? { host: "${LISTENER_HOST}" } : {}),
+            ...(scenario === "env-reference" || scenario === "include" || ready
+              ? { host: "${LISTENER_HOST}" }
+              : {}),
           },
           label: "kept",
         });
@@ -734,9 +722,9 @@ describe("installed plugin update config migration", () => {
         expect(readDeferredPluginMigrations({ env: state.env })).toEqual(
           inactive || pendingState ? beforePending : retainsOther ? [unrelated] : [],
         );
-        expect(readPersistedInstalledPluginIndexInstallRecords({ env: state.env })).toEqual(
-          nextRecords,
-        );
+        expect(
+          await readPersistedInstalledPluginIndexInstallRecordsAsync({ env: state.env }),
+        ).toEqual(nextRecords);
         if (inactive) {
           expect(plugins.entries[pluginId].enabled).toBe(false);
         }
@@ -745,9 +733,7 @@ describe("installed plugin update config migration", () => {
         }
         if (pendingState) {
           expect(applyRuntime).not.toHaveBeenCalled();
-          expect(gateway.call.mock.calls.map(([method]) => method)).toEqual(
-            installScenario ? [] : ["plugins.list"],
-          );
+          expect(gateway.call).not.toHaveBeenCalled();
           expect(log.mock.calls.flat().join("\n")).toContain("openclaw doctor --fix");
           expect(fs.existsSync(previousPath)).toBe(true);
         } else if (settled) {
@@ -755,11 +741,6 @@ describe("installed plugin update config migration", () => {
           expect(log).not.toHaveBeenCalledWith(
             "Updates saved; they will load on the next Gateway start.",
           );
-        } else if (scenario === "unchanged" || scenario === "partial-update") {
-          expect(gateway.call.mock.calls.map(([method]) => method)).toEqual([
-            "plugins.list",
-            "plugins.refresh",
-          ]);
         } else if (scenario !== "install-replacement" && scenario !== "disabled-install") {
           expect(log).toHaveBeenCalledWith(
             "Updates saved; they will load on the next Gateway start.",

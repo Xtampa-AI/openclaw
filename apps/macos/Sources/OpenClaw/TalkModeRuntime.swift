@@ -102,10 +102,8 @@ actor TalkModeRuntime {
     var pendingRealtimeRelayStartLifecycleGeneration: Int?
     var realtimeRestartGeneration: UInt64 = 0
     var realtimeRestartTask: Task<Void, Never>?
-    var realtimeReconfigurationGeneration: UInt64 = 0
     let realtimeTalkBootstrapProvider: RealtimeTalkBootstrapProvider
     #if DEBUG
-    var realtimeConfigApplicationCheckpoint: (@Sendable () async -> Void)?
     var recognitionCleanupProbe: (@Sendable () -> Void)?
     #endif
     private var lastInterruptedAtSeconds: Double?
@@ -141,7 +139,7 @@ actor TalkModeRuntime {
         if enabled {
             await start()
         } else {
-            await self.stop(reconfigurationGeneration: nil, lifecycleGeneration: nil)
+            await self.stop(lifecycleGeneration: nil)
         }
     }
 
@@ -1209,13 +1207,10 @@ extension TalkModeRuntime {
 
     func stopSpeaking(
         reason: TalkStopReason,
-        reconfigurationGeneration expectedReconfigurationGeneration: UInt64? = nil,
         lifecycleGeneration expectedLifecycleGeneration: Int? = nil) async
     {
         let ownsReconfiguration = {
-            self.ownsReconfiguration(
-                expectedReconfigurationGeneration,
-                lifecycleGeneration: expectedLifecycleGeneration)
+            expectedLifecycleGeneration.map { $0 == self.lifecycleGeneration } ?? true
         }
         guard ownsReconfiguration() else { return }
         if let realtimeSession {

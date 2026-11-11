@@ -1,12 +1,14 @@
-import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isIncognitoSessionKey } from "../../../routing/session-key.js";
 import { truncateUtf16WithEllipsis } from "../../../shared/text-truncate.js";
 import { wrapPromptDataBlock } from "../../sanitize-for-prompt.js";
 import { extractStoredAssistantText } from "../../tools/chat-history-text.js";
 import { resolveSubagentCompletionResultText } from "../completion/subagent-completion-result.js";
+import { resolveSubagentChildAgentId } from "../registry/subagent-child-owner-match.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "../registry/subagent-lifecycle-events.js";
 import type { SubagentRunRecord } from "../registry/subagent-registry.types.js";
 import { isSameSubagentRunOwner } from "../registry/subagent-run-generation.js";
+import { withSubagentSessionSource } from "../spawn/subagent-session-source.js";
 
 const MAX_CHILD_COMPLETION_FIELD_CHARS = 256;
 const MAX_CHILD_COMPLETION_FINDINGS_CHARS = 160_000;
@@ -15,10 +17,7 @@ const MIN_CHILD_COMPLETION_RESULT_CHARS = 64;
 type OutputRuntime = typeof import("./subagent-announce.runtime.js");
 type SubagentAnnounceResultDeps = Pick<
   OutputRuntime,
-  | "getRuntimeConfig"
-  | "readSubagentSessionEntry"
-  | "resolveAgentIdFromSessionKey"
-  | "resolveSessionStorePathCore"
+  "getRuntimeConfig" | "readSubagentSessionEntry" | "resolveSessionStorePathCore"
 > & {
   readSubagentRun: (runId: string) => SubagentRunRecord | undefined;
   findTranscriptEvent: typeof import("../../../config/sessions/session-accessor.js").findTranscriptEvent;
@@ -29,39 +28,6 @@ export type PreparedAnnounceResult = { text: string | undefined; isCurrent: () =
 
 export class SubagentAnnouncePreparationConflictError extends Error {
   override name = "SubagentAnnouncePreparationConflictError";
-}
-
-function announceResultFacts(child: SubagentRunRecord) {
-  return {
-    task: child.task,
-    taskName: child.taskName,
-    label: child.label,
-    endedReason: child.endedReason,
-    status: child.execution.status,
-    endedAt: child.execution.endedAt,
-    outcome: child.execution.outcome,
-    interruptionReason: child.execution.interruptionReason,
-    transcriptTarget: child.execution.transcriptTarget,
-    terminalReply: child.completion?.terminalReply,
-    resultText: child.completion?.resultText,
-    fallbackResultText: child.completion?.fallbackResultText,
-  };
-}
-
-function captureAnnounceResultAuthority(
-  child: SubagentRunRecord,
-  readSubagentRun: SubagentAnnounceResultDeps["readSubagentRun"],
-): () => boolean {
-  const facts = structuredClone(announceResultFacts(child));
-  const runId = child.runId;
-  return () => {
-    const current = readSubagentRun(runId);
-    return Boolean(
-      current &&
-      isSameSubagentRunOwner(current, child) &&
-      isDeepStrictEqual(announceResultFacts(current), facts),
-    );
-  };
 }
 
 /** Read the final assistant message from the transcript identity owned by this run. */
@@ -75,7 +41,15 @@ export async function readSubagentRunAnnounceResultUsing(
       "The completed child run's owner changed before announcement.",
     );
   }
-  const isCurrent = captureAnnounceResultAuthority(child, deps.readSubagentRun);
+  // Terminal result metadata is best-effort; replacement executions still lose ownership.
+  const isCurrent = () => {
+    const current = deps.readSubagentRun(child.runId);
+    return (
+      isSameSubagentRunOwner(current, child) &&
+      current?.endedReason === child.endedReason &&
+      current?.execution.outcome?.status === child.execution.outcome?.status
+    );
+  };
   const terminalReply = child.completion?.terminalReply;
   const capturedResult = resolveSubagentCompletionResultText(child);
   if (
@@ -87,37 +61,46 @@ export async function readSubagentRunAnnounceResultUsing(
   }
   const runId = child.runId;
   const childSessionKey = child.childSessionKey;
+  const childAgentId = resolveSubagentChildAgentId(child);
+  if (!childAgentId) {
+    return { text: capturedResult, isCurrent };
+  }
   const target = child.execution.transcriptTarget;
-  const agentId = target?.agentId ?? deps.resolveAgentIdFromSessionKey(childSessionKey);
+  const agentId = target?.agentId ?? childAgentId;
   const storePath =
     target?.storePath ??
     deps.resolveSessionStorePathCore(deps.getRuntimeConfig().session?.store, { agentId });
   const sessionKey = target?.sessionKey ?? childSessionKey;
-  const sessionId =
-    target?.sessionId ?? deps.readSubagentSessionEntry(storePath, sessionKey)?.sessionId;
-  const scope = { agentId, storePath, sessionKey };
-  const found = sessionId
-    ? await deps.findTranscriptEvent({ ...scope, sessionId }, { kind: "visible-final", runId })
-    : undefined;
-  let event: unknown = found?.event;
-  if (!event) {
-    // Delete commits the canonical archive before its derived file is published.
-    event = (await deps.findSessionTranscriptArchiveEventReadOnly({ ...scope, sessionId }, runId))
-      ?.event;
-  }
-  if (!isCurrent()) {
-    throw new SubagentAnnouncePreparationConflictError(
-      "The completed child run's transcript identity changed during announcement.",
-    );
-  }
-  const answer = isRecord(event) ? extractStoredAssistantText(event.message) : undefined;
-  if (!answer) {
-    return {
-      text: `[truncated-by-retention: complete child answer unavailable]\n${terminalReply.text}`,
-      isCurrent,
-    };
-  }
-  return { text: answer, isCurrent };
+  return withSubagentSessionSource({ agentId, storePath, sessionKey }, async (source) => {
+    const sourcePath = source?.path ?? storePath;
+    const sessionId =
+      target?.sessionId ??
+      (await deps.readSubagentSessionEntry(sourcePath, sessionKey, agentId))?.sessionId;
+    const scope = { agentId, storePath: sourcePath, sessionKey };
+    const found =
+      sessionId && (source || !isIncognitoSessionKey(sessionKey))
+        ? await deps.findTranscriptEvent({ ...scope, sessionId }, { kind: "visible-final", runId })
+        : undefined;
+    let event: unknown = found?.event;
+    if (!event && !isIncognitoSessionKey(sessionKey)) {
+      // Delete commits the canonical archive before its derived file is published.
+      event = (await deps.findSessionTranscriptArchiveEventReadOnly({ ...scope, sessionId }, runId))
+        ?.event;
+    }
+    if (!isCurrent()) {
+      throw new SubagentAnnouncePreparationConflictError(
+        "The completed child run's transcript identity changed during announcement.",
+      );
+    }
+    const answer = isRecord(event) ? extractStoredAssistantText(event.message) : undefined;
+    if (!answer) {
+      return {
+        text: `[truncated-by-retention: complete child answer unavailable]\n${terminalReply.text}`,
+        isCurrent,
+      };
+    }
+    return { text: answer, isCurrent };
+  });
 }
 
 function describeSubagentOutcome(child: ChildCompletionRow): string {
@@ -127,7 +110,8 @@ function describeSubagentOutcome(child: ChildCompletionRow): string {
     return error ? `cancelled: ${error}` : "cancelled";
   }
   if (child.execution.interruptionReason === "gateway-restart") {
-    return "interrupted by gateway restart";
+    const error = outcome?.error?.trim();
+    return error ? `interrupted by gateway restart: ${error}` : "interrupted by gateway restart";
   }
   if (!outcome) {
     return "unknown";

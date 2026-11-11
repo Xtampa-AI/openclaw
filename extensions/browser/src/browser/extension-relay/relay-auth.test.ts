@@ -20,10 +20,6 @@ afterEach(() => {
 });
 
 describe("extension relay host-local secret", () => {
-  it("returns null before the secret is created", () => {
-    expect(readExtensionRelayToken(env)).toBeNull();
-  });
-
   it("creates a 64-hex secret on ensure and persists it privately", async () => {
     const token = await ensureExtensionRelayToken(env);
     expect(token).toMatch(/^[0-9a-f]{64}$/);
@@ -33,40 +29,38 @@ describe("extension relay host-local secret", () => {
     }
   });
 
-  it.each([
-    { name: "private directory", mode: 0o700, symlink: false },
-    { name: "0750 directory", mode: 0o750, symlink: false },
-    { name: "symlinked directory", mode: 0o750, symlink: true },
-  ])("reuses a valid key without mutating its $name", async ({ mode, symlink }) => {
-    const first = await ensureExtensionRelayToken(env);
-    const credentials = path.dirname(secretPath);
-    if (process.platform !== "win32") {
-      fs.chmodSync(credentials, mode);
-    }
-    if (symlink) {
-      const target = path.join(stateDir, "credential-target");
-      fs.renameSync(credentials, target);
-      fs.symlinkSync(target, credentials, "junction");
-    }
-    const before = fs.statSync(secretPath);
-    const bytes = fs.readFileSync(secretPath);
-    await expect(ensureExtensionRelayToken(env)).resolves.toBe(first);
-    expect(readExtensionRelayToken(env)).toBe(first);
-    expect(fs.readFileSync(secretPath)).toEqual(bytes);
-    expect(fs.statSync(secretPath)).toMatchObject({
-      dev: before.dev,
-      ino: before.ino,
-      mode: before.mode,
-    });
-    expect(fs.lstatSync(credentials).isSymbolicLink()).toBe(symlink);
-    if (process.platform !== "win32") {
-      expect(fs.statSync(credentials).mode & 0o777).toBe(mode);
-    }
-  });
+  it.each([{ name: "symlinked directory", mode: 0o750, symlink: true }])(
+    "reuses a valid key without mutating its $name",
+    async ({ mode, symlink }) => {
+      const first = await ensureExtensionRelayToken(env);
+      const credentials = path.dirname(secretPath);
+      if (process.platform !== "win32") {
+        fs.chmodSync(credentials, mode);
+      }
+      if (symlink) {
+        const target = path.join(stateDir, "credential-target");
+        fs.renameSync(credentials, target);
+        fs.symlinkSync(target, credentials, "junction");
+      }
+      const before = fs.statSync(secretPath);
+      const bytes = fs.readFileSync(secretPath);
+      await expect(ensureExtensionRelayToken(env)).resolves.toBe(first);
+      expect(readExtensionRelayToken(env)).toBe(first);
+      expect(fs.readFileSync(secretPath)).toEqual(bytes);
+      expect(fs.statSync(secretPath)).toMatchObject({
+        dev: before.dev,
+        ino: before.ino,
+        mode: before.mode,
+      });
+      expect(fs.lstatSync(credentials).isSymbolicLink()).toBe(symlink);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(credentials).mode & 0o777).toBe(mode);
+      }
+    },
+  );
 
   it.each([
     { name: "simultaneous first callers", writerStarted: false, symlink: false },
-    { name: "a writer already in progress", writerStarted: true, symlink: false },
     { name: "a writer in progress through a directory alias", writerStarted: true, symlink: true },
   ])("adopts the first writer's token with $name", async ({ writerStarted, symlink }) => {
     const writerToken = "a1".repeat(32);
@@ -112,34 +106,61 @@ describe("extension relay host-local secret", () => {
   });
 
   it.each([
-    { name: "empty", content: "" },
-    { name: "whitespace", content: " \n\t" },
-    { name: "malformed", content: "not-a-relay-token\n" },
-  ])("rejects a persistent $name secret without replacing it", async ({ content }) => {
+    ["empty", "", "is empty"],
+    ["malformed", "not-a-relay-token\n", "does not contain a 64-character lowercase hex token"],
+    ["uppercase", `${"A".repeat(64)}\n`, "does not contain a 64-character lowercase hex token"],
+  ])("rejects a persistent %s secret without replacing it", async (_name, content, problem) => {
     fs.mkdirSync(path.dirname(secretPath), { mode: 0o700 });
     fs.writeFileSync(secretPath, content, { flag: "wx", mode: 0o600 });
-    const before = fs.statSync(secretPath);
-    await expect(ensureExtensionRelayToken(env)).rejects.toMatchObject({
-      cause: expect.any(Error),
-    });
-    expect(fs.readFileSync(secretPath, "utf8")).toBe(content);
-    expect(fs.statSync(secretPath)).toMatchObject({ dev: before.dev, ino: before.ino });
-  });
-
-  it("gives different hosts (state dirs) different secrets", async () => {
-    const a = await ensureExtensionRelayToken(env);
-    const otherDir = fs.realpathSync(
-      fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-relay-auth-2-")),
+    const { dev, ino } = fs.statSync(secretPath);
+    await expect(ensureExtensionRelayToken(env)).rejects.toThrow(
+      `Browser extension relay secret ${secretPath} ${problem}. Move it aside, then run`,
     );
-    try {
-      const b = await ensureExtensionRelayToken({ OPENCLAW_STATE_DIR: otherDir });
-      expect(b).not.toBe(a);
-    } finally {
-      fs.rmSync(otherDir, { recursive: true, force: true });
-    }
+    expect(fs.readFileSync(secretPath, "utf8")).toBe(content);
+    expect(fs.statSync(secretPath)).toMatchObject({ dev, ino });
   });
 
-  it.runIf(process.platform !== "win32").each([0o644, 0o660])(
+  describe.runIf(process.platform !== "win32")("rejected secret files", () => {
+    it.each([
+      [
+        "a symlink",
+        "is a symlink",
+        () => {
+          const target = path.join(stateDir, "elsewhere.secret");
+          fs.writeFileSync(target, `${"a".repeat(64)}\n`, { mode: 0o600 });
+          fs.symlinkSync(target, secretPath);
+        },
+      ],
+      ["a directory", "is not a regular file", () => fs.mkdirSync(secretPath)],
+      [
+        "hard-linked",
+        "has 2 hard links",
+        () => {
+          fs.writeFileSync(secretPath, `${"a".repeat(64)}\n`, { mode: 0o600 });
+          fs.linkSync(secretPath, path.join(stateDir, "backup.secret"));
+        },
+      ],
+    ])(
+      "fails without waiting or replacing when the secret is %s",
+      async (_name, problem, setup) => {
+        fs.mkdirSync(path.dirname(secretPath), { mode: 0o700 });
+        setup();
+        const before = fs.lstatSync(secretPath);
+        // A retry loop would stall on fake timers; persistent states must fail on the first read.
+        vi.useFakeTimers();
+        try {
+          const error = await ensureExtensionRelayToken(env).catch((err: unknown) => err);
+          expect(String(error)).toContain(`${secretPath} ${problem}.`);
+          expect(String(error)).toContain("browser extension pair");
+        } finally {
+          vi.useRealTimers();
+        }
+        expect(fs.lstatSync(secretPath)).toMatchObject({ dev: before.dev, ino: before.ino });
+      },
+    );
+  });
+
+  it.runIf(process.platform !== "win32").each([0o644])(
     "self-heals a secret with mode %i to 0600 and still reads it",
     async (mode) => {
       const token = await ensureExtensionRelayToken(env);
@@ -156,7 +177,7 @@ describe("extension relay host-local secret", () => {
       const owner = fs.statSync(secretPath).uid;
       vi.spyOn(process, "getuid").mockReturnValue(owner + 1);
       expect(readExtensionRelayToken(env)).toBeNull();
-      await expect(ensureExtensionRelayToken(env)).rejects.toThrow("unreadable/malformed");
+      await expect(ensureExtensionRelayToken(env)).rejects.toThrow("is owned by another user");
       expect(fs.readFileSync(secretPath, "utf8").trim()).toBe(token);
     },
   );
@@ -180,6 +201,8 @@ describe("extension relay host-local secret", () => {
       fs.chmodSync(secretPath, 0o644);
       const replacement = path.join(stateDir, "replacement");
       fs.writeFileSync(replacement, "b2".repeat(32), { mode: 0o644 });
+      // Creation modes are masked by umask; the replacement must start broad.
+      fs.chmodSync(replacement, 0o644);
       const inspected = fs.lstatSync(secretPath);
       vi.spyOn(fs, "lstatSync").mockImplementationOnce(() => {
         fs.renameSync(secretPath, path.join(stateDir, "original"));

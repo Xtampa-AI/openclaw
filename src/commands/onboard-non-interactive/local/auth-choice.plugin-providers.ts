@@ -293,7 +293,7 @@ export async function applyNonInteractivePluginProviderChoice(
     await import("../../../system-agent/setup-inference-credentials.js");
   let result: OpenClawConfig | null;
   if (
-    isSetupCredentialReplacement({
+    await isSetupCredentialReplacement({
       provider: providerChoice.provider.id,
       baseConfig: params.baseConfig,
       agentDir,
@@ -301,7 +301,7 @@ export async function applyNonInteractivePluginProviderChoice(
   ) {
     const [
       { withAuthProfileStoreAgentDir, clearRuntimeAuthProfileStoreSnapshot },
-      { loadAuthProfileStoreWithoutExternalProfiles, saveAuthProfileStore },
+      { loadAuthProfileStoreWithoutExternalProfilesAsync, saveAuthProfileStore },
       { loadPersistedAuthProfileStore },
       { closeAuthProfileReadPool },
       { closeOpenClawAgentDatabasesAsync },
@@ -322,7 +322,7 @@ export async function applyNonInteractivePluginProviderChoice(
       import("../../../system-agent/setup-inference-core.js"),
       import("../../../system-agent/setup-inference-custom.js"),
     ]);
-    const realStore = loadAuthProfileStoreWithoutExternalProfiles(agentDir);
+    const realStore = await loadAuthProfileStoreWithoutExternalProfilesAsync(agentDir);
     // This is preparation for the same owner, not a new agent. Preserve static
     // metadata even when cross-agent copying is disabled; never clone refresh material.
     const seeded = {

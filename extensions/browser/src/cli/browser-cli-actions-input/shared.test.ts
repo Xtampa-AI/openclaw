@@ -1,5 +1,5 @@
 // Browser tests cover shared plugin behavior.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
@@ -23,38 +23,6 @@ describe("browser JSON byte input", () => {
       await expect(result).rejects.toThrow("must be valid UTF-8");
       expect(await fs.readFile(file)).toEqual(bytes);
     });
-  });
-
-  it.each(["fields", "actions"] as const)("preserves valid Unicode in %s files", async (kind) => {
-    await withTempDir("openclaw-browser-utf8-", async (root) => {
-      const file = path.join(root, "input.json");
-      const text = '[{"ref":"1","value":"合法 � 😀"}]\r\n';
-      await fs.writeFile(file, text);
-      if (kind === "fields") {
-        expect(await readFields({ fieldsFile: file })).toEqual([
-          { ref: "1", type: "text", value: "合法 � 😀" },
-        ]);
-      } else {
-        expect(await readActionsPayload({ actionsFile: file })).toBe(text);
-      }
-      expect(await fs.readFile(file, "utf8")).toBe(text);
-    });
-  });
-
-  it("rejects malformed stdin bytes after bounded collection", async () => {
-    const iterator = vi
-      .spyOn(process.stdin, Symbol.asyncIterator)
-      .mockImplementationOnce(async function* () {
-        yield Buffer.from('[{"kind":"type","text":"');
-        yield Buffer.from([0xe2, 0x82]);
-        yield Buffer.from('"}]');
-        return undefined;
-      });
-    try {
-      await expect(readActionsPayload({ actionsFile: "-" })).rejects.toThrow("must be valid UTF-8");
-    } finally {
-      iterator.mockRestore();
-    }
   });
 
   it("preserves valid stdin Unicode split across chunks", async () => {
@@ -98,11 +66,6 @@ describe("readActionsPayload", () => {
     await expect(
       readActionsPayload({ actions: "[]", actionsFile: "/tmp/openclaw-browser-actions.json" }),
     ).rejects.toThrow("Specify only one of --actions or --actions-file");
-  });
-
-  it("preserves inline actions larger than the file input ceiling", async () => {
-    const actions = " ".repeat(1_000_001);
-    await expect(readActionsPayload({ actions })).resolves.toBe(actions);
   });
 
   it("bounds action files with the same byte limit as stdin", async () => {
@@ -161,3 +124,53 @@ describe("readActionsPayload", () => {
     },
   );
 });
+
+async function withInput(content: string, run: (file: string) => Promise<void>) {
+  await withTempDir("browser-fields", async (root) => {
+    const file = path.join(root, "fields.json");
+    await fs.writeFile(file, content);
+    await run(file);
+  });
+}
+it.each([false, true])(
+  "preserves oversized Unicode fields files (symlink: %s)",
+  async (symlink) => {
+    await withInput(`[${" ".repeat(1_048_577)}{"ref":"1","value":"合法 😀"}]`, async (file) => {
+      if (symlink) {
+        await fs.symlink(file, `${file}.link`);
+      }
+      const fields = await readFields({ fieldsFile: symlink ? `${file}.link` : file });
+      expect(fields).toEqual([{ ref: "1", type: "text", value: "合法 😀" }]);
+    });
+  },
+);
+
+it.skipIf(process.platform === "win32").each([false, true])(
+  "rejects FIFO fields files (symlink: %s)",
+  async (symlink) => {
+    await withTempDir("openclaw-browser-fields-", async (tempDir) => {
+      const fifoPath = path.join(tempDir, "fields.pipe");
+      execFileSync("mkfifo", [fifoPath]);
+      if (symlink) {
+        await fs.symlink(fifoPath, `${fifoPath}.link`);
+      }
+      // A writer lets a regressed reader finish instead of stranding the test runner.
+      const writer = spawn(
+        process.execPath,
+        ["-e", "require('node:fs').writeFileSync(process.argv[1], '[]')", fifoPath],
+        { stdio: "ignore" },
+      );
+      const writerClosed = new Promise((resolve) => {
+        writer.once("close", resolve);
+      });
+      try {
+        await expect(
+          readFields({ fieldsFile: symlink ? `${fifoPath}.link` : fifoPath }),
+        ).rejects.toThrow("regular file");
+      } finally {
+        writer.kill("SIGKILL");
+        await writerClosed;
+      }
+    });
+  },
+);

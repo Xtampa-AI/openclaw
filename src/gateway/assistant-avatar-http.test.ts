@@ -5,6 +5,10 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import * as imageOps from "../media/image-ops.js";
 import { readImageMetadataFromHeader } from "../media/image-ops.js";
@@ -18,7 +22,10 @@ import { APNG_BYTES } from "./http-image.test-support.js";
 import { makeMockHttpResponse } from "./test-http-response.js";
 
 const tempRoots = useAutoCleanupTempDirTracker(afterEach);
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  clearRuntimeConfigSnapshot();
+});
 
 it.each(["https://example.test/avatar.png", "data:text/html,<html>avatar</html>"])(
   "rejects %s before invoking the native data decoder",
@@ -114,6 +121,7 @@ it.each([
   const config: OpenClawConfig = {
     agents: { entries: { main: { workspace, identity: { avatar } } } },
   };
+  setRuntimeConfigSnapshot(config);
   const { avatar: url } = await resolveGatewayAssistantAvatar({
     cfg: config,
     identity: await resolveAssistantIdentity({ cfg: config, agentId: "main" }),
@@ -159,6 +167,7 @@ it.each(["local", "data"])(
         },
       },
     };
+    setRuntimeConfigSnapshot(config);
     const project = async (agentId = "main") =>
       (
         await resolveGatewayAssistantAvatar({
@@ -203,6 +212,19 @@ it.each(["local", "data"])(
       "private, max-age=31536000, immutable",
     );
     expect(first.setHeader).toHaveBeenCalledWith("vary", "Authorization, Cookie");
+    if (sourceKind === "data") {
+      for (const method of ["GET", "HEAD"]) {
+        const response = await request({ url: "/control/avatar/main", method });
+        expect(response.res.statusCode).toBe(200);
+        expect(response.setHeader).toHaveBeenCalledWith("content-type", "image/png");
+        expect(response.setHeader).toHaveBeenCalledWith("cache-control", "private, no-cache");
+        expect(response.setHeader).toHaveBeenCalledWith("vary", "Authorization, Cookie");
+        expect(response.end.mock.calls[0]?.[0]).toEqual(method === "HEAD" ? undefined : thumbnail);
+      }
+      expect(
+        (await request({ url: "/control/avatar/main", authorized: false })).res.statusCode,
+      ).toBe(401);
+    }
     const etag = first.setHeader.mock.calls.find(([name]) => name === "etag")?.[1] as string;
     expect(etag).toBeTruthy();
 
@@ -219,6 +241,7 @@ it.each(["local", "data"])(
             sourceKind === "local" ? filename : `data:image/png;base64,${bytes.toString("base64")}`,
         },
       };
+      setRuntimeConfigSnapshot(config);
       urls.push(await project(agentId));
       expect((await request({ url: urls[index] })).res.statusCode).toBe(200);
     }
@@ -255,6 +278,7 @@ it.each(["local", "data"])(
       fs.renameSync(path.join(workspace, "replacement.png"), avatarPath);
     } else {
       config.agents!.entries!.main!.identity!.avatar = `data:image/png;base64,${replacement.toString("base64")}`;
+      setRuntimeConfigSnapshot(config);
     }
     const replacedUrl = await project();
     expect(replacedUrl).not.toBe(url);

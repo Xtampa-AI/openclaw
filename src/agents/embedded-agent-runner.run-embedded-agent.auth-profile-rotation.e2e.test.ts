@@ -8,10 +8,7 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { wrapRunWithTestPreparedAdmission } from "./admitted-run-context.test-support.js";
-import {
-  resolveInlineProviderApiKeyUsageId,
-  type AuthProfileFailureReason,
-} from "./auth-profiles.js";
+import { resolveInlineProviderApiKeyUsageId, type ProfileUsageStats } from "./auth-profiles.js";
 import {
   createApiKeyCredential,
   createAuthProfileStoreFixture,
@@ -114,11 +111,13 @@ let cleanupLogCapture: (() => void) | undefined;
 let resetLoggerFn: typeof import("../logging/logger.js").resetLogger;
 let setLoggerOverrideFn: typeof import("../logging/logger.js").setLoggerOverride;
 let registerAgentHarnessFn: typeof import("./harness/registry.js").registerAgentHarness;
+let setRuntimeConfigSnapshot: typeof import("../config/config.js").setRuntimeConfigSnapshot;
 const originalFetch = globalThis.fetch;
 
 beforeAll(async () => {
   vi.resetModules();
   installRunEmbeddedMocks();
+  ({ setRuntimeConfigSnapshot } = await import("../config/config.js"));
   runEmbeddedAgent = wrapRunWithTestPreparedAdmission(
     (await import("./embedded-agent-runner/run.js")).runEmbeddedAgent,
   );
@@ -153,6 +152,7 @@ async function runEmbeddedAgentInline(
 }
 
 beforeEach(() => {
+  setRuntimeConfigSnapshot({});
   vi.useRealTimers();
   runEmbeddedAttemptMock.mockReset();
   runEmbeddedAttemptMock.mockImplementation(async () => {
@@ -281,16 +281,7 @@ const writeAuthStore = async (
   opts?: {
     includeAnthropic?: boolean;
     order?: Record<string, string[]>;
-    usageStats?: Record<
-      string,
-      {
-        lastUsed?: number;
-        cooldownUntil?: number;
-        disabledUntil?: number;
-        disabledReason?: AuthProfileFailureReason;
-        failureCounts?: Partial<Record<AuthProfileFailureReason, number>>;
-      }
-    >;
+    usageStats?: Record<string, ProfileUsageStats>;
   },
 ) => {
   // Store order and usageStats are the persisted inputs the rotation picker
@@ -1129,6 +1120,7 @@ describe("runEmbeddedAgent auth profile rotation", () => {
             },
             "openai:backup": {
               cooldownUntil: now + 60 * 60 * 1000,
+              cooldownReason: "rate_limit",
               lastRateLimitAt: now,
             },
           },
@@ -1341,7 +1333,7 @@ describe("runEmbeddedAgent auth profile rotation", () => {
             lastUsed: 1,
             disabledUntil: now + 60 * 60 * 1000,
             disabledReason: "billing",
-            failureCounts: { rate_limit: 4 },
+            lastRateLimitAt: now,
           },
           "openai:p2": {
             lastUsed: 2,

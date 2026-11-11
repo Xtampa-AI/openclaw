@@ -1,3 +1,4 @@
+import { hash } from "node:crypto";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   asPositiveFiniteNumber,
@@ -43,8 +44,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   DEFAULT_FIRECRAWL_BASE_URL,
-  resolveFirecrawlApiKey,
-  resolveFirecrawlBaseUrl,
+  resolveFirecrawlConnection,
   resolveFirecrawlMaxAgeMs,
   resolveFirecrawlOnlyMainContent,
   resolveFirecrawlScrapeTimeoutSeconds,
@@ -183,6 +183,14 @@ async function resolveEndpoint(
   return { url: url.toString(), mode };
 }
 
+function readFirecrawlErrorDetail(payload: Record<string, unknown>, fallback: string): string {
+  return typeof payload.error === "string"
+    ? payload.error
+    : typeof payload.message === "string"
+      ? payload.message
+      : fallback;
+}
+
 async function postFirecrawlJson<T>(
   params: FirecrawlResolvedEndpoint & {
     timeoutSeconds: number;
@@ -224,12 +232,7 @@ async function postFirecrawlJson<T>(
           // Non-JSON errors keep their bounded text body.
         }
         if (payload) {
-          detail =
-            typeof payload.error === "string"
-              ? payload.error
-              : typeof payload.message === "string"
-                ? payload.message
-                : detail;
+          detail = readFirecrawlErrorDetail(payload, detail);
         } else if (errorBody.text) {
           detail = errorBody.text;
         }
@@ -354,7 +357,8 @@ export async function runFirecrawlSearch(
   params.signal?.throwIfAborted();
   const keyless = params.access === "keyless";
   const providerId = keyless ? "firecrawl-free" : "firecrawl";
-  const apiKey = keyless ? undefined : resolveFirecrawlApiKey(params.cfg);
+  const connection = resolveFirecrawlConnection(params.cfg, "webSearch");
+  const apiKey = keyless ? undefined : connection.apiKey;
   if (!apiKey && !keyless) {
     throw new Error(
       "web_search (firecrawl) needs a Firecrawl API key. Set FIRECRAWL_API_KEY in the Gateway environment, or configure plugins.entries.firecrawl.config.webSearch.apiKey.",
@@ -377,11 +381,12 @@ export async function runFirecrawlSearch(
   const tbs = normalizeOptionalString(params.tbs);
   const location = normalizeOptionalString(params.location);
   const country = normalizeOptionalString(params.country);
-  const baseUrl = resolveFirecrawlBaseUrl(params.cfg);
+  const baseUrl = connection.baseUrl;
   const cacheKey = normalizeCacheKey(
     JSON.stringify({
       type: "firecrawl-search",
       provider: providerId,
+      credential: apiKey ? hash("sha256", apiKey, "hex") : undefined,
       q: params.query,
       count,
       baseUrl,
@@ -435,12 +440,7 @@ export async function runFirecrawlSearch(
         "Firecrawl Search API error",
       );
       if (payloadValue.success === false) {
-        const error =
-          typeof payloadValue.error === "string"
-            ? payloadValue.error
-            : typeof payloadValue.message === "string"
-              ? payloadValue.message
-              : "unknown error";
+        const error = readFirecrawlErrorDetail(payloadValue, "unknown error");
         const safeError = wrapWebContent(
           truncateSanitizedExternalContent(error, 1_000).text,
           "web_search",
@@ -557,7 +557,7 @@ export async function runFirecrawlScrape(params: FirecrawlScrapeParams) {
   params.signal?.throwIfAborted();
   assertFirecrawlScrapeTargetAllowed(params.url);
 
-  const apiKey = resolveFirecrawlApiKey(params.cfg);
+  const { apiKey, baseUrl } = resolveFirecrawlConnection(params.cfg, "webFetch");
   // Hosted v2/scrape accepts starter requests without a bearer token.
   // Only the selected web_fetch provider opts into that access mode.
   if (!apiKey && params.access !== "keyless") {
@@ -565,7 +565,6 @@ export async function runFirecrawlScrape(params: FirecrawlScrapeParams) {
       "firecrawl_scrape needs a Firecrawl API key. Set FIRECRAWL_API_KEY in the Gateway environment, or configure plugins.entries.firecrawl.config.webFetch.apiKey.",
     );
   }
-  const baseUrl = resolveFirecrawlBaseUrl(params.cfg);
   const timeoutSeconds = resolveFirecrawlScrapeTimeoutSeconds(params.cfg, params.timeoutSeconds);
   const onlyMainContent = resolveFirecrawlOnlyMainContent(params.cfg, params.onlyMainContent);
   const maxAgeMs = resolveFirecrawlMaxAgeMs(params.cfg, params.maxAgeMs);
@@ -603,12 +602,7 @@ export async function runFirecrawlScrape(params: FirecrawlScrapeParams) {
         maxBytes: FIRECRAWL_SCRAPE_RESPONSE_MAX_BYTES,
       });
       if (data.success === false) {
-        const detail =
-          typeof data.error === "string"
-            ? data.error
-            : typeof data.message === "string"
-              ? data.message
-              : response.statusText;
+        const detail = readFirecrawlErrorDetail(data, response.statusText);
         throw new Error(
           `Firecrawl fetch failed (${response.status}): ${wrapWebContent(
             truncateSanitizedExternalContent(detail, FIRECRAWL_SCRAPE_METADATA_MAX_CHARS).text,

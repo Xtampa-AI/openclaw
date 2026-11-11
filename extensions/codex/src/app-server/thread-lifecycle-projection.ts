@@ -1,4 +1,4 @@
-import { isCodexAppServerLiveThreadBackgroundOnly } from "./client-runtime.js";
+import { isCodexAppServerLiveThreadBackgroundOnly } from "./client-runtime-thread-state.js";
 import {
   buildCodexPluginAppsConfigPatchFromPolicyContext,
   type CodexPluginThreadConfig,
@@ -33,7 +33,7 @@ export async function canRetainCodexProjectionBackgroundWork(
     binding.connectionScope === "supervision"
       ? undefined
       : (params.params.authProfileId ?? binding.authProfileId);
-  const resumeParams = context.buildResumeParams(
+  const resumeParams = await context.buildResumeParams(
     binding,
     authProfileId,
     buildCodexThreadRequestConfig(params, context, pluginConfig, finalConfig.configPatch),
@@ -46,6 +46,7 @@ export async function canRetainCodexProjectionBackgroundWork(
       authProfileId,
       context.dynamicToolsFingerprint,
       binding,
+      params,
     ),
   );
 }

@@ -13,6 +13,7 @@ import { scopedAgentIdForSession, visibleSessionMatches } from "../../lib/sessio
 import { generateUUID } from "../../lib/uuid.ts";
 import { discardChatAttachmentDataUrls } from "./attachment-payload-store.ts";
 import { readChatResetTargetAccess } from "./chat-commands.ts";
+import { captureChatConnectionOwner } from "./chat-connection-owner.ts";
 import { setChatError } from "./chat-history-state.ts";
 import { loadChatHistory } from "./chat-history.ts";
 import {
@@ -29,7 +30,6 @@ import { isTerminalFailureChatSendAck } from "./chat-send-ack.ts";
 import { restoreRejectedChatDelivery } from "./chat-send-composer.ts";
 import type { ChatHost } from "./chat-send-contract.ts";
 import {
-  captureChatConnectionOwner,
   deliveryStateWriter,
   finishChatDeliveryAdmission,
   finishScopedChatSending,
@@ -389,7 +389,6 @@ async function sendPreparedChatMessage(
           sessionKey,
           clearIndicators: ownsLocalRun,
           clearLocalRun: ownsLocalRun,
-          clearChatStream: ownsLocalRun,
           clearToolStream: ownsLocalRun,
           publishRunStatus: false,
           armLocalTerminalReconcile: (!host.chatRunId || ownsLocalRun) && ack.runId === runId,
@@ -442,7 +441,6 @@ async function sendPreparedChatMessage(
           runId: ack.runId,
           sessionKey,
           clearLocalRun: true,
-          clearChatStream: true,
           clearToolStream: true,
           publishRunStatus: false,
           armLocalTerminalReconcile: true,
@@ -603,9 +601,18 @@ export async function deliverChatQueueItem(
           sendOptions,
         );
         if (typeof parked === "string") {
-          if (parked === "pending" && outbox.queue[0]?.id !== item.id) {
-            // Reconcile older restored rows without delaying this turn's active-run policy.
-            void scheduleOutboxDrain(host, outbox, chatOutboxDrainDependencies);
+          if (parked === "pending") {
+            // A local busy flag can outlive a missed terminal event. Reconcile
+            // through the outbox owner before leaving the follow-up parked.
+            void scheduleOutboxDrain(
+              host,
+              outbox,
+              chatOutboxDrainDependencies,
+              undefined,
+              undefined,
+              undefined,
+              true,
+            );
           }
           return parked;
         }

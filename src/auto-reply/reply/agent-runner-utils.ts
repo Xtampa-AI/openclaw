@@ -37,6 +37,12 @@ import {
   mintMessageActionTurnCapability,
   resolveMessageActionTurnCapabilityLifetime,
 } from "../../gateway/message-action-turn-capability.js";
+import {
+  buildAgentHookContextChannelFields,
+  buildAgentHookContextIdentityFields,
+} from "../../plugins/hook-agent-context.js";
+import type { PluginHookAgentContext } from "../../plugins/hook-types.js";
+import { readUserTurnPromptReactionSource } from "../../sessions/user-turn-transcript-admission.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../utils/provider-utils.js";
 import type { TemplateContext } from "../templating.js";
@@ -45,6 +51,7 @@ import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import {
   buildReplyRunStateParams,
   resolveModelFallbackOptions,
+  resolveReplyScheduledToolPolicy,
   resolveRunModelHasVision,
 } from "./agent-runner-run-params.js";
 import { hasInboundAudio } from "./inbound-media.js";
@@ -225,7 +232,7 @@ export function resolveRunFastModeForFallbackCandidate(params: {
     sessionEntry: params.sessionEntry,
   });
   return {
-    fastMode: params.run.fastModeOverride ? params.run.fastMode : state.mode,
+    fastMode: params.run.fastModeOverride ? params.run.fastMode : state.requestMode,
     fastModeAutoOnSeconds: params.run.fastModeAutoOnSecondsOverride
       ? params.run.fastModeAutoOnSeconds
       : state.fastAutoOnSeconds,
@@ -316,6 +323,25 @@ function buildTemplateSenderContext(sessionCtx: TemplateContext) {
   };
 }
 
+/** Reuse the candidate's channel and sender projection for early model routing. */
+export function buildModelResolveContext(
+  params: Parameters<typeof buildEmbeddedContextFromTemplate>[0] & {
+    trigger: PluginHookAgentContext["trigger"];
+  },
+) {
+  const context = {
+    ...buildEmbeddedContextFromTemplate(params),
+    ...buildTemplateSenderContext(params.sessionCtx),
+    ...buildReplyRunStateParams(params.run),
+    trigger: params.trigger,
+  };
+  return {
+    trigger: context.trigger,
+    ...buildAgentHookContextChannelFields(context),
+    ...buildAgentHookContextIdentityFields(context),
+  };
+}
+
 /** Bind either runtime to the same trusted source turn and requester. */
 export function mintReplyMessageActionTurnCapability(
   turn: Pick<
@@ -330,11 +356,7 @@ export function mintReplyMessageActionTurnCapability(
   }
   const channelIngress = isTrustedMessageActionTurnIngress(turn.sessionCtx.Provider);
   const dashboardAdmission = turn.opts?.dashboardReadAdmission;
-  if (
-    turn.isHeartbeat ||
-    (!channelIngress &&
-      (turn.sessionCtx.Provider !== "webchat" || dashboardAdmission?.runId !== runId))
-  ) {
+  if (turn.isHeartbeat || (!channelIngress && turn.sessionCtx.Provider !== "webchat")) {
     return undefined;
   }
   const context = buildEmbeddedContextFromTemplate({
@@ -348,23 +370,34 @@ export function mintReplyMessageActionTurnCapability(
     return undefined;
   }
   if (!channelIngress) {
-    // Queue options may come from another input. Match the original admission,
-    // not opts.runId, which followup execution replaces with its own run ID.
-    if (
-      !dashboardAdmission ||
-      dashboardAdmission.agentId !== context.agentId ||
-      dashboardAdmission.sessionKey !== sessionKey ||
-      dashboardAdmission.sessionId !== context.sessionId
-    ) {
+    // Read permission stays tied to its original run. A queued prompt instead
+    // brings its own native source custody, bound below to this new execution.
+    const dashboard =
+      dashboardAdmission?.runId === runId &&
+      dashboardAdmission.agentId === context.agentId &&
+      dashboardAdmission.sessionKey === sessionKey &&
+      dashboardAdmission.sessionId === context.sessionId
+        ? dashboardAdmission
+        : undefined;
+    const recorder = turn.followupRun.userTurnTranscriptRecorder;
+    const source = readUserTurnPromptReactionSource(recorder);
+    const promptSource =
+      source && source.agentId === context.agentId && source.sessionKey === sessionKey
+        ? source
+        : undefined;
+    if (!dashboard && !promptSource) {
       return undefined;
     }
-    dashboardAdmission.assertCurrent();
+    dashboard?.assertCurrent();
+    promptSource?.assertCurrent();
     return mintMessageActionTurnCapability({
       agentId: context.agentId,
       runId,
       sessionKey,
       sessionId: context.sessionId,
-      assertDashboardReadCurrent: dashboardAdmission.assertCurrent,
+      assertDashboardReadCurrent: dashboard?.assertCurrent,
+      promptReactionSource:
+        promptSource && recorder ? { source: promptSource, recorder } : undefined,
       expiresWithRun: true,
     });
   }
@@ -418,6 +451,10 @@ export async function buildEmbeddedRunExecutionParams(params: {
   // Retain the base-input snapshot across thinking and vision discovery.
   const snapshot = { ...params };
   const config = snapshot.run.config;
+  const automation = snapshot.run.scheduledAutomation;
+  automation?.assertCurrent();
+  const job = automation?.job;
+  const scheduledToolPolicy = resolveReplyScheduledToolPolicy(snapshot.run);
   const { modelFallbackAvailability, fallbacksOverride: modelFallbacksOverride } =
     resolveModelFallbackOptions(snapshot.run);
   let modelThinkingCapability: PreparedModelThinkingCapability | undefined;
@@ -452,6 +489,8 @@ export async function buildEmbeddedRunExecutionParams(params: {
         workspaceDir: snapshot.run.workspaceDir,
         modelId: snapshot.model,
       }));
+  const modelHasVision = await resolveRunModelHasVision(snapshot);
+  automation?.assertCurrent();
   // Runtime policy keys may differ from session keys for direct-message scoped policy.
   return {
     ...embeddedContext,
@@ -463,7 +502,14 @@ export async function buildEmbeddedRunExecutionParams(params: {
     agentDir: snapshot.run.agentDir,
     config,
     trustedInternalHandoff: snapshot.run.trustedInternalHandoff,
-    scheduledToolPolicy: snapshot.run.scheduledToolPolicy,
+    scheduledToolPolicy,
+    ...(job
+      ? {
+          jobId: job.id,
+          scheduledRuntimeAuthority: job.runtimeAuthority,
+          scheduledRuntimeAuthorityRecoveryRequired: job.runtimeAuthorityRecoveryRequired === true,
+        }
+      : {}),
     runtimePluginToolGrant: snapshot.run.runtimePluginToolGrant,
     enforceFinalTag,
     silentExpected: snapshot.run.silentExpected,
@@ -473,7 +519,7 @@ export async function buildEmbeddedRunExecutionParams(params: {
     skillLibraryAuthoring: snapshot.run.skillLibraryAuthoring,
     provider: snapshot.provider,
     model: snapshot.model,
-    modelHasVision: await resolveRunModelHasVision(snapshot),
+    modelHasVision,
     ...(modelThinkingCapability ? { modelThinkingCapability } : {}),
     requestedRouteResolution: "resolved" as const,
     modelSelectionLocked: snapshot.run.modelSelectionLocked,
@@ -481,6 +527,7 @@ export async function buildEmbeddedRunExecutionParams(params: {
     modelFallbacksOverride,
     ...authProfile,
     thinkLevel: snapshot.run.thinkLevel,
+    thinkingExplicit: snapshot.run.thinkingExplicit,
     fastMode: snapshot.run.fastMode,
     fastModeAutoOnSeconds: snapshot.run.fastModeAutoOnSeconds,
     verboseLevel: snapshot.run.verboseLevel,

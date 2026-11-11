@@ -1,18 +1,39 @@
 import { embeddedAgentLog, formatErrorMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { createPreparedNativeSessionBindingAuthority } from "openclaw/plugin-sdk/agent-harness-session-runtime";
+import type { captureSessionEntryCurrentCheckAsync } from "openclaw/plugin-sdk/session-binding-runtime";
 import { appendSessionTranscriptMessageByIdentityStrict } from "openclaw/plugin-sdk/session-transcript-runtime";
 import type { CodexNativeSubagentHistoryOwner } from "./native-subagent-history-owner.js";
 import type { CodexNativeSubagentAssignmentStore } from "./native-subagent-pending-assignments.js";
+import type { CodexNativeSubagentSubmissionStore } from "./native-subagent-submission.js";
 import { matchesCodexNativeSubagentSubmissionBinding } from "./session-binding-record.js";
 import type {
   CodexAppServerBindingIdentity,
   CodexAppServerBindingStore,
+  CodexBindingAuthority,
 } from "./session-binding.js";
+
+/** Accepted child writes retain the captured parent lifecycle beyond foreground settlement. */
+export function createNativeSubagentSessionAuthority(
+  parent: Awaited<ReturnType<typeof captureSessionEntryCurrentCheckAsync>> | undefined,
+): CodexBindingAuthority | undefined {
+  if (!parent) {
+    return undefined;
+  }
+  return createPreparedNativeSessionBindingAuthority({
+    lineage: [],
+    source: parent.source,
+    entryChecks: parent.entryCurrent ? [parent.entryCurrent] : [],
+    assertCurrent: () => parent.source.assertScopeCurrent(),
+  });
+}
 
 export function createNativeSubagentAssignmentStore(params: {
   bindingStore: CodexAppServerBindingStore;
   identity: CodexAppServerBindingIdentity;
   owner: CodexNativeSubagentHistoryOwner;
   assertLifecycleCurrent?: () => void;
+  assertLifecycleCurrentAsync?: () => Promise<void>;
+  authority?: CodexBindingAuthority;
 }): CodexNativeSubagentAssignmentStore {
   const { bindingStore, identity, owner } = params;
   const assertCurrent = () => {
@@ -22,11 +43,18 @@ export function createNativeSubagentAssignmentStore(params: {
       throw new Error("Native assignment binding is no longer current.");
     }
   };
+  const assertCurrentAsync = async () => {
+    await params.assertLifecycleCurrentAsync?.();
+    assertCurrent();
+  };
   return {
     assertCurrent,
-    read: () => {
-      assertCurrent();
-      return bindingStore.readNativeSubagentAssignments?.(identity, owner) ?? [];
+    assertCurrentAsync,
+    read: async () => {
+      const assignments =
+        (await bindingStore.readNativeSubagentAssignments?.(identity, owner)) ?? [];
+      await assertCurrentAsync();
+      return assignments;
     },
     record: (assignment, assertSourceCurrent) =>
       bindingStore.mutate(
@@ -36,8 +64,13 @@ export function createNativeSubagentAssignmentStore(params: {
           assertCurrent();
           assertSourceCurrent();
         },
+        params.authority,
       ),
     consume: async (assignment, assertSourceCurrent, undelivered) => {
+      const assertRetirementCurrent = () => {
+        assertCurrent();
+        assertSourceCurrent();
+      };
       const applied = await bindingStore.mutate(
         identity,
         {
@@ -46,10 +79,8 @@ export function createNativeSubagentAssignmentStore(params: {
           assignment,
           ...(undelivered ? { undelivered: true } : {}),
         },
-        () => {
-          assertCurrent();
-          assertSourceCurrent();
-        },
+        assertRetirementCurrent,
+        params.authority,
       );
       if (applied && undelivered) {
         embeddedAgentLog.warn("Native subagent completion retired without delivery", {
@@ -59,13 +90,14 @@ export function createNativeSubagentAssignmentStore(params: {
           childSessionKey: assignment.runId,
         });
         try {
-          if (identity.kind !== "session" || !identity.sessionKey) {
-            throw new Error("Native completion has no parent transcript identity.");
+          if (identity.kind !== "session" || !identity.sessionKey || !params.authority) {
+            throw new Error("Native completion has no parent transcript authority.");
           }
           const note = await appendSessionTranscriptMessageByIdentityStrict({
             agentId: identity.agentId,
             sessionId: owner.sessionId,
             sessionKey: identity.sessionKey,
+            preparation: { source: params.authority.prepared.source },
             updateMode: "inline",
             message: {
               role: "custom",
@@ -93,5 +125,43 @@ export function createNativeSubagentAssignmentStore(params: {
       }
       return applied;
     },
+  };
+}
+
+export function createNativeSubagentSubmissionStore(params: {
+  bindingStore: CodexAppServerBindingStore;
+  identity: CodexAppServerBindingIdentity;
+  owner: CodexNativeSubagentHistoryOwner;
+  assertLifecycleCurrentAsync: () => Promise<void>;
+  authority?: CodexBindingAuthority;
+}): CodexNativeSubagentSubmissionStore {
+  const { bindingStore, identity, owner } = params;
+  const assertCurrent = () => {
+    const current = bindingStore.read(identity);
+    if (!current || !matchesCodexNativeSubagentSubmissionBinding(current, owner)) {
+      throw new Error("Native submission binding is no longer current.");
+    }
+  };
+  return {
+    assertCurrent,
+    assertCurrentAsync: async () => {
+      await params.assertLifecycleCurrentAsync();
+      assertCurrent();
+    },
+    read: () => bindingStore.readNativeSubagentSubmissions(identity, owner),
+    record: (receipt, assertSourceCurrent) =>
+      bindingStore.mutate(
+        identity,
+        { kind: "record-native-subagent-submission", owner, receipt },
+        assertSourceCurrent,
+        params.authority,
+      ),
+    consume: (receipt, assertSourceCurrent) =>
+      bindingStore.mutate(
+        identity,
+        { kind: "consume-native-subagent-submission", owner, receipt },
+        assertSourceCurrent,
+        params.authority,
+      ),
   };
 }

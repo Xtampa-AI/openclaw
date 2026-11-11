@@ -6,7 +6,6 @@ import * as packageMetadata from "../../infra/update-check-package-target.js";
 import * as updateGlobal from "../../infra/update-global.js";
 import { defaultRuntime } from "../../runtime.js";
 import * as shared from "./shared.js";
-import { runtimeFixture } from "./update-command-fixtures.test-support.js";
 import { installFreshUpdateFixture, targetMetadata } from "./update-command-fresh.test-support.js";
 import * as runtimeRecovery from "./update-command-node-runtime-resolution.js";
 import * as packageUpdate from "./update-command-package.js";
@@ -36,9 +35,13 @@ it.each([
         ? { npmOwner: { version: "11.10.0", lifecyclePolicy: "unflagged" } }
         : {}),
     });
-    vi.spyOn(runtimePaths, "resolveNodeRuntimeInfo").mockResolvedValue(
-      runtimeFixture(version, "3.53.0"),
-    );
+    vi.spyOn(runtimePaths, "resolveNodeRuntimeInfo").mockResolvedValue({
+      status: "supported",
+      version,
+      sqliteVersion: "3.53.0",
+      nodeSharedSqlite: false,
+      sqliteProbe: { available: true, version: "3.53.0", text: true, blob: true, json: true },
+    });
     vi.mocked(packageMetadata.fetchNpmPackageTargetStatus).mockResolvedValue({
       ...targetMetadata,
       version: "2026.10.6",

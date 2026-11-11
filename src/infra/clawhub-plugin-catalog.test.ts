@@ -45,6 +45,37 @@ function requestedUrl(fetchImpl: ReturnType<typeof mockResponse>) {
 }
 
 describe("ClawHub plugin catalog client", () => {
+  it("keeps astral MCP display text whole at the metadata caps", async () => {
+    const detail = await fetchClawHubPluginDetail({
+      baseUrl: "https://example.com",
+      packageName: "memory-plus",
+      skipAuth: true,
+      fetchImpl: mockResponse({
+        package: remotePlugin,
+        version: {
+          version: "1.2.3",
+          createdAt: 100,
+          pluginManifestSummary: {
+            configFields: [],
+            bundledSkills: [],
+            mcpServers: [
+              {
+                name: "astral",
+                transport: "stdio",
+                scope: `${"s".repeat(999)}\u{1F600}scope tail`,
+                setup: `${"d".repeat(1999)}\u{1F9DE}setup tail`,
+              },
+            ],
+          },
+        },
+        versions: { items: [] },
+      }),
+    });
+    expect(detail.mcpServerDetails).toEqual([
+      { name: "astral", transport: "stdio", scope: "s".repeat(999), setup: "d".repeat(1999) },
+    ]);
+  });
+
   it.each([false, true])(
     "attributes manual search unless telemetry is disabled: %s",
     async (disabled) => {
@@ -108,10 +139,10 @@ describe("ClawHub plugin catalog client", () => {
       },
       async () => {
         const authorization: Array<string | null> = [];
-        const fetchImpl = async (_input: string | URL | Request, init?: RequestInit) => {
+        const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
           authorization.push(new Headers(init?.headers).get("authorization"));
           return jsonResponse({ items: [remotePlugin], categories: [remoteCategory] });
-        };
+        });
         await read({ fetchImpl });
         await read({ fetchImpl, skipAuth: false });
         await read({ fetchImpl, token: "explicit-test-token" });
@@ -183,7 +214,7 @@ describe("ClawHub plugin catalog client", () => {
   it("rejects ambiguous registry category priorities", async () => {
     await expect(
       fetchClawHubPluginCategories({
-        fetchImpl: async () =>
+        fetchImpl: vi.fn(async () =>
           jsonResponse({
             categories: [
               {
@@ -192,6 +223,7 @@ describe("ClawHub plugin catalog client", () => {
               },
             ],
           }),
+        ),
       }),
     ).rejects.toThrow("duplicate or invalid pinned package");
   });
@@ -326,7 +358,7 @@ describe("ClawHub plugin catalog client", () => {
     await expect(
       fetchClawHubPluginCategories({
         baseUrl: "https://example.com",
-        fetchImpl: async () => jsonResponse({ categories: [category] }),
+        fetchImpl: vi.fn(async () => jsonResponse({ categories: [category] })),
       }),
     ).resolves.toEqual([category]);
   });
@@ -483,7 +515,7 @@ describe("ClawHub plugin catalog client", () => {
           },
         },
         security: {
-          overview: "Exact release passed ClawHub security review.",
+          overview: "No security analysis has been recorded yet.",
           verdict: "review",
           securityAuditUrl: "https://example.com/alice/plugins/memory-plus/security-audit",
           trust: {
@@ -527,7 +559,7 @@ describe("ClawHub plugin catalog client", () => {
       },
       downloadability: { status: "unknown" },
       metadata: { manifest: "available", readme: "available", security: "available" },
-      trust: { disposition: "clean", pending: false, stale: false },
+      trust: { disposition: "review-required", pending: false, stale: false },
       createdAt: 100,
       updatedAt: 300,
       readme: "# Memory Plus\n\nLong-term memory.",
@@ -564,10 +596,10 @@ describe("ClawHub plugin catalog client", () => {
         scanStatus: "clean",
       },
       security: {
-        status: "clean",
+        status: "review",
         verdict: "review",
         auditUrl: "https://example.com/alice/plugins/memory-plus/security-audit",
-        summary: "Exact release passed ClawHub security review.",
+        summary: "No security analysis has been recorded yet.",
       },
     });
     expect(detail.uiCapabilities).toEqual(expected);

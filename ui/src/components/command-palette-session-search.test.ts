@@ -11,7 +11,7 @@ import {
   findPaletteOption,
   mountPalette,
 } from "./command-palette.test-support.ts";
-import "./command-palette.ts";
+import "./command-palette.tsx";
 
 describe("CommandPalette session search", () => {
   let restoreDialogPolyfill: () => void;
@@ -31,6 +31,12 @@ describe("CommandPalette session search", () => {
       name: "punctuation-normalized title",
       query: "per session communi",
       title: "Per-session communication controls in UI",
+      sameSession: true,
+    },
+    {
+      name: "canonical Unicode title",
+      query: "München",
+      title: "Mu\u0308nchen",
       sameSession: true,
     },
     { name: "transcript-only match", serverMatch: false },

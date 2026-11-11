@@ -2,6 +2,7 @@
 import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
+import { chunkMarkdownTextWithMode } from "openclaw/plugin-sdk/reply-chunking";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 import type { ResolvedGoogleChatAccount } from "./accounts.js";
@@ -36,7 +37,10 @@ function createCore(params?: { chunks?: readonly string[] }) {
     channel: {
       text: {
         resolveChunkMode: vi.fn(() => "markdown"),
-        chunkMarkdownTextWithMode: vi.fn((text: string) => params?.chunks ?? [text]),
+        chunkMarkdownTextWithMode: vi.fn(
+          (text: string, limit: number, mode: "length" | "newline") =>
+            params?.chunks ?? chunkMarkdownTextWithMode(text, limit, mode),
+        ),
       },
       media: {
         readRemoteMediaBuffer: vi.fn(async () => ({ buffer: Buffer.from("image") })),
@@ -57,6 +61,57 @@ afterAll(() => {
 });
 
 describe("Google Chat reply delivery", () => {
+  it("formats Markdown for typing updates and subsequent sends", async () => {
+    const first = "a".repeat(55);
+    const second = "b".repeat(55);
+    const limitedAccount = {
+      ...account,
+      config: { ...account.config, textChunkLimit: 64 },
+    } as ResolvedGoogleChatAccount;
+
+    await deliverGoogleChatReply({
+      payload: { text: `**${first}**\n\n**${second}**`, replyToId: "spaces/AAA/threads/root" },
+      account: limitedAccount,
+      spaceId: "spaces/AAA",
+      runtime: createRuntimeSpies(),
+      core: createCore(),
+      config,
+      typingMessage: createGoogleChatTypingMessage({
+        messageName: "spaces/AAA/messages/typing",
+        requestedThreadName: "spaces/AAA/threads/root",
+        deliveredThreadName: "spaces/AAA/threads/root",
+      }),
+    });
+
+    expect(mocks.updateGoogleChatMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.updateGoogleChatMessage.mock.calls[0]?.[0]?.text.trim()).toBe(`*${first}*`);
+    expect(mocks.sendGoogleChatMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.sendGoogleChatMessage.mock.calls[0]?.[0]?.text.trim()).toBe(`*${second}*`);
+  });
+
+  it("preserves reference links across configured source chunk boundaries", async () => {
+    const replyText = `${"A".repeat(45)} [docs][ref]\n\n[ref]: https://example.com`;
+    const limitedAccount = {
+      ...account,
+      config: { ...account.config, textChunkLimit: 64 },
+    } as ResolvedGoogleChatAccount;
+
+    await deliverGoogleChatReply({
+      payload: { text: replyText },
+      account: limitedAccount,
+      spaceId: "spaces/AAA",
+      runtime: createRuntimeSpies(),
+      core: createCore(),
+      config,
+    });
+
+    const deliveredText = mocks.sendGoogleChatMessage.mock.calls
+      .map((call) => call[0]?.text)
+      .join("");
+    expect(deliveredText).toContain("<https://example.com|docs>");
+    expect(deliveredText).not.toContain("[ref]");
+  });
+
   it("does not resend the first chunk when the typing update result is ambiguous", async () => {
     const core = createCore({ chunks: ["first chunk", "second chunk"] });
     const runtime = createRuntimeSpies();
@@ -246,14 +301,23 @@ describe("Google Chat reply delivery", () => {
     expect(mocks.sendGoogleChatMessage).toHaveBeenCalledTimes(2);
   });
 
-  it("cleans up typing and rejects local media without provider upload access", async () => {
+  it.each([
+    {
+      payload: { mediaUrl: "/tmp/reply.png" },
+      reason: "Google Chat outbound attachments require remote HTTP(S) URLs.",
+    },
+    {
+      payload: { text: "<div></div>" },
+      reason: "Google Chat reply has no visible text after formatting.",
+    },
+  ])("cleans up typing and rejects undeliverable replies: $reason", async ({ payload, reason }) => {
     const core = createCore();
     const runtime = createRuntimeSpies();
 
     await expect(
       deliverGoogleChatReply({
         payload: {
-          mediaUrl: "/tmp/reply.png",
+          ...payload,
           replyToId: "spaces/AAA/threads/root",
         },
         account,
@@ -272,7 +336,7 @@ describe("Google Chat reply delivery", () => {
       (error: unknown) =>
         error instanceof PlatformMessageNotDispatchedError &&
         !error.retryable &&
-        error.message === "Google Chat outbound attachments require remote HTTP(S) URLs.",
+        error.message === reason,
     );
 
     expect(mocks.deleteGoogleChatMessage).toHaveBeenCalledWith({

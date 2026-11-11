@@ -26,6 +26,7 @@ import {
   releaseProvenanceMarkers,
   recoverUnavailablePullRequests,
   renderedContributionRecordReferences,
+  resolveCanonicalReleaseBranch,
   resolvedReleasePullRequests,
   standardRevertedHash,
   subtractShippedPullRequests,
@@ -33,6 +34,7 @@ import {
   withoutExcludedContributionRecords,
 } from "../../.agents/skills/openclaw-changelog-update/scripts/verify-release-notes.mjs";
 import { splitChangelog, writeReleaseChangelog } from "../../scripts/lib/release-changelog.mjs";
+import { renderGithubReleaseNotes } from "../../scripts/render-github-release-notes.mts";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -75,6 +77,12 @@ function git(cwd: string, args: string[], extraEnv: Record<string, string> = {})
       ...extraEnv,
     },
   }).trim();
+}
+
+function commitAll(cwd: string, message: string, extraEnv: Record<string, string> = {}): string {
+  git(cwd, ["add", "."]);
+  git(cwd, ["commit", "--allow-empty", "-qm", message], extraEnv);
+  return git(cwd, ["rev-parse", "HEAD"]);
 }
 
 function runVerifier(
@@ -124,6 +132,153 @@ function runVerifier(
 }
 
 describe("release-note verification", () => {
+  it("prefers the pushed canonical release branch over a stale local branch", () => {
+    const resolved = new Map([
+      ["refs/remotes/origin/release/2026.7.1", "remote"],
+      ["release/2026.7.1", "local"],
+    ]);
+    const visited: string[] = [];
+
+    expect(
+      resolveCanonicalReleaseBranch("release/2026.7.1", (ref: string) => {
+        visited.push(ref);
+        return resolved.get(ref);
+      }),
+    ).toBe("refs/remotes/origin/release/2026.7.1");
+    expect(visited).toEqual(["refs/remotes/origin/release/2026.7.1"]);
+  });
+
+  it("explains how to recover when a shallow checkout cannot resolve the beta merge base", () => {
+    const origin = tempDirs.make("openclaw-shallow-release-origin-");
+    git(origin, ["init", "-q", "-b", "main"]);
+    git(origin, ["config", "commit.gpgsign", "false"]);
+    commitAll(origin, "chore: baseline");
+    git(origin, ["tag", "--no-sign", "v2026.7.1"]);
+    commitAll(origin, "chore: candidate");
+
+    const cloneParent = tempDirs.make("openclaw-shallow-release-clone-");
+    const cwd = join(cloneParent, "repo");
+    git(cloneParent, ["clone", "-q", "--depth=1", "--no-tags", `file://${origin}`, cwd]);
+    git(cwd, ["fetch", "-q", "--depth=1", "origin", "tag", "v2026.7.1"]);
+
+    const result = runVerifier(cwd, {
+      base: "v2026.7.1",
+      target: "HEAD",
+      version: "2026.7.2-beta.1",
+      mainRef: null,
+      write: false,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "this checkout is shallow; fetch complete history (for example, git fetch --unshallow origin) and retry",
+    );
+  });
+
+  it("rejects an off-branch generation target before release-note discovery", () => {
+    const cwd = tempDirs.make("openclaw-off-branch-notes-");
+    git(cwd, ["init", "-q", "-b", "main"]);
+    git(cwd, ["config", "commit.gpgsign", "false"]);
+    writeFileSync(join(cwd, "CHANGELOG.md"), createReleaseNotesFixtureLines().join("\n"));
+    splitChangelog({ rootDir: cwd });
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-qm", "docs: seed changelog"]);
+    const base = git(cwd, ["rev-parse", "HEAD"]);
+    git(cwd, ["branch", "release/2026.7.1", base]);
+    writeFileSync(join(cwd, "off-branch.txt"), "wrong worktree\n");
+    git(cwd, ["add", "off-branch.txt"]);
+    git(cwd, ["commit", "-qm", "docs: prepare notes elsewhere"]);
+
+    const result = runVerifier(cwd, {
+      base,
+      target: "HEAD",
+      extraArgs: ["--release-branch", "release/2026.7.1"],
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "is not reachable from canonical release branch release/2026.7.1",
+    );
+    expect(readdirSync(join(cwd, ".git"))).not.toContain("openclaw-release-cache");
+  });
+
+  it("initializes a missing target section before writing its contribution record", () => {
+    const cwd = tempDirs.make("openclaw-initial-release-notes-");
+    git(cwd, ["init", "-q"]);
+    git(cwd, ["config", "commit.gpgsign", "false"]);
+    writeFileSync(
+      join(cwd, "CHANGELOG.md"),
+      createReleaseNotesFixtureLines().join("\n").replace("2026.7.1", "2026.6.11"),
+    );
+    splitChangelog({ rootDir: cwd });
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-qm", "docs: seed changelog"]);
+    const target = git(cwd, ["rev-parse", "HEAD"]);
+    const version = "2026.7.1-beta.1";
+
+    const result = runVerifier(cwd, { base: target, target, version });
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(readFileSync(join(cwd, `CHANGELOG/${version}.md`), "utf8")).toContain(
+      [`## ${version}`, "", "### Highlights", "", "### Changes", "", "### Fixes"].join("\n"),
+    );
+    expect(readFileSync(join(cwd, `CHANGELOG/records/${version}.md`), "utf8")).toContain(
+      "0 in-range PRs + 0 retained seed-only PRs = 0 unique PRs",
+    );
+  });
+
+  it("verifies extended-stable GitHub notes with their regular-stable context", () => {
+    const cwd = tempDirs.make("openclaw-extended-stable-notes-");
+    const bin = join(cwd, "bin");
+    mkdirSync(bin);
+    git(cwd, ["init", "-q", "-b", "main"]);
+    const version = "2026.8.35";
+    const tag = `v${version}`;
+    const regularStableVersion = "2026.9.5";
+    const changelog = createReleaseNotesFixtureLines().join("\n").replace("2026.7.1", version);
+    writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
+    git(cwd, ["add", "CHANGELOG.md"]);
+    git(cwd, ["commit", "-qm", "initial"]);
+    const target = git(cwd, ["rev-parse", "HEAD"]);
+    const verifiedChangelog = [
+      changelog,
+      "",
+      "### Complete contribution record",
+      "",
+      `This audited record covers the complete HEAD..${target} history: 0 in-range PRs + 0 retained seed-only PRs = 0 unique PRs.`,
+    ].join("\n");
+    writeFileSync(join(cwd, "CHANGELOG.md"), verifiedChangelog);
+    const body = renderGithubReleaseNotes({
+      changelog: verifiedChangelog,
+      version,
+      tag,
+      repository: "openclaw/openclaw",
+      regularStableVersion,
+    }).body;
+    const gh = join(bin, "gh");
+    writeFileSync(
+      gh,
+      `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(JSON.stringify({ id: 1, body }))});\n`,
+    );
+    chmodSync(gh, 0o755);
+
+    const result = runVerifier(cwd, {
+      version,
+      write: false,
+      extraArgs: [
+        "--release-tag",
+        tag,
+        "--check-github",
+        "--regular-stable-version",
+        regularStableVersion,
+      ],
+      env: { PATH: `${bin}:${process.env.PATH}` },
+    });
+
+    expect(result.status, `${result.stderr}\n${result.stdout}`).toBe(0);
+    expect(JSON.parse(result.stdout).github).toMatchObject([{ tag, matches: true }]);
+  });
+
   it.each([
     { previous: "2026.6.11", divergent: false },
     { previous: "2026.7.1-beta.2", divergent: false },
@@ -228,12 +383,21 @@ describe("release-note verification", () => {
     expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toBe(index);
   });
 
-  it("excludes maintainer and automation identities from contributor credit", () => {
+  it("credits human maintainers but excludes automation identities", () => {
     expect(isEligibleHandle("human-contributor")).toBe(true);
-    expect(isEligibleHandle("steipete")).toBe(false);
-    expect(isEligibleHandle("steipete-oai")).toBe(false);
-    expect(isEligibleHandle("hugin-bot")).toBe(false);
-    expect(isEligibleHandle("roboclaw-bot")).toBe(false);
+    expect(isEligibleHandle("steipete")).toBe(true);
+    expect(isEligibleHandle("copilot-contributor")).toBe(true);
+    for (const handle of [
+      "steipete-oai",
+      "hugin-bot",
+      "roboclaw-bot",
+      "tideclaw-bot",
+      "Copilot",
+      "copilot",
+      "COPILOT",
+    ]) {
+      expect(isEligibleHandle(handle)).toBe(false);
+    }
   });
 
   it("accepts only canonical commit PR suffixes", () => {
@@ -431,7 +595,7 @@ process.exitCode = errors.length ? 1 : 0;
     (mode) => {
       const number = 102147;
       const commit = {
-        authorHandle: undefined,
+        authorHandle: "release-operator",
         closingReferences: [102146],
         coauthors: [],
         committedAt: "2026-07-01T12:00:00Z",
@@ -459,7 +623,6 @@ process.exitCode = errors.length ? 1 : 0;
               ]
             : []),
         ],
-        coauthorsByReference: new Map<number, Set<string>>(),
         pullRequests: new Set<number>(),
         target: "c".repeat(40),
       };
@@ -489,11 +652,11 @@ process.exitCode = errors.length ? 1 : 0;
         title: "Fix silent maintenance delivery status",
         mergedAt: commit.committedAt,
         mergeCommit: { oid: commit.hash },
-        author: { __typename: "User", login: "coolmanns" },
+        recordedThanks: ["coolmanns"],
       });
       expect(commit.pullRequests).toEqual([number]);
       expect(source.pullRequests).toEqual(new Set([number]));
-      expect(source.coauthorsByReference.get(number)).toEqual(new Set(["coolmanns"]));
+      expect(recovered.get(number)).not.toHaveProperty("author");
     },
   );
 
@@ -1239,6 +1402,101 @@ process.exitCode = errors.length ? 1 : 0;
     ).toEqual(expected);
   });
 
+  it("credits the original PR, not its backport, and rejects stale generated thanks", () => {
+    const cwd = tempDirs.make("openclaw-release-credit-");
+    git(cwd, ["init", "-q", "-b", "main"]);
+    const changelog = createReleaseNotesFixtureLines().join("\n");
+    writeFileSync(join(cwd, "CHANGELOG.md"), changelog);
+    const base = commitAll(cwd, "chore: baseline");
+    const originalMessage =
+      "fix: preserve playback errors (#21)\n\nFixes #20\nCo-authored-by: Helper <helper@example.invalid>\nCo-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>";
+    writeFileSync(join(cwd, "playback.txt"), "fixed\n");
+    const original = commitAll(cwd, originalMessage);
+    git(cwd, ["checkout", "-qb", "release", base]);
+    commitAll(cwd, "chore: release preparation");
+    git(cwd, ["cherry-pick", "-x", original]);
+    git(cwd, [
+      "commit",
+      "--amend",
+      "-qm",
+      `${git(cwd, ["log", "-1", "--format=%B"])}\nCo-authored-by: RomneyDa <6581799+RomneyDa@users.noreply.github.com>`,
+    ]);
+    const target = git(cwd, ["rev-parse", "HEAD"]);
+    const stale = `${changelog}- Preserve playback errors by @steipete and @original-helper. (#21) Thanks @RomneyDa.\n\n### Complete contribution record\n\nThis audited record covers the complete ${base}..${target} history: 1 in-range PR + 0 retained seed-only PRs = 1 unique PR.\n\n#### Pull requests\n\n- **PR #21** Related #20. Thanks @RomneyDa.\n`;
+    writeFileSync(join(cwd, "CHANGELOG.md"), stale);
+    const seed = commitAll(cwd, "docs: old credit");
+    const gh = join(cwd, "gh");
+    writeFileSync(
+      gh,
+      `#!${process.execPath}\n
+const original = ${JSON.stringify(original)};
+const target = ${JSON.stringify(target)};
+const query = process.argv.find((arg) => arg.startsWith("query="))?.slice(6) ?? "";
+const data = {};
+for (const [, alias, hash] of query.matchAll(/(c\\d+): repository[\\s\\S]*?object\\(expression: "([0-9a-f]+)"\\)/g)) {
+  data[alias] = { object: {
+    associatedPullRequests: { nodes: hash === original ? [{ number: 21, mergedAt: "2020-01-01T00:00:00Z", mergeCommit: { oid: original } }] : [], pageInfo: { hasNextPage: false } },
+    authors: { nodes: [{ email: "helper@example.invalid", user: { login: "original-helper" } }, { email: "223556219+Copilot@users.noreply.github.com", user: { login: "Copilot" } }, ...(hash === target ? [{ email: "6581799+RomneyDa@users.noreply.github.com", user: { login: "RomneyDa" } }] : [])] },
+    author: { user: { login: "release-operator" } }
+  } };
+}
+for (const [, alias, rawNumber] of query.matchAll(/(n\\d+): repository[\\s\\S]*?issueOrPullRequest\\(number: (\\d+)\\)/g)) {
+  const number = Number(rawNumber);
+  data[alias] = { issueOrPullRequest: number === 21 ? {
+    __typename: "PullRequest", number, title: "fix: preserve playback errors", baseRefName: "main",
+    mergedAt: "2020-01-01T00:00:00Z", mergeCommit: { oid: original, message: ${JSON.stringify(originalMessage)} },
+    author: { __typename: "User", login: "steipete" }, closingIssuesReferences: { nodes: [{ number: 20 }], pageInfo: { hasNextPage: false } }
+  } : { __typename: "Issue", number, title: "Playback failed", author: { __typename: "User", login: "reporter" }, closedByPullRequestsReferences: { nodes: [], pageInfo: { hasNextPage: false } } } };
+}
+for (const [, alias, login] of query.matchAll(/(u\\d+): user\\(login: "([^"]+)"\\)/g)) data[alias] = { __typename: "User", login };
+console.log(JSON.stringify({ data }));
+`,
+    );
+    chmodSync(gh, 0o755);
+    splitChangelog({ rootDir: cwd });
+    const run = (write: boolean) =>
+      runVerifier(cwd, {
+        base,
+        target,
+        mainRef: original,
+        write,
+        extraArgs: ["--seed-ref", seed],
+        env: { PATH: `${cwd}:${process.env.PATH}` },
+      });
+    const generated = run(true);
+    expect(generated.stderr).toBe("");
+    expect(generated.status, generated.stdout).toBe(0);
+    const entryPath = join(cwd, "CHANGELOG/2026.7.1.md");
+    const section = readFileSync(entryPath, "utf8");
+    expect(section).toContain(
+      "- **PR #21** Related #20. Authored by @steipete. Thanks @original-helper and @reporter.",
+    );
+    expect(section).toContain(
+      "(#21) Authored by @steipete. Thanks @original-helper and @reporter.",
+    );
+    expect(section).not.toContain("@Copilot");
+    expect(section).not.toContain("@RomneyDa");
+    expect(section).not.toContain("@release-operator");
+    const checked = run(false);
+    expect(checked.status, checked.stderr + checked.stdout).toBe(0);
+    writeReleaseChangelog({
+      rootDir: cwd,
+      version: "2026.7.1",
+      section: section.replaceAll("Authored by @steipete", "Authored by @RomneyDa and @steipete"),
+    });
+    const rejected = run(false);
+    expect(rejected.status).toBe(1);
+    expect(JSON.parse(rejected.stdout).errors).toEqual(
+      expect.arrayContaining([
+        "unexpected Thanks @RomneyDa for #21",
+        "unexpected editorial Thanks @RomneyDa",
+      ]),
+    );
+    const repaired = run(true);
+    expect(repaired.status, repaired.stderr + repaired.stdout).toBe(0);
+    expect(readFileSync(entryPath, "utf8")).toBe(section);
+  });
+
   it.each([0, 1, 2])(
     "accounts for merged side ancestry with %i reversals without duplicating shipped PRs",
     (reversals) => {
@@ -1981,6 +2239,7 @@ Atomics.wait = function (...args) {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toContain("1 errors");
+    expect(result.stdout).toContain("- ### Highlights must contain 5-8 top-level bullets; found 1");
     expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
       schemaVersion: 3,
       version: "2026.7.1",

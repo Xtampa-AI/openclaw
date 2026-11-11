@@ -128,6 +128,8 @@ export type AgentRunModelOptions = {
   /** Outer model-fallback owner facts for this admitted attempt. */
   modelRoutingProvenance?: ModelFallbackAttemptProvenance;
   thinkLevel?: ThinkLevel;
+  /** Run-scoped selection intent for declared chat-template effort. */
+  thinkingExplicit?: boolean;
   fastMode?: FastMode;
   /** Stable outer-run start time for auto fast-mode cutoff across retries/fallbacks. */
   fastModeStartedAtMs?: number;
@@ -159,7 +161,10 @@ export type AgentRunInputContext = {
   transcriptPrompt?: string;
   currentInboundEventKind?: InboundEventKind;
   inputProvenance?: InputProvenance;
+  heartbeatEventQueueSessionKey?: string;
   extraSystemPrompt?: string;
+  /** Exact producer-owned transient section; unannotated instructions remain persistent. */
+  extraSystemPromptTurnContext?: { start: number; text: string };
   images?: ImageContent[];
   imageOrder?: PromptImageOrderEntry[];
   /** Ordered facts represented by attachment text in the current prompt. */

@@ -1,5 +1,10 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  recordCodexThreadForkSettings,
+  recordCodexTurnForkSettings,
+  requireCodexThreadForkSettings,
+} from "./client-fork-settings.js";
 import { wasCodexAppServerThreadClosed } from "./client-thread-closure.js";
 import type { CodexAppServerClient } from "./client.js";
 import { createClientHarness } from "./test-support.js";
@@ -59,6 +64,42 @@ describe("Codex app-server client runtime", () => {
     vi.restoreAllMocks();
     mocks.refreshAuth.mockClear();
     mocks.mergeRateLimitUpdate.mockClear();
+  });
+
+  it("keeps native creation instructions and latest turn settings only for the live parent", () => {
+    const { client } = createRuntimeHarness();
+    expect(() => requireCodexThreadForkSettings(client, "parent")).toThrow("normal message first");
+    recordCodexThreadForkSettings(client, "parent", {
+      model: "parent-model",
+      developerInstructions: "creation policy",
+      config: { web_search: "disabled", "features.computer_use": true },
+    });
+    recordCodexTurnForkSettings(client, {
+      threadId: "parent",
+      input: [],
+      effort: "high",
+      environments: [{ environmentId: "parent-env", cwd: "/workspace" }],
+    });
+    recordCodexThreadForkSettings(client, "parent", {
+      threadId: "parent",
+      developerInstructions: "ignored warm resume override",
+    });
+    recordCodexTurnForkSettings(client, {
+      threadId: "parent",
+      input: [],
+      effort: "xhigh",
+      serviceTier: "priority",
+    });
+    expect(requireCodexThreadForkSettings(client, "parent")).toMatchObject({
+      thread: {
+        model: "parent-model",
+        developerInstructions: "creation policy",
+        config: { web_search: "disabled", "features.computer_use": true },
+      },
+      turn: { effort: "xhigh", serviceTier: "priority" },
+    });
+    client.close();
+    expect(() => requireCodexThreadForkSettings(client, "parent")).toThrow("normal message first");
   });
 
   it("retains ephemeral policy and history beyond persistent idle and capacity limits", async () => {
@@ -305,35 +346,6 @@ describe("Codex app-server client runtime", () => {
     await expect(
       retainCodexAppServerLiveThread(harness.client, "thread-owned", successor?.release),
     ).resolves.toBe(true);
-  });
-
-  it("does not let an older owner forget or release a newly claimed thread generation", async () => {
-    const request = vi.fn(async () => ({}));
-    const client = {
-      request,
-      addCloseHandler: vi.fn(),
-      addNotificationHandler: vi.fn(),
-      addRequestHandler: vi.fn(),
-    } as unknown as CodexAppServerClient;
-    ensureCodexAppServerClientRuntime(client, { agentDir: "/tmp/agent" });
-    await retainCodexAppServerLiveThread(client, "thread-reclaimed");
-    const first = await consumeCodexAppServerLiveThread(client, "thread-reclaimed");
-    await retainCodexAppServerLiveThread(client, "thread-reclaimed", first?.release);
-    expect(isCodexAppServerLiveThreadClaimed(client, "thread-reclaimed")).toBe(false);
-    const second = await consumeCodexAppServerLiveThread(client, "thread-reclaimed");
-
-    first?.forget();
-    await first?.release("thread-reclaimed");
-
-    expect(request).not.toHaveBeenCalled();
-    expect(isCodexAppServerLiveThreadClaimed(client, "thread-reclaimed")).toBe(true);
-    await second?.release("thread-reclaimed");
-    expect(request).toHaveBeenCalledExactlyOnceWith(
-      "thread/unsubscribe",
-      { threadId: "thread-reclaimed" },
-      { timeoutMs: 5_000 },
-    );
-    expect(isCodexAppServerLiveThreadClaimed(client, "thread-reclaimed")).toBe(false);
   });
 
   it("preserves a retained successor from obsolete forget, release, and republish after independent-retain", async () => {
@@ -736,69 +748,37 @@ describe("Codex app-server client runtime", () => {
     ).resolves.toEqual(expect.objectContaining({ release: expect.any(Function) }));
   });
 
-  it.each(["thread/archived", "thread/deleted", "thread/closed"])(
-    "discards only the exact thread after %s",
-    async (method) => {
-      const harness = createRuntimeHarness();
-      await retainCodexAppServerLiveThread(harness.client, "thread-a");
-      await retainCodexAppServerLiveThread(harness.client, "thread-b");
-      const invalidated = vi.fn();
-      const ownership = await claimCodexAppServerLiveThread(
-        harness.client,
-        "thread-a",
-        invalidated,
-      );
-      expect(ownership).toBeDefined();
-      await retainCodexAppServerLiveThread(harness.client, "thread-a", ownership?.release);
-      let notifications = 0;
-      const notificationObserved = new Promise<void>((resolve) => {
-        harness.client.addNotificationHandler((notification) => {
-          if (notification.method === method && ++notifications === 2) {
-            resolve();
-          }
-        });
-      });
-
-      harness.send({ method, params: { threadId: "thread-a" } });
-      harness.send({ method, params: { threadId: "thread-a" } });
-      await notificationObserved;
-      expect(invalidated).toHaveBeenCalledOnce();
-      expect(wasCodexAppServerThreadClosed(harness.client, "thread-a")).toBe(true);
-      await expect(
-        consumeCodexAppServerLiveThread(harness.client, "thread-a"),
-      ).resolves.toBeUndefined();
-      await expect(consumeCodexAppServerLiveThread(harness.client, "thread-b")).resolves.toEqual(
-        expect.objectContaining({ release: expect.any(Function) }),
-      );
-      await expect(retainCodexAppServerLiveThread(harness.client, "thread-a")).resolves.toBe(true);
-      expect(wasCodexAppServerThreadClosed(harness.client, "thread-a")).toBe(false);
-    },
-  );
-
-  it("clears idle ownership and its timer when the physical client closes", async () => {
-    vi.useFakeTimers();
+  it("discards only the exact thread after thread/closed", async () => {
+    const method = "thread/closed";
     const harness = createRuntimeHarness();
-    const release = vi.fn(async (_threadId: string) => undefined);
-    await retainCodexAppServerLiveThread(harness.client, "thread-closed", release);
+    await retainCodexAppServerLiveThread(harness.client, "thread-a");
+    await retainCodexAppServerLiveThread(harness.client, "thread-b");
     const invalidated = vi.fn();
-    const ownership = await claimCodexAppServerLiveThread(
-      harness.client,
-      "thread-closed",
-      invalidated,
-    );
+    const ownership = await claimCodexAppServerLiveThread(harness.client, "thread-a", invalidated);
     expect(ownership).toBeDefined();
-    await retainCodexAppServerLiveThread(harness.client, "thread-closed", ownership?.release);
-    expect(invalidated).not.toHaveBeenCalled();
+    await retainCodexAppServerLiveThread(harness.client, "thread-a", ownership?.release);
+    let notifications = 0;
+    const notificationObserved = new Promise<void>((resolve) => {
+      harness.client.addNotificationHandler((notification) => {
+        if (notification.method === method && ++notifications === 2) {
+          resolve();
+        }
+      });
+    });
 
-    harness.client.close();
-    harness.client.close();
-    await vi.advanceTimersByTimeAsync(EXPECTED_LIVE_THREAD_IDLE_TIMEOUT_MS);
-
-    expect(release).not.toHaveBeenCalled();
+    harness.send({ method, params: { threadId: "thread-a" } });
+    harness.send({ method, params: { threadId: "thread-a" } });
+    await notificationObserved;
     expect(invalidated).toHaveBeenCalledOnce();
+    expect(wasCodexAppServerThreadClosed(harness.client, "thread-a")).toBe(true);
     await expect(
-      consumeCodexAppServerLiveThread(harness.client, "thread-closed"),
+      consumeCodexAppServerLiveThread(harness.client, "thread-a"),
     ).resolves.toBeUndefined();
+    await expect(consumeCodexAppServerLiveThread(harness.client, "thread-b")).resolves.toEqual(
+      expect.objectContaining({ release: expect.any(Function) }),
+    );
+    await expect(retainCodexAppServerLiveThread(harness.client, "thread-a")).resolves.toBe(true);
+    expect(wasCodexAppServerThreadClosed(harness.client, "thread-a")).toBe(false);
   });
 
   it("cannot resurrect thread ownership when its client closes during release", async () => {

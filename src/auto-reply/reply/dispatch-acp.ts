@@ -45,6 +45,7 @@ import {
   stripExtractedFileImageMetadata,
   type ExtractedFileImage,
 } from "../../media-understanding/extracted-file-images.js";
+import type { PluginHookReplyDispatchContext } from "../../plugins/hook-types.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { recordAcceptedSessionParticipantInput } from "../../sessions/session-participant-input-recording.js";
 import { prepareChannelParticipantObservation } from "../../sessions/session-participant-input.js";
@@ -62,6 +63,7 @@ import type {
 import type { FinalizedRuntimeMsgContext } from "../templating.js";
 import { createLazyAcpElicitationHandler } from "./acp-elicitation-handler-lazy.js";
 import { createAcpReplyProjector } from "./acp-projector.js";
+import { resolveAcpProjectionSettings } from "./acp-stream-settings.js";
 import {
   collectDescribedImageAttachmentIndexes,
   loadAgentTurnMediaRuntime,
@@ -118,6 +120,8 @@ export async function tryDispatchAcpReplyCore(
     shouldSendFullToolDetails: () => Promise<boolean>;
     bypassForCommand: boolean;
     onAgentRunStart?: GetReplyOptions["onAgentRunStart"];
+    onPreparedAgentRunStart?: GetReplyOptions["onPreparedAgentRunStart"];
+    turnAdoption?: PluginHookReplyDispatchContext["turnAdoption"];
     userTurnTranscriptRecorder?: GetReplyOptions["userTurnTranscriptRecorder"];
     prepareAssistantTranscriptMessage?: PrepareAssistantTranscriptMessage;
     recordProcessed: InboundMessageAuditTerminalRecorder["note"];
@@ -311,11 +315,22 @@ export async function tryDispatchAcpReplyCore(
   }
   const deliverDeferredTextFallback = async (): Promise<boolean> =>
     shouldDeferVisibleTextForTts ? await delivery.recoverBlockText() : false;
+  const isLive = resolveAcpProjectionSettings(params.cfg).deliveryMode === "live";
+  let streamedText = "";
   const projector = createAcpReplyProjector({
     cfg: params.cfg,
     shouldSendToolSummaries: params.shouldSendToolSummaries,
     shouldSendFullToolDetails: params.shouldSendFullToolDetails,
-    deliver: delivery.deliver,
+    deliver: async (kind, payload, meta) => {
+      const delivered = await delivery.deliver(kind, payload, meta);
+      const text = isLive && kind === "block" ? delivery.getVisibleBlockDisplayText() : "";
+      const delta = text.startsWith(streamedText) ? text.slice(streamedText.length) : text;
+      if (delta && !auditOnly && !params.suppressUserDelivery) {
+        auditRuntime.emitAcpAssistantDelta({ runId: auditRunId, text, delta });
+        streamedText = text;
+      }
+      return delivered;
+    },
     getConversationContext: () => params.ctx.agentText,
     onProgress: markAcpProgress,
     provider: params.ctx.Surface ?? params.ctx.Provider,
@@ -369,6 +384,7 @@ export async function tryDispatchAcpReplyCore(
     sessionId: transcriptSessionId,
     runId: auditRunId,
     onAgentRunStart: params.onAgentRunStart,
+    onPreparedAgentRunStart: params.onPreparedAgentRunStart,
     getResult: () => ({ assistantTranscript, terminalOutcome }),
   });
   await input.withCurrent(() => {});
@@ -592,13 +608,6 @@ export async function tryDispatchAcpReplyCore(
       return { queuedFinal: false, counts };
     }
 
-    emitAuditStart();
-    try {
-      await delivery.startReplyLifecycle();
-    } catch (error) {
-      logVerbose(`dispatch-acp: start reply lifecycle failed: ${formatErrorMessage(error)}`);
-    }
-
     admittedRunContext = await prepareChannelRunAdmission({
       cfg: params.cfg,
       runId: requestId,
@@ -626,6 +635,13 @@ export async function tryDispatchAcpReplyCore(
     // ACP can act before its terminal transcript arrives. Consume accepted input
     // before submission while leaving final assistant/outcome persistence below.
     await persistInput?.();
+    // Start publications clear prior lifecycle facts; settle input before they can race its guard.
+    emitAuditStart();
+    try {
+      await delivery.startReplyLifecycle();
+    } catch (error) {
+      logVerbose(`dispatch-acp: start reply lifecycle failed: ${formatErrorMessage(error)}`);
+    }
     await assertPreparedConversationBindingRouteCurrent(params.ctx);
     const turnInput: Parameters<typeof acpManager.runTurn>[0] = {
       admittedRunContext,
@@ -644,6 +660,16 @@ export async function tryDispatchAcpReplyCore(
       mode: "prompt",
       requestId,
       ...(params.abortSignal ? { signal: params.abortSignal } : {}),
+      onBeforePrompt: async () => {
+        await input.withCurrent(() => {});
+        await params.turnAdoption?.adopt();
+        await assertPreparedConversationBindingRouteCurrent(params.ctx);
+        await input.withCurrent(() => {
+          if (getAdmittedRunDelegatedAuthority(turnAdmission) === undefined) {
+            throw new Error("ACP turn admission ended before input dispatch.");
+          }
+        });
+      },
       onElicitation,
       onLifecycle: recordUnsupportedNativeActionEvidence,
       onEvent: async (event) => {
@@ -710,6 +736,7 @@ export async function tryDispatchAcpReplyCore(
     emitAuditTerminal();
     return result;
   } catch (err) {
+    params.turnAdoption?.assertCurrent();
     const acpError = toAcpRuntimeError({
       error: err,
       fallbackCode: "ACP_TURN_FAILED",

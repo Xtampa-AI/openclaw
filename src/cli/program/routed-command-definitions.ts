@@ -69,8 +69,24 @@ export const routedCommandDefinitions = {
     await runConfigGet(args);
   }),
   "config-unset": defineRoutedCommand(parseConfigUnsetRouteArgs, async (args) => {
-    const { runConfigUnset } = await import("../config-cli.js");
-    await runConfigUnset(args);
+    const { routeConfigMutationToOwner, runConfigUnset } = await import("../config-cli.js");
+    const runLocal = () => runConfigUnset(args);
+    if (args.cliOptions?.dryRun) {
+      return runLocal();
+    }
+    const { runWithLocalStateOwner } = await import("../local-state-owner.js");
+    const { quoteCliArg } = await import("../quote-cli-arg.js");
+    await runWithLocalStateOwner({
+      method: "config unset",
+      params: {},
+      target: args.path,
+      recoveryCommand: `openclaw config get ${quoteCliArg(args.path)}`,
+      onForeignOwner: routeConfigMutationToOwner(
+        (commit) => runConfigUnset({ ...args, commit }),
+        "config unset",
+      ),
+      runLocal,
+    });
   }),
   "models-list": defineRoutedCommand(parseModelsListRouteArgs, async (args) => {
     const { modelsListCommand } = await import("../../commands/models/list.list-command.js");

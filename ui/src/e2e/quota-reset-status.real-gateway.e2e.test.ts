@@ -12,6 +12,7 @@ import { waitForControlUiDocument } from "../../../src/commands/control-ui-hando
 import type { ModelAuthStatusResult } from "../../../src/gateway/server-methods/models-auth-status.types.js";
 import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "../../../src/state/openclaw-state-db-contract.js";
 import { resolveOpenClawStateSqlitePath } from "../../../src/state/openclaw-state-db.paths.js";
+import { quotaRequestMode } from "../../../test/e2e/qa-lab/runtime/quota-reset-diagnostics.mjs";
 import {
   ACCOUNT_ID,
   MARKER,
@@ -357,16 +358,12 @@ describe.each(["automatic", "saved-clear", "automatic-during-catalog"] as const)
           const inference = provider.requests
             .slice(beforeRecovery)
             .filter((request) => request.path.endsWith("/responses"));
-          const primaryInference = inference.filter(({ body, transport }) => {
+          const primaryInference = inference.filter(({ body }) => {
             const request: unknown = JSON.parse(body ?? "{}");
             return (
               isRecord(request) &&
               request.model === "gpt-5.5" &&
-              !(
-                transport === "websocket" &&
-                request.type === "response.create" &&
-                request.generate === false
-              )
+              quotaRequestMode(body) === "inference"
             );
           });
           observations.push({ action: "next-ordinary-turn", result: nextTurn, state: stats() });
@@ -386,6 +383,8 @@ describe.each(["automatic", "saved-clear", "automatic-during-catalog"] as const)
             expect(beforeRecoveryReply?.blockedUntil, evidence()).toBeUndefined();
             const refreshed = await catalogRefresh;
             observations.push({ action: "held-catalog-refresh", result: refreshed });
+            // Quota-only updates keep the catalog owner, so the held refresh completes;
+            // availability must stay recovered after its response publishes.
             expect(refreshed, evidence()).toMatchObject({ ok: true });
             let published: ModelsListResult | undefined;
             await expect

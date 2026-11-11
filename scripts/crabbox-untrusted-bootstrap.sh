@@ -48,11 +48,11 @@ fi
 case "$(/usr/bin/uname -m)" in
   x86_64)
     node_arch="x64"
-    node_sha256="6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
+    node_sha256="fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6"
     ;;
   aarch64 | arm64)
     node_arch="arm64"
-    node_sha256="dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e"
+    node_sha256="6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2"
     ;;
   *)
     echo "unsupported architecture: $(/usr/bin/uname -m)" >&2
@@ -140,12 +140,6 @@ case "$pnpm_version:$node_arch" in
     ;;
   12.15.0:arm64)
     pnpm_native_sha512="a8c2fff1a097b2587cb5dff0e14f8724da94719dbe9ba11f4db592708cd9466c8fb1114dfb10782cfd54fe1ca6c5cd6248988ab46e7a1c9c767ef504ad61481b"
-    ;;
-  12.9.0:x64)
-    pnpm_native_sha512="12500d614c10b8c7d6a8c251e26e4be61f732a3bc629c03c862da9bade09d43331dac99568d1a41a7c6481e21880c8e617b505c6564370be2322d912720b16e0"
-    ;;
-  12.9.0:arm64)
-    pnpm_native_sha512="535981a06dbbf89fc7b9662d559390aef6e22a74e50ec0d5cf2ae8290a87b096931d35e2d07e58f9f5351a353231c346e6bfc45ed6e1a7d880c10b7ae2e5d3c5"
     ;;
   12.7.0:x64)
     pnpm_native_sha512="8065bb349166af7dc827a299bbed70f74281b45c4c55fffe0141bc68a269cb8bfa7519d4779bfce0f707d9e8d4bb1a7f7e6df3334218ea1f4bc1c60fbbd77176"

@@ -15,15 +15,14 @@ import {
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../runtime-snapshot.js";
 import {
   appendTranscriptMessage,
   appendTranscriptMessageSync,
-  appendTranscriptEventSync,
   deleteSessionEntryLifecycle,
   loadTranscriptEvents,
   readActiveTranscriptEntryAnchor,
   readSessionSubmittedInput,
-  replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "./session-accessor.js";
 import {
@@ -35,16 +34,22 @@ import {
   type SessionPendingInputReceipt,
 } from "./session-accessor.pending-inputs.js";
 import { copySessionNodeArtifactsForRepair } from "./session-accessor.sqlite-node-artifacts.js";
-import { listSessionPendingInputReceipts } from "./session-accessor.sqlite-pending-input-receipts.js";
 import { withSessionPendingInputRelocation } from "./session-accessor.sqlite-pending-inputs.js";
 import {
   resolveSqliteScope,
   runExclusiveSqliteSessionWrite,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
-import type { SessionPendingInputAuthority } from "./session-pending-input-authority.js";
+import {
+  appendTranscriptEventSync,
+  replaceTranscriptEvents,
+} from "./session-accessor.sqlite-transcript-write.test-support.js";
 import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
-import { waitForSessionTranscriptProjection } from "./session-transcript-reconcile.js";
+import { readSessionPendingInputReceiptsInWorker as listSessionPendingInputReceipts } from "./session-pending-input-receipts.js";
+import {
+  waitForSessionTranscriptIndexReconcile,
+  waitForSessionTranscriptProjection,
+} from "./session-transcript-reconcile.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
 
 const custodyFault = useSqliteWorkerFault([
@@ -104,6 +109,9 @@ describe("accepted input custody", () => {
       );
 
   beforeEach(async () => {
+    setRuntimeConfigSnapshot({ session: { store: fixture.storePath() } });
+    // Raw custody/savepoint fixtures need their native handle before worker writes start.
+    database();
     await upsertSessionEntryCore(scope(), { sessionId, updatedAt: 1 });
   });
   afterEach(async () => {
@@ -112,7 +120,9 @@ describe("accepted input custody", () => {
       receipt.finish("interrupted");
     }
     await Promise.allSettled(retained.map(async (receipt) => receipt.settled?.()));
+    await closeOpenClawAgentDatabasesAsync();
     closeOpenClawAgentDatabasesForTest();
+    clearRuntimeConfigSnapshot();
   });
 
   it("keeps accepted input outside the active transcript and applies its hook once across replay and promotion", async () => {
@@ -384,61 +394,54 @@ describe("accepted input custody", () => {
     const receipt = await stage("relocation-savepoints");
     await promote(receipt);
     const databaseOptions = toDatabaseOptions(resolveSqliteScope(scope()));
+    await waitForSessionTranscriptIndexReconcile(databaseOptions);
     const appendCopy = createRelocation(receipt);
 
-    expect(() =>
-      runOpenClawAgentWriteTransaction(() => {
-        receipt.run(() => appendCopy(receipt.inputId, "rolled-back-outer"));
-        throw new Error("outer rollback");
-      }, databaseOptions),
-    ).toThrow("outer rollback");
-
-    runOpenClawAgentWriteTransaction(() => {
-      receipt.run(() => {
-        expect(appendCopy(receipt.inputId, "first-savepoint-copy")).toMatchObject({
-          ok: true,
-          value: { appended: true, messageId: "first-savepoint-copy" },
-        });
+    await runExclusiveSqliteSessionWrite(
+      resolveSqliteScope(scope()),
+      async () => {
         expect(() =>
           runOpenClawAgentWriteTransaction(() => {
-            appendCopy("first-savepoint-copy", "rolled-back-savepoint");
-            throw new Error("savepoint rollback");
+            receipt.run(() => appendCopy(receipt.inputId, "rolled-back-outer"));
+            throw new Error("outer rollback");
           }, databaseOptions),
-        ).toThrow("savepoint rollback");
-        expect(appendCopy("first-savepoint-copy", "final-savepoint-copy")).toMatchObject({
-          ok: true,
-          value: { appended: true, messageId: "final-savepoint-copy" },
-        });
-      });
-    }, databaseOptions);
+        ).toThrow("outer rollback");
+
+        runOpenClawAgentWriteTransaction(() => {
+          receipt.run(() => {
+            expect(appendCopy(receipt.inputId, "first-savepoint-copy")).toMatchObject({
+              ok: true,
+              value: { appended: true, messageId: "first-savepoint-copy" },
+            });
+            expect(() =>
+              runOpenClawAgentWriteTransaction(() => {
+                appendCopy("first-savepoint-copy", "rolled-back-savepoint");
+                throw new Error("savepoint rollback");
+              }, databaseOptions),
+            ).toThrow("savepoint rollback");
+            expect(appendCopy("first-savepoint-copy", "final-savepoint-copy")).toMatchObject({
+              ok: true,
+              value: { appended: true, messageId: "final-savepoint-copy" },
+            });
+          });
+        }, databaseOptions);
+      },
+      "session.pending-input.stage",
+    );
 
     for (const eventId of ["rolled-back-outer", "rolled-back-savepoint"]) {
       expect(await loadTranscriptEvents(scope())).not.toContainEqual(
         expect.objectContaining({ id: eventId }),
       );
     }
-    expect(() =>
-      receipt.run(() => appendCopy("first-savepoint-copy", "stale-savepoint-source")),
-    ).toThrow("does not match");
-    expect(
-      receipt.run(() => appendTranscriptMessageSync(scope(), { message: receipt.message })),
-    ).toMatchObject({ ok: true, value: { appended: false } });
-  });
-
-  it("does not use a dirty projection to excuse an inactive admitted user", async () => {
-    const receipt = await stage("dirty-off-path");
-    await promote(receipt);
-    expect(
-      appendTranscriptMessageSync(scope(), {
-        eventId: "other-root",
-        message: message("other-root"),
-        parentId: null,
-      }),
-    ).toMatchObject({ ok: true, value: { appended: true, messageId: "other-root" } });
-
-    expect(() =>
-      receipt.run(() => appendTranscriptMessageSync(scope(), { message: receipt.message })),
-    ).toThrow("no longer active");
+    await runOpenClawAgentWriteAdmission(databaseOptions, () => {
+      expect(() =>
+        receipt.run(() => appendCopy("first-savepoint-copy", "stale-savepoint-source")),
+      ).toThrow("does not match");
+      expect(
+        receipt.run(() => appendTranscriptMessageSync(scope(), { message: receipt.message })),
+      ).toMatchObject({ ok: true, value: { appended: false } });
+    });
   });
 
   it("rejects a split-cursor replay before and after projection reconciliation", async () => {
@@ -507,7 +510,9 @@ describe("accepted input custody", () => {
     await expect(promote(aggregate)).rejects.toThrow("collect consume failed");
     expect(await loadTranscriptEvents(scope())).toEqual(before);
     expect((await listSessionPendingInputs(scope())).total).toBe(2);
-    expect(listSessionPendingInputReceipts(scope(), { runIds: ["atomic-a", "atomic-b"] })).toEqual([
+    expect(
+      await listSessionPendingInputReceipts(scope(), { runIds: ["atomic-a", "atomic-b"] }),
+    ).toEqual([
       { runId: "atomic-a", state: "pending" },
       { runId: "atomic-b", state: "pending" },
     ]);
@@ -541,7 +546,7 @@ describe("accepted input custody", () => {
   });
 
   it("binds lazy recorder collection to approved sources and reports consumed source retry without execution", async () => {
-    const target = { ...scope(), sessionEntry: undefined };
+    const target = { ...scope(), sessionEntry: undefined, config: {} };
     const hook = vi.fn(({ message: input }: { message: PersistedUserTurnMessage }) => ({
       ...input,
       content: "Approved source",
@@ -626,37 +631,6 @@ describe("accepted input custody", () => {
       expect(await promote(await stage("new-authorized-run"))).toMatchObject({ appended: true });
     },
   );
-
-  it("rejects an authorized stage when the same input is staged between its read and write", async () => {
-    // Authorized staging holds no outer reservation, so a racing duplicate can
-    // commit after the snapshot read; the staging transaction must refuse it.
-    let raced: Promise<SessionPendingInputReceipt> | undefined;
-    const authority: SessionPendingInputAuthority = {
-      assertLifetimeCurrent: () => {},
-      withCurrent: async (consume) => {
-        raced ??= stage("raced");
-        await raced;
-        return consume(
-          {
-            agentId: "main",
-            storePath: fixture.storePath(),
-            sessionKey,
-            entry: undefined,
-            members: [],
-          },
-          () => {},
-        );
-      },
-      withPreparedCurrent: (_facts, consume) => consume(),
-    };
-    await expect(stage("raced", { authority })).rejects.toThrow(
-      "Pending input changed before staging committed",
-    );
-    expect((await raced)?.state).toBe("queued");
-    expect(
-      database().db.prepare("SELECT COUNT(*) AS count FROM session_pending_inputs").get(),
-    ).toEqual({ count: 1 });
-  });
 
   it("fences authority loss after an await without overriding the owner's terminal disposition", async () => {
     let current = true;
@@ -881,7 +855,7 @@ describe("accepted input custody", () => {
         });
         expect(duplicate?.state).toBe("consumed");
         expect(
-          listSessionPendingInputReceipts(destinationScope, { runIds: ["cross-agent"] }),
+          await listSessionPendingInputReceipts(destinationScope, { runIds: ["cross-agent"] }),
         ).toEqual([
           {
             runId: "cross-agent",

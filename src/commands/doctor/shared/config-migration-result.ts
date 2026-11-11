@@ -8,6 +8,7 @@ import type {
   LegacyStateMigrationStepReceipt,
   PreparedPostSessionPluginMigration,
 } from "../../../infra/state-migrations.types.js";
+import type { PluginCache } from "../../../plugins/plugin-cache.js";
 import type { PluginMetadataSnapshot } from "../../../plugins/plugin-metadata-snapshot.types.js";
 import type { CronCodexRuntimePolicyTarget } from "../cron/store-migration.js";
 
@@ -29,9 +30,13 @@ export type DoctorConfigPreflightOptions = {
   preparePluginMetadataSnapshot?: boolean;
   /** Enable migrations that may retire security-sensitive stores only during explicit repair. */
   doctorOnlyStateMigrations?: boolean;
+  /** Unattended diagnostics inspect plugin packages without downloading or replacing them. */
+  deferPluginPackageRepair?: boolean;
 };
 
 export type DoctorConfigPreflightResult = {
+  /** Caller owns retirement after consuming the final metadata snapshot. */
+  pluginCache?: PluginCache;
   snapshot: ConfigFileSnapshot;
   baseConfig: OpenClawConfig;
   /** Repair diagnostics retained for managed update parents, not only terminal notes. */

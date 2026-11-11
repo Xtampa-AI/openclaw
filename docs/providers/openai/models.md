@@ -25,6 +25,12 @@ sidebarTitle: "Models"
 | Image generation or editing                       | `openai/gpt-image-2`                                               | Works with `OPENAI_API_KEY` or Codex OAuth.                         |
 | Transparent-background images                     | `openai/gpt-image-2.6-sunburst`                                    | Set `outputFormat` to `png` or `webp` and `background=transparent`. |
 
+Isolated and utility completions on the Codex runtime use the same account routes
+as the model picker. A model listed by your ChatGPT account does not require an
+OpenAI API key for these completions. An explicit auth profile or utility-model
+override still controls the request; OpenClaw does not replace it with another
+account.
+
 ### Retired subscription model references
 
 GPT-5.4 and GPT-5.4 Mini are retired from the ChatGPT-account Codex route. Run `openclaw doctor --fix` to replace persisted subscription references with their documented successors: `openai/gpt-5.6-terra` and `openai/gpt-5.6-luna`, respectively. This includes defaults, per-agent model selections, automation overrides, and unlocked session overrides whose selected route is known. The Platform API-key route is unaffected. Doctor retains pinned overrides when their successor is outside the agent's model policy, or when clearing an override would keep the same retired model and account. Doctor also retains the original reference and warns when its declared successor is retired or definitively unsupported on the selected account route; unknown availability and temporary cooldowns do not block migration. It reports the model or policy change needed, along with unresolved or conflicting account routes. Review the repair output, restart the Gateway, and re-enable any automation that was disabled after repeated failures.
@@ -178,8 +184,12 @@ incompatible settings, or a changed model, route, session, or auth profile start
 a fresh request using the selected effort. Older transcripts without this
 metadata also start fresh after transport expiry.
 
-The native [Codex harness](/plugins/codex-harness) owns its own Responses loop;
-these built-in-runtime capabilities do not imply native Codex support.
+The native [Codex harness](/plugins/codex-harness) owns its own Responses loop.
+OpenClaw enables its cache-preserving reasoning-effort updates for managed
+threads, including when native code mode is disabled. Codex uses its model
+catalog to decide eligibility and keeps unsupported models on ordinary
+request-level effort. This does not enable the built-in-runtime async-tool or
+steering implementation inside Codex.
 
 ## GPT-6.1 Sol
 
@@ -191,10 +201,12 @@ openclaw models set openai/gpt-6.1-sol
 ```
 
 It uses the Responses API for tool calls, accepts text and images, and supports
-a 1,050,000-token context window with up to 128,000 output tokens. OpenClaw
-keeps its 272,000-token active input budget by default; native Codex follows
-the selected account's advertised limits. Existing selections and the Astra
-setup default are unchanged. A successful account catalog remains authoritative;
+a 1,050,000-token context window with up to 128,000 output tokens. Direct
+OpenAI API-key traffic keeps its 272,000-token active input budget by default.
+The OpenClaw harness defaults to a 500,000-token active window with ChatGPT/Codex
+subscription auth; native Codex owns its context window and compaction. Explicit
+context budgets, other models, and the Astra setup default are unchanged. A successful account
+catalog remains authoritative, including smaller account-specific windows;
 subscription offline hints do not imply access.
 
 Reasoning defaults to `medium` and supports `low`, `medium`, `high`, `xhigh`,
@@ -263,8 +275,8 @@ and [access guide](https://help.openai.com/en/articles/20001325-a-preview-of-gpt
 OpenAI's [GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
 documents the bare `openai/gpt-5.6` id as a supported alias for Sol. Fresh
 API-key and ChatGPT/Codex OAuth setup use `openai/gpt-6-astra`. Existing
-GPT-5.6 selections retain their canonical Sol identity. Run
-`openclaw doctor --fix` to rewrite persisted bare OpenAI refs to that canonical
+GPT-5.6 selections retain their full Sol identity. Run
+`openclaw doctor --fix` to rewrite persisted bare OpenAI refs to that full
 identity. The native Codex catalog can show the exact Sol, Terra, and Luna ids depending on
 workspace access. Check the current account with:
 

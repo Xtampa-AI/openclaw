@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
 import {
@@ -22,6 +26,7 @@ import * as pageReclamation from "./session-accessor.sqlite-page-reclamation.js"
 import {
   getSessionKysely,
   resolveSqliteTranscriptArchiveDirectory,
+  runExclusiveSqliteSessionWrite,
 } from "./session-accessor.sqlite-scope.js";
 import type { PublishedSessionTranscriptArchive } from "./session-history-archive-pruning.types.js";
 
@@ -119,12 +124,101 @@ it("prunes through the worker while preserving reason, age, path, and file rules
   expect(retainedIds()).toEqual(["boundary", "outside", "pending", "present", "reset"]);
 });
 
-it("selects at most 256 published rows in stable order before applying retention rules", async () => {
+it("drains all eligible published rows across bounded pages", async () => {
   for (let index = 257; index >= 0; index -= 1) {
     seed(`bounded-${String(index).padStart(3, "0")}`);
   }
-  expect(await prune()).toBe(256);
-  expect(retainedIds()).toEqual(["bounded-256", "bounded-257"]);
+  expect(await prune()).toBe(258);
+  expect(retainedIds()).toEqual([]);
+});
+
+it("continues past a retained prefix to reach later eligible rows", async () => {
+  for (let index = 0; index < 300; index += 1) {
+    const retained = seed(`retained-${String(index).padStart(3, "0")}`, { created_at: index });
+    fs.writeFileSync(path.join(directory, retained.archive_name), "retained");
+  }
+  for (let index = 0; index < 20; index += 1) {
+    seed(`expired-${String(index).padStart(3, "0")}`, { created_at: 300 + index });
+  }
+
+  expect(
+    await prunePublishedSessionArchivesByRetention({
+      scope: options(),
+      nowMs: 1000,
+      rules: [{ reason: "deleted", olderThanMs: 10 }],
+    }),
+  ).toBe(20);
+  expect(retainedIds()).toHaveLength(300);
+  expect(retainedIds().every((id) => id.startsWith("retained-"))).toBe(true);
+});
+
+it("admits foreground writes during retention selection and between deletion batches", async ({
+  signal,
+}) => {
+  for (let index = 0; index < 17; index++) {
+    seed(`batch-${String(index).padStart(3, "0")}`);
+  }
+  const entered = createDeferred();
+  const release = createDeferred();
+  const scope = {
+    agentId: "main",
+    storePath: database.path,
+    env: state.env,
+    sessionKey: "agent:main:retention-owner",
+  };
+  replaceSessionEntrySync(scope, { sessionId: "live-generation", updatedAt: Date.now() });
+  const writeForeground = (previousSessionId?: string) =>
+    runExclusiveSqliteSessionWrite(
+      options(),
+      async () =>
+        replaceSessionEntrySync(scope, {
+          sessionId: "live-generation",
+          updatedAt: Date.now(),
+          label: previousSessionId ?? "selection write",
+          ...(previousSessionId ? { previousSessionId } : {}),
+        }),
+      "session-entry.patch",
+    );
+  const withPages = pageReclamation.withSqliteSessionPageReclamation;
+  let selectionWrite: Promise<unknown> | undefined;
+  let foreground: Promise<unknown> | undefined;
+  vi.spyOn(pageReclamation, "withSqliteSessionPageReclamation").mockImplementation(
+    <T>(...args: Parameters<typeof withPages<T>>) => {
+      const [input, run] = args;
+      return withPages(input, (reclaim, assertCurrent, prepared, archives) =>
+        run(reclaim, assertCurrent, prepared, {
+          ...archives,
+          readRetentionCandidates: async () => {
+            entered.resolve();
+            await release.promise;
+            return archives.readRetentionCandidates();
+          },
+          pruneRetention: async (retention) => {
+            const removed = await archives.pruneRetention(retention);
+            // Queue the foreground update while the first batch still owns the writer.
+            foreground ??= writeForeground("batch-016");
+            return removed;
+          },
+        }),
+      );
+    },
+  );
+  const work = prune();
+  try {
+    await withinTest(
+      awaitGateBeforeSettlement(entered.promise, work, "retention never reached selection"),
+      signal,
+    );
+    selectionWrite = writeForeground();
+    await withinTest(selectionWrite, signal);
+    release.resolve();
+    expect(await withinTest(work, signal)).toBe(16);
+    await foreground;
+    expect(retainedIds()).toEqual(["batch-016"]);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([work, foreground, selectionWrite]);
+  }
 });
 
 it.each(["changed", "revoked", "rejected"])(

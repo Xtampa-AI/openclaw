@@ -8,6 +8,7 @@ import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-cloc
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 import type { CronEvent } from "./service.js";
 import { CronService } from "./service.js";
+import { stop } from "./service/ops-lifecycle.js";
 import * as cronServiceState from "./service/state.js";
 import {
   createCronServiceState,
@@ -187,6 +188,7 @@ export function createStartedCronServiceWithFinishedBarrier(params: {
   onEvent?: CronServiceDeps["onEvent"];
 }): {
   cron: CronService;
+  state: CronServiceState;
   enqueueSystemEvent: MockFn;
   requestHeartbeat: MockFn;
   requestHeartbeatAndWait: MockFn;
@@ -198,7 +200,7 @@ export function createStartedCronServiceWithFinishedBarrier(params: {
     params.requestHeartbeatAndWait ?? (async () => ({ status: "ran" as const, durationMs: 1 })),
   );
   const finished = createFinishedBarrier();
-  const cron = new CronService({
+  const { cron, state } = createCronServiceWithStateForTest({
     scheduler: params.scheduler,
     nowMs: params.nowMs,
     storePath: params.storePath,
@@ -214,7 +216,7 @@ export function createStartedCronServiceWithFinishedBarrier(params: {
       params.onEvent?.(event);
     },
   });
-  return { cron, enqueueSystemEvent, requestHeartbeat, requestHeartbeatAndWait, finished };
+  return { cron, state, enqueueSystemEvent, requestHeartbeat, requestHeartbeatAndWait, finished };
 }
 
 export async function withCronServiceForTest(
@@ -228,6 +230,7 @@ export async function withCronServiceForTest(
   },
   run: (context: {
     cron: CronService;
+    state: CronServiceState;
     enqueueSystemEvent: ReturnType<typeof vi.fn>;
     requestHeartbeat: ReturnType<typeof vi.fn>;
   }) => Promise<void>,
@@ -235,7 +238,7 @@ export async function withCronServiceForTest(
   const store = await params.makeStorePath();
   const enqueueSystemEvent = vi.fn();
   const requestHeartbeat = vi.fn();
-  const cron = new CronService({
+  const { cron, state } = createCronServiceWithStateForTest({
     scheduler: params.scheduler,
     nowMs: params.nowMs,
     cronEnabled: params.cronEnabled,
@@ -250,14 +253,14 @@ export async function withCronServiceForTest(
 
   await cron.start();
   try {
-    await run({ cron, enqueueSystemEvent, requestHeartbeat });
+    await run({ cron, state, enqueueSystemEvent, requestHeartbeat });
   } finally {
     cron.stop();
     await store.cleanup();
   }
 }
 
-export function createRunningCronServiceState(params: {
+export function createCronServiceStateWithJobs(params: {
   storePath: string;
   log: CronServiceDeps["log"];
   nowMs: () => number;
@@ -273,8 +276,6 @@ export function createRunningCronServiceState(params: {
     requestHeartbeat: vi.fn(),
     runIsolatedAgentJob: vi.fn().mockResolvedValue({ status: "ok", summary: "ok" }),
   });
-  state.running = true;
-  state.activeTimerTicks = 1;
   state.store = {
     version: 1,
     jobs: params.jobs,
@@ -282,21 +283,15 @@ export function createRunningCronServiceState(params: {
   return state;
 }
 
-function disposeCronServiceState(state: Pick<CronServiceState, "timer">): void {
-  if (state.timer) {
-    state.timer.cancel();
-    state.timer = null;
-  }
-}
-
 export async function withCronServiceStateForTest<T>(
-  state: Pick<CronServiceState, "timer">,
+  state: CronServiceState,
   run: () => Promise<T>,
 ): Promise<T> {
   try {
     return await run();
   } finally {
-    disposeCronServiceState(state);
+    stop(state);
+    await state.schedulerDrain;
   }
 }
 

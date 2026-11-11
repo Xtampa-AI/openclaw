@@ -88,7 +88,7 @@ describe("happy path prompt snapshots", () => {
     const scenarios = [
       { name: "telegram-direct", replacements: [] },
       { name: "discord-group", replacements: ["sessions_spawn"] },
-      { name: "heartbeat-turn", replacements: ["openclaw_direct"] },
+      { name: "heartbeat-turn", replacements: [] },
     ];
 
     for (const { name, replacements } of scenarios) {
@@ -144,6 +144,20 @@ describe("happy path prompt snapshots", () => {
           expect.arrayContaining(["session_status", "web_fetch", "web_search"]),
         );
       }
+    }
+  });
+
+  it("preserves canonical JSON bytes with a neutral temporary-root formatter config", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-prompt-json-"));
+    // CI temp roots do not inherit the repository config that ignores JSON files.
+    fs.writeFileSync(path.join(root, ".oxfmtrc.json"), "{}\n");
+    const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(root);
+    try {
+      const materialized = await materializeCodexDynamicToolSnapshot("telegram-direct");
+      expect(materialized).toBe(`${JSON.stringify(JSON.parse(materialized), null, 2)}\n`);
+    } finally {
+      tmpdir.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

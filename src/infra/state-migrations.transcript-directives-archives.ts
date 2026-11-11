@@ -48,6 +48,7 @@ import {
   parseDirectiveMigrationTranscriptEvent,
   transformHistoricalTranscriptEvent,
 } from "./state-migrations.transcript-directives-transform.js";
+import { Utf8InputError } from "./utf8-input.js";
 
 export const TRANSCRIPT_DIRECTIVE_MIGRATION_BATCH_SIZE = TRANSCRIPT_ARCHIVE_MIGRATION_BATCH_SIZE;
 export const MEDIA_ARCHIVE_VERIFICATION_KEY = "media-transcript-archive-verification-v1";
@@ -68,6 +69,7 @@ type ArchiveMigrationOptions = {
   signal?: AbortSignal;
   verification?: { key: string; prepared?: ReadonlySet<string>; collect?: Set<string> };
   verifyOnly?: boolean;
+  beforeRewrite?: () => void;
   writeCursor?: (cursor: ArchiveCursor | { phase: "complete" }) => void;
 };
 
@@ -209,6 +211,9 @@ async function listArchiveBatch(
       });
     } catch (error) {
       if (options?.signal?.aborted && error === options.signal.reason) {
+        throw error;
+      }
+      if (error instanceof Utf8InputError) {
         throw error;
       }
       const detail = error instanceof Error ? error.message : String(error);
@@ -493,6 +498,7 @@ export async function migrateCanonicalTranscriptArchives(
               return !planned.changed && assertArchiveSourceUnchanged(params.database, planned);
             })
           : write("historical-transcript-archive-directives", () => {
+              params.beforeRewrite?.();
               const pending = new Map(
                 (readTranscriptArchiveRecoveryJournal(params.database)?.rows ?? []).map((row) => [
                   transcriptArchiveRecoveryRowKey(row),

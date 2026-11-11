@@ -35,10 +35,7 @@ import {
 } from "./reply-run-registry.js";
 import { waitForReplyOperationBackend } from "./reply-run-registry.state.js";
 import { refreshReplyOperationTyping } from "./reply-run-typing.js";
-import {
-  resolveFollowupRunToolAuthorityFingerprint,
-  resolveFollowupRunToolAuthorityFingerprintAsync,
-} from "./reply-tool-authority.js";
+import { resolveInboundReplyToolAuthorityOverlay } from "./reply-tool-authority.js";
 import { buildChannelSourceTurnId } from "./source-turn-id.js";
 import { prepareSteeringDelivery } from "./steering-delivery-preparation.js";
 import type { TypingSignaler } from "./typing-mode.js";
@@ -121,6 +118,8 @@ export async function runActiveReplySteer(
     followupRun.operatorAuthority?.assertCurrent();
     params.assertSourceCurrent?.();
   };
+  let delivery: ReturnType<typeof prepareSteeringDelivery> | undefined;
+  let releaseToolAuthority: (() => void) | undefined;
   let steerSessionId = activeReplyOperation?.sessionId ?? followupRun.run.sessionId;
   const parked = parkSteerCandidate(queueKey, followupRun, resolvedQueue, runFollowup);
   if (!parked) {
@@ -195,7 +194,7 @@ export async function runActiveReplySteer(
     if (!injectionTarget) {
       return await fallback("injection_unavailable");
     }
-    const delivery = prepareSteeringDelivery({
+    delivery = prepareSteeringDelivery({
       agentId: followupRun.run.agentId,
       sessionKey,
       storePath: params.storePath,
@@ -204,11 +203,28 @@ export async function runActiveReplySteer(
       entry: params.sessionEntry,
       assertCurrent: assertReadCurrent,
     });
+    const steeringDelivery = delivery;
+    const isInboundUserMessage =
+      followupRun.currentInboundEventKind !== "room_event" &&
+      (followupRun.run.inputProvenance?.kind === undefined ||
+        followupRun.run.inputProvenance.kind === "external_user");
+    const caller = resolveInboundReplyToolAuthorityOverlay({
+      ctx: params.sessionCtx,
+      sessionEntry: params.sessionEntry,
+      senderIsOwner: followupRun.run.senderIsOwner === true,
+      operatorAuthority: followupRun.operatorAuthority,
+      toolsAllow: followupRun.toolsAllow,
+      disableTools: followupRun.disableTools === true,
+      allowCollaborativeSteering:
+        followupRun.run.config.messages?.queue?.allowCollaborativeSteering === true,
+    });
     const steeringAuthority = await resolveReplySteeringAuthority(
       followupRun,
       activeReplyOperation,
       assertReadCurrent,
+      caller,
     );
+    releaseToolAuthority = steeringAuthority.toolAuthority.release;
     assertReadCurrent();
     if (
       activeReplyOperation.key !== activeReplyKey ||
@@ -241,8 +257,7 @@ export async function runActiveReplySteer(
       }
     };
     const text = followupRun.prompt;
-    const assertLegacyPolicyCurrent = () =>
-      assertPolicy(resolveFollowupRunToolAuthorityFingerprint(followupRun, automaticFallbackRoute));
+    const assertLegacyPolicyCurrent = () => assertPolicy(steeringAuthority.toolAuthority.read());
     const sourceBound = Boolean(
       params.assertSourceCurrent ||
       automaticFallbackRoute ||
@@ -260,23 +275,15 @@ export async function runActiveReplySteer(
           assertCurrent: assertSourceCurrent,
           compatAssertCurrent: assertLegacyPolicyCurrent,
           prepareCurrent: async () => {
-            assertPolicy(
-              await resolveFollowupRunToolAuthorityFingerprintAsync(
-                followupRun,
-                automaticFallbackRoute,
-                assertSourceCurrent,
-              ),
-            );
-            await delivery.prepareCurrent();
+            assertPolicy(steeringAuthority.toolAuthority.read());
+            await steeringDelivery.prepareCurrent();
             assertSourceCurrent();
           },
         }),
       ),
       steeringMode: "all",
-      isInboundUserMessage:
-        followupRun.currentInboundEventKind !== "room_event" &&
-        (followupRun.run.inputProvenance?.kind === undefined ||
-          followupRun.run.inputProvenance.kind === "external_user"),
+      isInboundUserMessage,
+      allowPendingUserInputAnswer: steeringAuthority.allowPendingUserInputAnswer,
       terminalReplyExpectation: followupRun.run.terminalReplyExpectation,
       toolAuthorityFingerprint: steeringAuthority.toolAuthorityFingerprint,
       personalToolParticipant: {
@@ -311,7 +318,9 @@ export async function runActiveReplySteer(
       ...(followupRun.run.sourceReplyDeliveryMode
         ? { sourceReplyDeliveryMode: followupRun.run.sourceReplyDeliveryMode }
         : {}),
-      taskSuggestionDeliveryMode: followupRun.run.taskSuggestionDeliveryMode,
+      ...(steeringAuthority.continuationKind
+        ? {}
+        : { taskSuggestionDeliveryMode: followupRun.run.taskSuggestionDeliveryMode }),
       ...(followupRun.userTurnTranscriptRecorder
         ? { userTurnTranscriptRecorder: followupRun.userTurnTranscriptRecorder }
         : {}),
@@ -364,6 +373,8 @@ export async function runActiveReplySteer(
     await touchActiveSessionEntry();
     return "handled";
   } finally {
+    releaseToolAuthority?.();
+    delivery?.release();
     try {
       // A backend can report rejection before delivery settles, clearing
       // steerPending while leaving the input queued for fallback. A revoked

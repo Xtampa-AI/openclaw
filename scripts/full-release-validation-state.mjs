@@ -554,6 +554,20 @@ async function validateReuse(executionPlan, signal) {
     ) {
       throw new Error("reused release evidence no longer matches the requested validation");
     }
+    if (
+      evidenceReuse.sourceArtifact &&
+      JSON.stringify(sortJsonValueKeys(evidence.root.artifact)) !==
+        JSON.stringify(sortJsonValueKeys(evidenceReuse.sourceArtifact))
+    ) {
+      throw new Error("reused release evidence artifact differs from the immutable plan");
+    }
+    if (
+      evidenceReuse.sourceManifest &&
+      JSON.stringify(sortJsonValueKeys(evidence.manifest)) !==
+        JSON.stringify(sortJsonValueKeys(evidenceReuse.sourceManifest))
+    ) {
+      throw new Error("reused release evidence manifest differs from the immutable plan");
+    }
     validateReleaseTelegramWaiverBinding(executionPlan, evidence.manifest.validationInputs);
     if (
       evidenceReuse.sourceArtifact &&

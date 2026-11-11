@@ -107,12 +107,42 @@ describe("projects vitest config", () => {
     });
   });
 
-  it("resolves the complete root watch project graph", () => {
+  it("keeps the resolved root and generated projects in their explicit environments", () => {
     const result = spawnNodeEvalSync(
       `
+        import assert from "node:assert/strict";
         import { resolveConfig } from "vitest/node";
         import rootConfig from "./vitest.config.ts";
+        import { sharedVitestConfig } from "./test/vitest/vitest.shared.config.ts";
         const resolved = await resolveConfig({ config: false }, rootConfig);
+        const generated = await resolveConfig({ config: false }, {
+          plugins: sharedVitestConfig.plugins,
+          test: {
+            projects: [undefined, "jsdom", "happy-dom"].map(environment => ({
+              extends: false,
+              plugins: sharedVitestConfig.plugins,
+              test: {
+                name: environment ? "ui-" + environment : "generated-node",
+                ...(environment ? { environment } : {}),
+              },
+            })),
+          },
+        });
+        const projects = [
+          resolved.test,
+          ...resolved.test.resolvedProjects.map(({ projectConfig }) => projectConfig),
+          generated.test,
+          ...generated.test.resolvedProjects.map(({ projectConfig }) => projectConfig),
+        ];
+        for (const project of projects) {
+          if (!/^ui(?:-|$)/u.test(project.name ?? "")) {
+            assert.equal(project.environment, "node", project.name || "root");
+          }
+        }
+        assert.deepEqual(
+          generated.test.resolvedProjects.map(({ projectConfig }) => projectConfig.environment),
+          ["node", "jsdom", "happy-dom"],
+        );
         console.log("ROOT_PROJECT_RESOLUTION " + resolved.test.resolvedProjects.length);
       `,
       {
@@ -180,6 +210,57 @@ describe("projects vitest config", () => {
       } else {
         expect(files.toSorted()).toEqual(selected.toSorted());
       }
+    },
+  );
+
+  it.each([1, 2])(
+    "preserves the Gateway worker cap %i after Vitest project resolution",
+    (workers) => {
+      const result = spawnNodeEvalSync(
+        `
+        import assert from "node:assert/strict";
+        import { globSync } from "node:fs";
+        import { resolveConfig } from "vitest/node";
+        const resolved = await resolveConfig({
+          config: "test/vitest/vitest.gateway-server.config.ts",
+        });
+        const projects = resolved.test.resolvedProjects.map(({ projectConfig }) => projectConfig);
+        assert.equal(projects.length, 2);
+        const [native, parallel] = projects;
+        assert.match(native.name, /gateway-server-native/);
+        assert.match(parallel.name, /gateway-server-parallel/);
+        assert.equal(native.maxWorkers, 1);
+        assert.equal(native.fileParallelism, false);
+        assert.equal(parallel.maxWorkers, Number(process.env.OPENCLAW_VITEST_MAX_WORKERS));
+        assert.equal(parallel.fileParallelism, Number(process.env.OPENCLAW_VITEST_MAX_WORKERS) > 1);
+        assert.equal(parallel.sequence.groupOrder, native.sequence.groupOrder + 1);
+        for (const project of projects) {
+          assert.equal(project.pool, "forks");
+          assert.equal(project.isolate, false);
+        }
+        const files = (project) => globSync(project.include, {
+          cwd: project.dir,
+          exclude: project.exclude,
+        });
+        const partition = projects.flatMap(files);
+        assert.equal(new Set(partition).size, partition.length);
+        assert.deepEqual(partition.sort(), files(resolved.test).sort());
+      `,
+        {
+          imports: ["tsx"],
+          env: {
+            ...process.env,
+            OPENCLAW_VITEST_MAX_WORKERS: String(workers),
+            OPENCLAW_VITEST_INCLUDE_FILE: undefined,
+            VITEST_MAX_WORKERS: undefined,
+          },
+          timeout: DEFAULT_VITEST_TEST_TIMEOUT_MS,
+        },
+      );
+      const output = JSON.stringify({ stdout: result.stdout, stderr: result.stderr });
+      expect(result.error, output).toBeUndefined();
+      expect(result.signal, output).toBeNull();
+      expect(result.status, output).toBe(0);
     },
   );
 
@@ -262,8 +343,8 @@ describe("projects vitest config", () => {
     [
       "fake-timer unit-fast",
       createUnitFastFakeTimersVitestConfig,
-      ["src/acp/translator.stop-reason.test.ts"],
-      ["src/acp/translator.stop-reason.test.ts"],
+      ["src/utils.test.ts"],
+      ["src/utils.test.ts"],
     ],
   ] as const)(
     "limits %s include files to the project's owned tests",
@@ -273,7 +354,7 @@ describe("projects vitest config", () => {
         ...owned,
         "src/plugin-sdk/text-chunking.test.ts",
         "src/system-agent/assistant.configured.test.ts",
-        "src/acp/translator.stop-reason.test.ts",
+        "src/utils.test.ts",
         "src/gateway/openresponses-http.test.ts",
         unrelated,
       ]);
@@ -368,93 +449,100 @@ describe("projects vitest config", () => {
     },
   );
 
-  it.each([
-    { family: "channels", filter: undefined },
-    {
-      family: "channels",
-      filter: "src/channels/plugins/contracts/session-binding.registry-backed.contract.test.ts",
-    },
-    {
-      family: "channels",
-      filter: "src/channels/plugins/contracts/session-key-artifact.contract.test.ts",
-    },
-    { family: "plugins", filter: undefined },
-    { family: "plugins", filter: "src/plugins/contracts/host-hook-state.identity.test.ts" },
-    { family: "plugins", filter: "src/plugins/contracts/host-hooks.contract.test.ts" },
-  ])(
-    "preserves public $family contract command coverage with include filter $filter",
-    ({ family, filter }) => {
-      const root =
-        family === "channels" ? "src/channels/plugins/contracts" : "src/plugins/contracts";
-      const includeFile = filter
+  it("preserves public contract command coverage across include filters", () => {
+    const scenarios = [
+      { family: "channels", filter: undefined },
+      {
+        family: "channels",
+        filter: "src/channels/plugins/contracts/session-binding.registry-backed.contract.test.ts",
+      },
+      {
+        family: "channels",
+        filter: "src/channels/plugins/contracts/session-key-artifact.contract.test.ts",
+      },
+      { family: "plugins", filter: undefined },
+      { family: "plugins", filter: "src/plugins/contracts/host-hook-state.identity.test.ts" },
+      { family: "plugins", filter: "src/plugins/contracts/host-hooks.contract.test.ts" },
+    ].map(({ family, filter }) => ({
+      family,
+      includeFile: filter
         ? patternFiles.writePatternFile("command-include.json", [filter])
-        : undefined;
-      const result = spawnNodeEvalSync(
-        `
+        : undefined,
+    }));
+    // Keep real CLI/config resolution, but pay for its isolated process only once.
+    const result = spawnNodeEvalSync(
+      `
         import assert from "node:assert/strict";
         import { globSync, readFileSync, rmSync } from "node:fs";
         import path from "node:path";
         import { parseCLI, resolveConfig } from "vitest/node";
         import { createVitestRunSpecs, writeVitestIncludeFile } from "./scripts/test-projects.test-support.mts";
-        const command = JSON.parse(readFileSync("package.json", "utf8")).scripts[${JSON.stringify(`test:contracts:${family}`)}];
-        const argv = command.split(/\\s+/u);
-        const wrapper = argv.indexOf("scripts/test-projects.mts");
-        assert.notEqual(wrapper, -1);
-        const specs = createVitestRunSpecs(argv.slice(wrapper + 1));
-        const includeFile = process.env.OPENCLAW_VITEST_INCLUDE_FILE;
-        const matches = [];
-        for (const spec of specs) {
-          try {
-            if (spec.includeFilePath) {
-              writeVitestIncludeFile(spec.includeFilePath, spec.includePatterns);
-            }
-            if (spec.env.OPENCLAW_VITEST_INCLUDE_FILE === undefined) {
-              delete process.env.OPENCLAW_VITEST_INCLUDE_FILE;
-            } else {
-              process.env.OPENCLAW_VITEST_INCLUDE_FILE = spec.env.OPENCLAW_VITEST_INCLUDE_FILE;
-            }
-            const { options } = parseCLI(["vitest", ...spec.pnpmArgs.slice(spec.pnpmArgs.indexOf("run"))]);
-            const resolved = await resolveConfig(options);
-            for (const { projectConfig } of resolved.test.resolvedProjects) {
-              for (const file of globSync(projectConfig.include, { cwd: projectConfig.dir, exclude: projectConfig.exclude })) {
-                const relative = path.relative(process.cwd(), path.resolve(projectConfig.dir, file)).replaceAll("\\\\", "/");
-                matches.push(relative);
-                if (relative.endsWith("/session-binding.registry-backed.contract.test.ts")) {
-                  assert.equal(projectConfig.pool, "forks");
-                  assert.equal(projectConfig.maxWorkers, 1);
-                }
-                if (relative === "src/plugins/contracts/host-hook-state.identity.test.ts" || relative === "src/plugins/contracts/host-hooks.contract.test.ts") {
-                  assert.equal(projectConfig.isolate, true);
-                  assert.equal(projectConfig.name, "infra");
+        const scripts = JSON.parse(readFileSync("package.json", "utf8")).scripts;
+        for (const { family, includeFile } of ${JSON.stringify(scenarios)}) {
+          if (includeFile === undefined) {
+            delete process.env.OPENCLAW_VITEST_INCLUDE_FILE;
+          } else {
+            process.env.OPENCLAW_VITEST_INCLUDE_FILE = includeFile;
+          }
+          const command = scripts["test:contracts:" + family];
+          const argv = command.split(/\\s+/u);
+          const wrapper = argv.indexOf("scripts/test-projects.mts");
+          assert.notEqual(wrapper, -1);
+          const specs = createVitestRunSpecs(argv.slice(wrapper + 1));
+          const matches = [];
+          for (const spec of specs) {
+            try {
+              if (spec.includeFilePath) {
+                writeVitestIncludeFile(spec.includeFilePath, spec.includePatterns);
+              }
+              if (spec.env.OPENCLAW_VITEST_INCLUDE_FILE === undefined) {
+                delete process.env.OPENCLAW_VITEST_INCLUDE_FILE;
+              } else {
+                process.env.OPENCLAW_VITEST_INCLUDE_FILE = spec.env.OPENCLAW_VITEST_INCLUDE_FILE;
+              }
+              const { options } = parseCLI(["vitest", ...spec.pnpmArgs.slice(spec.pnpmArgs.indexOf("run"))]);
+              const resolved = await resolveConfig(options);
+              for (const { projectConfig } of resolved.test.resolvedProjects) {
+                for (const file of globSync(projectConfig.include, { cwd: projectConfig.dir, exclude: projectConfig.exclude })) {
+                  const relative = path.relative(process.cwd(), path.resolve(projectConfig.dir, file)).replaceAll("\\\\", "/");
+                  matches.push(relative);
+                  if (relative.endsWith("/session-binding.registry-backed.contract.test.ts")) {
+                    assert.equal(projectConfig.pool, "forks");
+                    assert.equal(projectConfig.maxWorkers, 1);
+                  }
+                  if (relative === "src/plugins/contracts/host-hook-state.identity.test.ts" || relative === "src/plugins/contracts/host-hooks.contract.test.ts") {
+                    assert.equal(projectConfig.isolate, true);
+                    assert.equal(projectConfig.name, "infra");
+                  }
                 }
               }
+            } finally {
+              if (spec.includeFilePath) rmSync(spec.includeFilePath);
             }
-          } finally {
-            if (spec.includeFilePath) rmSync(spec.includeFilePath);
           }
+          const filters = includeFile ? JSON.parse(readFileSync(includeFile, "utf8")) : null;
+          const root = family === "channels" ? "src/channels/plugins/contracts" : "src/plugins/contracts";
+          const expected = globSync(root + "/**/*.test.ts")
+            .map(file => file.replaceAll("\\\\", "/"))
+            .filter(file => !filters || filters.some(filter => path.matchesGlob(file, filter)));
+          assert.deepEqual(matches.toSorted(), expected.toSorted(), family + ": " + (includeFile ?? "all"));
+          assert.equal(new Set(matches).size, matches.length);
         }
-        const filters = includeFile ? JSON.parse(readFileSync(includeFile, "utf8")) : null;
-        const expected = globSync(${JSON.stringify(`${root}/**/*.test.ts`)})
-          .map(file => file.replaceAll("\\\\", "/"))
-          .filter(file => !filters || filters.some(filter => path.matchesGlob(file, filter)));
-        assert.deepEqual(matches.toSorted(), expected.toSorted());
-        assert.equal(new Set(matches).size, matches.length);
       `,
-        {
-          imports: ["tsx"],
-          env: {
-            ...process.env,
-            GITHUB_ACTIONS: "true",
-            OPENCLAW_VITEST_INCLUDE_FILE: includeFile,
-          },
-          timeout: DEFAULT_VITEST_TEST_TIMEOUT_MS,
+      {
+        imports: ["tsx"],
+        env: {
+          ...process.env,
+          GITHUB_ACTIONS: "true",
+          OPENCLAW_VITEST_INCLUDE_FILE: undefined,
         },
-      );
-      expect(result.error, result.stderr).toBeUndefined();
-      expect(result.signal, result.stderr).toBeNull();
-      expect(result.status, result.stderr).toBe(0);
-    },
-  );
+        timeout: DEFAULT_VITEST_TEST_TIMEOUT_MS,
+      },
+    );
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+  });
 
   it("keeps shared and isolated UI owners together in root and full runtime runs", () => {
     for (const projects of [

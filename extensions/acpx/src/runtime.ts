@@ -515,12 +515,12 @@ export class AcpxRuntime implements CompleteAcpRuntime {
 
   private async runInGeneration<T>(
     target: BridgeSession & { acpxRecordId?: string; bridgeSession?: BridgeSession | null },
-    scope: { generation: AcpxGeneration; closeRecord?: AcpLoadedSessionRecord; recordId?: string },
+    scope: { generation: AcpxGeneration; closeRecord?: AcpLoadedSessionRecord },
     run: () => Promise<T>,
   ): Promise<T> {
     const release = this.generationRegistry.retainGenerationOperation(
       scope.generation,
-      scope.recordId ?? target.acpxRecordId ?? scope.generation.resource,
+      target.acpxRecordId ?? scope.generation.resource,
     );
     try {
       return await this.sessionScope.run(resolveBridgeSession(target), () =>
@@ -546,39 +546,16 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     allowRetired = false,
   ): Promise<AcpxHandleOperationSnapshot> {
     const resource = generation.resource;
-    if (!allowRetired) {
-      this.generationRegistry.assertCurrentGeneration(generation);
-    }
     const ownedRecord = generation.records.get(handle.acpxRecordId ?? resource);
-    if (
-      ownedRecord &&
-      ((handle.acpxRecordId && ownedRecord.acpxRecordId !== handle.acpxRecordId) ||
-        (handle.backendSessionId &&
-          ownedRecord.acpSessionId &&
-          ownedRecord.acpSessionId !== handle.backendSessionId))
-    ) {
-      throw new AcpRuntimeError(
-        "ACP_TURN_FAILED",
-        "ACP handle no longer owns this runtime generation.",
-      );
-    }
-    let record = allowRetired
+    const record = allowRetired
       ? generation.retired
         ? ownedRecord
         : await this.sessionStore.loadForClose(handle.acpxRecordId ?? resource)
       : await acpxOperationScope.run({ generation }, () =>
           this.sessionStore.load(handle.acpxRecordId ?? resource),
         );
-    // A reset can retire this generation while the snapshot read is pending.
-    // Prefer its captured record over any replacement now visible in storage.
-    if (allowRetired && generation.retired && ownedRecord) {
-      record = ownedRecord;
-    }
     if (allowRetired && record) {
       captureGenerationRecord(generation, record);
-    }
-    if (!allowRetired) {
-      this.generationRegistry.assertCurrentGeneration(generation);
     }
     if (
       record &&
@@ -619,9 +596,6 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         );
       }
     }
-    if (!allowRetired) {
-      this.generationRegistry.assertCurrentGeneration(generation);
-    }
     return { record, command, generation };
   }
 
@@ -630,16 +604,11 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     run: (snapshot: AcpxHandleOperationSnapshot) => Promise<T>,
   ): Promise<T> {
     const generation = this.generationForHandle(handle);
-    // Hold the owner before lookup can yield; the verified record gets its own
-    // reservation without leaving a gap between snapshot and operation custody.
+    // Keep the runtime alive through lookup and execution, then check once at the effect.
     return await this.runInGeneration(handle, { generation }, async () => {
       const snapshot = await this.loadOperationSnapshotForHandle(handle, generation);
       this.generationRegistry.assertCurrentGeneration(generation);
-      return await this.runInGeneration(
-        handle,
-        { generation, recordId: snapshot.record?.acpxRecordId },
-        () => run(snapshot),
-      );
+      return await run(snapshot);
     });
   }
 
@@ -886,7 +855,6 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         sessionKey: resource,
         agent: input.agent,
       });
-      this.generationRegistry.assertCurrentGeneration(generation);
       // Returned handles keep their reset fence, including closed persisted history.
       generation.admitted ||= Boolean(handle);
       return handle
@@ -1070,7 +1038,6 @@ export class AcpxRuntime implements CompleteAcpRuntime {
       });
     const turnPromise = this.runWithOperationSnapshot(input.handle, (snapshot) => {
       const { command, generation } = snapshot;
-      this.generationRegistry.assertCurrentGeneration(generation);
       const delegate = this.resolveDelegateForOperationSnapshot(input.handle, snapshot);
       return this.sessionScope.run(resolveBridgeSession(input.handle), () =>
         acpxOperationScope.run({ generation }, () =>

@@ -13,6 +13,7 @@ import {
 } from "../../agents/cron-creator-authority-context.js";
 import { resolveFastModeState } from "../../agents/fast-mode.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
+import { bindReplyInputChannel } from "../../agents/harness/host-private-capabilities.js";
 import { resolveOwnerPromptNumbers } from "../../agents/owner-display.js";
 import { revokeRequesterCronAuthority } from "../../agents/subagents/requester-cron-authority.js";
 import {
@@ -22,7 +23,7 @@ import {
 import { readChannelContextAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
 import { copyChildSessionPublication } from "../../channels/message-access/child-session-publication.js";
 import { getRuntimeConfig } from "../../config/config.js";
-import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity.js";
+import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity-inbound.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
 import { getGatewayLocalUserIngress } from "../../gateway/local-user-ingress.js";
@@ -40,7 +41,9 @@ import { isConfiguredCommandOwner } from "../command-auth.js";
 import { bindCommandOwnerAuthority, getCommandOwnerAuthority } from "../command-owner-authority.js";
 import { getGroupThreadTurn } from "../group-thread-context.js";
 import { resolveInternalTurnTranscript } from "../internal-turn-source.js";
+import { transferRequesterProfile } from "../requester-profile.js";
 import type { OriginatingChannelType } from "../templating.js";
+import { resolveReplyScheduledToolPolicy } from "./agent-runner-run-params.js";
 import { resolveCurrentTurnImages } from "./current-turn-images.js";
 import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import type { PreparedReplyRunAdmission } from "./get-reply-run-admission.js";
@@ -111,6 +114,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     useFastReplyRuntime,
     fullAccessState,
     extraSystemPromptParts,
+    extraSystemPromptTurnContext,
     sourceConversationContextByMode,
     sourceConversationContextPromptOffset,
     extraSystemPromptStatic,
@@ -393,11 +397,14 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     deliveryCorrelations: opts?.queuedDeliveryCorrelations,
     turnAdoptionLifecycle: opts?.turnAdoptionLifecycle,
     runObservers: {
+      awaitSessionDiffBaseline: opts?.awaitSessionDiffBaseline,
       onAgentRunStart: opts?.onAgentRunStart,
+      onPreparedAgentRunStart: opts?.onPreparedAgentRunStart,
       onAgentRunTerminalOutcome: opts?.onAgentRunTerminalOutcome,
       onModelSelected: opts?.onModelSelected,
       prepareAssistantTranscriptMessage: opts?.prepareAssistantTranscriptMessage,
       resolveReplyDelivery: opts?.resolveReplyDelivery,
+      resolveReplyDeliveryFacts: opts?.resolveReplyDeliveryFacts,
       onDeliberateSilentTerminalReply: opts?.onDeliberateSilentTerminalReply,
     },
     ...(opts?.onFollowupQueueDisposition
@@ -436,6 +443,10 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       normalizeOptionalString(sessionCtx.ChatId),
     originatingChatType: replyRoute.chatType,
     run: {
+      scheduledAutomation: opts?.scheduledAutomation,
+      scheduledToolPolicy: resolveReplyScheduledToolPolicy({
+        scheduledAutomation: opts?.scheduledAutomation,
+      }),
       internalEventExecution: opts?.internalEventExecution,
       providerReviewAcknowledgment: opts?.providerReviewAcknowledgment,
       agentId,
@@ -501,6 +512,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       authProfileIdSource,
       thinkingCatalog,
       thinkLevel: resolvedThinkLevel,
+      thinkingExplicit: params.thinkingExplicit,
       thinkLevelOverride,
       ...(() => {
         if (useFastReplyRuntime) {
@@ -514,7 +526,9 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
           sessionEntry: preparedSessionState.sessionEntry,
         });
         return {
-          fastMode: params.resolvedFastMode ?? fastModeState.mode,
+          fastMode: params.resolvedFastModeOverride
+            ? params.resolvedFastMode
+            : fastModeState.requestMode,
           fastModeAutoOnSeconds:
             params.resolvedFastModeAutoOnSeconds ?? fastModeState.fastAutoOnSeconds,
           ...(params.resolvedFastModeOverride ? { fastModeOverride: true } : {}),
@@ -552,7 +566,9 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
         ? { suppressNextUserMessagePersistence: true }
         : {}),
       extraSystemPrompt: extraSystemPromptParts.join("\n\n") || undefined,
+      extraSystemPromptTurnContext,
       sourceReplyDeliveryMode,
+      bootstrapContextMode: opts?.bootstrapContextMode,
       taskSuggestionDeliveryMode: opts?.taskSuggestionDeliveryMode,
       silentReplyPromptMode,
       extraSystemPromptStatic,
@@ -568,6 +584,13 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     },
   };
   const sourceReplyDeliveryRuntimeOptions = opts as SourceReplyDeliveryRuntimeOptions | undefined;
+  if (!inputProvenance || inputProvenance.kind === "external_user") {
+    transferRequesterProfile(ctx, followupRun);
+    bindReplyInputChannel(
+      followupRun.run,
+      ctx.SenderIsBot ? undefined : (ctx.Provider ?? ctx.Surface),
+    );
+  }
   copyChildSessionPublication(sessionCtx, followupRun.run);
   const channelOwnerAuthority = getCommandOwnerAuthority(sessionCtx);
   if (command.senderIsOwner && channelOwnerAuthority) {
@@ -639,7 +662,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       shouldFollowup,
       hasQueuedFollowups,
       isActive,
-      isRunActive: () => {
+      isRunActive: async () => {
         const latestSessionState = resolvePreparedSessionState();
         const latestActiveSessionId =
           resolveActiveEmbeddedSessionId(latestSessionState.sessionFile) ??

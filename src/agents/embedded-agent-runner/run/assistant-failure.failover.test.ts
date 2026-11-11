@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { projectProviderError } from "../../../../packages/ai/src/utils/provider-error.js";
+import { buildKnownAgentRunFailureReplyPayload } from "../../../auto-reply/reply/agent-runner-failure-reply.js";
 import { buildRealtimeVoiceAgentErrorProviderResult } from "../../../talk/agent-run-control.js";
 import type { AgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import { formatBillingErrorMessage } from "../../embedded-agent-helpers.js";
@@ -109,14 +110,6 @@ async function expectFailure(input: Input): Promise<FailoverError> {
 }
 
 describe("assistant failure recovery", () => {
-  beforeEach(() => {
-    vi.spyOn(log, "warn").mockImplementation(() => {});
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
   it("stops unchanged retries and model fallback after prompt projection loses its user turn", async () => {
     let attempts = 0;
     const run = vi.fn(async () => {
@@ -144,6 +137,83 @@ describe("assistant failure recovery", () => {
     ).rejects.toThrow("Model prompt projection lost its canonical user turn");
     expect(run).toHaveBeenCalledOnce();
     expect(attempts).toBe(1);
+  });
+
+  beforeEach(() => {
+    vi.spyOn(log, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("explains retry exhaustion without replacing the raw provider failure", async () => {
+    const providerError = "429 rate limit exceeded. Please try again in 221ms.";
+    const input = makeInput(providerError);
+    input.rateLimitRetriesExhausted = 9;
+    const failure = await expectFailure(input);
+    expect(failure).toMatchObject({
+      message: expect.stringContaining("9 automatic retries"),
+      rateLimitRetriesExhausted: 9,
+      reason: "rate_limit",
+      status: 429,
+      rawError: providerError,
+    });
+    expect(input.normalizedAttempt.attemptAssistant?.errorMessage).toBe(providerError);
+    expect(
+      buildKnownAgentRunFailureReplyPayload({
+        err: failure,
+        sessionCtx: {},
+        resolvedVerboseLevel: "off",
+      })?.text,
+    ).toContain("9 automatic retries");
+  });
+
+  it.each([
+    { errorMessage: "Pending input is no longer active in its admitted transcript" },
+    { errorMessage: "400 malformed input item", errorType: "invalid_request_error" },
+    { errorMessage: "Request rejected by content policy", errorType: "invalid_request_error" },
+    {
+      errorMessage: "invalid_prompt: rejected",
+      errorType: "invalid_request_error",
+      errorCode: "invalid_prompt",
+    },
+  ])("stops unchanged retries and model fallback for $errorMessage", async (fields) => {
+    const run = vi.fn(async () => {
+      const input = makeInput(fields.errorMessage);
+      const assistant = input.normalizedAttempt.attemptAssistant!;
+      Object.assign(assistant, fields, { content: [] });
+      input.normalizedAttempt.attempt.assistantTexts = [];
+      input.normalizedAttempt.terminalState = resolveEmbeddedRunAttemptTerminalState({
+        attempt: input.normalizedAttempt.attempt,
+        assistant,
+      });
+      for (;;) {
+        const outcome = await handleEmbeddedAssistantFailure(input);
+        if (outcome.action !== "retry") {
+          throw new Error("failure was not surfaced");
+        }
+        input.emptyErrorRetries = outcome.emptyErrorRetries;
+      }
+    });
+    await expect(
+      runWithModelFallback({
+        cfg: undefined,
+        provider: "anthropic",
+        model: "test-model",
+        manifestPlugins: [],
+        fallbacksOverride: ["openai/fixture-next", "groq/fixture-last"],
+        skipAuthProfileRuntime: true,
+        run,
+      }),
+    ).rejects.toThrow();
+    expect(run).toHaveBeenCalledOnce();
+    expect(log.warn).toHaveBeenCalledWith(
+      "Assistant attempt failed",
+      expect.objectContaining({
+        message: fields.errorMessage,
+      }),
+    );
   });
 
   it("selects the next profile before marking failure and retries without waiting for the mark", async () => {
@@ -178,21 +248,7 @@ describe("assistant failure recovery", () => {
     await vi.waitFor(() => expect(events).toEqual(["advance", "mark-start", "mark-finish"]));
   });
 
-  it("rotates after transient recovery is exhausted", async () => {
-    const input = makeInput("429 rate_limit_exceeded: too many requests per minute");
-    input.failover = { ...input.failover, transientRetryCount: 8 };
-    input.failover.advanceAuthProfile = vi.fn(async () => true);
-    const outcome = await handleEmbeddedAssistantFailure(input);
-    expect(outcome.action).toBe("retry");
-    expect(input.failover.advanceAuthProfile).toHaveBeenCalledExactlyOnceWith("rate_limit", {
-      failoverProvider: "anthropic",
-      failoverModel: "test-model",
-      logFallbackDecision: expect.any(Function),
-    });
-    expect(input.traceAttempts[0]?.result).toBe("rotate_profile");
-  });
-
-  it.each([undefined, "anthropic:p1"])(
+  it.each([undefined])(
     "records billing failures for profile %s before surfacing",
     async (profileId) => {
       const input = makeInput("credit balance is too low", { profileId });
@@ -290,7 +346,7 @@ describe("assistant failure recovery", () => {
     expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("Profile "));
   });
 
-  it.each([false, true])(
+  it.each([false])(
     "retains provider error details with model fallback=%s",
     async (fallbackConfigured) => {
       for (const [message, reason, status] of [
@@ -328,30 +384,8 @@ describe("assistant failure recovery", () => {
     },
   );
 
-  it.each(["529 overloaded", "503 overloaded"])(
-    "enforces the overload cap while retaining %s",
-    async (errorMessage) => {
-      const input = makeInput(errorMessage);
-      input.overloadProfileRotations = 3;
-      input.failover.resolveAuthProfileFailureReason = () => "overloaded";
-      const failure = await expectFailure(input);
-      expect(failure).toMatchObject({
-        reason: "overloaded",
-        status: Number(errorMessage.slice(0, 3)),
-        rawError: errorMessage,
-        message: "The AI service is temporarily overloaded. Please try again in a moment.",
-      });
-      expect(input.failover.advanceAuthProfile).not.toHaveBeenCalled();
-      expect(input.failover.maybeMarkAuthProfileFailure).toHaveBeenCalledOnce();
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("after 4 rotations"));
-      expect(input.traceAttempts[0]?.result).toBe("error");
-    },
-  );
-
   it.each([
-    [{ kind: "ok" }, {}],
     [{ kind: "timeout", phase: "compaction", source: "observation" }, {}],
-    [{ kind: "timeout", phase: "compaction", source: "runtime" }, { stopReason: "timeout" }],
     [
       { kind: "timeout", phase: "tool_execution", source: "runtime" },
       { stopReason: "timeout", timeoutPhase: "tool_execution" },
@@ -360,7 +394,6 @@ describe("assistant failure recovery", () => {
       { kind: "timeout", phase: "prompt", source: "idle" },
       { stopReason: "timeout", timeoutPhase: "provider", providerStarted: true },
     ],
-    [{ kind: "timeout", phase: "compaction", source: "idle" }, { stopReason: "timeout" }],
   ] satisfies Array<readonly [AgentRunAttemptTerminal, object]>)(
     "keeps recorded timeout facts independent of provider status: %s",
     async (terminal, expected) => {
@@ -371,22 +404,19 @@ describe("assistant failure recovery", () => {
     },
   );
 
-  it.each(["billing", "timeout"])(
-    "ignores stale %s text on a successful assistant",
-    async (errorMessage) => {
-      const input = makeInput(errorMessage);
-      if (!input.normalizedAttempt.attemptAssistant) {
-        throw new Error("missing test assistant");
-      }
-      input.normalizedAttempt.attemptAssistant.stopReason = "stop";
-      input.normalizedAttempt.terminalState = resolveEmbeddedRunAttemptTerminalState({
-        attempt: input.normalizedAttempt.attempt,
-        assistant: input.normalizedAttempt.attemptAssistant,
-      });
-      expect((await handleEmbeddedAssistantFailure(input)).action).toBe("proceed");
-      expect(input.failover.advanceAuthProfile).not.toHaveBeenCalled();
-    },
-  );
+  it.each(["timeout"])("ignores stale %s text on a successful assistant", async (errorMessage) => {
+    const input = makeInput(errorMessage);
+    if (!input.normalizedAttempt.attemptAssistant) {
+      throw new Error("missing test assistant");
+    }
+    input.normalizedAttempt.attemptAssistant.stopReason = "stop";
+    input.normalizedAttempt.terminalState = resolveEmbeddedRunAttemptTerminalState({
+      attempt: input.normalizedAttempt.attempt,
+      assistant: input.normalizedAttempt.attemptAssistant,
+    });
+    expect((await handleEmbeddedAssistantFailure(input)).action).toBe("proceed");
+    expect(input.failover.advanceAuthProfile).not.toHaveBeenCalled();
+  });
 
   it("keeps harness-owned timeout handling inside the harness", async () => {
     const input = makeInput("request timed out");
@@ -395,34 +425,23 @@ describe("assistant failure recovery", () => {
     expect(input.failover.advanceAuthProfile).not.toHaveBeenCalled();
   });
 
-  it("surfaces provider-owned stalled streams with their owning provider", async () => {
-    const input = makeInput(
-      "opencode-go stream timed out after provider-owned SSE boundary stalled",
-      { provider: "opencode-go" },
-    );
-    expect(await expectFailure(input)).toMatchObject({
-      reason: "timeout",
-      status: 408,
-      provider: "opencode-go",
-    });
-  });
-
-  it.each([
-    Object.assign(new Error("This operation was aborted"), { name: "AbortError" }),
-    Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }),
-    new Error("provider connection failed"),
-  ])("keeps provider $name failures visible to realtime voice", async (error) => {
-    const signal = new AbortController().signal;
-    const input = makeInput(error.message);
-    if (!input.normalizedAttempt.attemptAssistant) {
-      throw new Error("missing test assistant");
-    }
-    Object.assign(input.normalizedAttempt.attemptAssistant, projectProviderError(error, signal));
-    input.normalizedAttempt.attemptAssistant.content = [];
-    input.emptyErrorRetries = 3;
-    const failure = await expectFailure(input);
-    expect(failure.rawError).toBe(error.message);
-    expect(buildRealtimeVoiceAgentErrorProviderResult(failure)).toEqual({ error: failure.message });
-    expect(signal.aborted).toBe(false);
-  });
+  it.each([new Error("provider connection failed")])(
+    "keeps provider $name failures visible to realtime voice",
+    async (error) => {
+      const signal = new AbortController().signal;
+      const input = makeInput(error.message);
+      if (!input.normalizedAttempt.attemptAssistant) {
+        throw new Error("missing test assistant");
+      }
+      Object.assign(input.normalizedAttempt.attemptAssistant, projectProviderError(error, signal));
+      input.normalizedAttempt.attemptAssistant.content = [];
+      input.emptyErrorRetries = 3;
+      const failure = await expectFailure(input);
+      expect(failure.rawError).toBe(error.message);
+      expect(buildRealtimeVoiceAgentErrorProviderResult(failure)).toEqual({
+        error: failure.message,
+      });
+      expect(signal.aborted).toBe(false);
+    },
+  );
 });

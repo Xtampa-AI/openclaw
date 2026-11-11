@@ -12,7 +12,12 @@ import { loadPairedDevicePairingStoreRecordReadOnly } from "../infra/device-pair
 import { GatewayOperatorRecoveryOwnershipError } from "../infra/restart-recovery-errors.js";
 import { onSessionIdentityMutation } from "../sessions/session-lifecycle-events.js";
 import { onUserProfilesChanged } from "../state/user-profile-events.js";
-import { prepareUserProfileIdentity } from "../state/user-profile-list.js";
+import { profileCatalogPath } from "../state/user-profile-identity.read.js";
+import {
+  prepareUserProfileIdentity,
+  projectUserProfileDisplay,
+  readResidentUserProfileRevision,
+} from "../state/user-profile-list.js";
 import { isGatewayAuthGrantCurrent } from "./auth-policy.js";
 import {
   captureGatewayDeviceRevocation,
@@ -25,6 +30,7 @@ import {
 } from "./operator-role-policy.js";
 import { sourceRolePolicy } from "./operator-role-source-policy.js";
 import {
+  bindGatewayOperatorContinuationAuthority,
   captureChannelOperatorRunAuthority,
   intersectOperatorRunModelPolicy,
 } from "./operator-run-authority.js";
@@ -33,6 +39,7 @@ import {
   type OperatorRunRecoverySnapshot,
 } from "./operator-run-recovery-source.js";
 import type { GatewayRequestContext } from "./server-methods/shared-types.js";
+import type { GatewayAuthenticatedUserProfile } from "./server/client-identity-types.js";
 
 export type OperatorRecoveryTarget = {
   agentId: string;
@@ -157,6 +164,7 @@ export async function restoreGatewayOperatorSource(params: {
   prepareCurrent?: () => Promise<void>;
 }): Promise<{
   authority: AdmittedRunOperatorAuthority;
+  authenticatedUserProfile: GatewayAuthenticatedUserProfile;
   controlUiAdmin: boolean;
   release: () => void;
 }> {
@@ -171,12 +179,11 @@ export async function restoreGatewayOperatorSource(params: {
     signal.abort(
       new Error("Restart recovery operator authority changed; start a new user turn.", { cause }),
     );
-  const assertOwner = () => {
+  const assertLifetime = () => {
     if (references === 0) {
       throw new Error("Restart recovery operator authority is no longer active.");
     }
     signal.signal.throwIfAborted();
-    assertCurrent();
   };
   const subscriptions: Array<() => void> = [
     onSessionIdentityMutation((mutation) => {
@@ -225,7 +232,7 @@ export async function restoreGatewayOperatorSource(params: {
       subscriptions.push(releaseDeviceNotification);
     }
     const assertSourcePolicy = () => {
-      assertOwner();
+      assertLifetime();
       const cfg = getConfig();
       const role = resolveOperatorRolePolicyForAssignment(
         snapshot.profileId,
@@ -245,6 +252,10 @@ export async function restoreGatewayOperatorSource(params: {
       return cfg;
     };
     let assertPolicy = assertSourcePolicy;
+    const assertRecoveryCurrent = () => {
+      assertCurrent();
+      return assertPolicy();
+    };
     const recheck = () => {
       if (references > 0 && !signal.signal.aborted) {
         try {
@@ -265,36 +276,41 @@ export async function restoreGatewayOperatorSource(params: {
         }
       }),
     );
-    assertSourcePolicy();
+    assertRecoveryCurrent();
     identity = await prepareUserProfileIdentity(snapshot.profileId);
     const profileIdentity = identity;
+    let githubAccountIds: readonly number[] | undefined;
     const assertFacts = () => {
       const cfg = assertSourcePolicy();
       const profile = profileIdentity.readCurrentFacts(snapshot.aliasBindingIds).profile;
       if (
         profile.profileId !== snapshot.profileId ||
         profile.assignedRole !== snapshot.assignedRole ||
-        (profile.githubLogin ?? null) !== snapshot.githubLogin
+        (profile.githubLogin ?? null) !== snapshot.githubLogin ||
+        githubAccountIds?.some((accountId) => !profile.githubAccountIds?.includes(accountId))
       ) {
         throw new Error("Restart recovery operator identity changed.");
       }
+      githubAccountIds ??= profile.githubAccountIds ?? [];
       return { cfg, profile };
     };
     let accessAuthority: ReturnType<typeof resumeGatewayOperatorAccessGrant>;
     assertPolicy = () => {
       try {
         const { profile, cfg } = assertFacts();
-        const access = resumeGatewayOperatorAccessGrant(profile, cfg, snapshot.grant);
+        const access = resumeGatewayOperatorAccessGrant(
+          profile,
+          cfg,
+          snapshot.grant,
+          accessAuthority,
+        );
         if (access && !accessAuthority) {
           accessAuthority = access;
           const onAbort = () => revoke(access.signal.reason);
           access.signal.addEventListener("abort", onAbort, { once: true });
           subscriptions.push(() => access.signal.removeEventListener("abort", onAbort));
         }
-        // Retain the first exact resumed owner before recovery yields. Later
-        // policy checks cannot replace a revoked source with a fresh authority.
-        accessAuthority?.signal.throwIfAborted();
-        accessAuthority?.assertCurrent();
+        // The grant assertion can synchronously abort its signal.
         accessAuthority?.signal.throwIfAborted();
         // A policy callback can change committed identity/config synchronously.
         return assertFacts().cfg;
@@ -304,7 +320,7 @@ export async function restoreGatewayOperatorSource(params: {
       }
     };
     subscriptions.push(onUserProfilesChanged(recheck));
-    assertPolicy();
+    assertRecoveryCurrent();
     if (snapshot.device) {
       const paired = await loadPairedDevicePairingStoreRecordReadOnly(snapshot.device.deviceId);
       if (
@@ -314,9 +330,9 @@ export async function restoreGatewayOperatorSource(params: {
       }
       assertPolicy();
     }
-    assertPolicy();
+    assertRecoveryCurrent();
     await params.prepareCurrent?.();
-    assertPolicy();
+    assertRecoveryCurrent();
     const live = captureChannelOperatorRunAuthority({
       profileId: snapshot.profileId,
       assignedRole: snapshot.assignedRole,
@@ -330,21 +346,44 @@ export async function restoreGatewayOperatorSource(params: {
     const originalModels = snapshot.modelPolicy
       ? restoreOperatorModelPolicySnapshot(snapshot.modelPolicy)
       : undefined;
-    const authority = createAdmittedRunOperatorAuthority({
+    const retainPolicy = () => {
+      assertPolicy();
+      references += 1;
+      return releaseHold();
+    };
+    const policyAuthority = createAdmittedRunOperatorAuthority({
       ...live,
       signal: signal.signal,
       recoverySnapshot: snapshot,
-      retain: () => {
-        assertPolicy();
-        references += 1;
-        return releaseHold();
-      },
+      retain: retainPolicy,
       get modelPolicy() {
         return intersectOperatorRunModelPolicy(originalModels, live.modelPolicy);
       },
     });
+    const authority = createAdmittedRunOperatorAuthority({
+      ...policyAuthority,
+      assertCurrent: assertRecoveryCurrent,
+      retain: () => {
+        assertCurrent();
+        return retainPolicy();
+      },
+      get modelPolicy() {
+        return policyAuthority.modelPolicy;
+      },
+    });
+    bindGatewayOperatorContinuationAuthority(authority, policyAuthority);
     authority.assertCurrent();
-    return { authority, controlUiAdmin: snapshot.controlUiAdmin, release };
+    const profile = readResidentUserProfileRevision(snapshot.profileId, profileCatalogPath({}));
+    if (!profile) {
+      throw new Error("Restart recovery operator profile is unavailable.");
+    }
+    const { id, ...display } = projectUserProfileDisplay(profile);
+    return {
+      authority,
+      authenticatedUserProfile: { profileId: id, ...display, updatedAt: profile.updated_at },
+      controlUiAdmin: snapshot.controlUiAdmin,
+      release,
+    };
   } catch (error) {
     release();
     throw error;

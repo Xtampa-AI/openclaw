@@ -5,6 +5,7 @@ import { createAssistantMessageEventStream, type AssistantMessage } from "opencl
 import { createRequireRecord, createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createModelProviderConfig } from "../../test-support/model-provider-config.test-support.js";
+import { LmstudioModelLoadError } from "./models.fetch.js";
 
 let wrapLmstudioInferencePreload: typeof import("./stream.js").wrapLmstudioInferencePreload;
 let defaultBaseUrl: string;
@@ -18,12 +19,14 @@ const resolveLmstudioRuntimeApiKeyMock = vi.hoisted(() =>
   vi.fn(async (_params?: unknown) => undefined),
 );
 
-vi.mock("./models.fetch.js", () => ({
+vi.mock("./models.fetch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./models.fetch.js")>()),
   prepareLmstudioModelForInference: (params: unknown) =>
     prepareLmstudioModelForInferenceMock(params),
 }));
 
-vi.mock("./runtime.js", () => ({
+vi.mock("./runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./runtime.js")>()),
   resolveLmstudioProviderHeaders: (params: unknown) => resolveLmstudioProviderHeadersMock(params),
   resolveLmstudioRuntimeApiKey: (params: unknown) => resolveLmstudioRuntimeApiKeyMock(params),
 }));
@@ -292,9 +295,9 @@ function runHeldPreloadScenario(
 
 describe("lmstudio stream wrapper", () => {
   beforeEach(() => {
-    // Production preload state is keyed by base URL, model, and context length.
-    // Give each test a real cache namespace while preserving within-test reuse.
+    // Give tests distinct endpoint scope while preserving within-test cache reuse.
     defaultBaseUrl = `http://lmstudio-test-${defaultBaseUrlSequence++}.localhost:1234`;
+    prepareLmstudioModelForInferenceMock.mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
@@ -384,9 +387,7 @@ describe("lmstudio stream wrapper", () => {
       id: `lmstudio/${canonicalKey}@q4_k_m`,
     };
     prepareLmstudioModelForInferenceMock.mockRejectedValueOnce(
-      Object.assign(new Error("load failed"), {
-        resolvedModelKey: canonicalKey,
-      }),
+      new LmstudioModelLoadError(canonicalKey, undefined, new Error("load failed")),
     );
     const baseStream = buildDoneStreamFn();
     const wrapped = createWrappedLmstudioStream(baseStream);

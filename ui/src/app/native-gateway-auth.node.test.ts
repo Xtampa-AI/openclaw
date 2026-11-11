@@ -474,7 +474,7 @@ describe("native authenticated Control UI", () => {
       });
       const first = connect();
       if (failure.startsWith("silent bridge")) {
-        // Stop at the authorization deadline, before the local close's retry fires.
+        // Observe authorization expiry before the local close's retry can begin.
         await vi.advanceTimersByTimeAsync(DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS / 2);
       }
       await first.closed.promise;

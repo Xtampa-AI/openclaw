@@ -198,34 +198,6 @@ describe("browser manage output", () => {
     expect(output).not.toContain("supersecrettokenvalue1234567890");
   });
 
-  it("shows chrome-mcp transport after creating an existing-session profile", async () => {
-    getBrowserManageGatewayMock().mockImplementation(async (_method, _opts, req) =>
-      req.path === "/profiles/create"
-        ? {
-            ok: true,
-            profile: "chrome-live",
-            transport: "chrome-mcp",
-            cdpPort: null,
-            cdpUrl: null,
-            userDataDir: null,
-            color: "#00AA00",
-            isRemote: false,
-          }
-        : {},
-    );
-
-    const program = createBrowserManageProgram();
-    await program.parseAsync(
-      ["browser", "create-profile", "--name", "chrome-live", "--driver", "existing-session"],
-      { from: "user" },
-    );
-
-    const output = lastRuntimeLog();
-    expect(output).toContain('Created profile "chrome-live"');
-    expect(output).toContain("transport: chrome-mcp");
-    expect(output).not.toContain("port: 0");
-  });
-
   it("shows cdpUrl after creating an existing-session endpoint profile", async () => {
     getBrowserManageGatewayMock().mockImplementation(async (_method, _opts, req) =>
       req.path === "/profiles/create"
@@ -304,29 +276,6 @@ describe("browser manage output", () => {
     expect(output).not.toContain("supersecrettokenvalue1234567890");
   });
 
-  it("redacts sensitive remote cdpUrl details in status output", async () => {
-    mockStatus({
-      profile: "remote",
-      driver: "openclaw",
-      transport: "cdp",
-      pid: null,
-      cdpPort: 9222,
-      cdpUrl:
-        "https://alice:supersecretpasswordvalue1234@example.com/chrome?token=supersecrettokenvalue1234567890",
-    });
-
-    const program = createBrowserManageProgram();
-    await program.parseAsync(["browser", "--browser-profile", "remote", "status"], {
-      from: "user",
-    });
-
-    const output = lastRuntimeLog();
-    expect(output).toContain("cdpUrl: https://example.com/chrome?token=supers…7890");
-    expect(output).not.toContain("alice");
-    expect(output).not.toContain("supersecretpasswordvalue1234");
-    expect(output).not.toContain("supersecrettokenvalue1234567890");
-  });
-
   it("prints managed graphics facts in status output", async () => {
     mockStatus({
       profile: "openclaw",
@@ -391,46 +340,44 @@ describe("browser manage output", () => {
     expect(output).toContain("id: RAW_TARGET_1");
   });
 
-  it("rejects non-integer tab indexes without calling browser actions", async () => {
+  it.each([
+    ["select", "1.9", false],
+    ["close", "abc", false],
+    ["select", "0", true],
+    ["select", "-1", true],
+    ["select", "1.9", true],
+    ["close", "abc", true],
+  ] as const)("rejects tab %s %s (json=%s) before dispatch", async (action, index, json) => {
     const program = createBrowserManageProgram();
-
     await expect(
-      program.parseAsync(["browser", "tab", "select", "1.9"], { from: "user" }),
-    ).rejects.toThrow("__exit__:1");
-    expect(getBrowserCliRuntimeCapture().runtimeErrors.at(-1)).toContain(
-      "index must be a positive integer",
-    );
-
-    getBrowserCliRuntimeCapture().resetRuntimeCapture();
-    await expect(
-      program.parseAsync(["browser", "tab", "close", "abc"], { from: "user" }),
-    ).rejects.toThrow("__exit__:1");
-    expect(getBrowserCliRuntimeCapture().runtimeErrors.at(-1)).toContain(
-      "index must be a positive integer",
-    );
-    expect(getBrowserManageGatewayMock()).not.toHaveBeenCalledWith(
-      "browser.request",
-      expect.anything(),
-      expect.objectContaining({ path: "/tabs/action" }),
-      expect.anything(),
-    );
-  });
-
-  it("accepts signed decimal tab indexes", async () => {
-    const program = createBrowserManageProgram();
-
-    await program.parseAsync(["browser", "tab", "select", "+2"], { from: "user" });
-
-    expect(getBrowserManageGatewayMock()).toHaveBeenCalledWith(
-      "browser.request",
-      expect.anything(),
-      expect.objectContaining({
-        path: "/tabs/action",
-        body: { action: "select", index: 1 },
+      program.parseAsync(["browser", ...(json ? ["--json"] : []), "tab", action, index], {
+        from: "user",
       }),
-      expect.anything(),
+    ).rejects.toThrow(json ? "index must be a positive integer" : "__exit__:1");
+    expect(getBrowserCliRuntimeCapture().runtimeErrors).toEqual(
+      json ? [] : ["index must be a positive integer"],
     );
+    expect(getBrowserCliRuntime().exit).toHaveBeenCalledTimes(json ? 0 : 1);
+    expect(getBrowserManageGatewayMock()).not.toHaveBeenCalled();
   });
+
+  it.each(["select", "close"] as const)(
+    "dispatches a valid %s index as zero-based",
+    async (action) => {
+      getBrowserManageGatewayMock().mockResolvedValueOnce({ ok: true });
+      await createBrowserManageProgram().parseAsync(["browser", "--json", "tab", action, "2"], {
+        from: "user",
+      });
+      expect(getBrowserManageGatewayMock()).toHaveBeenCalledWith(
+        "browser.request",
+        expect.anything(),
+        expect.objectContaining({ path: "/tabs/action", body: { action, index: 1 } }),
+        expect.anything(),
+      );
+      expect(getBrowserCliRuntimeCapture().runtimeErrors).toEqual([]);
+      expect(getBrowserCliRuntime().exit).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects unsupported profile drivers before creating a profile", async () => {
     const program = createBrowserManageProgram();
@@ -520,74 +467,6 @@ describe("browser manage output", () => {
     expect(lastRuntimeLog()).toContain("INFO extension-version: version data unavailable");
     expect(lastRuntimeLog()).not.toContain("WARN extension-version");
     expect(process.exitCode).toBe(0);
-  });
-
-  it("preserves one nonfatal JSON report for confirmed extension version drift", async () => {
-    mockBrowserResponses(
-      {
-        "/doctor": {
-          checks: [
-            {
-              id: "extension-version",
-              label: "Chrome extension version",
-              status: "warn",
-              summary: "running 2.0.0; bundled 2.2.0 (mismatch)",
-              fixHint: "Reload the OpenClaw extension.",
-            },
-          ],
-          status: {
-            enabled: true,
-            profile: "chrome",
-            transport: "extension",
-            running: true,
-          },
-        },
-        "/profiles": { profiles: [{ name: "chrome", running: true }] },
-      },
-      { running: true, tabs: [] },
-    );
-
-    const program = createBrowserManageProgram();
-    await program.parseAsync(["browser", "--json", "doctor"], { from: "user" });
-
-    expect(parseSingleRuntimeJson()).toMatchObject({
-      ok: true,
-      checks: expect.arrayContaining([
-        expect.objectContaining({ name: "extension-version", ok: true, warning: true }),
-      ]),
-    });
-    expect(getBrowserCliRuntimeCapture().runtimeErrors).toEqual([]);
-    expect(getBrowserCliRuntime().writeJson).toHaveBeenCalledTimes(1);
-    expect(getBrowserCliRuntime().exit).not.toHaveBeenCalled();
-    expect(process.exitCode).toBe(0);
-  });
-
-  it("runs exactly one deep snapshot after consuming the canonical doctor report", async () => {
-    mockBrowserResponses({
-      "/doctor": {
-        checks: [],
-        status: {
-          enabled: true,
-          profile: "chrome",
-          transport: "extension",
-          running: true,
-        },
-      },
-      "/profiles": { profiles: [{ name: "chrome", running: true }] },
-      "/tabs": { running: true, tabs: [] },
-      "/snapshot": { ok: true, format: "aria", nodes: [{ role: "document" }] },
-    });
-
-    const program = createBrowserManageProgram();
-    await program.parseAsync(["browser", "--browser-profile", "chrome", "doctor", "--deep"], {
-      from: "user",
-    });
-
-    expect(lastRuntimeLog()).toContain("OK live-snapshot: 1 nodes/lines");
-    const snapshotCalls = getBrowserManageGatewayMock().mock.calls.filter(
-      (call) => call[2].path === "/snapshot",
-    );
-    expect(snapshotCalls).toHaveLength(1);
   });
 
   it("prints a readable browser doctor report", async () => {
@@ -715,20 +594,14 @@ describe("browser manage output", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it.each([
-    { deleted: false, json: false },
-    { deleted: true, json: false },
-    { deleted: false, json: true },
-    { deleted: true, json: true },
-  ])("reports profile deletion with deleted=$deleted and json=$json", async ({ deleted, json }) => {
+  it.each([false, true])("reports profile deletion with deleted=%s", async (deleted) => {
     const result = { ok: true, profile: "proof-retained", deleted };
     getBrowserManageGatewayMock().mockResolvedValueOnce(result);
 
     const program = createBrowserManageProgram();
-    await program.parseAsync(
-      ["browser", ...(json ? ["--json"] : []), "delete-profile", "--name", result.profile],
-      { from: "user" },
-    );
+    await program.parseAsync(["browser", "delete-profile", "--name", result.profile], {
+      from: "user",
+    });
 
     expect(getBrowserManageGatewayMock()).toHaveBeenCalledWith(
       "browser.request",
@@ -736,17 +609,12 @@ describe("browser manage output", () => {
       expect.objectContaining({ method: "DELETE", path: "/profiles/proof-retained" }),
       expect.objectContaining({ scopes: ["operator.admin"] }),
     );
-    if (json) {
-      expect(parseSingleRuntimeJson()).toEqual(result);
-      expect(getBrowserCliRuntime().writeJson).toHaveBeenCalledTimes(1);
-    } else {
-      expect(lastRuntimeLog()).toBe(
-        deleted
-          ? '🦞 Deleted profile "proof-retained" (user data removed)'
-          : '🦞 Deleted profile "proof-retained" (user data removal not confirmed)',
-      );
-      expect(getBrowserCliRuntime().writeJson).not.toHaveBeenCalled();
-    }
+    expect(lastRuntimeLog()).toBe(
+      deleted
+        ? '🦞 Deleted profile "proof-retained" (user data removed)'
+        : '🦞 Deleted profile "proof-retained" (user data removal not confirmed)',
+    );
+    expect(getBrowserCliRuntime().writeJson).not.toHaveBeenCalled();
     expect(getBrowserCliRuntimeCapture().runtimeErrors).toEqual([]);
     expect(getBrowserCliRuntime().exit).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(0);

@@ -17,6 +17,7 @@ import {
   createServiceChildRelayAdapter,
   createWritableRelayChild,
 } from "./service-child-relay-host.test-support.js";
+import { createServiceChildCleanupExpiryError } from "./service-child-relay-retirement.js";
 
 const mocks = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", async (importOriginal) => ({
@@ -168,5 +169,47 @@ it.each(["lineage", "signal"] as const)(
       stub.disconnectMock();
       stub.emitExit(0);
     }
+  },
+);
+
+it.each([false, true])(
+  "retains structured cleanup diagnostics without widening serialized payloads (signal=%s)",
+  (failedSignal) => {
+    const signalError = failedSignal ? new Error("synthetic signal failure") : undefined;
+    const diagnostics = {
+      durationMs: 5_000,
+      escalationAfterMs: failedSignal ? 4_000 : undefined,
+      signalError,
+    };
+    const owner = {
+      generation: "owned-generation",
+      relayPid: 1234,
+      anchorPid: 3456,
+      commandPid: 2345,
+      treeOwnership: "process-group",
+    };
+    const error = createServiceChildCleanupExpiryError(
+      { relayExit: true, lineageEof: false },
+      owner,
+      diagnostics,
+    );
+    expect(error.message).toContain('"relayExit":true');
+    expect(error.cause).toBeInstanceOf(Error);
+    expect(error.cause).toMatchObject(diagnostics);
+    if (!(error.cause instanceof Error)) {
+      throw new Error("Expected owner-attribution Error");
+    }
+    expect(error.cause.cause).toBe(signalError);
+    expect(error.cause.message).toBe(
+      "service child cleanup owner: " +
+        JSON.stringify({
+          ...owner,
+          durationMs: 5_000,
+          escalationAfterMs: diagnostics.escalationAfterMs,
+        }),
+    );
+    // The live compatibility fields must not become a new JSON payload surface.
+    expect(Object.keys(error.cause)).toEqual([]);
+    expect(JSON.stringify(error.cause)).toBe("{}");
   },
 );

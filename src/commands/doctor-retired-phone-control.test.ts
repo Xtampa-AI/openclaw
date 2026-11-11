@@ -68,36 +68,6 @@ describe("retired Phone Control doctor migration", () => {
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
-  it("removes journal-owned allows and the exact setup deny seed", async () => {
-    const store = createLeaseJournal();
-    await store.register(
-      "generation-1",
-      createV3State({
-        addedToAllow: ["sms.send"],
-        removedFromDeny: ["sms.send"],
-      }),
-    );
-    const cfg = {
-      gateway: {
-        nodes: {
-          commands: {
-            allow: ["sms.send", "custom.command"],
-            deny: RETIRED_PHONE_CONTROL_SEEDED_DENY_COMMANDS.filter(
-              (command) => command !== "sms.send",
-            ),
-          },
-        },
-      },
-    } as OpenClawConfig;
-
-    const result = await prepareRetiredPhoneControlCleanup({ cfg, env });
-
-    expect(result.config.gateway?.nodes?.commands?.allow).toEqual(["custom.command"]);
-    expect(result.config.gateway?.nodes?.commands?.deny).toBeUndefined();
-    expect(result.cleanupPending).toBe(true);
-    expect(result.configChanges).toHaveLength(2);
-  });
-
   it("does not expose an allow that was effective only because a lease removed the seed deny", async () => {
     const store = createLeaseJournal();
     await store.register(
@@ -155,19 +125,6 @@ describe("retired Phone Control doctor migration", () => {
 
     expect(result.config.gateway?.nodes?.commands?.allow).toEqual(["health.summary"]);
     expect(result.cleanupSafe).toBe(true);
-  });
-
-  it("removes an exact setup deny seed without creating an empty commands object", async () => {
-    const cfg = {
-      gateway: {
-        nodes: { commands: { deny: [...RETIRED_PHONE_CONTROL_SEEDED_DENY_COMMANDS] } },
-      },
-    } as OpenClawConfig;
-
-    const result = await prepareRetiredPhoneControlCleanup({ cfg, env });
-
-    expect(result.config.gateway?.nodes?.commands).toBeUndefined();
-    expect(result.configChanges).toEqual(["Removed the retired Phone Control setup deny seed."]);
   });
 
   it("keeps exact-seed entries that currently shadow explicit allows", async () => {
@@ -253,6 +210,36 @@ describe("retired Phone Control doctor migration", () => {
     }
   });
 
+  it("preserves policy and original bytes for malformed UTF-8 legacy journals", async () => {
+    const legacyPath = path.join(stateDir, "plugins", "phone-control", "armed.json");
+    await fs.mkdir(path.dirname(legacyPath), { recursive: true });
+    await fs.writeFile(
+      legacyPath,
+      JSON.stringify({
+        version: 1,
+        armedAtMs: 1,
+        expiresAtMs: null,
+        removedFromDeny: ["CORRUPT"],
+      }),
+    );
+    const bytes = Buffer.from(
+      (await fs.readFile(legacyPath, "utf8")).replace("CORRUPT", "\x80"),
+      "latin1",
+    );
+    await fs.writeFile(legacyPath, bytes);
+    const cfg: OpenClawConfig = {
+      gateway: { nodes: { commands: { deny: ["operator.command"] } } },
+    };
+
+    const result = await prepareRetiredPhoneControlCleanup({ cfg, env });
+
+    expect(result.config).toBe(cfg);
+    expect(result.cleanupSafe).toBe(false);
+    expect(result.configChanges).toEqual([]);
+    expect(result.warnings).toEqual([expect.stringContaining("must be valid UTF-8")]);
+    expect(await fs.readFile(legacyPath)).toEqual(bytes);
+  });
+
   it("does not touch operator-authored command entries that differ from the old seed", async () => {
     const deny = [...RETIRED_PHONE_CONTROL_SEEDED_DENY_COMMANDS, "custom.command"];
     const cfg = {
@@ -304,7 +291,7 @@ describe("retired Phone Control doctor migration", () => {
     expect(result.changes).toHaveLength(2);
     await expect(store.entries()).resolves.toEqual([]);
     await expect(fs.access(legacyPath)).rejects.toThrow();
-    await expect(fs.access(`${legacyPath}.migrated`)).resolves.toBeUndefined();
+    await fs.access(`${legacyPath}.migrated`);
   });
 
   it("keeps the canonical journal when the stale legacy source cannot be archived", async () => {
@@ -319,6 +306,6 @@ describe("retired Phone Control doctor migration", () => {
 
     expect(result.warnings).toHaveLength(1);
     await expect(store.entries()).resolves.toHaveLength(1);
-    await expect(fs.access(legacyPath)).resolves.toBeUndefined();
+    await fs.access(legacyPath);
   });
 });

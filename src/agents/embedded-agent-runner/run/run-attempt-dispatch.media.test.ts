@@ -325,7 +325,7 @@ describe("plugin harness prompt media", () => {
       runParams: {
         agentId: "main",
         config: { agents: { defaults: { sandbox: { mode: "off" } } } },
-        sessionId: "session-run-suppressed",
+        sessionId: "session-run-suppression",
         images: [inlineImage],
         imageOrder: ["inline"],
         media: [
@@ -353,7 +353,6 @@ describe("plugin harness prompt media", () => {
       },
       runtime: {
         model: { input: ["text", "image"] },
-        sessionId: "session-run-suppressed",
         workspaceDir: "/tmp",
       },
     } as unknown as Parameters<typeof preparePluginHarnessPromptImages>[0]);

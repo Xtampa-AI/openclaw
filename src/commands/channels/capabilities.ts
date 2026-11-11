@@ -2,12 +2,13 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { resolveChannelAccount } from "../../channels/account-resolution.js";
 import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
 import {
   createMessageActionDiscoveryContext,
-  resolveMessageActionDiscoveryForPlugin,
+  resolveMessageActionDiscoveryForPluginAsync,
 } from "../../channels/plugins/message-action-discovery.js";
 import { listReadOnlyChannelPluginsForConfig } from "../../channels/plugins/read-only.js";
 import type { AnyChannelPlugin as ChannelPlugin } from "../../channels/plugins/types.plugin.js";
@@ -22,7 +23,7 @@ import { getChannelsCommandSecretTargetIds } from "../../cli/command-secret-targ
 import { formatUnknownChannelMessage } from "../../cli/error-format.js";
 import { ExpectedCliError } from "../../cli/failure-output.js";
 import { parseTimeoutMsWithFallback } from "../../cli/parse-timeout.js";
-import { getRuntimeConfig, type OpenClawConfig } from "../../config/config.js";
+import { captureRuntimeConfigAsyncReader, type OpenClawConfig } from "../../config/config.js";
 import { danger } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../../runtime.js";
@@ -123,14 +124,15 @@ function formatGenericProbeLines(probe: unknown): ChannelCapabilitiesDisplayLine
 }
 
 function renderDisplayLine(line: ChannelCapabilitiesDisplayLine) {
+  const text = sanitizeTerminalText(line.text);
   switch (line.tone) {
     case "muted":
     case "success":
     case "warn":
     case "error":
-      return theme[line.tone](line.text);
+      return theme[line.tone](text);
     default:
-      return line.text;
+      return text;
   }
 }
 
@@ -202,15 +204,17 @@ async function resolveChannelReports(params: {
               }),
           })
         : undefined;
-    const discoveredActions = resolveMessageActionDiscoveryForPlugin({
-      pluginId: plugin.id,
-      actions: plugin.actions,
-      context: createMessageActionDiscoveryContext({
-        cfg,
-        accountId,
-      }),
-      includeActions: true,
-    }).actions;
+    const discoveredActions = (
+      await resolveMessageActionDiscoveryForPluginAsync({
+        pluginId: plugin.id,
+        actions: plugin.actions,
+        context: createMessageActionDiscoveryContext({
+          cfg,
+          accountId,
+        }),
+        includeActions: true,
+      })
+    ).actions;
     const actions = Array.from(new Set<string>(["send", "broadcast", ...discoveredActions]));
 
     reports.push({
@@ -291,7 +295,10 @@ export async function channelsCapabilitiesCommand(
         runtime,
       });
       // The writer refreshes the prepared view used by probes after installation.
-      cfg = await resolveCapabilitiesRuntimeConfig(getRuntimeConfig(), runtime);
+      cfg = await resolveCapabilitiesRuntimeConfig(
+        await captureRuntimeConfigAsyncReader()(),
+        runtime,
+      );
     }
     selected = resolved.plugin ? [resolved.plugin] : [];
   }

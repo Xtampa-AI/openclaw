@@ -4,6 +4,7 @@
  * history sanitization, tool IDs, thinking blocks, and turn validation align.
  */
 import { isDirectAnthropicModel } from "@openclaw/ai/internal/anthropic";
+import { requiresReasoningContentReplay } from "@openclaw/ai/internal/openai-completions-compat";
 import { supportsNativeOpenAIResponsesEndpoint } from "@openclaw/ai/internal/openai-responses-payload-policy";
 import { supportsClaudeInHistorySystemMessages } from "@openclaw/llm-core";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
@@ -87,75 +88,35 @@ function buildUnownedProviderTransportReplayFallback(params: {
   const isClaudeOpenAiResponses =
     isOpenAiResponses && /(?:^|[./:_-])claude(?:$|[./:_-])/.test(modelId);
   return {
-    ...(isGoogle ? { sanitizeMode: "full" as const } : {}),
+    sanitizeMode: isGoogle ? "full" : undefined,
     sanitizeToolCallIds: true,
     toolCallIdMode: "strict",
-    ...(isGoogle
+    sanitizeThoughtSignatures: isGoogle
       ? {
-          sanitizeThoughtSignatures: {
-            allowBase64Only: true,
-            includeCamelCase: true,
-          },
+          allowBase64Only: true,
+          includeCamelCase: true,
         }
-      : {}),
-    ...(isStrictOpenAiCompatible
-      ? {
-          dropReasoningFromHistory:
-            params.model?.reasoning !== true && !requiresReasoningContentReplay(params.modelId),
-        }
-      : {}),
-    ...(isGoogle || isStrictOpenAiCompatible
-      ? { applyAssistantFirstOrderingFix: true, validateGeminiTurns: true }
-      : {}),
-    ...(isStrictOpenAiCompatible || isClaudeOpenAiResponses
-      ? { validateAnthropicTurns: true }
-      : {}),
-    ...(isGoogle || isOpenAiResponses ? { allowSyntheticToolResults: true } : {}),
+      : undefined,
+    dropReasoningFromHistory: isStrictOpenAiCompatible
+      ? params.model?.reasoning !== true && !requiresReasoningContentReplay(params.modelId)
+      : undefined,
+    applyAssistantFirstOrderingFix: isGoogle || isStrictOpenAiCompatible ? true : undefined,
+    validateGeminiTurns: isGoogle || isStrictOpenAiCompatible ? true : undefined,
+    validateAnthropicTurns: isStrictOpenAiCompatible || isClaudeOpenAiResponses ? true : undefined,
+    allowSyntheticToolResults: isGoogle || isOpenAiResponses ? true : undefined,
   };
 }
 
-const REASONING_CONTENT_REPLAY_MODEL_IDS = new Set([
-  "kimi-for-coding",
-  "kimi-k2.5",
-  "kimi-k2.6",
-  "kimi-k2.7-code",
-  "kimi-k2.7-code-highspeed",
-  "kimi-k3",
-  "kimi-k3.1-pro",
-  "kimi-k3.1-pro-highspeed",
-  "kimi-k2-thinking",
-  "kimi-k2-thinking-turbo",
-  "mimo-v2-pro",
-  "mimo-v2-omni",
-  "mimo-v2.5",
-  "mimo-v2.5-pro",
-  "mimo-v2.6-flash",
-  "mimo-v2.6-pro",
-  "mimo-v2.6-pro-ultraspeed",
-]);
-
-function requiresReasoningContentReplay(modelId: string | null | undefined): boolean {
-  const normalized = normalizeLowercaseStringOrEmpty(modelId);
-  if (!normalized) {
-    return false;
-  }
-  const parts = normalized.split("/").filter(Boolean);
-  const finalPart = parts[parts.length - 1] ?? normalized;
-  const candidates = [finalPart];
-  const colonParts = finalPart.split(":").filter(Boolean);
-  if (colonParts.length > 1) {
-    candidates.push(colonParts[0] ?? "", colonParts[colonParts.length - 1] ?? "");
-  }
-  return candidates.some((candidate) => REASONING_CONTENT_REPLAY_MODEL_IDS.has(candidate));
-}
-
-function mergeTranscriptPolicy(policy: ProviderReplayPolicy | undefined): TranscriptPolicy {
-  if (!policy) {
-    return DEFAULT_TRANSCRIPT_POLICY;
-  }
-
-  const merged = { ...DEFAULT_TRANSCRIPT_POLICY };
-  for (const [key, value] of Object.entries(policy)) {
+function mergeTranscriptPolicy(
+  policy: ProviderReplayPolicy | undefined,
+  modelApi: string | null | undefined,
+): TranscriptPolicy {
+  const merged = {
+    ...DEFAULT_TRANSCRIPT_POLICY,
+    // Exact-entry caches need earlier temporal carriers to remain in the request prefix.
+    appendOnlyRuntimeContext: modelApi === "openai-completions" || modelApi === "ollama",
+  };
+  for (const [key, value] of Object.entries(policy ?? {})) {
     if (value != null) {
       Object.assign(merged, {
         [key === "applyAssistantFirstOrderingFix" ? "applyGoogleTurnOrdering" : key]: value,
@@ -245,13 +206,13 @@ export function resolveTranscriptPolicy(params: {
         })),
   };
 
-  // Once a provider adopts the replay-policy hook, replay policy should come
-  // from the plugin, not from transport-family defaults in core.
+  // Provider hooks replace the fallback and can override the shared retention default.
   const buildReplayPolicy = runtimePlugin?.buildReplayPolicy;
   const policy = mergeTranscriptPolicy(
     buildReplayPolicy
       ? (buildReplayPolicy(context) ?? undefined)
       : buildUnownedProviderTransportReplayFallback(context),
+    params.modelApi,
   );
   if (policy.inHistorySystemUpdates) {
     policy.inHistorySystemUpdates = context.inHistorySystemUpdates;

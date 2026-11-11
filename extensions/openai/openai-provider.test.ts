@@ -8,14 +8,15 @@ import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-sha
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   OPENAI_API_BASE_URL,
-  OPENAI_CODEX_MODELS_ENDPOINT as OPENAI_CODEX_MODELS_URL,
   OPENAI_CODEX_RESPONSES_BASE_URL,
+  resolveOpenAICodexModelsEndpoint,
 } from "./base-url.js";
 import { OPENAI_DEFAULT_MODEL } from "./default-models.js";
 import { buildOpenAIProvider } from "./openai-provider.js";
 import manifest from "./openclaw.plugin.json" with { type: "json" };
 import { resolveThinkingProfile } from "./provider-policy-api.js";
 import { registerOpenAIServiceTierCatalogTests } from "./test-support/model-service-tiers.test-support.js";
+import { registerOpenAIFailoverTests } from "./test-support/provider-failover.test-support.js";
 
 const mocks = vi.hoisted(() => ({
   resolveApiKeyForProvider: vi.fn(),
@@ -104,9 +105,10 @@ async function buildOpenAICodexLiveProviderConfig(params: {
   ).provider;
 }
 
+// mock-isolation: Catalog tests supply synthetic credentials and account metadata.
 vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
   resolveApiKeyForProvider: mocks.resolveApiKeyForProvider,
-  resolveProviderAuthProfileMetadata: mocks.resolveProviderAuthProfileMetadata,
+  resolveProviderAuthProfileMetadataAsync: mocks.resolveProviderAuthProfileMetadata,
 }));
 
 async function runWrappedPayloadCase(params: {
@@ -225,34 +227,7 @@ describe("buildOpenAIProvider", () => {
     });
   });
 
-  it("classifies OpenAI-native code-only failover errors", () => {
-    const provider = buildOpenAIProvider();
-
-    for (const providerId of ["openai", "azure-openai", "azure-openai-responses"]) {
-      expect(
-        provider.classifyFailoverReason?.({
-          provider: providerId,
-          errorMessage: "",
-          code: "SERVER_ERROR",
-        }),
-      ).toBe("server_error");
-      expect(
-        provider.classifyFailoverReason?.({
-          provider: providerId,
-          errorMessage: "",
-          code: "INSUFFICIENT_QUOTA",
-        }),
-      ).toBe("billing");
-    }
-    // API_ERROR is an Anthropic-native code, not OpenAI's: fall through to generic.
-    expect(
-      provider.classifyFailoverReason?.({
-        provider: "openai",
-        errorMessage: "",
-        code: "API_ERROR",
-      }),
-    ).toBeUndefined();
-  });
+  registerOpenAIFailoverTests();
 
   it("does not hardcode transport routing on static catalog entries (#91710)", () => {
     const openaiModels = manifest.modelCatalog.providers.openai.models as Array<
@@ -613,7 +588,7 @@ describe("buildOpenAIProvider", () => {
         maxTokens: 64_000,
       });
       expect(fetchSpy).toHaveBeenCalledOnce();
-      expect(fetchSpy.mock.calls[0]?.[0]).toBe(OPENAI_CODEX_MODELS_URL);
+      expect(fetchSpy.mock.calls[0]?.[0]).toBe(await resolveOpenAICodexModelsEndpoint());
       const headers = fetchSpy.mock.calls[0]?.[1]?.headers;
       expect(headers).toBeInstanceOf(Headers);
       if (!(headers instanceof Headers)) {
@@ -777,7 +752,6 @@ describe("buildOpenAIProvider", () => {
   });
 
   registerOpenAIServiceTierCatalogTests({
-    modelsUrl: OPENAI_CODEX_MODELS_URL,
     runCatalogWithFetchGuard,
   });
 
@@ -791,9 +765,9 @@ describe("buildOpenAIProvider", () => {
         source: "profile",
       },
       accountId: "acct-openai-workspace",
-      fetchGuard: async () => ({
+      fetchGuard: async ({ url }) => ({
         response: new Response("forbidden", { status: 403 }),
-        finalUrl: OPENAI_CODEX_MODELS_URL,
+        finalUrl: url,
         release,
       }),
     });
@@ -1388,56 +1362,6 @@ describe("buildOpenAIProvider", () => {
     expectNoCatalogEntry(entries, "gpt-5.5");
     expectNoCatalogEntry(entries, "chat-latest");
     expectCatalogEntry(entries, "gpt-5.5-pro", { provider: "openai", name: "gpt-5.5-pro" });
-  });
-
-  it("owns replay policy for OpenAI and Codex transports", () => {
-    const provider = buildOpenAIProvider();
-    const codexProvider = buildOpenAIProvider();
-
-    expect(
-      provider.buildReplayPolicy?.({
-        provider: "openai",
-        modelApi: "openai",
-        modelId: "gpt-5.4",
-      } as never),
-    ).toEqual({
-      sanitizeMode: "images-only",
-      applyAssistantFirstOrderingFix: false,
-      sanitizeToolCallIds: false,
-      validateGeminiTurns: false,
-      validateAnthropicTurns: false,
-    });
-
-    expect(
-      provider.buildReplayPolicy?.({
-        provider: "openai",
-        modelApi: "openai-completions",
-        modelId: "gpt-5.4",
-      } as never),
-    ).toEqual({
-      sanitizeMode: "images-only",
-      applyAssistantFirstOrderingFix: false,
-      sanitizeToolCallIds: true,
-      toolCallIdMode: "strict",
-      validateGeminiTurns: false,
-      validateAnthropicTurns: false,
-    });
-
-    expect(
-      codexProvider.buildReplayPolicy?.({
-        provider: "openai",
-        modelApi: "openai-chatgpt-responses",
-        modelId: "gpt-5.4",
-      } as never),
-    ).toEqual({
-      sanitizeMode: "images-only",
-      applyAssistantFirstOrderingFix: false,
-      sanitizeToolCallIds: false,
-      validateGeminiTurns: false,
-      validateAnthropicTurns: false,
-      allowSyntheticToolResults: true,
-      appendOnlyRuntimeContext: true,
-    });
   });
 
   it("owns direct OpenAI wrapper composition for responses payloads", async () => {

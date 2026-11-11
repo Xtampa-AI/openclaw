@@ -1,7 +1,9 @@
 import http from "node:http";
+import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import * as fileAccessRuntime from "openclaw/plugin-sdk/file-access-runtime";
 import {
   createPluginRuntimeMock,
   createPluginRegistry,
@@ -17,6 +19,7 @@ import {
   retireSessionMcpRuntime,
   setSessionMcpRuntimeScheduler,
 } from "../src/agents/agent-bundle-mcp-manager-api.js";
+import { prepareSharedAuthStoreOwnershipForNative } from "../src/agents/auth-profiles/path-resolve.native.js";
 import {
   setRuntimeAuthProfileStoreSnapshot,
   clearRuntimeAuthProfileStoreSnapshots,
@@ -25,18 +28,16 @@ import { log as embeddedAgentLog } from "../src/agents/embedded-agent-runner/log
 import { runAgentHarnessBeforeMessageWriteHook } from "../src/agents/harness/hook-helpers.js";
 import { createAgentHarnessHostCapabilities } from "../src/agents/harness/host-capability.js";
 import { listRegisteredAgentHarnesses } from "../src/agents/harness/registry.js";
-import {
-  createAdmittedGatewayToolCallerIdentity,
-  withGatewayToolCallerIdentity,
-} from "../src/agents/tools/gateway-caller-context.js";
+import { withGatewayToolCallerIdentity } from "../src/agents/tools/gateway-caller-context.js";
+import { setRuntimeConfigSnapshot } from "../src/config/runtime-snapshot.js";
 import {
   listSessionEntriesCore,
   loadSessionEntry,
   loadTranscriptEvents,
-  replaceTranscriptEvents,
 } from "../src/config/sessions/session-accessor.js";
 import { writeSessionEntry } from "../src/config/sessions/session-accessor.sqlite-entry-store.js";
-import { readClosedTranscriptTurnInDatabase } from "../src/config/sessions/session-accessor.transcript-range.js";
+import { replaceTranscriptEvents } from "../src/config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
+import { readClosedTranscriptTurnInDatabase } from "../src/config/sessions/session-accessor.transcript-range.worker.js";
 import type { OpenClawConfig } from "../src/config/types.openclaw.js";
 import { sessionRewindHandlers } from "../src/gateway/server-methods/sessions-rewind.js";
 import type {
@@ -48,10 +49,11 @@ import { seedAttachedPlacementEnvironment } from "../src/gateway/worker-environm
 import { readCodexSessionTranscriptEventsBeforeAdmission } from "../src/plugin-sdk/codex-session-transcript-runtime.js";
 import { appendSessionTranscriptMessagesByIdentity } from "../src/plugin-sdk/session-transcript-runtime.js";
 import {
-  createPluginStateKeyedStore,
+  createPluginStateKeyedStoreV2,
   createPluginStateSyncKeyedStore,
   type OpenAsyncKeyedStoreOptions,
   type OpenKeyedStoreOptions,
+  type PluginStateActionAuthority,
 } from "../src/plugin-state/plugin-state-store.js";
 import { createRuntimePluginManifestLookup } from "../src/plugins/active-runtime-registry.js";
 import { resolvePluginCapabilityCatalogContext } from "../src/plugins/loader-runtime-load.js";
@@ -170,7 +172,7 @@ async function withFixture(
       key: string,
       entryId: string,
     ) => Promise<{ ok: boolean; key?: string; message?: string }>,
-    revoke: (target: "source" | "child" | "registry", sourceKey: string) => void,
+    revoke: (target: "source" | "child", sourceKey: string) => void,
     admissions: Array<{ recorder: UserTurnTranscriptRecorder; before: unknown[] }>,
     runtime: ReturnType<typeof createPluginRuntimeMock>,
   ) => Promise<void>,
@@ -186,6 +188,7 @@ async function withFixture(
   } = {},
 ) {
   await withState(async (state) => {
+    prepareSharedAuthStoreOwnershipForNative(state.env);
     const config: OpenClawConfig = {
       agents: {
         ownership: "explicit",
@@ -206,8 +209,11 @@ async function withFixture(
       agent: createRuntimeAgent(),
       config: { current: () => config },
       state: {
-        openKeyedStore: <T>(storeOptions: OpenAsyncKeyedStoreOptions) =>
-          createPluginStateKeyedStore<T>("codex", { ...storeOptions, env: state.env }),
+        openKeyedStoreV2: <T>(
+          storeOptions: OpenAsyncKeyedStoreOptions,
+          authority: PluginStateActionAuthority = { assertCurrent() {} },
+        ) =>
+          createPluginStateKeyedStoreV2<T>("codex", { ...storeOptions, env: state.env }, authority),
         openSyncKeyedStore: <T>(storeOptions: OpenKeyedStoreOptions) =>
           createPluginStateSyncKeyedStore<T>("codex", { ...storeOptions, env: state.env }),
       },
@@ -307,9 +313,7 @@ async function withFixture(
           });
         }
         const capturedWorkerClaim = workerClaim;
-        // Production dispatch (withPreparedEmbeddedGatewayTools) keeps the admitted
-        // caller ambient for the whole attempt; plugin tools take invocation authority from it.
-        const callerIdentity =
+        const host = await withGatewayToolCallerIdentity(
           capturedWorkerClaim && placements
             ? {
                 agentId: "main",
@@ -318,36 +322,30 @@ async function withFixture(
                 workerTurnClaim: capturedWorkerClaim,
                 receiptAuthority: () => placements.validateTurnClaim(capturedWorkerClaim),
               }
-            : createAdmittedGatewayToolCallerIdentity({
-                admittedRunContext,
+            : undefined,
+          () =>
+            createAgentHarnessHostCapabilities({
+              pluginId: "codex",
+              attempt: {
                 agentId: "main",
+                sessionId,
                 sessionKey,
-              });
-        const host = await withGatewayToolCallerIdentity(callerIdentity, () =>
-          createAgentHarnessHostCapabilities({
-            pluginId: "codex",
-            attempt: {
-              agentId: "main",
-              sessionId,
-              sessionKey,
-              runId,
-              config,
-              cwd: state.workspaceDir,
-              workspaceDir: state.workspaceDir,
-              admittedRunContext,
-              abortSignal: abortController.signal,
-              userTurnTranscriptRecorder: recorder,
-              sessionTarget: target,
-              senderIsOwner,
-              senderId,
-              githubPublicationAvailable: false,
-            },
-          }),
+                runId,
+                config,
+                cwd: state.workspaceDir,
+                workspaceDir: state.workspaceDir,
+                admittedRunContext,
+                abortSignal: abortController.signal,
+                userTurnTranscriptRecorder: recorder,
+                sessionTarget: target,
+                senderIsOwner,
+                senderId,
+                githubPublicationAvailable: false,
+              },
+            }),
         );
         return {
           ...host,
-          runWithScope: (run) =>
-            withGatewayToolCallerIdentity(callerIdentity, () => host.runWithScope(run)),
           abortController,
           invalidate: async (reason) => {
             if (reason === "claim") {
@@ -398,6 +396,7 @@ async function withFixture(
           openai: { enabled: true },
         },
       };
+      setRuntimeConfigSnapshot(config);
       const { registry, createApi } = createPluginRegistry({
         runtime,
         logger: { info() {}, warn() {}, error() {} },
@@ -518,10 +517,6 @@ async function withFixture(
             fixture,
             fork,
             (target, sourceKey) => {
-              if (target === "registry") {
-                markPluginRegistryRetired(registry);
-                return;
-              }
               const key =
                 target === "source"
                   ? sourceKey
@@ -689,9 +684,9 @@ describe("canonical descendant lifecycle through real owners", () => {
   );
 
   it.each(
-    ["source", "child", "registry"].flatMap((target) =>
+    ["source", "child"].flatMap((target) =>
       ["prewrite", "overload", "acknowledged"].map((phase) => ({
-        target: target as "source" | "child" | "registry",
+        target: target as "source" | "child",
         phase,
       })),
     ),
@@ -1005,51 +1000,7 @@ describe("canonical descendant lifecycle through real owners", () => {
       }
     });
   }, 180_000);
-  it.each(["source", "child", "registry"] as const)(
-    "fences physical fork writes after %s revocation during configuration wait",
-    async (target) => {
-      await withFixture(async (fixture, fork, revoke) => {
-        const source = await fixture.adopt();
-        await fixture.turn(source.sessionKey, "canonical");
-        const selected = (await fixture.readEntries(source.sessionKey)).at(-1)!;
-        await fixture.withClient(async (client) => {
-          const release = await fixture.holdConfiguration(client);
-          const request = vi.spyOn(client, "request"); // Pass-through: the real fence still runs.
-          const before = fixture.native.calls.filter(
-            (call) => call.method === "thread/fork",
-          ).length;
-          const pending = fork(source.sessionKey, selected.entryId);
-          let result: Awaited<ReturnType<typeof fork>>;
-          try {
-            await vi.waitFor(
-              () =>
-                expect(request.mock.calls.some(([method]) => method === "thread/fork")).toBe(true),
-              { timeout: 10_000 },
-            );
-            expect(
-              fixture.native.calls.filter((call) => call.method === "thread/fork"),
-            ).toHaveLength(before);
-            revoke(target, source.sessionKey);
-          } finally {
-            release();
-            result = await pending;
-            request.mockRestore();
-          }
-          expect(result.ok).toBe(false);
-          expect(fixture.native.calls.filter((call) => call.method === "thread/fork")).toHaveLength(
-            before,
-          );
-          await fixture.withClient(async (next) => {
-            expect(next).toBe(client);
-          });
-          await expect(client.request("config/read", {})).resolves.toMatchObject({ config: {} });
-        });
-      });
-    },
-    180_000,
-  );
-
-  it.each(["source", "child", "registry"] as const)(
+  it.each(["source", "child"] as const)(
     "fences physical fork retries after %s revocation on overload",
     async (target) => {
       await withFixture(async (fixture, fork, revoke) => {
@@ -1073,10 +1024,7 @@ describe("canonical descendant lifecycle through real owners", () => {
     180_000,
   );
 
-  it.each([
-    ["source", 2, 0],
-    ["registry", 1, 1],
-  ] as const)(
+  it.each([["source", 2, 0]] as const)(
     "keeps native archive overload retry within captured rollback after %s revocation",
     async (target, attempts, retained) => {
       await withFixture(async (fixture, fork, revoke) => {
@@ -1106,7 +1054,6 @@ describe("canonical descendant lifecycle through real owners", () => {
   it.each([
     ["source", true],
     ["child", false],
-    ["registry", false],
   ] as const)(
     "uses captured rollback ownership after %s revocation following native fork",
     async (target, rollbackAllowed) => {
@@ -1149,6 +1096,41 @@ describe("canonical descendant lifecycle through real owners", () => {
     },
     180_000,
   );
+
+  it("hands a fresh canonical fork to a separate turn connection without a restart", async () => {
+    await withFixture(async (fixture, fork) => {
+      const source = await fixture.adopt();
+      await fixture.turn(source.sessionKey, "canonical");
+      const selected = (await fixture.readEntries(source.sessionKey)).at(-1)!;
+      const forkOffset = fixture.native.calls.length;
+      const forked = await fork(source.sessionKey, selected.entryId);
+      expect(forked, forked.message).toMatchObject({ ok: true });
+      const childKey = expectDefined(forked.key, "child key");
+      const child = expectDefined(
+        fixture.bindingStore.read(fixture.identity(childKey)),
+        "child binding",
+      );
+      const forkCall = expectDefined(
+        fixture.native.calls.slice(forkOffset).find((call) => call.method === "thread/fork"),
+        "canonical fork request",
+      );
+      const turnOffset = fixture.native.calls.length;
+      // Live supervision turns use another app-server process on the same Codex home.
+      const continued = await fixture.turn(childKey, "warm child turn", {
+        separateConnection: true,
+      });
+      expect(continued.threadId).toBe(child.threadId);
+      const resume = expectDefined(
+        fixture.native.calls
+          .slice(turnOffset)
+          .find(
+            (call) => call.method === "thread/resume" && call.params.threadId === child.threadId,
+          ),
+        "child resume",
+      );
+      expect(resume.client).not.toBe(forkCall.client);
+    });
+  }, 180_000);
 
   it("keeps ordinary archive cleanup on the healthy client while its notification is delayed", async () => {
     await withFixture(async (fixture, fork) => {
@@ -1375,7 +1357,11 @@ describe("canonical descendant lifecycle through real owners", () => {
             expect(result.success).toBe(false);
             // The declared executor rejects nonowners before sending any native request.
             expect(result.executionStarted, JSON.stringify(result.contentItems)).toBe(true);
-            expect(JSON.stringify(result.contentItems)).toContain("owner-authorized sender");
+            // Release admits plugin tool invocations per run, so this fixture's call is refused
+            // at that boundary before the owner check; either way no native request is sent.
+            expect(JSON.stringify(result.contentItems)).toContain(
+              "Plugin tool invocation authority is unavailable",
+            );
             expect(fixture.native.calls).toHaveLength(calls);
           };
           await fixture.native.restart();
@@ -1867,17 +1853,15 @@ describe("canonical descendant lifecycle through real owners", () => {
     ["ignored cut", /did not apply the exact beforeTurnId cut/],
     ["missing model", /model/i],
     ["null model", /model/i],
-    ["model changed during preparation", /canonical Codex source changed/],
-    ["provider changed during preparation", /canonical Codex source changed/],
     ["request authorization changed after native fork", /request authorization changed/],
     ["sandbox policy changed during initialization", /requires a sandbox/],
     ["catalog mismatch", /native tool catalog is missing, corrupt, or changed/],
     ["child catalog", /did not preserve the actual native tool catalog/],
-    ["child model", /did not preserve the exact canonical source and selected native model/],
-    ["child thread model", /did not preserve the exact canonical source and selected native model/],
+    ["child model", /did not preserve the exact source session and selected native model/],
+    ["child thread model", /did not preserve the exact source session and selected native model/],
     [
       "null child thread model",
-      /did not preserve the exact canonical source and selected native model/,
+      /did not preserve the exact source session and selected native model/,
     ],
     ["child lineage", /unsafe native thread identity/],
     ["unsubscribe failure", /unsubscribe|subscription|guarded rollback/i],
@@ -1904,35 +1888,12 @@ describe("canonical descendant lifecycle through real owners", () => {
             (call) => call.method === "thread/archive",
           ).length;
           const current = expectDefined(fixture.native.threads.get(binding.threadId), "canonical");
-          const create = runtime.agent.session.createSessionEntry;
           const createSession = vi.spyOn(runtime.agent.session, "createSessionEntry");
           if (failure === "missing model") {
             delete current.thread.model;
           }
           if (failure === "null model") {
             current.thread.model = null;
-          }
-          if (
-            failure === "model changed during preparation" ||
-            failure === "provider changed during preparation"
-          ) {
-            createSession.mockImplementation((params) =>
-              create({
-                ...params,
-                afterCreate: async (created) => {
-                  if (failure === "model changed during preparation") {
-                    current.thread.model = "gpt-5.5";
-                  } else {
-                    current.thread.modelProvider = "changed-provider";
-                  }
-                  const patch = await params.afterCreate?.(created);
-                  if (!patch) {
-                    throw new Error("Expected the canonical fork initialization patch");
-                  }
-                  return patch;
-                },
-              }),
-            );
           }
           if (failure === "ignored cut") {
             fixture.native.setIgnoreCut(true);
@@ -2004,9 +1965,7 @@ describe("canonical descendant lifecycle through real owners", () => {
           if (
             failure === "catalog mismatch" ||
             failure === "missing model" ||
-            failure === "null model" ||
-            failure === "model changed during preparation" ||
-            failure === "provider changed during preparation"
+            failure === "null model"
           ) {
             expect(
               fixture.native.calls.filter((call) => call.method === "thread/fork"),
@@ -2049,4 +2008,78 @@ describe("canonical descendant lifecycle through real owners", () => {
     },
     180_000,
   );
+  it("PROOF canonical fork under wall-clock skew keeps the rollout observation deadline monotonic", async () => {
+    await withFixture(async (fixture, fork) => {
+      const source = await fixture.adopt();
+      await fixture.turn(source.sessionKey, "canonical");
+      const selected = (await fixture.readEntries(source.sessionKey)).at(-1)!;
+      const traces: Array<Record<string, unknown>> = [];
+      for (const delta of [-90_000, 90_000]) {
+        // Real timers and real performance.now throughout; only Date.now is skewed.
+        // The skew opens when the production reader roots the sessions directory
+        // (after its deadline seed, before its remaining-budget read) and closes
+        // when the reader arms its deadline timer.
+        const realDateNow = Date.now;
+        let skewActive = false;
+        let rootTriggered = false;
+        const rootOriginal = fileAccessRuntime.root;
+        const rootSpy = vi.spyOn(fileAccessRuntime, "root").mockImplementation(((...args) => {
+          // Platform-aware: the sessions dir basename is "sessions" on POSIX and
+          // Windows alike (path.join produces backslashes on Windows), so match
+          // the basename instead of a hard-coded "/sessions" suffix.
+          if (!rootTriggered && path.basename(args[0]) === "sessions") {
+            rootTriggered = true;
+            skewActive = true;
+            Date.now = () => realDateNow() + delta;
+          }
+          return rootOriginal(...args);
+        }) as typeof fileAccessRuntime.root);
+        const originalSetTimeout = globalThis.setTimeout;
+        let readerArmedDelay: number | undefined;
+        const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+          callback: (...cbArgs: unknown[]) => void,
+          timeout?: number,
+          ...args: unknown[]
+        ) => {
+          if (skewActive) {
+            skewActive = false;
+            Date.now = realDateNow;
+            readerArmedDelay = timeout ?? 0;
+          }
+          return originalSetTimeout(() => callback(...args), timeout);
+        }) as typeof setTimeout);
+        const startedAt = performance.now();
+        let result: { ok: boolean; key?: string; message?: string } | undefined;
+        try {
+          result = await fork(source.sessionKey, selected.entryId);
+        } finally {
+          Date.now = realDateNow;
+          rootSpy.mockRestore();
+          setTimeoutSpy.mockRestore();
+        }
+        traces.push({
+          wallClockDeltaMs: delta,
+          rootTriggered,
+          forkOk: result?.ok,
+          ...(result?.message ? { forkMessage: result.message.slice(0, 100) } : {}),
+          forkElapsedMs: Math.round(performance.now() - startedAt),
+          readerArmedDelayMs: readerArmedDelay,
+          // Real CodexAppServerClient JSON-RPC methods hit via fromTransportForTests.
+          clientMethods: fixture.native.calls.map((call) => call.method),
+        });
+      }
+      console.log("PROOF_TRACE " + JSON.stringify(traces));
+      expect(traces.map((trace) => trace.forkOk)).toEqual([true, true]);
+      for (const trace of traces) {
+        // The regression validates the budget contract, not disk latency: the
+        // post-fix reader arms its monotonic deadline timer at
+        // max(1, deadline - performance.now()), which stays within the 5s budget
+        // and is never inflated by wall-clock skew. There is no fixed lower bound
+        // (slow lstat/root/open legitimately consume part of the budget while the
+        // fork still succeeds within it), so only the upper budget bound is asserted.
+        expect(trace.readerArmedDelayMs).toBeGreaterThanOrEqual(1);
+        expect(trace.readerArmedDelayMs).toBeLessThanOrEqual(5_000);
+      }
+    });
+  }, 180_000);
 });

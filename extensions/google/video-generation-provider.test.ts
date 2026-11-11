@@ -151,9 +151,9 @@ describe("google video generation provider", () => {
     expect(provider.capabilities.videoToVideo?.supportsAudio).toBe(false);
   });
 
-  it("advertises Gemini video generation with a config-only Google API key", () => {
+  it("advertises Gemini video generation with a config-only Google API key", async () => {
     expect(
-      buildGoogleVideoGenerationProvider().isConfigured?.({
+      await buildGoogleVideoGenerationProvider().isConfiguredAsync?.({
         cfg: {
           models: {
             providers: {
@@ -203,7 +203,7 @@ describe("google video generation provider", () => {
     expect(clientOptions.apiKey).toBe("google-key");
     const httpOptions = recordField(clientOptions.httpOptions, "httpOptions");
     expect(httpOptions).not.toHaveProperty("baseUrl");
-    expect(httpOptions).not.toHaveProperty("apiVersion");
+    expect(httpOptions.apiVersion).toBe("v1beta");
   });
 
   it("returns inline video bytes encoded with URL-safe base64", async () => {
@@ -262,24 +262,48 @@ describe("google video generation provider", () => {
 
   it.each([
     {
-      name: "strips /v1beta suffix from configured baseUrl before passing to GoogleGenAI SDK",
+      name: "preserves a configured /v1beta endpoint without appending a second version",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-      expectedBaseUrl: "https://generativelanguage.googleapis.com",
+      expectedBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      apiVersion: "",
       prompt: "A tiny robot watering a windowsill garden",
     },
     {
       name: "does NOT strip /v1beta when it appears mid-path (end-anchor proof)",
       baseUrl: "https://proxy.example.com/v1beta/route",
       expectedBaseUrl: "https://proxy.example.com/v1beta/route",
+      apiVersion: "",
       prompt: "test",
     },
     {
-      name: "passes baseUrl unchanged when no /v1beta suffix is present",
+      name: "normalizes the official API origin to its v1beta endpoint",
       baseUrl: "https://generativelanguage.googleapis.com",
-      expectedBaseUrl: "https://generativelanguage.googleapis.com",
+      expectedBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      apiVersion: "",
       prompt: "test",
     },
-  ])("$name", async ({ baseUrl, expectedBaseUrl, prompt }) => {
+    {
+      name: "preserves an explicitly configured v1alpha endpoint",
+      baseUrl: "https://proxy.example.com/v1alpha",
+      expectedBaseUrl: "https://proxy.example.com/v1alpha",
+      apiVersion: "",
+      prompt: "test",
+    },
+    {
+      name: "preserves an explicitly configured v1 endpoint",
+      baseUrl: "https://proxy.example.com/v1",
+      expectedBaseUrl: "https://proxy.example.com/v1",
+      apiVersion: "",
+      prompt: "test",
+    },
+    {
+      name: "pins v1beta for an unversioned custom endpoint",
+      baseUrl: "https://proxy.example.com/google",
+      expectedBaseUrl: "https://proxy.example.com/google",
+      apiVersion: "v1beta",
+      prompt: "test",
+    },
+  ])("$name", async ({ baseUrl, expectedBaseUrl, apiVersion, prompt }) => {
     mockGoogleApiKeyAuth();
     generateVideosMock.mockResolvedValue(
       completedVideo({ videoBytes: Buffer.from("mp4").toString("base64"), mimeType: "video/mp4" }),
@@ -292,6 +316,7 @@ describe("google video generation provider", () => {
     });
 
     expect(firstGoogleClientHttpOptions().baseUrl).toBe(expectedBaseUrl);
+    expect(firstGoogleClientHttpOptions().apiVersion).toBe(apiVersion);
   });
 
   it("downloads MLDev direct video uri responses without routing through the Files API", async () => {
@@ -510,6 +535,59 @@ describe("google video generation provider", () => {
     ).rejects.toThrow("Google generated video download exceeds 1 bytes");
     expect(downloadMock).not.toHaveBeenCalled();
   });
+
+  it.each(["google/veo-3.1-fast-generate-preview", "google/models/veo-3.1-fast-generate-preview"])(
+    "normalizes %s for SDK submission while preserving the result model",
+    async (model) => {
+      mockGoogleApiKeyAuth();
+      generateVideosMock.mockResolvedValue(
+        completedVideo({
+          videoBytes: Buffer.from("mp4").toString("base64"),
+          mimeType: "video/mp4",
+        }),
+      );
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await generateVideo({ model });
+
+      expect(generateVideosMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ model: model.slice("google/".length) }),
+      );
+      expect(result.model).toBe(model);
+      expect(result.videos[0]?.buffer).toEqual(Buffer.from("mp4"));
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { name: "empty", response: { generatedVideos: [] } },
+    {
+      name: "filtered",
+      response: {
+        generatedVideos: [],
+        raiMediaFilteredCount: 1,
+        raiMediaFilteredReasons: ["Synthetic content filter"],
+      },
+    },
+  ])(
+    "reports a completed $name result without submitting another generation",
+    async ({ response }) => {
+      mockGoogleApiKeyAuth();
+      generateVideosMock.mockResolvedValue({ done: true, name: "operations/empty", response });
+      const fetchMock = vi.fn(() => {
+        throw new Error("Unexpected second generation request");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(generateVideo()).rejects.toThrow(
+        "Google video generation response missing generated videos",
+      );
+
+      expect(generateVideosMock).toHaveBeenCalledOnce();
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("falls back to REST predictLongRunning when text-only SDK video generation returns 404", async () => {
     mockGoogleApiKeyAuth();

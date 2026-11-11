@@ -1,5 +1,6 @@
+import type { SessionAdmissionTransition } from "../../../config/sessions/session-admission-transition.types.js";
+import { runWithoutOwnedSessionTranscriptWrites } from "../../../config/sessions/transcript-write-context-owner.js";
 import {
-  runWithoutOwnedSessionTranscriptWrites,
   withOwnedSessionTranscriptWrites,
   type SessionTranscriptWriterFence,
 } from "../../../config/sessions/transcript-write-context.js";
@@ -22,7 +23,7 @@ import {
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 const CONTINUATION_PROMPT =
-  "Continue the current task from the existing transcript, preserving completed work. If an action was interrupted, inspect its state before deciding whether to retry it. Do not restart the task or repeat completed actions.";
+  "Continue the current task from the existing transcript, preserving completed work and the user's constraints. Use recorded tool results to determine what completed. Before retrying an action with an unknown outcome, inspect its state. If the recorded results already satisfy the remaining request, report them without additional tool calls. Do not restart the task or repeat completed actions.";
 
 type ActivePrompt = {
   override?: string;
@@ -41,7 +42,7 @@ export async function createEmbeddedRunSessionPromptState(input: {
   let activeSessionId = params.sessionId;
   let activeSessionFile = params.sessionFile;
   let activeSessionTarget: ContextEngineSessionTarget | undefined =
-    buildContextEngineCompactionSessionTarget({
+    await buildContextEngineCompactionSessionTarget({
       agentId: params.agentId ?? sessionAgentId,
       config: params.config,
       sessionFile: activeSessionFile,
@@ -65,6 +66,7 @@ export async function createEmbeddedRunSessionPromptState(input: {
   const initialTarget = initialWriter ? { ...activeSessionTarget } : undefined;
   let sessionTargetAdopted = false;
   let committedCompactionSuccessor: AcceptedCompactionSuccessor | undefined;
+  const committedCompactionTransitions: SessionAdmissionTransition[] = [];
   // Only retries after this run mutates its transcript may wait for deferred projection work.
   // Fresh attempts retain the projection owner's bounded, retryable failure contract.
   let settleOwnedTranscriptProjection = false;
@@ -109,6 +111,9 @@ export async function createEmbeddedRunSessionPromptState(input: {
   const recordCommittedCompactionSuccessor = (accepted: AcceptedCompactionSuccessor) => {
     // Commit-edge bookkeeping only: observers may cancel before the patch promise
     // returns, so neither notification callbacks nor another await belongs here.
+    if (accepted.admissionTransition && committedCompactionSuccessor !== accepted) {
+      committedCompactionTransitions.push(accepted.admissionTransition);
+    }
     committedCompactionSuccessor = accepted;
     capturePreparedCompactionTarget(accepted);
   };
@@ -203,6 +208,9 @@ export async function createEmbeddedRunSessionPromptState(input: {
     get sessionTargetAdopted() {
       return sessionTargetAdopted;
     },
+    get committedCompactionTransitions() {
+      return Object.freeze([...committedCompactionTransitions]);
+    },
     get committedCompactionSuccessor() {
       return committedCompactionSuccessor;
     },
@@ -230,8 +238,10 @@ export async function createEmbeddedRunSessionPromptState(input: {
         role: "custom",
         customType: "incomplete-tool-call",
         content:
-          `Runtime notice: The tool call${toolCallId ? ` ${JSON.stringify(toolCallId.slice(0, 200))}` : ""} was cut off at the provider's output limit (max_output_tokens) and was not executed. ` +
-          "Split the remaining work into smaller tool calls with shorter arguments. Earlier actions may have completed; verify their results before continuing and do not repeat completed actions.",
+          (toolCallId
+            ? `Runtime notice: The tool call ${JSON.stringify(toolCallId.slice(0, 200))} was cut off at the provider's output limit (max_output_tokens) and was not executed. Split the remaining work into smaller tool calls with shorter arguments only if the original request allows continuing that work. `
+            : "Runtime notice: The model response reached the provider's output limit (max_output_tokens) before producing an answer. Continue with a shorter response and smaller tool calls only if the original request allows continuing that work. ") +
+          "Use recorded tool results to determine what completed, and do not repeat completed actions. Inspect state only for actions whose outcomes are unknown.",
         display: false,
         details: { reason: "max_output_tokens", ...(toolCallId ? { toolCallId } : {}) },
         timestamp: Date.now(),

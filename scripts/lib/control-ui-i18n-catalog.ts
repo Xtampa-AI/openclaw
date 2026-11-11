@@ -5,7 +5,6 @@ import { buildBaseHints } from "../../src/config/schema.hints.js";
 import { configHintTranslationKey } from "../../ui/src/i18n/lib/config-hint-translation.ts";
 import { registerActivityEnglish } from "../../ui/src/i18n/locales/en-activity.ts";
 import { registerAgentsHomeEnglish } from "../../ui/src/i18n/locales/en-agents-home.ts";
-import { registerApprovalsEnglish } from "../../ui/src/i18n/locales/en-approvals.ts";
 import { registerAppsEnglish } from "../../ui/src/i18n/locales/en-apps.ts";
 import { registerBoardWebsiteEnglish } from "../../ui/src/i18n/locales/en-board-website.ts";
 import { registerBrowserEnglish } from "../../ui/src/i18n/locales/en-browser.ts";
@@ -25,9 +24,7 @@ import { registerFilePreviewEnglish } from "../../ui/src/i18n/locales/en-file-pr
 import { registerGitHubEnglish } from "../../ui/src/i18n/locales/en-github.ts";
 import { registerLabsEnglish } from "../../ui/src/i18n/locales/en-labs.ts";
 import { registerLinkReaderEnglish } from "../../ui/src/i18n/locales/en-link-reader.ts";
-import { registerLogbookEnglish } from "../../ui/src/i18n/locales/en-logbook.ts";
 import { registerLoginEnglish } from "../../ui/src/i18n/locales/en-login.ts";
-import { registerLogsEnglish } from "../../ui/src/i18n/locales/en-logs.ts";
 import { registerMcpAppEnglish } from "../../ui/src/i18n/locales/en-mcp-app.ts";
 import { registerMcpEnglish } from "../../ui/src/i18n/locales/en-mcp.ts";
 import { registerMeetingsEnglish } from "../../ui/src/i18n/locales/en-meetings.ts";
@@ -42,7 +39,7 @@ import { registerPluginManagementEnglish } from "../../ui/src/i18n/locales/en-pl
 import { registerPortalsEnglish } from "../../ui/src/i18n/locales/en-portals.ts";
 import { registerProcessesEnglish } from "../../ui/src/i18n/locales/en-processes.ts";
 import { registerProfileEnglish } from "../../ui/src/i18n/locales/en-profile.ts";
-import { registerSecretsStoreEnglish } from "../../ui/src/i18n/locales/en-secrets-store.ts";
+import { registerSessionOrganizationEnglish } from "../../ui/src/i18n/locales/en-session-organization.ts";
 import { registerSessionPeopleEnglish } from "../../ui/src/i18n/locales/en-session-people.ts";
 import { registerSessionPlacementEnglish } from "../../ui/src/i18n/locales/en-session-placement.ts";
 import { registerSettingsEnglish } from "../../ui/src/i18n/locales/en-settings.ts";
@@ -74,10 +71,6 @@ const sourceFiles = [
   "en-activity.ts",
   "en-agents-home.ts",
   "en-apps.ts",
-  "en-logbook.ts",
-  "en-logs.ts",
-  "en-approvals.ts",
-  "en-secrets-store.ts",
   "en-board-website.ts",
   "en-browser.ts",
   "en-chat-camera.ts",
@@ -106,6 +99,7 @@ const sourceFiles = [
   "en-model-controls.ts",
   "en-model-setup.ts",
   "en-personal-instructions.ts",
+  "en-session-organization.ts",
   "en-session-people.ts",
   "en-session-placement.ts",
   "en-new-session-setup.ts",
@@ -145,6 +139,9 @@ export function loadControlUiSourceCatalog(): TranslationMap {
     if (key === "searchPlaceholder") {
       Object.assign(sessionsView, registerCommandPaletteEnglish.catalog.sessionsView);
     }
+    if (key === "archiveSession") {
+      Object.assign(sessionsView, registerSessionOrganizationEnglish.catalog.sessionsView);
+    }
     if (key === "assignToMe") {
       Object.assign(sessionsView, registerSessionPeopleEnglish.catalog.sessionsView);
     }
@@ -163,14 +160,17 @@ export function loadControlUiSourceCatalog(): TranslationMap {
     // Preserve partial-fragment key order while keeping shared labels eager.
     {
       ...en,
-      secretsStore: registerSecretsStoreEnglish.catalog.secretsStore,
       custodian: { ...registerPluginManagementEnglish.catalog.custodian, ...en.custodian },
       chat: {
         ...en.chat,
         commands: registerCommandPaletteEnglish.catalog.chat.commands,
         welcome: registerCommandPaletteEnglish.catalog.chat.welcome,
         messages: registerChatMessageMetadataEnglish.catalog.chat.messages,
+        pullRequests: registerGitHubEnglish.catalog.chat.pullRequests,
       },
+      sessionHovercard: registerGitHubEnglish.catalog.sessionHovercard,
+      githubPublication: registerGitHubEnglish.catalog.githubPublication,
+      githubConnections: registerGitHubEnglish.catalog.githubConnections,
       agentTools: {
         ...registerGitHubEnglish.catalog.agentTools,
         ...en.agentTools,
@@ -193,10 +193,6 @@ export function loadControlUiSourceCatalog(): TranslationMap {
     registerActivityEnglish.catalog,
     registerAgentsHomeEnglish.catalog,
     registerAppsEnglish.catalog,
-    registerLogbookEnglish.catalog,
-    registerLogsEnglish.catalog,
-    registerApprovalsEnglish.catalog,
-    registerSecretsStoreEnglish.catalog,
     registerBrowserEnglish.catalog,
     registerChatCameraEnglish.catalog,
     registerChatCiEnglish.catalog,
@@ -239,7 +235,11 @@ export function loadControlUiSourceCatalog(): TranslationMap {
 
 export async function readControlUiSourceCatalog(): Promise<string> {
   const sources = await Promise.all(
-    sourceFiles.map((fileName) => readFile(path.join(localesDir, fileName), "utf8")),
+    [
+      ...sourceFiles.map((fileName) => path.join(localesDir, fileName)),
+      path.resolve(localesDir, "../../../../extensions/active-memory/control-ui.presentation.json"),
+      path.resolve(localesDir, "../../../../extensions/memory-wiki/control-ui.presentation.json"),
+    ].map((filePath) => readFile(filePath, "utf8")),
   );
   return [...sources, JSON.stringify(loadControlUiCoreHintCatalog())].join("\n");
 }

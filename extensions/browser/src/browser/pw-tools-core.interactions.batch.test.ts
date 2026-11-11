@@ -236,6 +236,7 @@ describe("executeActViaPlaywright batches", () => {
 
     expect(result).toEqual({ targetId: "tab-1", results: [{ ok: true }] });
     expect(withPageNavigationRequestGuard).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       action: expect.any(Function),
       onPolicyCheckStarted: expect.any(Function),
       onPolicyDenied: expect.any(Function),
@@ -272,6 +273,7 @@ describe("executeActViaPlaywright batches", () => {
 
     expect(result).toEqual({ targetId: "tab-1", results: [{ ok: true }] });
     expect(withPageNavigationRequestGuard).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
       action: expect.any(Function),
       onPolicyCheckStarted: expect.any(Function),
       onPolicyDenied: expect.any(Function),

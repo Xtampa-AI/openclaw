@@ -21,7 +21,6 @@ import {
 import { withPrivateStagedPackageInstall } from "./update-command-artifact.js";
 import {
   applyUpdateCandidateAdmission,
-  assertUpdateAdmissionConfigUnchanged,
   createUpdateCandidateAdmissionReport,
   inspectStagedUpdateCandidateAdmission,
 } from "./update-command-candidate-admission.js";
@@ -106,6 +105,27 @@ export async function initializeAndRunUpdate(
                 return;
               }
               const selectedTarget = selection.target;
+              const assertSelectedRuntimeCurrent = async () => {
+                if (!selectedTarget) {
+                  return;
+                }
+                try {
+                  await selectedTarget.assertPackageRuntimeCurrent?.();
+                } catch (error) {
+                  if (
+                    hasCommandProcessCleanupError(error) ||
+                    !(error instanceof UpdatePreMutationError)
+                  ) {
+                    throw error;
+                  }
+                  await selectedTarget.refuseUpdate(
+                    error.reason,
+                    error.message,
+                    error.failureFacts,
+                    error.recoverySteps,
+                  );
+                }
+              };
               const candidateAdmissionEnabled =
                 selectedTarget?.updateInstallKind === "package" &&
                 usesCandidateUpdateAdmission(opts, prepared.installKind);
@@ -243,6 +263,7 @@ export async function initializeAndRunUpdate(
                 }
               };
               const runCapturedInitialization = async () => {
+                await assertSelectedRuntimeCurrent();
                 await captureOriginal();
                 await runInitialized(initialization);
               };
@@ -315,7 +336,7 @@ export async function initializeAndRunUpdate(
                           applyUpdateCandidateAdmission({
                             target,
                             opts,
-                            result: initialization.candidateAdmission.result,
+                            result: initialization.candidateAdmission,
                           });
                         } catch (error) {
                           if (!(error instanceof UpdatePreMutationError)) {
@@ -343,31 +364,18 @@ export async function initializeAndRunUpdate(
                   return await runCapturedInitialization();
                 }
                 const timeoutMs = prepared.timeoutMs ?? DEFAULT_UPDATE_STEP_TIMEOUT_MS;
-                const selectedStoredChannel = target.storedChannel;
                 const candidateAdmissionChecks =
-                  initialization.candidateAdmission?.result.verdict?.verdict === "admit"
-                    ? initialization.candidateAdmission.result.verdict.facts.checks.map(
+                  initialization.candidateAdmission?.verdict?.verdict === "admit"
+                    ? initialization.candidateAdmission.verdict.facts.checks.map(
                         (check) => check.name,
                       )
                     : undefined;
-                const checkSchemas = async (phase?: "before" | "after") => {
+                const checkSchemas = async () => {
                   const config = await withOwnedManagedUpdateEnv(env, () =>
                     readUpdateChannelConfig(Boolean(opts.channel), {
                       tolerateReadFailure: candidateAdmissionChecks?.includes("config"),
                     }),
                   );
-                  if (candidateAdmissionChecks?.includes("config") && phase !== "after") {
-                    assertUpdateAdmissionConfigUnchanged(
-                      target.configSnapshot,
-                      config.configSnapshot,
-                    );
-                  }
-                  if (!opts.channel && config.storedChannel !== selectedStoredChannel) {
-                    await target.refuseUpdate(
-                      "update-channel-changed",
-                      "Stored update channel changed after target selection. Rerun the update, or specify --channel explicitly.",
-                    );
-                  }
                   Object.assign(target, config);
                   return await preflightUpdateCommandSchemas({
                     ...target,
@@ -396,6 +404,7 @@ export async function initializeAndRunUpdate(
                 await captureOriginal();
                 const runtime = await preparePackageUpdateRuntime({
                   ...target,
+                  assertPackageRuntimeCurrent: assertSelectedRuntimeCurrent,
                   managedService: schemaPreflight.service,
                   shouldRestart: prepared.shouldRestart,
                   opts,
@@ -440,6 +449,7 @@ export async function initializeAndRunUpdate(
                         await checkSchemas();
                         assertCurrent();
                         if (!target.packageAlreadyCurrent && !initialization.stagedPackage) {
+                          await assertSelectedRuntimeCurrent();
                           initializationStage = await stagePackageInstallUpdate(
                             stageParams(presentation),
                           );
@@ -455,7 +465,7 @@ export async function initializeAndRunUpdate(
                           invocationCwd,
                           progress: presentation.progress,
                           assertCurrent,
-                          checkSchemas: async (phase) => void (await checkSchemas(phase)),
+                          checkSchemas: async () => void (await checkSchemas()),
                         });
                       } finally {
                         presentation.dispose();
@@ -488,6 +498,7 @@ export async function initializeAndRunUpdate(
                 ) {
                   const presentation = createUpdateProgress(!opts.json);
                   try {
+                    await assertSelectedRuntimeCurrent();
                     return await withPrivateStagedPackageInstall(
                       stageParams(presentation),
                       async ({ stage }) => {

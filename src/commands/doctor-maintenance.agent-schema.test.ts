@@ -27,7 +27,7 @@ it.each([
   "lost-empty-sequence",
   "recorded-empty",
   "recorded-secondary",
-] as const)("verifies required agents after schema-24 repair (%s)", async (scenario) => {
+] as const)("verifies required agents after schema-26 repair (%s)", async (scenario) => {
   await withOpenClawTestState({ scenario: "empty" }, async (state) => {
     const agentId = scenario === "recorded-secondary" ? "worker" : "main";
     const cfg: OpenClawConfig = {
@@ -58,13 +58,13 @@ it.each([
     using seed = new DatabaseSync(pathname);
     seed.exec(
       fs.readFileSync(
-        new URL("../../test/fixtures/sqlite/openclaw-agent-schema-v24.sql", import.meta.url),
+        new URL("../../test/fixtures/sqlite/openclaw-agent-schema-v26.sql", import.meta.url),
         "utf8",
       ),
     );
-    seed.exec(`PRAGMA user_version = 24;
+    seed.exec(`PRAGMA user_version = 26;
       INSERT INTO schema_meta (meta_key, role, schema_version, agent_id, created_at, updated_at)
-      VALUES ('primary', 'agent', 24, '${agentId}', 1, 1);`);
+      VALUES ('primary', 'agent', 26, '${agentId}', 1, 1);`);
     const empty = scenario.startsWith("lost-empty") || scenario.startsWith("recorded-");
     if (!empty) {
       seed.exec(`
@@ -135,7 +135,7 @@ it.each([
         (cause: unknown) => cause,
       );
       expect(error).toBeInstanceOf(Error);
-      expect(String(error)).toContain("schema version 24");
+      expect(String(error)).toContain("schema version 26");
       expect(classifyDoctorMaintenanceRefusal(error)).toEqual({
         kind: "data-at-risk",
         reason: "incomplete-migration",
@@ -144,7 +144,7 @@ it.each([
     } else {
       await expect(ready).resolves.toEqual({ schemaPublicationDeferred: false });
       using migrated = new DatabaseSync(pathname, { readOnly: true });
-      expect(migrated.prepare("PRAGMA user_version").get()).toEqual({ user_version: 25 });
+      expect(migrated.prepare("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(migrated.prepare("SELECT event_json FROM transcript_events").all()).toEqual(
         empty ? [] : [{ event_json: transcript }],
       );

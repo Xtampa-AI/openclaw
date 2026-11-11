@@ -29,7 +29,7 @@ const DEFAULT_ACCOUNT_KEY = "default";
 const STORAGE_META_FILENAME = "storage-meta.json";
 
 function openStorageMetaStore(rootDir: string) {
-  return getMatrixRuntime().state.openKeyedStore<MatrixStorageMetadata>(
+  return getMatrixRuntime().state.openKeyedStoreV2<MatrixStorageMetadata>(
     openMatrixStorageMetaStoreOptions(rootDir),
   );
 }
@@ -288,19 +288,25 @@ export async function maybeMigrateLegacyStorage({
     return;
   }
   const syncCache = await import("./sync-cache-state.js");
-  if (!(await syncCache.readLegacyMatrixSyncCacheState(rootDir))) {
+  const { Utf8InputError } = await import("openclaw/plugin-sdk/runtime-doctor-migrations");
+  const logger = getMatrixRuntime().logging.getChildLogger({ module: "matrix-storage" });
+  let persisted;
+  try {
+    persisted = await syncCache.readLegacyMatrixSyncCacheState(rootDir);
+  } catch (error) {
+    if (!(error instanceof Utf8InputError)) {
+      throw error;
+    }
+    logger.warn?.(`${error.message} Legacy Matrix sync cache left in place: ${storagePath}`);
     return;
   }
-
-  const logger = getMatrixRuntime().logging.getChildLogger({ module: "matrix-storage" });
+  if (!persisted) {
+    return;
+  }
   fs.mkdirSync(rootDir, { recursive: true });
   let migrated = false;
   try {
-    const persisted = await syncCache.readLegacyMatrixSyncCacheState(rootDir);
-    if (!persisted) {
-      return;
-    }
-    const store = getMatrixRuntime().state.openKeyedStore<
+    const store = getMatrixRuntime().state.openKeyedStoreV2<
       import("./sync-cache-state.js").MatrixSyncCacheRecord
     >(syncCache.openMatrixSyncCacheStoreOptions(rootDir));
     if (!(await syncCache.hasMatrixSyncCacheStateInStore({ storageRootDir: rootDir, store }))) {
@@ -378,21 +384,6 @@ async function mutateStorageMeta(rootDir: string, mutation: StorageMetaMutation)
       store,
       STORAGE_META_STATE_KEY,
       (current) => prepareStorageMetaMutation(decode(current), mutation) ?? undefined,
-      () => {
-        // The published >=2026.9.4 host floor predates data-only comparisons.
-        const legacyStore = getMatrixRuntime().state.openSyncKeyedStore<MatrixStorageMetadata>(
-          openMatrixStorageMetaStoreOptions(rootDir),
-        );
-        const next = prepareStorageMetaMutation(
-          decode(legacyStore.lookup(STORAGE_META_STATE_KEY)),
-          mutation,
-        );
-        if (!next) {
-          return false;
-        }
-        legacyStore.register(STORAGE_META_STATE_KEY, next);
-        return true;
-      },
       "skip",
     );
   } catch {

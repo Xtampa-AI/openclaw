@@ -36,8 +36,10 @@ import { resolveEnvironmentValue } from "./process-env.js";
 import { throwSqliteLifecycleErrors } from "./sqlite-lifecycle-errors.js";
 import { stopSupervisedPredecessorGateway } from "./update-candidate-predecessor-stop.js";
 import { UPDATE_RUN_ID_ENV } from "./update-control-plane-sentinel.js";
+import { createDoctorServiceInspectionBudget } from "./update-doctor-deadline.js";
 import {
   UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV,
+  createUpdateDoctorDatabaseWriteCapture,
   recordUpdateDoctorConfigWriteRefusal,
   writeUpdatePostInstallDoctorResult,
 } from "./update-doctor-result.js";
@@ -55,11 +57,14 @@ import {
   createDelegatedUpdateRequesterAuthority,
   UpdateRequesterRevokedError,
 } from "./update-requester-authority.js";
-import { adoptUpdateRun, getUpdateRun } from "./update-run-ledger.js";
-import type { UpdateRunRecord } from "./update-run-record.js";
+import { adoptUpdateRun, getUpdateRun, recordUpdateRunStep } from "./update-run-ledger.js";
+import type { UpdateRunRecord, UpdateRunStep } from "./update-run-record.js";
 import type { UpdateRecoveryFence } from "./update-run-recovery.js";
+import { updateRunStepsFromResultStep } from "./update-run-step.js";
 import { recordUpdateRunStepAsync } from "./update-run-write.async.js";
+import type { UpdateRunResult } from "./update-runner-types.js";
 import { isOmittedUpdateTimeout } from "./update-timeout-provenance.js";
+import { closeDefaultRetainedNativeWorkerSource } from "./worker-native-lifecycle.js";
 
 async function finalizeMigratedUpdate(): Promise<void> {
   // Validation imports this whole candidate graph before activation. The helper
@@ -215,7 +220,6 @@ async function finalizeMigratedUpdate(): Promise<void> {
       ? { restartRunId: terminal.runId }
       : { terminalRunId: terminal.runId }),
     executorDelegation: "pid-start-v1",
-    automaticTriage: finalized.automaticTriage,
   };
   // Private response publication follows executor settlement and terminal history.
   await fs.writeFile(input.resultPath, JSON.stringify(response), { mode: 0o600 });
@@ -276,6 +280,7 @@ async function runDelegatedPostCore(input: UpdatePostCoreInput): Promise<void> {
 }
 
 async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
+  const remaining = createDoctorServiceInspectionBudget(input.serviceInspectionDeadlineAtMs);
   const resultPath = process.env[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV]?.trim();
   if (!resultPath || !input.executor) {
     throw new Error("Update Doctor requires its delegated executor and result path.");
@@ -323,12 +328,28 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
       }
       const { runDoctorHealthFlow } = await import("../flows/doctor-health.js");
       assertCurrent();
+      remaining();
+      const databaseWriteCapture = createUpdateDoctorDatabaseWriteCapture(
+        input.databaseGenerations,
+        {
+          env: process.env,
+          root: input.root,
+          signal: new AbortController().signal,
+          assertCurrent,
+          warn: (message) => process.stderr.write(message + "\n"),
+        },
+      );
+      await databaseWriteCapture?.admit();
+      assertCurrent();
       await stopSupervisedPredecessorGateway(input, {
+        databaseWriteCapture,
         root: input.root,
         assertCurrent,
+        serviceInspectionBudget: remaining,
         warn: (message) => process.stderr.write(`${message}\n`),
       });
       assertCurrent();
+      const doctorBudget = remaining();
       await runDoctorHealthFlow(
         {
           ...defaultRuntime,
@@ -345,6 +366,7 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
             : {}),
         },
         {
+          databaseWriteCapture,
           inputHash: input.configInputHash,
           assertCurrent,
           commandAuthority,
@@ -354,6 +376,8 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
             ref: input.originalRecoveryCapture,
           },
           ...(input.databaseGenerations ? { databaseGenerations: input.databaseGenerations } : {}),
+          serviceInspectionDeadlineAtMs:
+            doctorBudget === undefined ? undefined : Date.now() + doctorBudget,
           ...(input.postCoreSchemaRepair === true
             ? { postCoreSchemaRepair: { runId: input.runId, assertCurrent } }
             : {}),
@@ -361,6 +385,58 @@ async function runDelegatedDoctor(input: UpdateDoctorInput): Promise<void> {
       );
     },
   );
+}
+
+/**
+ * Time the handoff from receipts the previous driver already wrote, so an
+ * installed driver that predates this step still yields its start: its last
+ * completed row starts the handoff, and this fresh driver ends it before
+ * resuming verification. Timing never changes the update outcome.
+ */
+function recordDriverHandoff(
+  run: NonNullable<UpdateCommandOptions["run"]>,
+  result: UpdateRunResult,
+  adopted: UpdateRunRecord,
+  bufferedSteps: readonly UpdateRunStep[],
+): void {
+  try {
+    const steps = [...adopted.steps, ...bufferedSteps];
+    let previous: UpdateRunStep | undefined;
+    for (const step of steps) {
+      if (
+        step.endedAtMs !== undefined &&
+        !step.step.startsWith("driver:") &&
+        step.endedAtMs > (previous?.endedAtMs ?? 0)
+      ) {
+        previous = step;
+      }
+    }
+    if (previous?.endedAtMs === undefined) {
+      return;
+    }
+    const endedAtMs = Date.now();
+    const startedAtMs = Math.min(previous.endedAtMs, endedAtMs);
+    const adoptedAtMs = steps.find((step) => step.step === "driver:adopted")?.endedAtMs;
+    const step = {
+      name: "update-driver-handoff",
+      command: "openclaw update",
+      cwd: result.root ?? "",
+      durationMs: endedAtMs - startedAtMs,
+      exitCode: 0,
+      diagnostics: [
+        `Handoff began after "${previous.step}"` +
+          (adoptedAtMs === undefined
+            ? "."
+            : `; the fresh driver adopted the run after ${Math.max(0, adoptedAtMs - startedAtMs)}ms.`),
+      ],
+    };
+    result.steps.push(step);
+    for (const row of updateRunStepsFromResultStep(step)) {
+      recordUpdateRunStep(run.runId, { ...row, startedAtMs, endedAtMs }, { env: run.env });
+    }
+  } catch {
+    // Handoff timing is diagnostic; finalization proceeds without it.
+  }
 }
 
 async function finalizeInput(
@@ -379,7 +455,7 @@ async function finalizeInput(
   }
   const { requesterAuthority: descriptor, ...runIdentity } = transferredRun;
   executorFence.assertCurrent();
-  adoptUpdateRun(runIdentity.runId, { env: runIdentity.env });
+  const adopted = adoptUpdateRun(runIdentity.runId, { env: runIdentity.env });
   // Parent closures cannot cross JSON. The fresh runtime retains identity checks
   // under its validated original native update lineage.
   const run: NonNullable<UpdateCommandOptions["run"]> = {
@@ -412,6 +488,7 @@ async function finalizeInput(
       await recordUpdateRunStepAsync(run.runId, step, { env, context, assertCurrent });
     }
   }
+  recordDriverHandoff(run, input.params.result, adopted, input.bufferedSteps);
   const stopped = input.params.preManagedServiceStop;
   if (input.windowsTaskAutoStartSuspended && !stopped?.serviceEnv) {
     throw new Error("Transferred Windows task suspension is missing its stopped service owner.");
@@ -438,7 +515,6 @@ async function finalizeInput(
   let result;
   let exitCode = 0;
   let candidateStartAttempted = false;
-  let automaticTriage: MigratedUpdateFinalizationResult["automaticTriage"];
   try {
     // This worker already loaded the candidate; the local flag conveys no authority.
     result = await finishUpdate(
@@ -452,6 +528,7 @@ async function finalizeInput(
       },
       {
         candidateRuntime: true,
+        adoptedFinalization: true,
         onGatewayStartAttempted: () => {
           candidateStartAttempted = true;
         },
@@ -463,7 +540,6 @@ async function finalizeInput(
     }
     result = error.result;
     exitCode = error.exitCode;
-    automaticTriage = error.automaticTriage;
   } finally {
     await windowsRecovery?.complete(
       result?.status === "ok" ||
@@ -471,7 +547,7 @@ async function finalizeInput(
     );
   }
   executorFence.assertCurrent();
-  return { run, result, exitCode, automaticTriage, candidateStartAttempted };
+  return { run, result, exitCode, candidateStartAttempted };
 }
 
 void (async () => {
@@ -480,6 +556,7 @@ void (async () => {
     finalizeMigratedUpdate,
     finalizeActiveDebugProxyCaptures,
     closeOpenClawStateDatabaseAsync,
+    closeDefaultRetainedNativeWorkerSource,
   ]) {
     try {
       await finalize();

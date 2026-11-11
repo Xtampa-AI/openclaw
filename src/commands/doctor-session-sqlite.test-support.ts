@@ -326,12 +326,11 @@ export function useDoctorSessionSqliteTestFixture() {
     expect(imported.targets[0]?.issues).toEqual([]);
     const manifestPath = requireMigrationManifestPath(imported.migrationRun?.manifestPath);
     const manifest = readMigrationManifest(manifestPath);
-    const target = manifest.targets[0]!;
-    const archivePath = target.completedMoves.find(
+    const archivePath = manifest.targets[0]!.completedMoves.find(
       (move) => move.kind === "transcript",
     )!.archivePath;
     closeOpenClawAgentDatabasesForTest();
-    return { store, imported, archivePath, manifestPath, manifest, target };
+    return { store, imported, archivePath, manifestPath, manifest };
   }
 
   return {

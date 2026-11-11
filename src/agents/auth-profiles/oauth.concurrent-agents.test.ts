@@ -43,7 +43,11 @@ import { loadPersistedAuthProfileStore } from "./persisted.js";
 import { removeAuthProfilesAcrossOwnerStores } from "./profiles.js";
 import { clearRuntimeAuthProfileStoreSnapshots } from "./runtime-snapshots.js";
 import { resolveAuthProfileDatabasePath, writePersistedAuthProfileStoreRaw } from "./sqlite.js";
-import { ensureAuthProfileStore, saveAuthProfileStore } from "./store-runtime.js";
+import {
+  ensureAuthProfileStore,
+  resolvePersistedAuthProfileOwnerAgentDirAsync,
+  saveAuthProfileStore,
+} from "./store-runtime.js";
 import { resolvePersistedAuthProfileOwnerAgentDir } from "./store.js";
 import { persistAuthProfileBatch } from "./upsert-with-lock.js";
 
@@ -160,7 +164,7 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
         access: "surviving-access",
         refresh: "surviving-refresh",
         expires: Date.now() + 3_600_000,
-      } as never);
+      });
 
       const resolving = resolveFrom(mainAgentDir);
       if (peerGeneration === "matching") {
@@ -185,14 +189,18 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
   );
 
   it("gives one copied refresh generation one durable main-store owner", async () => {
+    const { createSqliteReadOnlyWorkerScope } =
+      await import("../../infra/sqlite-readonly-worker.js");
+    const readOnlyWorkers = createSqliteReadOnlyWorkerScope();
     const work = new AsyncWorkScope();
     const { promise: finishRefreshGate, resolve: finishRefresh } = createDeferredCore();
     // Vitest can time out the observer before the accepted refresh finishes.
     settleCaseWork = async () => {
       finishRefresh();
       await work.drain();
+      await readOnlyWorkers.close();
     };
-    await work.track(async () => {
+    const runCase = async () => {
       const freshExpiry = Date.now() + 60 * 60 * 1000;
       const subAgents = await Promise.all(
         Array.from({ length: 4 }, async (_, i) => {
@@ -254,6 +262,19 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
           profileId,
         }),
       ).toBeUndefined();
+      const [copiedOwner, independentOwner, portableOwner] = await Promise.all(
+        subAgents
+          .slice(1)
+          .map((agentDir) =>
+            work.track(() =>
+              resolvePersistedAuthProfileOwnerAgentDirAsync({ agentDir, profileId }),
+            ),
+          ),
+      );
+      expect(copiedOwner).toBeUndefined();
+      expect(independentOwner).toBe(subAgents[2]);
+      // A portable copy is not fenced, but its matching refresh generation still reads main.
+      expect(portableOwner).toBeUndefined();
       expect(callCount).toBe(1);
       for (const agentDir of subAgents.slice(0, 2)) {
         const fenced = read(agentDir);
@@ -309,7 +330,8 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
       await expect(resolveFrom(subAgents[3])).resolves.toEqual(
         expect.objectContaining({ apiKey: "portable-access" }),
       );
-    });
+    };
+    await readOnlyWorkers.run(() => work.track(runCase));
   }, 10_000);
 
   it("keeps pending observers read-only until the owner claims a late peer", async () => {

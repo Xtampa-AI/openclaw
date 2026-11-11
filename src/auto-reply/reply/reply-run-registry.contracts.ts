@@ -83,6 +83,7 @@ export type ReplyToolAuthorityRoute = Readonly<{
 
 /** Per-message authority facts projected against an active run's frozen owner state. */
 export type ReplyToolAuthorityOverlay = Readonly<{
+  sessionKey?: string;
   operatorAuthority?: AdmittedRunOperatorAuthority;
   permissionMode?: SessionEntry["permissionMode"];
   toolOverrides?: SessionEntry["toolOverrides"];
@@ -90,6 +91,8 @@ export type ReplyToolAuthorityOverlay = Readonly<{
   messageProvider?: string;
   chatType?: ChatType;
   agentAccountId?: string;
+  conversationId?: string;
+  messageThreadId?: string | number;
   conversationToolPolicy?: GroupToolPolicyConfig;
   groupId?: string;
   groupChannel?: string;
@@ -101,7 +104,9 @@ export type ReplyToolAuthorityOverlay = Readonly<{
   senderUsername?: string;
   senderE164?: string;
   senderIsOwner: boolean;
+  gitContributorProfileId?: string;
   inputProvenance?: InputProvenance;
+  allowCollaborativeSteering?: boolean;
   trustedInternalHandoff?: TrustedSubagentCompletionHandoff;
   scheduledToolPolicy?: ScheduledToolPolicyContext;
   runtimePluginToolGrant?: RuntimePluginToolGrant;
@@ -120,12 +125,13 @@ type ReplyTurnParticipantInput = Pick<
 >;
 
 export type ReplyToolAuthoritySnapshot = Readonly<{
+  close?(): void;
   personalToolOwner?: ReplyTurnParticipantInput;
   /** Selection admitted before runtime fallback or hooks choose a concrete model. */
   requestedRoute?: ReplyToolAuthorityRoute;
-  /** @deprecated Use fingerprintAsync for worker-backed preparation. */
+  /** @deprecated Use fingerprintAsync for worker-backed preparation. Supported through 2026-12-31. */
   fingerprint(route?: ReplyToolAuthorityRoute): string;
-  /** @deprecated Use projectAsync for worker-backed preparation. */
+  /** @deprecated Use projectAsync for worker-backed preparation. Supported through 2026-12-31. */
   project: (overlay: ReplyToolAuthorityOverlay, route: ReplyToolAuthorityRoute) => string;
   fingerprintAsync?(route?: ReplyToolAuthorityRoute): Promise<string>;
   projectAsync?(
@@ -180,7 +186,7 @@ export type ReplyToolAuthorityPreparation = {
 export type ReplyBackendMessageInjectionV2 = {
   readonly version: 2;
   isAvailable(): boolean;
-  /** @deprecated Use queueMessageAsync with fresh policy preparation. */
+  /** @deprecated Use queueMessageAsync with fresh policy preparation. Supported through 2026-12-31. */
   queueMessage(
     text: string,
     options: ReplyBackendQueueMessageOptions | undefined,
@@ -193,7 +199,7 @@ export type ReplyBackendMessageInjectionV2 = {
     preparation: ReplyToolAuthorityPreparation,
     authorityKind: "run" | "source-bound",
   ): Promise<void | ReplyBackendQueueMessageResult>;
-  /** @deprecated Use claimPendingUserInputAnswerAsync with fresh policy preparation. */
+  /** @deprecated Use claimPendingUserInputAnswerAsync with fresh policy preparation. Supported through 2026-12-31. */
   claimPendingUserInputAnswer?(
     text: string,
     options: ReplyBackendQueueMessageOptions | undefined,
@@ -206,7 +212,7 @@ export type ReplyBackendMessageInjectionV2 = {
     preparation: ReplyToolAuthorityPreparation,
     authorityKind: "run" | "source-bound",
   ): Promise<boolean>;
-  /** @deprecated Use cancelPendingUserInputAsync with fresh policy preparation. */
+  /** @deprecated Use cancelPendingUserInputAsync with fresh policy preparation. Supported through 2026-12-31. */
   cancelPendingUserInput?(
     resolvedBy: string,
     assertCurrent: () => void,
@@ -419,19 +425,19 @@ export type ReplyOperation = {
   markSteeredInputAccepted(params: { inboundAudio: boolean }): void;
   markSourceReplyDelivered(): void;
   /** Freeze the complete caller policy before a concrete backend attempt attaches. */
-  /** @deprecated Use bindToolAuthoritySnapshotAsync. */
+  /** @deprecated Use bindToolAuthoritySnapshotAsync. Supported through 2026-12-31. */
   bindToolAuthoritySnapshot(snapshot: ReplyToolAuthoritySnapshot): void;
   bindToolAuthoritySnapshotAsync(snapshot: ReplyToolAuthoritySnapshot): Promise<void>;
   setAutomaticFallbackRoute(route: ReplyToolAuthorityRoute | undefined): void;
   /** Project an inbound turn through the current concrete route; settled owners fail closed. */
-  /** @deprecated Use projectToolAuthorityFingerprintAsync. */
+  /** @deprecated Use projectToolAuthorityFingerprintAsync. Supported through 2026-12-31. */
   projectToolAuthorityFingerprint(overlay: ReplyToolAuthorityOverlay): string | undefined;
   projectToolAuthorityFingerprintAsync(
     this: void,
     overlay: ReplyToolAuthorityOverlay,
   ): Promise<string | undefined>;
   /** Prepare fingerprint and projection together for the final concrete attempt route. */
-  /** @deprecated Use bindToolAuthorityRouteAsync. */
+  /** @deprecated Use bindToolAuthorityRouteAsync. Supported through 2026-12-31. */
   bindToolAuthorityRoute(route: ReplyToolAuthorityRoute): string;
   bindToolAuthorityRouteAsync(route: ReplyToolAuthorityRoute): Promise<string>;
   updateSessionId(nextSessionId: string): void;

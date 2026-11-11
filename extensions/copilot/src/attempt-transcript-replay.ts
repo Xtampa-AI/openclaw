@@ -6,8 +6,9 @@ export type AttemptTranscriptMessage =
   | NonNullable<TranscriptRecorder["message"]>
   | Extract<AgentMessage, { role: "assistant" | "toolResult" }>;
 
-export function readIdempotencyKey(message: object): string | undefined {
-  const key = "idempotencyKey" in message ? message.idempotencyKey : undefined;
+export function readIdempotencyKey(message: AgentMessage): string | undefined {
+  // SAFETY: Reads an optional transcript field as unknown and validates it before use.
+  const key = (message as { idempotencyKey?: unknown }).idempotencyKey;
   return typeof key === "string" && key ? key : undefined;
 }
 

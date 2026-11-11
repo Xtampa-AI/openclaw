@@ -194,7 +194,7 @@ export function createMcpRequestLifecycle(humanInputTimeoutMs: number) {
         timeouts.add(timeoutError);
         abortController.abort(timeoutError);
       };
-      let deadline = Date.now() + timeoutMs;
+      let deadline = performance.now() + timeoutMs;
       let humanInputRemainingMs = humanInputTimeoutMs;
       let humanInputStartedAt = 0;
       let humanInputWaits = 0;
@@ -203,17 +203,20 @@ export function createMcpRequestLifecycle(humanInputTimeoutMs: number) {
       timeout.unref?.();
       const armTimeout = (expiresAt: number) => {
         clearTimeout(timeout);
-        timeout = setTimeout(onTimeout, Math.max(0, expiresAt - Date.now()));
+        timeout = setTimeout(onTimeout, Math.max(0, expiresAt - performance.now()));
         timeout.unref?.();
       };
       const holdForHumanInput = () => {
         if (humanInputWaits++ === 0) {
-          humanInputStartedAt = Date.now();
+          humanInputStartedAt = performance.now();
           armTimeout(deadline + humanInputRemainingMs);
         }
         return () => {
           if (--humanInputWaits === 0 && !finished && !abortController.signal.aborted) {
-            const elapsed = Math.min(Date.now() - humanInputStartedAt, humanInputRemainingMs);
+            const elapsed = Math.min(
+              performance.now() - humanInputStartedAt,
+              humanInputRemainingMs,
+            );
             humanInputRemainingMs -= elapsed;
             deadline += elapsed;
             armTimeout(deadline);

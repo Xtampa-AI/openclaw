@@ -1,4 +1,4 @@
-import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { coerceErrorMessage, formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { isJsonObject, type JsonValue } from "./protocol.js";
 
 export const CODEX_APP_SERVER_OVERLOADED_ERROR_CODE = -32_001;
@@ -46,6 +46,20 @@ export function isCodexThreadReadMissingError(error: unknown, threadId: string):
   );
 }
 
+export function isCodexThreadClosingError(
+  error: unknown,
+  threadId: string,
+): error is CodexAppServerRpcError {
+  // Native rejects this resume before acquiring its subscription while teardown is pending.
+  return (
+    error instanceof CodexAppServerRpcError &&
+    error.method === "thread/resume" &&
+    error.code === -32_600 &&
+    error.message ===
+      `thread ${threadId} is closing; retry thread/resume after the thread is closed`
+  );
+}
+
 function readCodexAppServerRpcReloginDetail(data: JsonValue | undefined): string | undefined {
   const record = isJsonObject(data) ? data : undefined;
   const nested = isJsonObject(record?.error) ? record.error : record;
@@ -79,5 +93,13 @@ export class CodexAppServerLocalRequestCancellationError extends Error {
 export function isCodexAppServerOverloadError(error: unknown): error is CodexAppServerRpcError {
   return (
     error instanceof CodexAppServerRpcError && error.code === CODEX_APP_SERVER_OVERLOADED_ERROR_CODE
+  );
+}
+
+export function isMissingCodexParentThreadError(error: unknown): boolean {
+  const message = formatErrorMessage(error);
+  return (
+    message.includes("no rollout found for thread id") ||
+    message.includes("includeTurns is unavailable before first user message")
   );
 }

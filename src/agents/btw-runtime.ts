@@ -1,26 +1,24 @@
-/** Runtime preparation for /btw side questions. */
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { GetReplyOptions } from "../auto-reply/get-reply-options.types.js";
 import type { ReplyPayload } from "../auto-reply/reply-payload.js";
-import {
-  buildReplyUsageState,
-  recordReplyUsageState,
-} from "../auto-reply/reply/reply-usage-state.js";
 import type { ReasoningLevel, ThinkLevel } from "../auto-reply/thinking.js";
 import type { ChatType } from "../channels/chat-type.js";
 import type { SessionEntry as StoredSessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { emitTrustedDiagnosticEvent, isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
 import type { ImageContent, Message, Model, TextContent } from "../llm/types.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { runWithAsyncWorkResources } from "../shared/async-work-resources.js";
-import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
+import {
+  prepareSystemAgentRunAdmission,
+  type AdmittedRunOperatorAuthority,
+} from "./admitted-run-context.js";
 import { resolveExternalCliAuthOverlayScopeFromSelection } from "./auth-profiles/external-cli-auth-selection.js";
 import { resolveSessionAuthSelection } from "./auth-profiles/session-override.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import { reconcileAuthProfileQuotaBlocks } from "./auth-profiles/usage.js";
 import { buildBtwCliPrompt, buildBtwSystemPrompt } from "./btw-prompts.js";
-import { normalizeBtwContentBlocks, resolveBtwSessionTranscriptPath } from "./btw-transcript.js";
+import { normalizeBtwContentBlocks } from "./btw-transcript.js";
 import { executePreparedCliRun } from "./cli-runner/execute.runtime.js";
 import { prepareCliRunContext } from "./cli-runner/prepare.runtime.js";
 import type { BlockReplyChunking } from "./embedded-agent-block-chunker.js";
@@ -28,8 +26,8 @@ import { resolveModelAsync } from "./embedded-agent-runner/model.js";
 import type { AgentHarness } from "./harness/types.js";
 import type { ImageSanitizationLimits } from "./image-sanitization.js";
 import {
-  ensureAuthProfileStore,
-  ensureAuthProfileStoreWithoutExternalProfiles,
+  ensureAuthProfileStoreAsync,
+  ensureAuthProfileStoreWithoutExternalProfilesAsync,
 } from "./model-auth.js";
 import { isOpenAIProvider } from "./openai-routing.js";
 import {
@@ -46,11 +44,9 @@ import {
 import type { AgentRuntimeAuthPlan } from "./runtime-plan/types.js";
 import { resolveAgentTimeoutMs } from "./timeout.js";
 import { sanitizeImageBlocks } from "./tool-images.js";
-import { hasBillableUsage, toDiagnosticUsage, type NormalizedUsage } from "./usage.js";
-
+import { normalizeUsage, type NormalizedUsage } from "./usage.js";
 // Planning and immediate resolution share one scoped snapshot so provider
 // bindings and cooldown decisions cannot diverge inside a side question.
-
 export async function prepareBtwRuntimeAuth(params: {
   cfg: OpenClawConfig;
   model: Model;
@@ -64,14 +60,17 @@ export async function prepareBtwRuntimeAuth(params: {
 }) {
   const { model } = params;
   const storeOptions = { profileId: params.authProfileId, allowKeychainPrompt: false };
-  const loadStore = (externalCliProviderIds?: readonly string[]) =>
+  const loadStore = async (externalCliProviderIds?: readonly string[]) =>
     externalCliProviderIds
-      ? ensureAuthProfileStore(params.agentDir, { ...storeOptions, externalCliProviderIds })
-      : ensureAuthProfileStoreWithoutExternalProfiles(params.agentDir, storeOptions);
+      ? await ensureAuthProfileStoreAsync(params.agentDir, {
+          ...storeOptions,
+          externalCliProviderIds,
+        })
+      : await ensureAuthProfileStoreWithoutExternalProfilesAsync(params.agentDir, storeOptions);
   let store: AuthProfileStore;
   let ignoreAutoPreferredProfile = false;
   if (isOpenAIProvider(model.provider)) {
-    store = loadStore(["openai"]);
+    store = await loadStore(["openai"]);
   } else {
     const selection = {
       provider: model.provider,
@@ -83,14 +82,14 @@ export async function prepareBtwRuntimeAuth(params: {
         params.authProfileIdSource === "user" ? params.authProfileId : undefined,
     };
     let externalCliAuthScope = resolveExternalCliAuthOverlayScopeFromSelection(selection);
-    store = loadStore(externalCliAuthScope.providerIds);
+    store = await loadStore(externalCliAuthScope.providerIds);
     if (!externalCliAuthScope.providerIds) {
       externalCliAuthScope = resolveExternalCliAuthOverlayScopeFromSelection({
         ...selection,
         store,
       });
       if (externalCliAuthScope.providerIds) {
-        store = loadStore(externalCliAuthScope.providerIds);
+        store = await loadStore(externalCliAuthScope.providerIds);
       }
     }
     ignoreAutoPreferredProfile = externalCliAuthScope.ignoreAutoPreferredProfile;
@@ -120,24 +119,19 @@ export async function prepareBtwRuntimeAuth(params: {
 }
 
 function isBtwTextBlock(block: unknown): block is TextContent {
-  if (!block || typeof block !== "object") {
-    return false;
-  }
-  // SAFETY: the guard above establishes a non-null object; only optional fields are inspected.
-  const record = block as { type?: unknown; text?: unknown };
-  return normalizeLowercaseStringOrEmpty(record.type) === "text" && typeof record.text === "string";
+  return (
+    isRecord(block) &&
+    normalizeLowercaseStringOrEmpty(block.type) === "text" &&
+    typeof block.text === "string"
+  );
 }
 
 function isBtwImageBlock(block: unknown): block is ImageContent {
-  if (!block || typeof block !== "object") {
-    return false;
-  }
-  // SAFETY: the guard above establishes a non-null object; only optional fields are inspected.
-  const record = block as { type?: unknown; data?: unknown; mimeType?: unknown };
   return (
-    normalizeLowercaseStringOrEmpty(record.type) === "image" &&
-    typeof record.data === "string" &&
-    typeof record.mimeType === "string"
+    isRecord(block) &&
+    normalizeLowercaseStringOrEmpty(block.type) === "image" &&
+    typeof block.data === "string" &&
+    typeof block.mimeType === "string"
   );
 }
 
@@ -181,31 +175,17 @@ async function sanitizeBtwUserMessage(params: {
 function sanitizeBtwAssistantMessage(
   message: Extract<Message, { role: "assistant" }>,
 ): Extract<Message, { role: "assistant" }> | undefined {
-  // SAFETY: persisted transcripts can contain legacy string content outside the current message type.
-  const rawContent = (message as { content?: unknown }).content;
+  const rawContent: unknown = message.content;
+  let content: TextContent[];
   if (typeof rawContent === "string") {
-    const trimmed = rawContent.trim();
-    return trimmed.length > 0
-      ? {
-          ...message,
-          content: [{ type: "text", text: trimmed }],
-        }
-      : undefined;
+    const text = rawContent.trim();
+    content = text ? [{ type: "text", text }] : [];
+  } else {
+    content = (normalizeBtwContentBlocks(rawContent) ?? []).flatMap((block): TextContent[] =>
+      isBtwTextBlock(block) ? [{ type: "text", text: block.text }] : [],
+    );
   }
-  const blocks = normalizeBtwContentBlocks(rawContent);
-  if (!blocks) {
-    return undefined;
-  }
-  const content = blocks.flatMap((block): TextContent[] =>
-    isBtwTextBlock(block) ? [{ type: "text", text: block.text }] : [],
-  );
-  if (content.length === 0) {
-    return undefined;
-  }
-  return {
-    ...message,
-    content,
-  };
+  return content.length > 0 ? { ...message, content } : undefined;
 }
 
 export async function toSimpleContextMessages(params: {
@@ -214,11 +194,8 @@ export async function toSimpleContextMessages(params: {
 }): Promise<Message[]> {
   const contextMessages: Message[] = [];
   for (const message of params.messages) {
-    if (!message || typeof message !== "object") {
-      continue;
-    }
-    // SAFETY: the guard above establishes a non-null object; only the optional discriminator is read.
-    const role = (message as { role?: unknown }).role;
+    // Read the role without narrowing `message`; the casts below are from the transcript entry.
+    const role = isRecord(message) ? message.role : undefined;
     if (role !== "user" && role !== "assistant") {
       continue;
     }
@@ -226,14 +203,14 @@ export async function toSimpleContextMessages(params: {
     // messages and strip hidden reasoning/tool replay data.
     let sanitizedMessage: Message | undefined;
     if (role === "user") {
-      // SAFETY: the runtime discriminator check above establishes the user-message variant.
+      // SAFETY: transcript entries with role "user" are persisted user Messages; only content is read and replaced.
       const userMessage = message as Extract<Message, { role: "user" }>;
       sanitizedMessage = await sanitizeBtwUserMessage({
         message: userMessage,
         imageLimits: params.imageLimits,
       });
     } else {
-      // SAFETY: the only remaining admitted discriminator is the assistant-message variant.
+      // SAFETY: transcript entries with role "assistant" are persisted assistant Messages; only content is read and replaced.
       const assistantMessage = message as Extract<Message, { role: "assistant" }>;
       sanitizedMessage = sanitizeBtwAssistantMessage(assistantMessage);
     }
@@ -419,6 +396,11 @@ export type RunBtwSideQuestionParams = {
   provider: string;
   model: string;
   question: string;
+  toolCalls?: "deny";
+  assertCurrent?: () => void;
+  operatorAuthority?: AdmittedRunOperatorAuthority;
+  /** Background consumers collect usage without recording a user-facing reply. */
+  onUsage?: (usage: NormalizedUsage | undefined) => void;
   images?: ImageContent[];
   sessionEntry: StoredSessionEntry;
   sessionStore?: Record<string, StoredSessionEntry>;
@@ -460,85 +442,6 @@ export type RunBtwSideQuestionParams = {
   authorityRunId?: string;
 };
 
-export function resolveBtwTranscript(params: RunBtwSideQuestionParams) {
-  const sessionId = params.sessionEntry.sessionId?.trim();
-  if (!sessionId) {
-    throw new Error("No active session context.");
-  }
-  const sessionFile = resolveBtwSessionTranscriptPath({
-    sessionId,
-    sessionEntry: params.sessionEntry,
-    sessionKey: params.sessionKey,
-    storePath: params.storePath,
-  });
-  if (!sessionFile) {
-    throw new Error("No active session transcript.");
-  }
-  return { sessionId, sessionFile };
-}
-
-export function createBtwRuntimeSelectionResolver(params: {
-  request: RunBtwSideQuestionParams;
-  sessionAgentId: string;
-  harness: AgentHarness;
-  preparedModelRuntime: PreparedModelRuntimeSnapshot;
-}) {
-  let selection: Awaited<ReturnType<typeof resolveRuntimeModel>> | undefined;
-  return async () => {
-    selection ??= await resolveRuntimeModel({
-      abortSignal: params.request.opts?.abortSignal,
-      provider: params.request.provider,
-      model: params.request.model,
-      agentId: params.sessionAgentId,
-      sessionEntry: params.request.sessionEntry,
-      sessionStore: params.request.sessionStore,
-      sessionKey: params.request.sessionKey,
-      storePath: params.request.storePath,
-      isNewSession: params.request.isNewSession,
-      harnessId: params.harness.id,
-      harnessAuthBootstrap: params.harness.authBootstrap,
-      preparedModelRuntime: params.preparedModelRuntime,
-    });
-    return selection;
-  };
-}
-
-export function createBtwUsageRecorder(params: {
-  request: RunBtwSideQuestionParams;
-  sessionAgentId: string;
-  sessionId: string;
-}) {
-  return (runtimeModel: Model, usage?: NormalizedUsage) => {
-    if (!hasBillableUsage(usage)) {
-      return;
-    }
-    const usageState = buildReplyUsageState({
-      config: params.request.cfg,
-      agentDir: params.request.agentDir,
-      agentId: params.sessionAgentId,
-      sessionId: params.sessionId,
-      provider: runtimeModel.provider,
-      model: runtimeModel.id,
-      chatType: params.request.chatType,
-      usage,
-    });
-    recordReplyUsageState(params.request.opts?.runId, usageState);
-    if (isDiagnosticsEnabled(params.request.cfg)) {
-      emitTrustedDiagnosticEvent({
-        type: "model.usage",
-        sessionKey: params.request.sessionKey,
-        sessionId: params.sessionId,
-        channel: params.request.messageChannel,
-        agentId: params.sessionAgentId,
-        provider: runtimeModel.provider,
-        model: runtimeModel.id,
-        usage: toDiagnosticUsage(usage),
-        costUsd: usageState.turnUsd,
-      });
-    }
-  };
-}
-
 export async function runCliBtwSideQuestion(params: {
   cfg: OpenClawConfig;
   model: string;
@@ -560,6 +463,7 @@ export async function runCliBtwSideQuestion(params: {
   messageProvider?: string;
   currentChannelId?: string;
   authorityRunId: string;
+  onUsage?: (usage: NormalizedUsage | undefined) => void;
 }): Promise<ReplyPayload> {
   const timeoutMs = resolveAgentTimeoutMs({
     cfg: params.cfg,
@@ -611,6 +515,7 @@ export async function runCliBtwSideQuestion(params: {
     if (!text) {
       throw new Error(`/btw side question via ${params.cliProvider} produced no answer.`);
     }
+    params.onUsage?.(normalizeUsage(output.usage));
     return { text };
   } finally {
     try {
@@ -635,5 +540,3 @@ export async function withBtwPreparedRuntime(
     });
   });
 }
-
-/** Answers a side question using sanitized session context and no tool execution. */

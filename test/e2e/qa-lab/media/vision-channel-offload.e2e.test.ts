@@ -205,7 +205,7 @@ describe("QA-channel vision offload", () => {
     expect(readInputRoles(activeModelRequest), requestDiagnostics).toEqual([
       "developer",
       "user",
-      "developer",
+      "user",
     ]);
     expect(imageRequest.cursor, requestDiagnostics).toBeLessThan(activeModelRequest.cursor);
     expect(imageRequest.allInputText, requestDiagnostics).toContain(IMAGE_PROMPT);

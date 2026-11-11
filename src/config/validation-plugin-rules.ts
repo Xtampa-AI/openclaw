@@ -32,6 +32,7 @@ import {
   normalizeBundledChannelId,
 } from "./validation-channel-rules.js";
 import { collectHeartbeatOwnerWarnings } from "./validation-core.js";
+import { validateProviderModelParams } from "./validation-model-params.js";
 import {
   formatChannelConfigIssueMessage,
   resolveDeferredChannelConfigWarning,
@@ -42,6 +43,7 @@ import {
   collectSecretRefProviderSourceIssues,
 } from "./validation-plugin-registry.js";
 import {
+  preparePluginSchemaValidations,
   validatePreparedPluginSchemaValue,
   type PreparedPluginSchemaValidations,
 } from "./validation-prepared.js";
@@ -79,7 +81,6 @@ export function validatePreparedConfigWithPlugins(
   opts: ValidateConfigWithPluginsParams & {
     applyDefaults: boolean;
     installedPluginRecordIds?: ReadonlySet<string>;
-    schemaValidations?: PreparedPluginSchemaValidations;
   },
 ): ValidateConfigWithPluginsResult {
   let registryInfo: RegistryInfo | null = opts.pluginMetadataSnapshot
@@ -97,12 +98,10 @@ export function validatePreparedConfigWithPlugins(
     return registryInfo;
   };
 
-  if (opts.applyDefaults && !registryInfo && opts.pluginValidation !== "core-only") {
-    const pluginMetadataSnapshot = opts.loadPluginMetadataSnapshot?.(parsedConfig);
-    if (pluginMetadataSnapshot) {
-      registryInfo = { registry: pluginMetadataSnapshot.manifestRegistry };
-    }
-  }
+  let schemaValidations: PreparedPluginSchemaValidations | undefined;
+  const ensureSchemaValidations = () =>
+    (schemaValidations ??= preparePluginSchemaValidations(ensureLoadedRegistryInfo().registry));
+
   const config = opts.applyDefaults
     ? materializeRuntimeConfig(parsedConfig, {
         env: opts.env,
@@ -275,7 +274,7 @@ export function validatePreparedConfigWithPlugins(
       ...new Set(
         registry.plugins
           .flatMap((record) => record.contracts?.webSearchProviders ?? [])
-          .map((providerId) => providerId.trim())
+          .map((providerId) => providerId.trim().toLowerCase())
           .filter((providerId) => providerId.length > 0),
       ),
     ].toSorted((left, right) => left.localeCompare(right));
@@ -286,7 +285,7 @@ export function validatePreparedConfigWithPlugins(
       ...new Set([
         ...collectActiveWebSearchProviderIds(),
         ...resolveWebSearchInstallCatalogEntries()
-          .map((entry) => entry.provider.id.trim())
+          .map((entry) => entry.provider.id.trim().toLowerCase())
           .filter((providerId) => providerId.length > 0),
       ]),
     ].toSorted((left, right) => left.localeCompare(right));
@@ -322,15 +321,17 @@ export function validatePreparedConfigWithPlugins(
       issues.push({ path: issuePath, message: "web_search provider must not be empty" });
       return;
     }
+    // Match the runtime's case-insensitive provider lookup.
+    const normalizedProviderId = trimmed.toLowerCase();
     const activeProviderIds = collectActiveWebSearchProviderIds();
-    if (activeProviderIds.includes(trimmed)) {
+    if (activeProviderIds.includes(normalizedProviderId)) {
       return;
     }
     if (preserveUnavailableConfig(issuePath)) {
       return;
     }
     const installCatalogEntry = resolveWebSearchInstallCatalogEntries().find(
-      (entry) => entry.provider.id === trimmed,
+      (entry) => entry.provider.id.trim().toLowerCase() === normalizedProviderId,
     );
     if (installCatalogEntry) {
       const issue = {
@@ -373,6 +374,16 @@ export function validatePreparedConfigWithPlugins(
       return;
     }
     const { registry } = ensureRegistry();
+    if (!findUninspectedPluginDiagnostic(registry.diagnostics)) {
+      issues.push(
+        ...validateProviderModelParams({
+          config,
+          registry,
+          deferredPluginIds,
+          schemaValidations: ensureSchemaValidations(),
+        }),
+      );
+    }
     const { suppressions } = planManifestModelCatalogSuppressions({ registry });
     const suppressedModels = new Map<string, (typeof suppressions)[number]>();
     for (const suppression of suppressions) {
@@ -496,7 +507,7 @@ export function validatePreparedConfigWithPlugins(
           applyDefaults: true, // Always apply defaults for plugin schema validation;
           // writeConfigFile persists persistCandidate, not validated.config (#61841)
         },
-        opts.schemaValidations,
+        ensureSchemaValidations(),
       );
       if (!result.ok) {
         for (const error of result.errors) {
@@ -586,8 +597,8 @@ export function validatePreparedConfigWithPlugins(
       config,
       env: opts.env,
       applyDefaults: opts.applyDefaults,
-      schemaValidations: opts.schemaValidations,
       registry,
+      schemaValidations: ensureSchemaValidations(),
       deferredPluginIds,
       ensureCompatPluginIds,
       ensureOverriddenPluginIds,
@@ -609,6 +620,9 @@ export function validatePreparedConfigWithPlugins(
     );
   }
 
+  if (issues.length === 0) {
+    (schemaValidations ?? preparePluginSchemaValidations(registryInfo?.registry)).publish();
+  }
   return issues.length > 0
     ? { ok: false, issues, warnings }
     : { ok: true, config: mutatedConfig, warnings };

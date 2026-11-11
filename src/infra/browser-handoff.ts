@@ -89,11 +89,11 @@ async function writeHandoffDocument(filePath: string, content: string): Promise<
     await fs.writeFile(filePath, content, { mode: 0o600, flag: "wx" });
     return;
   }
-  const fd = createPrivateWindowsFile(filePath);
+  const file = createPrivateWindowsFile(filePath);
   try {
-    fsSync.writeFileSync(fd, content);
+    fsSync.writeFileSync(file.fd, content);
   } finally {
-    fsSync.closeSync(fd);
+    file.close();
   }
 }
 

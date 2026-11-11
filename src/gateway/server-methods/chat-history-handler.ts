@@ -7,7 +7,7 @@ import {
   validateChatStartupParams,
 } from "../../../packages/gateway-protocol/src/index.js";
 import { readAcpSessionMetaForEntries } from "../../acp/runtime/session-meta-readonly.js";
-import { resolveAgentConfig } from "../../agents/agent-scope.js";
+import { resolveAgentConfig, resolveAgentVerboseDefault } from "../../agents/agent-scope.js";
 import { findModelCatalogEntry } from "../../agents/model-catalog.js";
 import { resolveConfiguredThinkingDefault } from "../../agents/model-thinking-default.js";
 import {
@@ -27,6 +27,7 @@ import { resolveClaudeCliBindingSessionId } from "../cli-session-history.claude.
 import { projectOperatorModelRead } from "../operator-model-presentation.js";
 import { SerializedJsonArray } from "../serialized-json.js";
 import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
+import { readPreparedGatewayModelMetadata } from "../server-model-catalog-view.js";
 import { buildGatewaySessionSnapshot } from "../session-event-payload.js";
 import { prepareSessionFastModePresentation } from "../session-fast-mode-presentation.js";
 import { resolveSessionHistoryUnavailableMessage } from "../session-history-error.js";
@@ -187,8 +188,9 @@ export async function handleChatHistoryRequest({
     });
     const max = limit ?? 200;
     const maxHistoryBytes = Math.min(maxBytes ?? Infinity, getMaxChatHistoryMessagesBytes());
-    // Recovery lookahead keeps its read budget; every response has the same byte target.
-    const maxResponseBytes = Math.min(maxBytes ?? Infinity, 512 * 1024, maxHistoryBytes);
+    // Keep the default response small while honoring explicit back-scroll budgets.
+    // Recovery lookahead retains its separate read budget.
+    const maxResponseBytes = Math.min(maxBytes ?? 512 * 1024, maxHistoryBytes);
     const effectiveMaxChars = resolveEffectiveChatHistoryMaxChars(maxChars);
     const pendingInputs =
       sessionId && sessionId === entry?.sessionId
@@ -333,6 +335,7 @@ export async function handleChatHistoryRequest({
                 ...selectedSession,
                 key: canonicalKey,
                 preparedAcpMeta: unsavedAcpMeta ?? null,
+                preparedRuntimeOwnership: null,
                 modelCatalog: sessionModelCatalog,
                 rowContext: rowProjection.state.rowContext,
               })),
@@ -398,6 +401,7 @@ export async function handleChatHistoryRequest({
               ...getSessionDefaults(cfg, defaultModelCatalog, {
                 agentId: sessionAgentId,
                 allowPluginNormalization: false,
+                metadataSnapshot: readPreparedGatewayModelMetadata(cfg),
                 providerPolicySource: "active",
               }),
               modelSelectionTarget: resolveGatewayModelSelectionPolicy({
@@ -449,7 +453,7 @@ export async function handleChatHistoryRequest({
       }
       const thinkingLevel =
         sessionInfo?.thinkingLevel ?? sessionInfo?.thinkingDefault ?? defaults?.thinkingDefault;
-      const verboseLevel = entry?.verboseLevel ?? cfg.agents?.defaults?.verboseDefault;
+      const verboseLevel = entry?.verboseLevel ?? resolveAgentVerboseDefault(cfg, sessionAgentId);
       if (sessionInfo) {
         sessionInfo.verboseLevel = verboseLevel;
       }

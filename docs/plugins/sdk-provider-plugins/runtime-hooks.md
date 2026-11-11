@@ -67,6 +67,13 @@ as an optional second argument. Use that captured config for checks such as
 regional endpoint compatibility instead of reloading global runtime config.
 Existing one-argument hooks remain compatible, and direct callers can omit config.
 
+Runtime auth exchange contexts accept an optional `signal`. Pass it to token-exchange
+requests and release resources when it aborts. Embedded runs share their existing
+deadline across credential lookup and exchange, including background runtime auth
+refresh. A timeout names the provider and auth step and fails the caller without
+installing late credentials. Durable OAuth refresh settlement remains owned by
+the OAuth manager.
+
 ## Hook examples
 
 <Tabs>
@@ -107,8 +114,8 @@ Existing one-argument hooks remain compatible, and direct callers can omit confi
     Existing wrappers may still pass the deprecated `maxRetries` stream option,
     including `0`. Built-in text transports ignore it: the embedded runner owns
     retry budgeting, and SDK-internal retries stay disabled. New wrappers should
-    omit the option. This shipped source contract is retained until a future
-    Plugin SDK major release and a published-plugin reader sweep confirm removal
+    omit the option. This shipped source contract is retained until a separately
+    announced ordinary stable release and a published-plugin reader sweep confirm removal
     is safe; it does not change image-generation or native-runtime retry policy.
 
   </Tab>
@@ -237,7 +244,7 @@ Cancelled preparation must reject after cleanup, not report a missing login.
 | `catalog`                         | Model catalog or base URL defaults                                                          |
 | `applyConfigDefaults`             | Provider-owned global defaults during config materialization                                |
 | `normalizeModelId`                | Legacy/preview model-id alias cleanup before lookup                                         |
-| `normalizeTransport`              | Provider-family `api` / `baseUrl` cleanup before generic model assembly                     |
+| `normalizeTransport`              | Same-origin `api` / `baseUrl` cleanup for its transport family before model assembly        |
 | `normalizeConfig`                 | Normalize `models.providers.<id>` config                                                    |
 | `applyNativeStreamingUsageCompat` | Native streaming-usage compat rewrites for config providers                                 |
 | `resolveConfigApiKey`             | Provider-owned env-marker auth resolution                                                   |
@@ -254,7 +261,7 @@ Cancelled preparation must reject after cleanup, not report a missing login.
 | `prepareExtraParams`              | Default request params                                                                      |
 | `createStreamFn`                  | Fully custom StreamFn transport                                                             |
 | `wrapStreamFn`                    | Custom headers/body wrappers on the normal stream path                                      |
-| `reconcileLocalService`           | Cheap, idempotent managed-service repair after health and before every request              |
+| `reconcileLocalService`           | Cheap managed-service repair safe to repeat after health and before every request           |
 | `resolveTransportTurnState`       | Native per-turn headers/metadata and WebSocket headers/cool-down                            |
 | `resolveWebSocketSessionPolicy`   | Deprecated WebSocket compatibility hook; use `resolveTransportTurnState`                    |
 | `formatApiKey`                    | Custom runtime token shape                                                                  |
@@ -302,6 +309,12 @@ entrypoint. Adapters that already bound and redact their diagnostics can constru
 `ProviderHttpError(message, { status })`. Keep that error instance when adjusting
 its message so status and retry metadata survive; search tools use those fields
 for safe authentication and quota guidance without exposing response bodies.
+
+The same entrypoint exposes `runHttpTlsPreflight(url, options)` for a
+non-redirecting reachability probe. It distinguishes certificate failures from
+other network failures, accepts cancellation and a current-authority callback,
+and requests best-effort cancellation of unread response bodies. Any HTTP status
+means the endpoint is reachable; this is not a credential or account check.
 
 Bundled and trusted official provider policies can use
 `resolveEffortThinkingProfile(compat?.supportedReasoningEfforts)` from the

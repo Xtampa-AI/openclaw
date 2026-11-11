@@ -15,6 +15,17 @@ native compaction, and app-server execution. OpenClaw still owns chat
 channels, session files, model selection, OpenClaw dynamic tools, approvals,
 media delivery, and the visible transcript mirror.
 
+If Codex discards an unused native thread, the next turn starts a replacement
+through the existing thread lifecycle and logs a warning. A binding with recorded
+conversation history is preserved when its native thread cannot be found;
+OpenClaw reports the error instead of silently starting over.
+
+Managed inference proxy restarts do not replace an otherwise reusable native
+thread. Thread identity uses the proxy's upstream provider and routing policy, not
+its temporary loopback address. Upstream, authentication-profile, and creation-time
+policy changes still invalidate thread reuse; live requests continue through the
+current owned proxy.
+
 ## Shared output projection
 
 Codex uses the shared native harness projection owners for bounded tool output,
@@ -130,9 +141,7 @@ The page producer and publication remain owned by the list's background completi
 One-shot lists, host-specific lookups, and pagination wait for a usable native
 page or confirmed empty inventory for at most five seconds (or the configured
 app-server request timeout when shorter).
-That single request budget also
-covers loading saved state and draining earlier cache writes after a configuration
-reload. A timed-out caller leaves the shared write drain running. Partial results carry an opaque continuation cursor;
+That single request budget also covers loading saved state. Partial results carry an opaque continuation cursor;
 a continuation that catches up with discovery waits for the next page within its
 request budget. If discovery is still pending at the deadline, the host reports a
 loading error and asks the caller to retry. The shared hydration continues in the
@@ -141,14 +150,13 @@ shown, and initial retries preserve positions already used in continuation curso
 The index persists reconstructible display rows and file fingerprints through
 plugin state in the OpenClaw SQLite database. A valid complete snapshot serves a
 recent unfiltered page without a native request, including on remote app-servers.
-Snapshot restoration waits for earlier cache writes, and mutations received during
-restoration fence stale saved rows from publication. Background work then
-reconciles changed files and native metadata. A
+Background work reconciles changed files and native metadata after snapshot restoration. A
 database-only native metadata walk recovers changes made while the Gateway was
 stopped. A full safety walk becomes due after 15 minutes and runs in the background on the next resident catalog read, including renames, Git branch and other displayed metadata, and the selected rollout
 path after a native revert. An idle catalog does not re-list native history, and the first resident read after an idle interval can return cached rows before the walk finishes. Metadata changes and explicit clears are applied even
-when native activity timestamps do not change. Newer Gateway observations fence
-older background pages. These coalesced background walks reuse previews for
+when native activity timestamps do not change. Overlapping events, snapshot restoration,
+and background pages are best effort: a later completion can temporarily replace
+newer display metadata until the next event or reconciliation. These coalesced background walks reuse previews for
 unchanged rows and do not ask Codex to scan or repair rollouts. Requests over a
 complete snapshot never wait for these refreshes. A local database-only response can omit existing files when
 indexing is incomplete or unavailable, so omission alone does not remove a local
@@ -159,8 +167,7 @@ or receiving its `notLoaded` status withdraws only that connection's observation
 an unrelated helper cannot clear activity observed by another open connection.
 Status resets to **Stored / activity unknown** after restart or when its final
 observing connection closes, until fresh native events or metadata supply current
-status. Overflow pages use this same source-owned status, and their native reads
-cannot overwrite a newer observation received while the request was pending.
+status. Overflow pages use this same source-owned status.
 Late responses from a closed connection cannot restore its active status.
 No native rollouts or transcripts are copied into the state database.
 Live workspace and model-provider settings also stay in memory, with at most
@@ -233,9 +240,10 @@ Explicit native empty previews clear the stored fallback. Empty/nonempty preview
 transitions remain visible even within one exposed timestamp second. Scans advance
 recency only from parsed turn-start facts. This authority flag survives SQLite restore;
 obsolete cached rows without it are discarded and pruned in the background before
-rehydration. Name, status, and live-settings observations have independent
-ordering, so a newer file update can coexist with a concurrent rename. Older
-native metadata responses cannot overwrite newer file updates or removals.
+rehydration. Name, status, and live-settings observations are stored separately
+from file metadata. Overlapping updates are best effort; a native response can
+temporarily replace a newer file update or restore a removed display row until
+the next reconciliation.
 Interrupted updates and transient file-read failures remain eligible for the next scan, even when
 file size and modification time stay unchanged.
 Plain and compressed rollouts share the native logical `.jsonl` identity;
@@ -338,7 +346,7 @@ through Codex's native image input.
 For an unsandboxed local Codex process with file-read permission, OpenClaw also
 supplies verified paths to saved documents. Codex can process the complete file
 when inline extraction is bounded. OpenClaw adds the paths to the admitted native
-input without changing its canonical attachment references or transcript text.
+input without changing its stored attachment references or transcript text.
 If the path note cannot fit the native input budget, OpenClaw omits it and retains
 the original request and inline attachment context.
 JSON escapes keep mention characters in attachment metadata from selecting skills
@@ -358,7 +366,7 @@ synchronized filesystem. Codex images are materialized directly from typed
 app-server events. Saved-path-only images use the same bounded remote reader.
 Uploads always use the Gateway's configured channel identity and request timeout.
 
-Use canonical OpenAI model refs such as `openai/gpt-6-astra`. Do not configure
+Use standard OpenAI model refs such as `openai/gpt-6-astra`. Do not configure
 legacy Codex GPT refs. Put OpenAI agent auth order under `auth.order.openai`.
 Legacy Codex auth profile ids and legacy Codex auth order entries are
 repaired by `openclaw doctor --fix`.
@@ -384,6 +392,26 @@ unless you opt into the experimental sandbox exec-server path. The effective
 tool profile must allow all native shell and filesystem capabilities: `coding`
 and `full` do, while `messaging` and `minimal` disable the native surface. Agent
 and provider profile overrides and explicit tool restrictions still apply.
+Selecting a managed GitHub Identity also uses OpenClaw's host-owned tools instead
+of native Code Mode. The same exec owner used by the built-in runtime binds the
+selected profile at child launch, preserves approval and caller lifetime checks,
+and reports an unavailable profile without falling back to native GitHub auth.
+Other tools and the conversation remain available; identity discovery does not
+block turn startup. Reconnect or change GitHub Identity in Settings to recover.
+With no managed identity selected, native Code Mode and shell defaults are unchanged.
+Ordinary paired-node exec keeps node-local authentication: a Gateway GitHub
+selection and command approval never export that credential to the node.
+
+`openclaw agent exec` also uses host-owned tools so its one-shot cleanup can
+join every command it starts. The generic `--code-mode` setting does not enable
+Codex native Code Mode; `codeModeEngaged` reports OpenClaw Code Mode, not the
+Codex harness's native surface.
+
+For one-shot runs without native commands, cleanup closes app-server stdin and
+waits for normal exit before resorting to process termination. Confirmed forced
+termination produces a warning without replacing a completed answer with an
+error. Unconfirmed process cleanup or native commands whose descendants cannot
+be accounted for still fail cleanup and retain state ownership until exit.
 When sandboxing disables the native surface, allowed shell commands remain available
 through `sandbox_exec`. Denying `process` removes `sandbox_process` and background
 continuation, while `sandbox_exec` runs to completion under the existing timeout,
@@ -442,7 +470,25 @@ is disabled. Idle conversation eviction does not interrupt that work.
 The existing unknown-outcome audit diagnostic remains; cancellation and a
 command with no confirmed live owner retain their failure handling.
 
-Stopping an active Codex run interrupts its turn. With the OpenClaw sandbox
+Stopping an active Codex run interrupts its turn. After a parent yields to native
+children, Stop waits for its admitted descendants to reach real terminal events
+and finish completion settlement. A child that completes successfully during
+Stop keeps its result. Stop does not cancel a sibling run or a replacement
+session generation. After Stop settles, you can send another message in the same
+chat without reconnecting.
+Stop also retires an already-interrupted child without interrupting its finished
+turn again, so that child cannot keep its parent session blocked.
+Before retiring a canceled native child, Stop also waits for its owned process
+cleanup. An interrupted turn alone does not prove its commands stopped. This
+includes children whose parent has yielded and children interrupted before Stop.
+If its previous native process is already closing, Stop cancels the waiting run
+without waiting for physical exit. A replacement writer still waits for that exit.
+Session-wide Stop preserves the caller's request ownership, protected-run, and
+side-run restrictions. Native descendants retain host-captured request custody
+after their foreground parent finishes; restored observations without that
+custody cannot acquire cancellation authority from session or run IDs alone.
+
+With the OpenClaw sandbox
 exec-server, cleanup stops the concrete processes admitted by that turn and
 preserves independent background work in the same reused thread. Each process
 retains its original source until settlement, including after foreground
@@ -586,9 +632,11 @@ same child result after the parent replies.
 
 - The official `@openclaw/codex` plugin installed. Include `codex` in
   `plugins.allow` if your config uses an allowlist.
-- Managed Codex app-server `0.160.0`. The plugin ships and manages
-  `@openai/codex` `0.160.0` by default, so a `codex` command on `PATH` does not
-  affect normal startup. Explicit custom, remote, and macOS desktop-owned
+- Managed Codex app-server `0.160.0` or newer. The plugin ships
+  `@openai/codex` `0.164.0` and uses a newer stable `codex` from `PATH` only
+  after it passes a version check and an app-server handshake; see
+  [Newer installed Codex](/plugins/codex-harness-reference/app-server-transport#newer-installed-codex).
+  Explicit custom, remote, and macOS desktop-owned
   app-servers must report a parseable semantic version of `0.149.0` or newer.
   Newer versions continue with a compatibility warning and normal runtime
   validation.
@@ -727,7 +775,7 @@ nine child pages below. The anchors from the single-page version still resolve h
 - <a id="deployment-patterns"></a>[Deployment patterns](/plugins/codex-harness/routing#deployment-patterns)
 - <a id="basic-codex-deployment"></a>[Basic Codex deployment](/plugins/codex-harness/routing#basic-codex-deployment)
 - <a id="mixed-provider-deployment"></a>[Mixed provider deployment](/plugins/codex-harness/routing#mixed-provider-deployment)
-- <a id="fail-closed-codex-deployment"></a>[Fail-closed Codex deployment](/plugins/codex-harness/routing#fail-closed-codex-deployment)
+- <a id="fail-closed-codex-deployment"></a>[Require Codex for deployment](/plugins/codex-harness/routing#fail-closed-codex-deployment)
 
 ### Codex harness configuration
 

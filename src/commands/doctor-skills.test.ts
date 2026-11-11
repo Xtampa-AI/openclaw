@@ -4,10 +4,6 @@ import { createEmptyInstallChecks } from "../cli/requirements-test-fixtures.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { SkillStatusEntry, SkillStatusReport } from "../skills/discovery/status.js";
 import { createDoctorPrompter, type DoctorPrompter } from "./doctor-prompter.js";
-import {
-  collectUnavailableAgentSkills,
-  disableUnavailableSkillsInConfig,
-} from "./doctor-skills-core.js";
 import { maybeRepairSkillReadiness } from "./doctor-skills.js";
 
 const mocks = vi.hoisted(() => ({
@@ -47,6 +43,14 @@ function createSkill(overrides: Partial<SkillStatusEntry>): SkillStatusEntry {
     ...createEmptyInstallChecks(),
     ...overrides,
   };
+}
+
+function unavailable(name: string, missing: Partial<SkillStatusEntry["missing"]> = {}) {
+  return createSkill({
+    name,
+    eligible: false,
+    missing: { ...createEmptyInstallChecks().missing, ...missing },
+  });
 }
 
 function createReport(skills: SkillStatusEntry[], agentId = "main"): SkillStatusReport {
@@ -99,32 +103,35 @@ describe("doctor skills", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each(["bins", "anyBins"] as const)(
+    "preserves skills whose missing %s may be available on a paired node",
+    async (requirement) => {
+      vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", undefined);
+      mocks.note.mockClear();
+      mocks.buildWorkspaceSkillStatus.mockReturnValue(
+        createReport([unavailable("node-tool", { [requirement]: ["node-tool-bin"] })]),
+      );
+      const cfg: OpenClawConfig = {
+        skills: { entries: { "node-tool": { enabled: true } } },
+      };
+
+      const next = await maybeRepairSkillReadiness({ cfg, prompter: createRepairPrompter() });
+
+      expect(next).toEqual(cfg);
+      const output = mocks.note.mock.calls.map(([message]) => String(message)).join("\n");
+      expect(output).toContain("node-tool");
+      expect(output).not.toContain("Disable unused skills:");
+    },
+  );
+
   it.each([
     { mode: "update", update: true, available: false, expectedEnabled: true },
     { mode: "standalone repair", update: false, available: false, expectedEnabled: false },
-    {
-      mode: "update with an available skill",
-      update: true,
-      available: true,
-      expectedEnabled: true,
-    },
   ])("honors skill-repair authority for $mode", async ({ update, available, expectedEnabled }) => {
     mocks.note.mockClear();
     vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", update ? "1" : undefined);
     mocks.buildWorkspaceSkillStatus.mockReturnValue(
-      createReport([
-        createSkill({
-          name: "optional-tool",
-          eligible: available,
-          missing: {
-            bins: available ? [] : ["missing-tool"],
-            anyBins: [],
-            env: [],
-            config: [],
-            os: [],
-          },
-        }),
-      ]),
+      createReport([unavailable("optional-tool", { env: ["MISSING_TOOL_KEY"] })]),
     );
     const cfg: OpenClawConfig = {
       skills: { entries: { "optional-tool": { enabled: true, env: { EXISTING: "1" } } } },
@@ -141,26 +148,6 @@ describe("doctor skills", () => {
     expect(output.includes("Disable unused skills: openclaw doctor --fix")).toBe(
       update && !available,
     );
-  });
-
-  it("collects only unavailable skills that this agent is allowed to use", () => {
-    const unavailable = createSkill({
-      name: "missing-bin",
-      eligible: false,
-      platformIncompatible: false,
-      modelVisible: false,
-      commandVisible: false,
-      missing: { bins: ["tool"], anyBins: [], env: [], config: [], os: [] },
-    });
-    const report = createReport([
-      createSkill({ name: "ready" }),
-      unavailable,
-      createSkill({ name: "disabled", eligible: false, disabled: true }),
-      createSkill({ name: "agent-filtered", eligible: true, blockedByAgentFilter: true }),
-      createSkill({ name: "bundled-blocked", eligible: false, blockedByAllowlist: true }),
-    ]);
-
-    expect(collectUnavailableAgentSkills(report)).toEqual([unavailable]);
   });
 
   it("formats unavailable skill names compactly and alphabetically", async () => {
@@ -196,6 +183,7 @@ describe("doctor skills", () => {
     expect(typeof body === "string" ? body.split("\n") : []).toEqual([
       "2 allowed skills are not usable in this environment (missing binaries, env vars, or config).",
       "- calendar, places",
+      "Missing local binaries may exist on paired nodes; these skills remain enabled.",
       "Disable unused skills: openclaw doctor --fix",
       "Inspect details: openclaw skills check --agent <id> or openclaw skills info <name> --agent <id>",
     ]);
@@ -224,73 +212,41 @@ describe("doctor skills", () => {
     expect(output).toContain("GH_CONFIG_DIR=/root/.config/gh");
   });
 
-  it("does not surface the GH_CONFIG_DIR hint for an ineligible skill", async () => {
-    const githubSkill = createSkill({
-      name: "github",
-      skillKey: "github",
-      eligible: false,
-      platformIncompatible: false,
-      missing: { bins: ["gh"], anyBins: [], env: [], config: [], os: [] },
-    });
-    const calls = await runSkillDoctor([githubSkill]);
-    expect(calls.some((call) => call[1] === "GitHub CLI")).toBe(false);
-  });
-
-  it("does not offer a global disable when another agent can use the skill", async () => {
-    vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", undefined);
-    mocks.note.mockClear();
-    mocks.buildWorkspaceSkillStatus.mockClear();
-    const healthy = createSkill({ name: "shared", skillKey: "shared" });
-    const missing = createSkill({
-      name: "shared",
-      skillKey: "shared",
-      eligible: false,
-      missing: { bins: ["shared-bin"], anyBins: [], env: [], config: [], os: [] },
-    });
-    mocks.buildWorkspaceSkillStatus.mockImplementation((_workspaceDir, { agentId }) =>
-      createReport(agentId === "secondary" ? [missing] : [healthy], agentId),
-    );
-    const cfg: OpenClawConfig = {
-      agents: {
-        entries: {
-          main: { workspace: "/tmp/main" },
-          secondary: { workspace: "/tmp/secondary" },
+  it.each(["eligible", "missing binary"])(
+    "does not offer a global disable when another agent's skill is %s",
+    async (readiness) => {
+      vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", undefined);
+      mocks.note.mockClear();
+      mocks.buildWorkspaceSkillStatus.mockClear();
+      const otherAgentSkill =
+        readiness === "eligible"
+          ? createSkill({ name: "shared" })
+          : unavailable("shared", { bins: ["shared-bin"] });
+      const missing = unavailable("shared", { env: ["SHARED_TOOL_KEY"] });
+      mocks.buildWorkspaceSkillStatus.mockImplementation((_workspaceDir, { agentId }) =>
+        createReport(agentId === "secondary" ? [missing] : [otherAgentSkill], agentId),
+      );
+      const cfg: OpenClawConfig = {
+        agents: {
+          entries: {
+            main: { workspace: "/tmp/main" },
+            secondary: { workspace: "/tmp/secondary" },
+          },
         },
-      },
-      skills: { entries: { shared: { enabled: true } } },
-    };
+        skills: { entries: { shared: { enabled: true } } },
+      };
 
-    const next = await maybeRepairSkillReadiness({ cfg, prompter: createRepairPrompter() });
+      const next = await maybeRepairSkillReadiness({ cfg, prompter: createRepairPrompter() });
 
-    expect(next).toEqual(cfg);
-    expect(next.skills?.entries?.shared?.enabled).toBe(true);
-    expect(mocks.buildWorkspaceSkillStatus).toHaveBeenCalledTimes(2);
-    expect(
-      String(mocks.note.mock.calls.find(([, title]) => title === "Skills")?.[0] ?? ""),
-    ).toContain('Agent "secondary"');
-    expect(
-      String(mocks.note.mock.calls.find(([, title]) => title === "Skills")?.[0] ?? ""),
-    ).not.toContain("doctor --fix");
-  });
-
-  it("disables unavailable skills through skills.entries without dropping existing config", () => {
-    const config: OpenClawConfig = {
-      skills: {
-        entries: {
-          gog: { env: { EXISTING: "1" } },
-          other: { enabled: true },
-        },
-      },
-    };
-
-    const next = disableUnavailableSkillsInConfig(config, [
-      createSkill({ name: "gog", skillKey: "gog", eligible: false }),
-      createSkill({ name: "wacli", skillKey: "wacli", eligible: false }),
-    ]);
-
-    expect(next.skills?.entries?.gog).toEqual({ env: { EXISTING: "1" }, enabled: false });
-    expect(next.skills?.entries?.wacli).toEqual({ enabled: false });
-    expect(next.skills?.entries?.other).toEqual({ enabled: true });
-    expect(config.skills?.entries?.gog).toEqual({ env: { EXISTING: "1" } });
-  });
+      expect(next).toEqual(cfg);
+      expect(next.skills?.entries?.shared?.enabled).toBe(true);
+      expect(mocks.buildWorkspaceSkillStatus).toHaveBeenCalledTimes(2);
+      const output = mocks.note.mock.calls
+        .filter(([, title]) => title === "Skills")
+        .map(([message]) => String(message))
+        .join("\n");
+      expect(output).toContain('Agent "secondary"');
+      expect(output).not.toContain("doctor --fix");
+    },
+  );
 });

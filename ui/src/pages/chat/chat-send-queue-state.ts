@@ -19,6 +19,7 @@ import {
 import { visibleSessionMatches } from "../../lib/sessions/index.ts";
 import { resolveUiConversationIdentity } from "../../lib/sessions/session-key.ts";
 import { generateUUID } from "../../lib/uuid.ts";
+import { captureChatConnectionOwner } from "./chat-connection-owner.ts";
 import { loadChatBranches } from "./chat-history-branches.ts";
 import {
   getChatHistoryLoadState,
@@ -132,18 +133,6 @@ export function reconnectSafeQueuedSendState(
   host: Pick<ChatHost, "client" | "connected">,
 ): "waiting-idle" | "waiting-reconnect" {
   return host.connected && host.client ? "waiting-idle" : "waiting-reconnect";
-}
-
-export function captureChatConnectionOwner(
-  host: Pick<ChatHost, "client" | "connected" | "connectionEpoch">,
-  requireConnected = true,
-): () => boolean {
-  const client = host.client;
-  const connectionEpoch = host.connectionEpoch;
-  return () =>
-    (!requireConnected || host.connected) &&
-    host.client === client &&
-    host.connectionEpoch === connectionEpoch;
 }
 
 export function resolveQueuedChatLeaf(
@@ -265,6 +254,9 @@ export function finishChatDeliveryAdmission(
   const sendsDuringActiveRun = Boolean(current.queueMode || options?.allowActiveRunSend);
   if (
     chatSendHoldReason(host, route, false, current.agentId) ||
+    chatOutboxOwner(host).admissions.has(
+      resolveUiConversationIdentity(host, queueSessionKey, current.agentId),
+    ) ||
     (options?.routingSessionKey && !routeVisible(current.agentId)) ||
     (!sendsDuringActiveRun &&
       routeVisible(current.agentId) &&
@@ -396,6 +388,11 @@ export function settleQueuedChatSendFailure(
       err.message === "gateway not connected";
     const retryDelayMs = retryableGatewayDelayMs(err);
     const safelyRejected = failedBeforeTransport || retryDelayMs !== null;
+    // Delivery or another pane may retire the row while its response is held.
+    if (!readQueuedMessageById(host, id)) {
+      finishScopedChatSending(host, scope);
+      return "pending";
+    }
     const rollbackAttempt = safelyRejected
       ? {
           sendAttempts: queued.sendAttempts,

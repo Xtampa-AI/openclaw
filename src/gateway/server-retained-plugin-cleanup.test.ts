@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,6 +7,12 @@ import {
   emptySqliteCounts,
   observeParentSqlite,
 } from "../../test/helpers/sqlite-parent-observer.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolvePluginNpmGenerationProjectDir } from "../plugins/install-paths.js";
 import { loadInstalledPluginIndexInstallRecordsSync } from "../plugins/installed-plugin-index-record-reader.js";
 import { RETAINED_MANAGED_NPM_KEEP_FILES_REASON } from "../plugins/managed-npm-retention-contract.js";
 import {
@@ -33,47 +40,42 @@ import {
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { cleanupGatewayRetiredPluginArtifacts } from "./server-retained-plugin-cleanup.js";
 
-it.each(["empty", "state", "temporary"] as const)(
-  "leaves shared state and hot metadata untouched with only %s captures",
-  async (placement) => {
-    await withOpenClawTestState({ label: "gateway-retained-plugin-empty" }, async (state) => {
-      const database = openOpenClawStateDatabase({ env: state.env });
-      loadInstalledPluginIndexInstallRecordsSync();
-      const cache = getProcessPluginCache();
-      const fact = cache.persistedInstalledIndex.get(database.path);
-      expect(fact).toBeDefined();
-      const capture =
-        placement === "empty"
-          ? undefined
-          : createPluginNativeCaptureRoot(state.stateDir, placement);
-      const witness = new DatabaseSync(database.path, { readOnly: true });
-      const version = () => witness.prepare("PRAGMA data_version").get()?.data_version;
-      const before = version();
-      const log = { info: vi.fn(), warn: vi.fn() };
-      const observer = observeParentSqlite();
+it("leaves shared state and hot metadata untouched with only state captures", async () => {
+  await withOpenClawTestState({ label: "gateway-retained-plugin-empty" }, async (state) => {
+    const database = openOpenClawStateDatabase({ env: state.env });
+    loadInstalledPluginIndexInstallRecordsSync();
+    const cache = getProcessPluginCache();
+    const fact = cache.persistedInstalledIndex.get(database.path);
+    expect(fact).toBeDefined();
+    const capture = createPluginNativeCaptureRoot(state.stateDir, "state");
+    const witness = new DatabaseSync(database.path, { readOnly: true });
+    const version = () => witness.prepare("PRAGMA data_version").get()?.data_version;
+    const before = version();
+    const log = { info: vi.fn(), warn: vi.fn() };
+    const observer = observeParentSqlite();
+    try {
       try {
-        try {
-          await cleanupGatewayRetiredPluginArtifacts({
-            log,
-            startupInstallPaths: [],
-            signal: new AbortController().signal,
-            assertCurrent: () => {},
-          });
-          expect(observer.counts).toEqual(emptySqliteCounts());
-        } finally {
-          observer.restore();
-        }
-        expect(version()).toBe(before);
-        expect(cache.persistedInstalledIndex.get(database.path)).toBe(fact);
-        expect(log.info).not.toHaveBeenCalled();
-        expect(log.warn).not.toHaveBeenCalled();
+        await cleanupGatewayRetiredPluginArtifacts({
+          log,
+          startupInstallPaths: [],
+          startupConfig: {},
+          signal: new AbortController().signal,
+          assertCurrent: () => {},
+        });
+        expect(observer.counts).toEqual(emptySqliteCounts());
       } finally {
-        witness.close();
-        await capture?.disposeAsync();
+        observer.restore();
       }
-    });
-  },
-);
+      expect(version()).toBe(before);
+      expect(cache.persistedInstalledIndex.get(database.path)).toBe(fact);
+      expect(log.info).not.toHaveBeenCalled();
+      expect(log.warn).not.toHaveBeenCalled();
+    } finally {
+      witness.close();
+      await capture.disposeAsync();
+    }
+  });
+});
 
 it.each([
   ["project", false],
@@ -104,6 +106,7 @@ it.each([
       await cleanupGatewayRetiredPluginArtifacts({
         log,
         startupInstallPaths: [],
+        startupConfig: {},
         signal: new AbortController().signal,
         assertCurrent: () => {},
       });
@@ -179,6 +182,7 @@ it.each(["project", "legacy"] as const)(
         await cleanupGatewayRetiredPluginArtifacts({
           log,
           startupInstallPaths,
+          startupConfig: {},
           signal: new AbortController().signal,
           assertCurrent: () => {},
         });
@@ -234,6 +238,7 @@ it.each([false, true])(
         await cleanupGatewayRetiredPluginArtifacts({
           log,
           startupInstallPaths: [],
+          startupConfig: {},
           signal: new AbortController().signal,
           assertCurrent: () => {},
         });
@@ -266,6 +271,7 @@ it("reports an unreadable candidate root instead of declaring cleanup empty", as
     await cleanupGatewayRetiredPluginArtifacts({
       log,
       startupInstallPaths: [],
+      startupConfig: {},
       signal: new AbortController().signal,
       assertCurrent: () => {},
     });
@@ -323,6 +329,7 @@ it.each(["lease", "caller"] as const)(
         const cleanup = cleanupGatewayRetiredPluginArtifacts({
           log,
           startupInstallPaths: [],
+          startupConfig: {},
           signal: new AbortController().signal,
           assertCurrent: () => {
             if (!current) {
@@ -341,6 +348,69 @@ it.each(["lease", "caller"] as const)(
         expect(fs.existsSync(packageDir)).toBe(true);
       } finally {
         inspection.mockRestore();
+      }
+    });
+  },
+);
+
+it.each(["startup", "current"] as const)(
+  "keeps a configured executable from %s config runnable after generation retirement",
+  async (source) => {
+    await withOpenClawTestState({ label: "retained-configured-command" }, async (state) => {
+      const project = resolvePluginNpmGenerationProjectDir({
+        npmDir: path.join(state.stateDir, "npm"),
+        packageName: "@openclaw/codex",
+        generationKey: "previous-release",
+      });
+      const packageDir = path.join(project, "node_modules", "@openclaw", "codex");
+      fs.mkdirSync(packageDir, { recursive: true });
+      const command = path.join(packageDir, "fixture.cjs");
+      fs.writeFileSync(command, 'process.stdout.write("still runnable");');
+      const cfg: OpenClawConfig = {
+        plugins: { entries: { codex: { config: { appServer: { command } } } } },
+      };
+      const obsolete = writeManagedNpmPlugin({
+        stateDir: state.stateDir,
+        packageName: "@openclaw/obsolete",
+        pluginId: "obsolete",
+        version: "1.0.0",
+        layout: "project",
+      });
+      const log = { info: vi.fn(), warn: vi.fn() };
+      for (const dir of [packageDir, obsolete]) {
+        await markRetainedManagedNpmInstall({
+          packageDir: dir,
+          pluginId: dir === packageDir ? "codex" : "obsolete",
+          reason: "replaced-plugin-generation",
+        });
+      }
+      await seedInstalledPluginIndex({}, { env: state.env, candidates: [] });
+      setRuntimeConfigSnapshot(source === "current" ? cfg : {});
+      try {
+        await cleanupGatewayRetiredPluginArtifacts({
+          log,
+          startupInstallPaths: [],
+          startupConfig: source === "startup" ? cfg : {},
+          signal: new AbortController().signal,
+          assertCurrent: () => {},
+        });
+        expect(execFileSync(process.execPath, [command], { encoding: "utf8" })).toBe(
+          "still runnable",
+        );
+        expect(fs.existsSync(obsolete)).toBe(false);
+        expect(cfg.plugins?.entries?.codex?.config).toEqual({ appServer: { command } });
+        expect(log.warn).not.toHaveBeenCalled();
+        setRuntimeConfigSnapshot({});
+        await cleanupGatewayRetiredPluginArtifacts({
+          log,
+          startupInstallPaths: [],
+          startupConfig: {},
+          signal: new AbortController().signal,
+          assertCurrent: () => {},
+        });
+        expect(fs.existsSync(project)).toBe(false);
+      } finally {
+        clearRuntimeConfigSnapshot();
       }
     });
   },

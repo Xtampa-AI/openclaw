@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import * as bundledDiscoveryState from "./bundled-discovery-state.js";
@@ -175,6 +176,34 @@ describe("plugin management catalog lifecycle", () => {
     expect(mocks.officialCatalog).toHaveBeenCalledTimes(2);
   });
 
+  it("serves installed rows while catalog enrichment is pending, then reuses the prepared facts", async () => {
+    const hosted = createDeferred<{ source: "hosted"; entries: never[] }>();
+    mocks.metadata.mockReturnValue(dependencyMetadataSnapshot({ pluginId: "phase-plugin" }));
+    mocks.officialCatalog.mockReturnValue(hosted.promise);
+    const config = { plugins: { entries: { "phase-plugin": { enabled: true } } } };
+    const params = { config, env: {}, cachedCatalogOnly: true };
+    const pending = listManagedPlugins(params);
+    try {
+      const first = await Promise.race([pending, nextTurn().then(() => undefined)]);
+      expect(first?.plugins).toContainEqual(
+        expect.objectContaining({ id: "phase-plugin", installed: true, enabled: true }),
+      );
+      expect(first?.diagnostics).toContainEqual(
+        expect.objectContaining({ message: expect.stringContaining("pending") }),
+      );
+    } finally {
+      hosted.resolve({ source: "hosted", entries: [] });
+      await pending;
+    }
+    const prepared = await listManagedPlugins({ config, env: {} });
+    expect(await listManagedPlugins(params)).toEqual(prepared);
+    config.plugins.entries["phase-plugin"].enabled = false;
+    expect((await listManagedPlugins(params)).plugins).toContainEqual(
+      expect.objectContaining({ id: "phase-plugin", enabled: false, state: "disabled" }),
+    );
+    expect(mocks.officialCatalog).toHaveBeenCalledOnce();
+  });
+
   it("uses current config after awaiting the hosted catalog", async () => {
     const config = { plugins: { entries: { "phase-plugin": { enabled: true } } } };
     const hosted = createDeferred<{ source: "hosted"; entries: never[] }>();
@@ -198,18 +227,18 @@ describe("plugin management catalog lifecycle", () => {
     mode: "compat" | "allowlist";
     providerEnabled: boolean;
     selectedMode?: "compat" | "allowlist";
-    dependencyError?: true;
+    missingDependency?: true;
   }>([
     { mode: "compat", providerEnabled: true },
     {
       mode: "compat",
       selectedMode: "allowlist",
       providerEnabled: false,
-      dependencyError: true,
+      missingDependency: true,
     },
   ])(
-    "keeps provider policy in the selected $mode/$selectedMode discovery mode",
-    async ({ mode, providerEnabled, selectedMode, dependencyError }) => {
+    "uses selected $mode/$selectedMode discovery policy for enablement and diagnostics",
+    async ({ mode, providerEnabled, selectedMode, missingDependency }) => {
       const env = { OPENCLAW_STATE_DIR: "/__openclaw_management_selected_root__" };
       const readMode = vi
         .spyOn(bundledDiscoveryState, "readBundledDiscoveryModeMemoized")
@@ -225,7 +254,7 @@ describe("plugin management catalog lifecycle", () => {
           enabledByDefault: true,
           providers: ["fixture-provider"],
           channels: ["fixture-chat"],
-          ...(dependencyError
+          ...(missingDependency
             ? { packageBuild: { bundledDist: false }, dependencies: { "missing-runtime": "1.0.0" } }
             : {}),
         });
@@ -254,26 +283,17 @@ describe("plugin management catalog lifecycle", () => {
           env,
         });
 
-        expect(catalog.plugins.find((plugin) => plugin.id === "bundled-provider")).toMatchObject({
+        const providerEntry = catalog.plugins.find((plugin) => plugin.id === "bundled-provider");
+        expect(providerEntry).toMatchObject({
           enabled: providerEnabled,
-          state: dependencyError ? "error" : providerEnabled ? "enabled" : "disabled",
-          ...(dependencyError ? { error: expect.stringContaining("missing-runtime") } : {}),
+          state: providerEnabled ? "enabled" : "disabled",
         });
+        expect(providerEntry).not.toHaveProperty("error");
         expect(catalog.plugins.find((plugin) => plugin.id === "bundled-ordinary")).toMatchObject({
           enabled: false,
           state: "disabled",
         });
-        expect(catalog.diagnostics).toEqual(
-          dependencyError
-            ? [
-                expect.objectContaining({
-                  level: "error",
-                  pluginId: "bundled-provider",
-                  message: expect.stringContaining("missing-runtime"),
-                }),
-              ]
-            : [],
-        );
+        expect(catalog.diagnostics).toEqual([]);
       } finally {
         readMode.mockRestore();
       }

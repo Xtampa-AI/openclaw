@@ -138,13 +138,12 @@ export function isMainSessionRecoveryPending(entry: SessionEntry, sessionKey: st
 
 /** Select reconciliation before new input adds custody; the store owner checks run liveness. */
 export function isMainSessionRecoveryReconciliationCandidate(entry: SessionEntry): boolean {
-  const killedFenceOnly = isKilledMainSessionRecoveryFenceOnly(entry);
   return (
-    (entry.status === undefined ||
-      entry.status === "failed" ||
-      killedFenceOnly ||
-      isMainRestartRecoveryTerminalOnly(entry)) &&
-    (entry.abortedLastRun !== true || killedFenceOnly) &&
+    (isKilledMainSessionRecoveryFenceOnly(entry) ||
+      ((entry.status === undefined ||
+        entry.status === "failed" ||
+        isMainRestartRecoveryTerminalOnly(entry)) &&
+        entry.abortedLastRun !== true)) &&
     hasMainSessionRecoveryClaim(entry) &&
     !isRetryableUnadoptedChatClaim(entry) &&
     !entry.mainRestartRecovery?.tombstone

@@ -1,3 +1,4 @@
+import type { NodePermissionRequest } from "../../packages/gateway-protocol/src/node-permissions.js";
 /**
  * Shared type contracts for bash exec tools.
  * Defines defaults, approval follow-up payloads, elevated policy defaults, and
@@ -87,6 +88,8 @@ export type ExecToolDefaults = {
   preparedRunEnvironment?: PreparedGitHubToolEnvironment;
   /** An explicit snapshot, including an empty one, replaces local store access. */
   preparedStoreEnvironment?: Readonly<SecretStoreExecEnvironment>;
+  /** Host-prepared routing hint; remote workers have no Gateway session database. */
+  preparedSubagentExecution?: boolean;
   autoReviewer?: ExecAutoReviewer;
   /** Reads current attempt context only when a command needs review. */
   reviewTranscript?: () => ExecAutoReviewTranscript | undefined;
@@ -224,6 +227,7 @@ export type ExecToolApprovalReview = {
 
 /** Structured details returned by exec tool calls. */
 export type ExecToolDetails = {
+  permissionMissing?: NodePermissionRequest;
   approvalReviews?: readonly ExecToolApprovalReview[];
   approvalReviewOutcome?: "approved" | "denied" | "reviewing";
 } & (
@@ -241,7 +245,7 @@ export type ExecToolDetails = {
       exitCode: number | null;
       exitSignal?: NodeJS.Signals | number | null;
       failureKind?: string;
-      reason?: "not-dispatched" | "outcome-unknown" | "policy-denied";
+      reason?: "not-dispatched" | "outcome-unknown" | "policy-denied" | "permission-missing";
       nodeInvokeFailure?: {
         failureCode?: string;
         message: string;

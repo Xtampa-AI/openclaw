@@ -3,9 +3,10 @@ import {
   prepareSqliteTranscriptReadScope,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
+import { captureSessionActorStorageOwner } from "./session-actor-storage-binding.js";
 import { prepareReconcileParams } from "./session-transcript-reconcile-readiness.js";
 import {
-  startPreparedSessionTranscriptIndexReconcile,
+  startSessionTranscriptIndexReconcile,
   waitForPreparedSessionTranscriptProjection,
 } from "./session-transcript-reconcile.js";
 
@@ -16,6 +17,9 @@ export async function recoverSessionTranscriptProjection(
   assertCurrent: () => void,
 ): Promise<void> {
   abortSignal.throwIfAborted();
+  if (captureSessionActorStorageOwner(scope, { assertCurrent, authorize() {} })) {
+    return;
+  }
   const resolved = await prepareSqliteTranscriptReadScope(scope, abortSignal);
   assertCurrent();
   abortSignal.throwIfAborted();
@@ -23,9 +27,6 @@ export async function recoverSessionTranscriptProjection(
     ...toDatabaseOptions(resolved),
     preferredSessionId: resolved.sessionId,
   });
-  startPreparedSessionTranscriptIndexReconcile(prepared);
-  const wait = () =>
-    waitForPreparedSessionTranscriptProjection(resolved.sessionId, prepared, abortSignal);
-  // Incognito projections settle inside their actor's shared state, like the pre-admission wait.
-  await (prepared.incognito ? prepared.incognito.actor.sessions.withSharedState(wait) : wait());
+  startSessionTranscriptIndexReconcile(prepared);
+  await waitForPreparedSessionTranscriptProjection(resolved.sessionId, prepared, abortSignal);
 }

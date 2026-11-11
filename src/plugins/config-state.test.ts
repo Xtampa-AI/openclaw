@@ -30,15 +30,6 @@ type ActivationProvenance = Pick<
   "explicitlyEnabled" | "source" | "reason"
 >;
 
-function activation(
-  enabled: boolean,
-  explicitlyEnabled: boolean,
-  source: ActivationProvenance["source"],
-  reason: string | undefined,
-) {
-  return { enabled, activated: enabled, explicitlyEnabled, source, reason };
-}
-
 function expectResolvedEnableState(
   params: Parameters<typeof resolveEnableState>,
   expected: ReturnType<typeof resolveEnableState>,
@@ -356,7 +347,13 @@ describe("resolveEffectivePluginActivationState", () => {
         acp: { enabled: true },
         plugins: { entries: { acpx: { enabled: true } } },
       },
-      expected: activation(true, false, "default", "bundled default enablement"),
+      expected: {
+        enabled: true,
+        activated: true,
+        explicitlyEnabled: false,
+        source: "default",
+        reason: "bundled default enablement",
+      },
     },
     {
       name: "keeps bundled default activation when auto-enable supplies a reason",
@@ -367,7 +364,13 @@ describe("resolveEffectivePluginActivationState", () => {
         autoEnabledReason: "ACP runtime configured",
       },
       rawConfig: {},
-      expected: activation(true, false, "default", "bundled default enablement"),
+      expected: {
+        enabled: true,
+        activated: true,
+        explicitlyEnabled: false,
+        source: "default",
+        reason: "bundled default enablement",
+      },
     },
     {
       name: "keeps allowlists authoritative over explicit bundled plugin enablement",

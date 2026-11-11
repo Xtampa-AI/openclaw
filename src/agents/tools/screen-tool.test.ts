@@ -1,11 +1,7 @@
 import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
 import { GATEWAY_CLIENT_CAPS } from "../../../packages/gateway-protocol/src/client-info.js";
-import {
-  UiCommandParamsSchema,
-  UiCommandResultSchema,
-} from "../../../packages/gateway-protocol/src/schema/ui-command.js";
-import { compactToolOutputHint } from "../tool-schema-hints.js";
+import { UiCommandResultSchema } from "../../../packages/gateway-protocol/src/schema/ui-command.js";
 import type { InProcessGatewayCaller } from "./in-process-gateway.js";
 import { createScreenTool } from "./screen-tool.js";
 
@@ -29,10 +25,16 @@ describe("screen tool", () => {
 
     expect(tool.outputSchema).toBe(UiCommandResultSchema);
     expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
-    expect(compactToolOutputHint(tool.outputSchema)).toBe("{ ok: boolean }");
+    expect(
+      Value.Check(tool.outputSchema!, {
+        ok: true,
+        delivery: "dispatched",
+        presentation: { portalId: "app", status: "blocked", reason: "remote-ingress-required" },
+      }),
+    ).toBe(true);
   });
 
-  it("omits unsupported actions and requires the UI capability", () => {
+  it("uses a flat action enum and requires the UI capability", () => {
     const tool = createScreenTool();
     expect(tool.requiredClientCaps).toEqual([GATEWAY_CLIENT_CAPS.UI_COMMANDS]);
     expect(tool.parameters).toMatchObject({
@@ -48,12 +50,22 @@ describe("screen tool", () => {
     });
   });
 
-  it("exposes GitHub identity settings only for a capable Control UI", () => {
-    const tool = createScreenTool({ githubIdentitySettingsAvailable: true });
+  it("offers and dispatches masked GitHub settings only to capable clients", async () => {
+    const { callGateway, calls } = createGatewayRecorder();
+    const tool = createScreenTool({
+      agentSessionKey: "agent:main:main",
+      callGateway,
+      githubIdentitySettingsAvailable: true,
+    });
     expect(tool.parameters).toMatchObject({
       properties: { action: { enum: expect.arrayContaining(["github_identity_settings"]) } },
     });
-    expect(tool.description).toContain("github_identity_settings");
+
+    await tool.execute("call", { action: "github_identity_settings" });
+
+    expect(calls).toEqual([
+      ["ui.command", { command: { kind: "agent-github-settings" }, sessionKey: "agent:main:main" }],
+    ]);
   });
 
   it.each([
@@ -78,31 +90,6 @@ describe("screen tool", () => {
     await tool.execute("call", { action });
 
     expect(calls).toEqual([["ui.command", { command, sessionKey: "agent:main:main" }]]);
-    expect(Value.Check(UiCommandParamsSchema, calls[0]?.[1])).toBe(true);
-  });
-
-  it("maps GitHub identity settings only for a capable Control UI", async () => {
-    const { callGateway, calls } = createGatewayRecorder();
-    const tool = createScreenTool({
-      agentSessionKey: "agent:main:main",
-      githubIdentitySettingsAvailable: true,
-      callGateway,
-    });
-
-    await tool.execute("call", { action: "github_identity_settings" });
-    expect(calls).toEqual([
-      [
-        "ui.command",
-        {
-          command: { kind: "agent-github-settings" },
-          sessionKey: "agent:main:main",
-        },
-      ],
-    ]);
-
-    await expect(
-      createScreenTool({ callGateway }).execute("call", { action: "github_identity_settings" }),
-    ).rejects.toThrow("unavailable in this Control UI");
   });
 
   it.each(["terminal_show", "browser_show"])("passes dock for %s", async (action) => {

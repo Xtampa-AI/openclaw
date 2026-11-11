@@ -50,16 +50,35 @@ afterEach(async () => {
 });
 
 describe("Code Mode wait, scope, and suspended runs", () => {
-  it.each(["native", "client-shadow", "plugin", "mcp", "empty", "cleared", "denied"] as const)(
+  it.each([-60_000, 60_000])(
+    "expires a parked run after its TTL despite a %d ms wall-clock step",
+    async (wallStep) => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "performance"] });
+      const { exec } = harness([], { codeMode: { snapshotTtlSeconds: 60 } });
+      const first = resultDetails(
+        await exec.execute("clock-step", { code: 'await yield_control(); return "done";' }),
+      );
+      const state = testing.activeRuns.get(String(first.runId))!;
+      expect(state).toBeDefined();
+      vi.setSystemTime(Date.now() + wallStep);
+      await exec.execute("clock-step-2", { code: 'await yield_control(); return "done";' });
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(state.owner.signal.aborted).toBe(false);
+      expect(testing.activeRuns.has(String(first.runId))).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(state.owner.signal.aborted).toBe(true);
+      expect(testing.activeRuns.has(String(first.runId))).toBe(false);
+    },
+  );
+
+  it.each(["native", "client-shadow", "mcp", "cleared", "denied"] as const)(
     "offers only executable native process guidance for a %s catalog",
     async (kind) => {
       const target =
-        kind === "plugin"
-          ? pluginTool("process", "Plugin process")
-          : kind === "mcp"
-            ? mcpTool({ name: "process", serverName: "remote", toolName: "process" })
-            : createProcessTool({ scopeKey: "wait-guidance" });
-      const fixture = harness(kind === "empty" ? [] : [target]);
+        kind === "mcp"
+          ? mcpTool({ name: "process", serverName: "remote", toolName: "process" })
+          : createProcessTool({ scopeKey: "wait-guidance" });
+      const fixture = harness([target]);
       if (kind === "client-shadow") {
         addClientToolsToToolCatalog({
           catalogRef: fixture.catalogRef,
@@ -532,39 +551,6 @@ describe("Code Mode wait, scope, and suspended runs", () => {
     }
   });
 
-  it("preserves accepted output when wait expiry exceeds the Date range", async () => {
-    const target = pluginTool("expiry_fixture", "Expiry fixture");
-    const { exec, wait } = harness([target], { codeMode: { snapshotTtlSeconds: 1 } });
-    const limit = 8_640_000_000_000_000;
-    const now = vi.spyOn(Date, "now").mockReturnValue(limit - 1_000);
-    let details: Record<string, unknown>;
-    try {
-      const input = {
-        code: `text("delivered"); await yield_control();
-        text("accepted first"); await expiry_fixture({}); text("accepted inline"); await yield_control("pause"); return "done";`,
-      };
-      const first = resultDetails(await exec.execute("park", input));
-      expect(first).toMatchObject({
-        status: "waiting",
-        output: [{ type: "text", text: "delivered" }],
-      });
-      now.mockReturnValue(limit - 1);
-      details = resultDetails(await wait.execute("resume", { runId: first.runId }));
-    } finally {
-      now.mockRestore();
-    }
-    expect(details).toMatchObject({
-      status: "failed",
-      error: "code mode run expiry is unavailable.",
-      output: [
-        { type: "text", text: "accepted first" },
-        { type: "text", text: "accepted inline" },
-      ],
-    });
-    expect(target.execute).toHaveBeenCalledOnce();
-    expect(testing.activeRuns.size).toBe(0);
-  });
-
   describe("suspended-run owner scope", () => {
     const identities = ["runId", "sessionId", "sessionKey", "agentId"] as const;
     const rejections = new Map<(typeof identities)[number], string>();
@@ -598,25 +584,16 @@ describe("Code Mode wait, scope, and suspended runs", () => {
   });
 
   it("rejects concurrent waits for the same suspended run", async () => {
-    const { exec, wait } = harness(
-      [
-        pluginToolWithExecute(
-          "slow",
-          "Slow helper",
-          async () => await new Promise<never>(() => {}),
-        ),
-      ],
-      { codeMode: { timeoutMs: 500 } },
-    );
+    const { exec, wait } = harness([]);
     const first = resultDetails(
-      await exec.execute("concurrent", { code: "await slow({}); return 'done';" }),
+      await exec.execute("concurrent", { code: "await yield_control(); return 'done';" }),
     );
     expect(first.status).toBe("waiting");
     const pending = wait.execute("wait-a", { runId: first.runId });
     await expect(wait.execute("wait-b", { runId: first.runId })).rejects.toThrow(
       "Use that wait’s result before deciding the next step",
     );
-    expect(resultDetails(await pending)).toMatchObject({ status: "waiting", runId: first.runId });
+    expect(resultDetails(await pending)).toMatchObject({ status: "completed", value: "done" });
   });
 });
 

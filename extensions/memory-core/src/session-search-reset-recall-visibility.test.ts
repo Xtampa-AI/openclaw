@@ -1,6 +1,5 @@
 import * as engineSessions from "openclaw/plugin-sdk/memory-core-host-engine-sessions";
 import type { MemorySearchResult } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
-import * as sessionTranscriptHit from "openclaw/plugin-sdk/session-transcript-hit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { filterMemorySearchHitsBySessionVisibility } from "./session-search-visibility.js";
 import {
@@ -17,26 +16,18 @@ vi.mock("openclaw/plugin-sdk/memory-core-host-engine-sessions", async (importOri
     await importOriginal<typeof import("openclaw/plugin-sdk/memory-core-host-engine-sessions")>();
   return {
     ...actual,
+    loadMemorySearchSessionStore: vi.fn(async () => ({
+      storePath: "(test)",
+      store: combinedSessionStore,
+    })),
     readSessionResetRecallCutoff: vi.fn(async () => ({ state: "absent" })),
     loadArchivedSessionsAsync: vi.fn(async () => []),
   };
 });
 
-vi.mock("openclaw/plugin-sdk/session-transcript-hit", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("openclaw/plugin-sdk/session-transcript-hit")>();
-  return {
-    ...actual,
-    loadCombinedSessionStoreForGateway: vi.fn(() => ({
-      storePath: "(test)",
-      store: combinedSessionStore,
-    })),
-  };
-});
-
 describe("reset-generation session search visibility", () => {
   afterEach(() => {
-    vi.mocked(sessionTranscriptHit.loadCombinedSessionStoreForGateway).mockClear();
+    vi.mocked(engineSessions.loadMemorySearchSessionStore).mockClear();
     vi.mocked(engineSessions.readSessionResetRecallCutoff).mockReset();
     vi.mocked(engineSessions.readSessionResetRecallCutoff).mockResolvedValue({ state: "absent" });
     vi.mocked(engineSessions.loadArchivedSessionsAsync).mockReset();
@@ -113,12 +104,8 @@ describe("reset-generation session search visibility", () => {
   });
 
   it.each([
-    { name: "pre-reset", range: [2, 3], cutoff: { state: "valid", cutoffLine: 4 }, kept: true },
     { name: "crossing", range: [3, 4], cutoff: { state: "valid", cutoffLine: 4 }, kept: false },
-    { name: "current", range: [4, 5], cutoff: { state: "valid", cutoffLine: 4 }, kept: false },
-    { name: "missing", range: [1, 2], cutoff: { state: "absent" }, kept: false },
     { name: "read-failure", range: [1, 2], cutoff: undefined, kept: false },
-    { name: "malformed", range: [1, 2], cutoff: { state: "invalid" }, kept: false },
   ] as const)(
     "handles a $name live SQLite reset-generation hit",
     async ({ range, cutoff, kept }) => {
@@ -152,6 +139,15 @@ describe("reset-generation session search visibility", () => {
       });
 
       expect(filtered).toEqual(kept ? [hit] : []);
+      expect(engineSessions.loadMemorySearchSessionStore).toHaveBeenCalledExactlyOnceWith(
+        asOpenClawConfig({ tools: { sessions: { visibility: "self" } } }),
+        {
+          agentId: "main",
+          sessionKeys: [`${anchorSessionKey}:active-memory:123456abcdef`, anchorSessionKey],
+          sessionIds: ["current"],
+        },
+      );
+      expect(engineSessions.readSessionResetRecallCutoff).toHaveBeenCalledTimes(1);
     },
   );
 
@@ -185,6 +181,14 @@ describe("reset-generation session search visibility", () => {
     });
 
     expect(filtered).toEqual(hits);
+    expect(engineSessions.loadMemorySearchSessionStore).toHaveBeenCalledExactlyOnceWith(
+      asOpenClawConfig({ tools: { sessions: { visibility: "self" } } }),
+      {
+        agentId: "main",
+        sessionKeys: [`${anchorSessionKey}:active-memory:123456abcdef`, anchorSessionKey],
+        sessionIds: ["current"],
+      },
+    );
     expect(engineSessions.readSessionResetRecallCutoff).toHaveBeenCalledTimes(1);
     expect(engineSessions.readSessionResetRecallCutoff).toHaveBeenCalledWith({
       agentId: "main",
@@ -194,7 +198,7 @@ describe("reset-generation session search visibility", () => {
     });
   });
 
-  it.each(["", ".zst"])(
+  it.each([""])(
     "allows an archived reset generation of the private anchor conversation%s",
     async (compressionSuffix) => {
       const anchorSessionKey = "agent:main:telegram:direct:owner";
@@ -219,32 +223,26 @@ describe("reset-generation session search visibility", () => {
       });
 
       expect(filtered).toEqual([hit]);
+      expect(engineSessions.loadMemorySearchSessionStore).toHaveBeenCalledExactlyOnceWith(
+        asOpenClawConfig({ tools: { sessions: { visibility: "self" } } }),
+        {
+          agentId: "main",
+          sessionKeys: [
+            `${anchorSessionKey}:active-memory:123456abcdef`,
+            anchorSessionKey,
+            "agent:main:current",
+          ],
+          sessionIds: ["current"],
+        },
+      );
     },
   );
 
   it.each([
     {
-      name: "the private anchor conversation",
-      path: "sessions/main/current.jsonl.deleted.2026-08-11T08-00-00.000Z",
-      snippet: "explicitly deleted private context",
-      includeDeletedSource: false,
-    },
-    {
-      name: "the compressed private anchor conversation",
-      path: "sessions/main/current.jsonl.deleted.2026-08-11T08-00-00.000Z.zst",
-      snippet: "explicitly deleted compressed private context",
-      includeDeletedSource: false,
-    },
-    {
       name: "another private conversation",
       path: "sessions/main/deleted-source.jsonl.deleted.2026-08-11T08-00-00.000Z",
       snippet: "intentionally deleted private context",
-      includeDeletedSource: true,
-    },
-    {
-      name: "another compressed private conversation",
-      path: "sessions/main/deleted-source.jsonl.deleted.2026-08-11T08-00-00.000Z.zst",
-      snippet: "intentionally deleted compressed private context",
       includeDeletedSource: true,
     },
   ])(

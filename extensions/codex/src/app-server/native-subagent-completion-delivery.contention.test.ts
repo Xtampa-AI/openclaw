@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { readVisibleSessionTranscriptMessageEntries } from "openclaw/plugin-sdk/session-transcript-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixture } from "./native-subagent-inventory.test-support.js";
 import {
   CodexNativeSubagentMonitor,
@@ -13,6 +17,9 @@ import {
   registerParent,
 } from "./native-subagent-monitor.test-support.js";
 import { setupRunAttemptTestHooks } from "./run-attempt-test-harness.js";
+
+beforeEach(() => setRuntimeConfigSnapshot({}));
+afterEach(() => clearRuntimeConfigSnapshot());
 
 const result = "Keep the accepted native result.";
 const completedChild = () =>
@@ -48,16 +55,17 @@ describe("native completion durable receipts", () => {
       await client.notify(completedChild());
       retirement = parent.unregister();
       await entered.promise;
-      // Stable registration readiness drains the shared parent's queued writes, so
-      // the observer binds its turn before the held retirement settles.
       observer = await f.register(client);
       observer.bindTurn("observer-turn");
       await client.notify(nativeCompletionNotification({ turnId: "observer-turn", result }));
       release.resolve();
+      // Restoration drains the retirement write, so release the test gate before awaiting it.
       await observer.ready;
       await retirement;
       await observer.unregister();
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+        [],
+      );
       expect(await readVisibleSessionTranscriptMessageEntries(f.identity)).toEqual([]);
       expect(f.deliver).toHaveBeenCalledOnce();
     } finally {
@@ -110,7 +118,9 @@ describe("native completion durable receipts", () => {
         ),
       ).toHaveLength(1);
       await Promise.all(writes);
-      expect(f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual([]);
+      expect(await f.store.readNativeSubagentAssignments?.(f.identity, f.historyOwner())).toEqual(
+        [],
+      );
       client.close();
       const replacement = await f.register(createClient());
       await replacement.ready;
@@ -169,6 +179,7 @@ describe("native completion settlement", () => {
         } else {
           observer = await registerParent(monitor);
           observer.bindTurn("observer-turn");
+          expect(observer.listPendingChildren()).toMatchObject([{ state: "completing" }]);
           await client.notify(
             nativeCompletionNotification({
               turnId: change === "receipt" ? "observer-turn" : "parent-turn",
@@ -186,6 +197,7 @@ describe("native completion settlement", () => {
         if (change === "retired-turn-receipt") {
           expect(releasePin).toHaveBeenCalledOnce();
           expect(canAdmit?.()).toBe(true);
+          expect(observer?.listPendingChildren()).toMatchObject([{ state: "completing" }]);
           expect(vi.getTimerCount()).toBe(1);
           await observer?.unregister();
           await vi.advanceTimersByTimeAsync(10);

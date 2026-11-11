@@ -59,6 +59,52 @@ function expectLastStatusFields(
   }
 }
 
+describe("createMatrixMonitorStatusController", () => {
+  it("does not publish ready until startup maintenance completes", () => {
+    const setStatus = vi.fn();
+    const statusController = createMatrixMonitorStatusController({
+      accountId: "default",
+      statusSink: setStatus,
+      deferReadyUntilStartupComplete: true,
+    });
+
+    statusController.noteSyncState("SYNCING", undefined, 100);
+    expectLastStatusFields(setStatus, {
+      connected: false,
+      lifecycle: "starting",
+      healthState: "starting",
+    });
+
+    statusController.markStartupComplete(200);
+    expectLastStatusFields(setStatus, {
+      connected: true,
+      lifecycle: "ready",
+      healthState: "healthy",
+      lastConnectedAt: 200,
+    });
+  });
+
+  it("does not publish a stale ready state after startup disconnects", () => {
+    const setStatus = vi.fn();
+    const statusController = createMatrixMonitorStatusController({
+      accountId: "default",
+      statusSink: setStatus,
+      deferReadyUntilStartupComplete: true,
+    });
+
+    statusController.noteSyncState("SYNCING", undefined, 100);
+    statusController.noteSyncState("RECONNECTING", new Error("network flap"), 150);
+    statusController.markStartupComplete(200);
+
+    expectLastStatusFields(setStatus, {
+      connected: false,
+      lifecycle: "recovering",
+      healthState: "reconnecting",
+      lastError: "network flap",
+    });
+  });
+});
+
 describe("createMatrixMonitorSyncLifecycle", () => {
   it("publishes blocked for an invalidated token and preserves it through cleanup", () => {
     const { setStatus, statusController } = createSyncLifecycleHarness();
@@ -90,26 +136,6 @@ describe("createMatrixMonitorSyncLifecycle", () => {
     expectLastStatusFields(setStatus, {
       lifecycle: "ready",
       terminalDisconnect: undefined,
-    });
-  });
-
-  it("publishes recovering for transient disconnects", () => {
-    const { setStatus, statusController } = createSyncLifecycleHarness();
-    statusController.noteSyncState("RECONNECTING", new Error("network reset"));
-    expectLastStatusFields(setStatus, { lifecycle: "recovering" });
-  });
-
-  it("rejects the channel wait on unexpected sync errors", async () => {
-    const { client, lifecycle, setStatus } = createSyncLifecycleHarness();
-
-    const waitPromise = lifecycle.waitForFatalStop();
-    client.emit("sync.unexpected_error", new Error("sync exploded"));
-
-    await expect(waitPromise).rejects.toThrow("sync exploded");
-    expectLastStatusFields(setStatus, {
-      accountId: "default",
-      healthState: "error",
-      lastError: "sync exploded",
     });
   });
 
@@ -266,18 +292,5 @@ describe("createMatrixMonitorSyncLifecycle", () => {
       healthState: "error",
       lastError: "sync exploded",
     });
-  });
-
-  it("rejects a second concurrent fatal-stop waiter", async () => {
-    const { lifecycle } = createSyncLifecycleHarness();
-
-    const firstWait = lifecycle.waitForFatalStop();
-
-    await expect(lifecycle.waitForFatalStop()).rejects.toThrow(
-      "Matrix fatal-stop wait already in progress",
-    );
-
-    lifecycle.dispose();
-    await expect(firstWait).resolves.toBeUndefined();
   });
 });

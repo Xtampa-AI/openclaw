@@ -3,7 +3,7 @@ import { setImmediate as waitForNextTask } from "node:timers/promises";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { logInfo } from "openclaw/plugin-sdk/logging-core";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
-import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { captureRuntimeConfigAsyncReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
   danger,
   info,
@@ -268,7 +268,7 @@ export async function startWebLoginWithQr(
   } = {},
 ): Promise<StartWebLoginWithQrResult> {
   const runtime = opts.runtime ?? defaultRuntime;
-  const cfg = getRuntimeConfig();
+  const cfg = await captureRuntimeConfigAsyncReader()();
   const account = resolveWhatsAppAccount({ cfg, accountId: opts.accountId });
   const socketTiming = resolveWhatsAppSocketTiming();
   const authState = await readWebAuthExistsForDecision(account.authDir);
@@ -469,7 +469,7 @@ export async function waitForWebLogin(
   } = {},
 ): Promise<{ connected: boolean; message: string; qrDataUrl?: string }> {
   const runtime = opts.runtime ?? defaultRuntime;
-  const cfg = getRuntimeConfig();
+  const cfg = await captureRuntimeConfigAsyncReader()();
   const account = resolveWhatsAppAccount({ cfg, accountId: opts.accountId });
   const activeLogin = activeLogins.get(account.accountId);
   if (!activeLogin) {
@@ -488,7 +488,7 @@ export async function waitForWebLogin(
     };
   }
   const timeoutMs = resolveTimerTimeoutMs(opts.timeoutMs, 120_000, 1000);
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   const currentQrDataUrl = opts.currentQrDataUrl;
 
   while (true) {
@@ -517,7 +517,7 @@ export async function waitForWebLogin(
       };
     }
 
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       return {
         connected: false,

@@ -3,11 +3,27 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import JSON5 from "json5";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveRepoToolBinPath } from "../../scripts/lib/local-check-runtime.mts";
-import { createScriptTestHarness } from "./test-helpers.js";
+import { createChangedOxlintEnv } from "../../scripts/lib/oxlint-changed-scope.mts";
+import { copyOxlintConfigFixture, createScriptTestHarness } from "./test-helpers.js";
 
 const { createTempDir } = createScriptTestHarness();
+
+beforeEach(() => {
+  vi.stubEnv("GITHUB_ACTIONS", "");
+  // CI release targets must not override the branch owned by each fixture.
+  for (const key of [
+    "OPENCLAW_RELEASE_CONTEXT_REF",
+    "GITHUB_BASE_REF",
+    "GITHUB_REF",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
+  ]) {
+    vi.stubEnv(key, "");
+  }
+});
+afterEach(() => vi.unstubAllEnvs());
 
 const sourceProjectOwners = [
   "agents",
@@ -148,7 +164,7 @@ describe("oxlint config", () => {
             : ["eslint(no-eval)", "eslint(no-eval)"],
       })),
     ];
-    fs.copyFileSync(".oxlintrc.json", path.join(tempRoot, ".oxlintrc.json"));
+    copyOxlintConfigFixture(tempRoot);
     for (const fixture of fixtures) {
       const target = path.join(tempRoot, fixture.file);
       fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -209,7 +225,8 @@ describe("oxlint config", () => {
 
   it("checks unbound methods in TypeScript and CommonJS source test support", () => {
     const tempRoot = fs.realpathSync(createTempDir("openclaw-oxlint-source-support-"));
-    for (const file of [".oxlintrc.json", "tsconfig.json", "src/tsconfig.json"]) {
+    copyOxlintConfigFixture(tempRoot);
+    for (const file of ["tsconfig.json", "src/tsconfig.json"]) {
       if (fs.existsSync(file)) {
         const target = path.join(tempRoot, file);
         fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -290,6 +307,7 @@ describe("oxlint config", () => {
       fs.writeFileSync(target, content);
     };
     const copy = (file: string) => write(file, fs.readFileSync(file, "utf8"));
+    copyOxlintConfigFixture(root);
     const packageOwners = [
       "ai",
       "llm-core",
@@ -298,7 +316,6 @@ describe("oxlint config", () => {
       "plugin-sdk",
     ];
     for (const file of [
-      ".oxlintrc.json",
       "tsconfig.json",
       "ui/src/css.d.ts",
       ...packageOwners.map((owner) => `packages/${owner}/tsconfig.json`),
@@ -492,10 +509,139 @@ describe("oxlint config", () => {
     expect(tsconfig.exclude ?? []).not.toContain("**/*.mts");
   });
 
+  it("keeps release line limits advisory while retaining correctness and other limits", () => {
+    const root = fs.realpathSync(createTempDir("openclaw-oxlint-release-limits-"));
+    fs.mkdirSync(path.join(root, ".git"));
+    fs.writeFileSync(path.join(root, "package.json"), "{}");
+    fs.writeFileSync(
+      path.join(root, ".oxlintrc.json"),
+      JSON.stringify({
+        categories: { correctness: "off" },
+        overrides: [
+          {
+            files: ["*.ts"],
+            rules: {
+              "max-lines": ["error", { max: 1 }],
+              "max-lines-per-function": ["error", { max: 1 }],
+              "max-params": ["error", 1],
+              "no-var": "error",
+            },
+          },
+        ],
+      }),
+    );
+    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    const write = (file: string, contents: string) =>
+      fs.writeFileSync(path.join(root, file), contents);
+    const lint = (status: number) => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/run-oxlint.mts"),
+          "--openclaw-focused-config",
+          "--threads=1",
+          "--format",
+          "json",
+          "fixture.ts",
+        ],
+        {
+          cwd: root,
+          encoding: "utf8",
+          timeout: 30_000,
+          env: {
+            ...process.env,
+            GITHUB_ACTIONS: "false",
+            OPENCLAW_RELEASE_CONTEXT_REF: "release/2026.11.4",
+          },
+        },
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(status);
+      return JSON.parse(result.stdout) as { diagnostics: Array<{ code: string }> };
+    };
+    write(
+      "fixture.ts",
+      "export function f(a: number, b: number) {\n  var c = a;\n  return c + b;\n}\n",
+    );
+    const report = lint(1);
+    expect(report.diagnostics.map(({ code }) => code).toSorted()).toEqual([
+      "eslint(max-lines)",
+      "eslint(max-lines-per-function)",
+      "eslint(max-params)",
+      "eslint(no-var)",
+    ]);
+    write("fixture.ts", "export function f(a: number) {\n  const c = a;\n  return c;\n}\n");
+    expect(
+      lint(0)
+        .diagnostics.map(({ code }) => code)
+        .toSorted(),
+    ).toEqual(["eslint(max-lines)", "eslint(max-lines-per-function)"]);
+  });
+
+  it("keeps release cap suppressions valid without weakening unused-disable enforcement", () => {
+    const root = fs.realpathSync(createTempDir("openclaw-oxlint-release-caps-"));
+    fs.mkdirSync(path.join(root, ".git"));
+    copyOxlintConfigFixture(root);
+    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    fs.mkdirSync(path.join(root, "src"));
+    const oversized = "export const values = [\n" + "  0,\n".repeat(702) + "];\n";
+    fs.writeFileSync(
+      path.join(root, "src/suppressed.ts"),
+      "/* oxlint-disable max-lines -- Existing cap debt. */\n" + oversized,
+    );
+    fs.writeFileSync(path.join(root, "src/advisory.ts"), oversized);
+    fs.writeFileSync(
+      path.join(root, "src/unused.ts"),
+      "/* oxlint-disable no-var -- Deliberately unused. */\nexport const value = 1;\n",
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.resolve("scripts/run-oxlint.mts"),
+        "--openclaw-focused-config",
+        "--threads=1",
+        "--format",
+        "json",
+        "--report-unused-disable-directives-severity=error",
+        "src/suppressed.ts",
+        "src/advisory.ts",
+        "src/unused.ts",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, GITHUB_ACTIONS: "true", GITHUB_BASE_REF: "release/2026.11.2" },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    const report = JSON.parse(result.stdout.split("\n::")[0]!) as {
+      diagnostics: Array<{ code: string; severity: string; filename: string; message: string }>;
+    };
+    expect(report.diagnostics.filter((item) => item.filename.endsWith("suppressed.ts"))).toEqual(
+      [],
+    );
+    expect(report.diagnostics).toContainEqual(
+      expect.objectContaining({
+        filename: "src/advisory.ts",
+        severity: "warning",
+        code: "eslint(max-lines)",
+      }),
+    );
+    expect(report.diagnostics).toContainEqual(
+      expect.objectContaining({
+        filename: "src/unused.ts",
+        severity: "error",
+        message: expect.stringContaining("Unused oxlint-disable directive"),
+      }),
+    );
+  });
+
   it("keeps native cap scopes and correctness while warning on untouched local line debt", () => {
     const root = fs.realpathSync(createTempDir("openclaw-oxlint-ci-limits-"));
     // Keep transient-config ownership inside this synthetic checkout.
     fs.mkdirSync(path.join(root, ".git"));
+    copyOxlintConfigFixture(root);
     const config = readJson(".oxlintrc.json") as OxlintConfig;
     fs.writeFileSync(
       path.join(root, ".oxlintrc.json"),
@@ -729,6 +875,178 @@ describe("oxlint config", () => {
         });
       }
     }
+  });
+
+  it("keeps untouched limits advisory for release-version-only manifest changes", () => {
+    const root = fs.realpathSync(createTempDir("openclaw-oxlint-release-version-scope-"));
+    const config = { categories: { correctness: "off" }, rules: { "max-lines": ["error", 2] } };
+    fs.writeFileSync(path.join(root, ".oxlintrc.json"), JSON.stringify(config));
+    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    fs.mkdirSync(path.join(root, "src"));
+    fs.writeFileSync(
+      path.join(root, "src/changed.ts"),
+      "export const changed = [\n  0,\n  1,\n];\n",
+    );
+    fs.writeFileSync(
+      path.join(root, "src/untouched.ts"),
+      "export const untouched = [\n  0,\n  1,\n];\n",
+    );
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "2026.10.10-beta.3" }),
+    );
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    git("init", "--quiet");
+    git("add", ".");
+    git(
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "--quiet",
+      "-m",
+      "base",
+    );
+    const base = git("rev-parse", "HEAD");
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "2026.10.10-beta.4" }),
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.resolve("scripts/run-oxlint.mts"),
+        "--openclaw-focused-config",
+        "--threads=1",
+        "--format=json",
+        "src/changed.ts",
+        "src/untouched.ts",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_ACTIONS: "false",
+          OPENCLAW_OXLINT_CHANGED_PATHS: JSON.stringify(["package.json", "src/changed.ts"]),
+          OPENCLAW_OXLINT_CHANGED_BASE: base,
+        },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      diagnostics: Array<{ filename: string; severity: string }>;
+    };
+    const severity = (file: string) =>
+      report.diagnostics.find((item) => item.filename.replaceAll("\\", "/") === file)?.severity;
+    expect(severity("src/changed.ts")).toBe("error");
+    expect(severity("src/untouched.ts")).toBe("warning");
+  });
+
+  it("trusts changed lint policy files only when they match authoritative main", () => {
+    const config = { categories: { correctness: "off" }, rules: { "max-lines": ["error", 2] } };
+    const root = fs.realpathSync(createTempDir("openclaw-oxlint-trusted-release-policy-"));
+    const write = (file: string, content: string) => {
+      const target = path.join(root, file);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content);
+    };
+    const json = (file: string, value: unknown) => write(file, JSON.stringify(value));
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    const runFocused = (env: NodeJS.ProcessEnv) => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.resolve("scripts/run-oxlint.mts"),
+          "--openclaw-focused-config",
+          "--threads=1",
+          "--format=json",
+          "src/changed.ts",
+          "src/untouched.ts",
+        ],
+        { cwd: root, encoding: "utf8", env: { ...process.env, ...env } },
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(1);
+      return JSON.parse(result.stdout) as {
+        diagnostics: Array<{ filename: string; severity: string }>;
+      };
+    };
+    const severity = (report: ReturnType<typeof runFocused>, file: string) =>
+      report.diagnostics.find((item) => item.filename.replaceAll("\\", "/") === file)?.severity;
+    write(".oxlintrc.json", JSON.stringify(config));
+    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
+    write("src/changed.ts", "export const changed = [\n  0,\n  1,\n];\n");
+    write("src/untouched.ts", "export const untouched = [\n  0,\n  1,\n];\n");
+    write("scripts/lib/oxlint-changed-scope.mts", 'export const policy = "base";\n');
+    json("package.json", { name: "fixture", version: "2026.10.10-beta.3" });
+    git("init", "--quiet");
+    git("add", ".oxlintrc.json", "package.json", "scripts", "src");
+    git(
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "--quiet",
+      "-m",
+      "base",
+    );
+    const base = git("rev-parse", "HEAD");
+    write("scripts/lib/oxlint-changed-scope.mts", 'export const policy = "trusted";\n');
+    git("add", "scripts/lib/oxlint-changed-scope.mts");
+    git(
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "--quiet",
+      "-m",
+      "trusted policy",
+    );
+    const trustedPolicyRef = git("rev-parse", "HEAD");
+    json("package.json", { name: "fixture", version: "2026.10.10-beta.4" });
+
+    const changedPaths = ["package.json", "scripts/lib/oxlint-changed-scope.mts", "src/changed.ts"];
+    const trustedEnv = createChangedOxlintEnv(
+      changedPaths,
+      {
+        CHECKOUT_BASE_SHA: base,
+        GITHUB_ACTIONS: "false",
+        OPENCLAW_OXLINT_TRUSTED_POLICY_REF: trustedPolicyRef,
+      },
+      { cwd: root },
+    );
+    expect(trustedEnv.OPENCLAW_OXLINT_CHANGED_BASE).toBe(base);
+    expect(trustedEnv.OPENCLAW_OXLINT_CHANGED_PATHS).toBe(JSON.stringify(changedPaths));
+    const trusted = runFocused({
+      GITHUB_ACTIONS: "false",
+      ...trustedEnv,
+    });
+    expect(severity(trusted, "src/changed.ts")).toBe("error");
+    expect(severity(trusted, "src/untouched.ts")).toBe("warning");
+
+    write("scripts/lib/oxlint-changed-scope.mts", 'export const policy = "untrusted";\n');
+    const untrusted = runFocused({
+      GITHUB_ACTIONS: "false",
+      OPENCLAW_OXLINT_CHANGED_PATHS: JSON.stringify(changedPaths),
+      OPENCLAW_OXLINT_CHANGED_BASE: base,
+      OPENCLAW_OXLINT_TRUSTED_POLICY_REF: trustedPolicyRef,
+    });
+    expect(severity(untrusted, "src/changed.ts")).toBe("error");
+    expect(severity(untrusted, "src/untouched.ts")).toBe("error");
   });
 
   it("preserves native config validation locally and in Actions", () => {

@@ -93,11 +93,11 @@ describe("retireStandaloneGitWrapper", () => {
         .spyOn(exec, "runCommandBuffered")
         .mockResolvedValue(pkgQueryResult(`${wrapper}\n`));
       try {
-        await withMockedPlatform("freebsd", () =>
-          expect(
+        await withMockedPlatform("freebsd", async () => {
+          await expect(
             retireStandaloneGitWrapper({ previousRoot: root, searchDirs: [base] }),
-          ).rejects.toThrow("installed by FreeBSD pkg"),
-        );
+          ).rejects.toThrow("installed by FreeBSD pkg");
+        });
         await expect(fs.readFile(wrapper, "utf8")).resolves.toBe(contents);
       } finally {
         query.mockRestore();

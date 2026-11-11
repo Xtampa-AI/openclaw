@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -54,29 +54,85 @@ describe("release:prepush", () => {
     expect(assertAuditBounds(HEAD_SHA, HEAD_SHA)).toBe(HEAD_SHA);
   });
 
-  it("selects the canonical release head in a real divergent Git history", () => {
+  it("pushes a first cut from its shipped ancestor while retaining strict changed-byte gates", () => {
+    const root = process.cwd();
     const repo = mkdtempSync(join(tmpdir(), "openclaw-release-baseline-"));
+    const remote = join(repo, "remote.git");
+    const checkout = join(repo, "checkout");
+    mkdirSync(checkout);
     const git = (args: string[]) =>
-      execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+      execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" }).trim();
+    const commit = (message: string) => {
+      git(["add", "."]);
+      git(["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", message]);
+      return git(["rev-parse", "HEAD"]);
+    };
+    const push = () =>
+      spawnSync(
+        process.execPath,
+        [
+          "--import",
+          join(root, "scripts/tsx.mjs"),
+          join(root, "scripts/release-prepush.mts"),
+          "--push",
+        ],
+        { cwd: checkout, encoding: "utf8" },
+      );
     try {
       git(["init", "--quiet", "--initial-branch=main"]);
       git(["config", "user.name", "Release Test"]);
       git(["config", "user.email", "release-test@example.com"]);
-      git(["commit", "--quiet", "--allow-empty", "-m", "shared"]);
-      git(["branch", "release/2026.10.6"]);
-      git(["commit", "--quiet", "--allow-empty", "-m", "main only"]);
-      const mainSha = git(["rev-parse", "HEAD"]);
-      git(["switch", "--quiet", "release/2026.10.6"]);
-      git(["commit", "--quiet", "--allow-empty", "-m", "published release"]);
-      const releaseSha = git(["rev-parse", "HEAD"]);
-      git(["commit", "--quiet", "--allow-empty", "-m", "candidate"]);
-      const candidateSha = git(["rev-parse", "HEAD"]);
-
-      expect(
-        selectChangedGateBase(mainSha, candidateSha, releaseSha, (baseSha, headSha) =>
-          git(["merge-base", baseSha, headSha]),
-        ),
-      ).toBe(releaseSha);
+      git(["config", "core.hooksPath", "/dev/null"]);
+      git(["init", "--quiet", "--bare", remote]);
+      git(["remote", "add", "origin", remote]);
+      mkdirSync(join(checkout, "scripts/lib"), { recursive: true });
+      for (const file of ["scripts/release-changelog.mjs", "scripts/lib/release-changelog.mjs"]) {
+        copyFileSync(join(root, file), join(checkout, file));
+      }
+      writeFileSync(
+        join(checkout, "CHANGELOG.md"),
+        "# Changelog\n\n## 2026.10.7\n\n### Fixes\n\n- Fixture.\n",
+      );
+      execFileSync(process.execPath, ["scripts/release-changelog.mjs", "split"], { cwd: checkout });
+      commit("shared");
+      git(["switch", "--quiet", "-c", "release/2026.10.6"]);
+      mkdirSync(join(checkout, "patches"));
+      writeFileSync(
+        join(checkout, "patches/vendor.patch"),
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n \n-\told\n+\tnew\n",
+      );
+      const shipped = commit("shipped patch bytes");
+      git(["tag", "v2026.10.6"]);
+      git(["switch", "--quiet", "main"]);
+      writeFileSync(join(checkout, "main.txt"), "main only\n");
+      commit("main diverges");
+      git(["push", "--quiet", "origin", "main", "--tags"]);
+      git(["tag", "--delete", "v2026.10.6"]);
+      git(["switch", "--quiet", "-c", "release/2026.10.7", shipped]);
+      writeFileSync(join(checkout, "candidate.txt"), "candidate \n");
+      commit("bad first candidate");
+      git(["tag", "v2026.10.7-beta.1"]);
+      git(["tag", "v2026.10.7"]);
+      expect(push().status).not.toBe(0);
+      expect(git(["ls-remote", "origin", "refs/heads/release/2026.10.7"])).toBe("");
+      writeFileSync(join(checkout, "candidate.txt"), "candidate\n");
+      const candidate = commit("new candidate");
+      const result = push();
+      expect(result.stderr).not.toContain("trailing whitespace");
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(git(["ls-remote", "origin", "refs/heads/release/2026.10.7"])).toContain(candidate);
+      for (const content of [
+        "new trailing whitespace \n",
+        "<<<<<<< ours\n=======\n>>>>>>> theirs\n",
+      ]) {
+        git(["reset", "--hard", candidate]);
+        writeFileSync(join(checkout, "candidate.txt"), content);
+        commit("bad candidate bytes");
+        const rejected = push();
+        expect(rejected.status).not.toBe(0);
+        expect(rejected.stderr).toContain("whitespace and conflict-marker check");
+        expect(git(["ls-remote", "origin", "refs/heads/release/2026.10.7"])).toContain(candidate);
+      }
     } finally {
       rmSync(repo, { force: true, recursive: true });
     }
@@ -92,66 +148,58 @@ describe("release:prepush", () => {
     );
   });
 
-  it("uses the audited merge base for gates on a divergent release branch", async () => {
+  it("uses the audited merge base for the short preflight on a divergent release branch", async () => {
     const runCommand = vi.fn().mockResolvedValue(0);
     const status = await runReleasePrepush(
       { base: "origin/main", dryRun: false, push: false },
       {
         assertCleanWorktree: vi.fn(),
         assertAuditBounds: vi.fn().mockReturnValue(MERGE_BASE_SHA),
-        createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
         currentBranch: vi.fn(),
         pushValidatedHead: vi.fn(),
         refreshMain: vi.fn(),
+        resolveInitialReleaseBase: vi.fn(),
         refreshReleaseBranch: vi.fn(),
-        removeValidationCheckout: vi.fn(),
         resolveCommit: vi.fn((ref) => (ref === "HEAD" ? HEAD_SHA : BASE_SHA)),
         runCommand,
       },
     );
     expect(status).toBe(0);
     expect(runCommand.mock.calls.map(([command]) => [command.bin, command.args])).toEqual([
-      ["pnpm", ["install", "--frozen-lockfile"]],
-      ["pnpm", ["check:changed", "--base", MERGE_BASE_SHA, "--head", HEAD_SHA]],
-      ["pnpm", ["deadcode:knip"]],
-      ["node", ["scripts/test-projects.mts", "--changed", MERGE_BASE_SHA]],
+      ["git", ["diff", "--check", MERGE_BASE_SHA, HEAD_SHA]],
+      ["node", ["scripts/release-changelog.mjs", "check", "--ref", HEAD_SHA]],
     ]);
+    expect(runCommand.mock.calls.every(([command]) => command.cwd === process.cwd())).toBe(true);
   });
 
-  it("pins changed static/type checks, dead-code analysis, and changed tests", () => {
-    const plan = buildReleasePrepushPlan(BASE_SHA, HEAD_SHA, "/snapshot", { PATH: "/bin" });
+  it("pins only the fast exact-SHA whitespace and changelog checks", () => {
+    const plan = buildReleasePrepushPlan(BASE_SHA, HEAD_SHA, process.cwd());
     expect(plan.map(({ bin, args }) => [bin, ...args])).toEqual([
-      ["pnpm", "install", "--frozen-lockfile"],
-      ["pnpm", "check:changed", "--base", BASE_SHA, "--head", HEAD_SHA],
-      ["pnpm", "deadcode:knip"],
-      ["node", "scripts/test-projects.mts", "--changed", BASE_SHA],
+      ["git", "diff", "--check", BASE_SHA, HEAD_SHA],
+      ["node", "scripts/release-changelog.mjs", "check", "--ref", HEAD_SHA],
     ]);
-    expect(plan.every((command) => command.cwd === "/snapshot")).toBe(true);
-    expect(plan[1]?.env).toMatchObject({ CI: "1", OPENCLAW_LOCAL_CHECK: "0" });
+    expect(plan.every((command) => command.cwd === process.cwd())).toBe(true);
   });
 
   it("stops at the first failed integrated gate", async () => {
     const runCommand = vi.fn().mockResolvedValueOnce(0).mockResolvedValueOnce(9);
-    const removeValidationCheckout = vi.fn();
     const status = await runReleasePrepush(
       { base: "origin/main", dryRun: false, push: false },
       {
         assertCleanWorktree: vi.fn(),
         assertAuditBounds: vi.fn().mockReturnValue(BASE_SHA),
-        createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
         currentBranch: vi.fn(),
         pushValidatedHead: vi.fn(),
         refreshMain: vi.fn(),
+        resolveInitialReleaseBase: vi.fn(),
         refreshReleaseBranch: vi.fn(),
-        removeValidationCheckout,
         resolveCommit: vi.fn((ref) => (ref === "HEAD" ? HEAD_SHA : BASE_SHA)),
         runCommand,
       },
     );
     expect(status).toBe(9);
     expect(runCommand).toHaveBeenCalledTimes(2);
-    expect(runCommand.mock.calls.every(([command]) => command.cwd === "/snapshot")).toBe(true);
-    expect(removeValidationCheckout).toHaveBeenCalledWith("/snapshot");
+    expect(runCommand.mock.calls.every(([command]) => command.cwd === process.cwd())).toBe(true);
   });
 
   it("rejects a head that changes during validation", async () => {
@@ -167,12 +215,11 @@ describe("release:prepush", () => {
         {
           assertCleanWorktree,
           assertAuditBounds: vi.fn().mockReturnValue(BASE_SHA),
-          createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
           currentBranch: vi.fn(),
           pushValidatedHead: vi.fn(),
           refreshMain: vi.fn(),
+          resolveInitialReleaseBase: vi.fn(),
           refreshReleaseBranch: vi.fn(),
-          removeValidationCheckout: vi.fn(),
           resolveCommit: resolve,
           runCommand: vi.fn().mockResolvedValue(0),
         },
@@ -194,12 +241,11 @@ describe("release:prepush", () => {
           .fn()
           .mockReturnValueOnce(MERGE_BASE_SHA)
           .mockReturnValueOnce(RELEASE_SHA),
-        createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
         currentBranch,
         pushValidatedHead,
         refreshMain,
+        resolveInitialReleaseBase: vi.fn(),
         refreshReleaseBranch: vi.fn().mockReturnValue(RELEASE_SHA),
-        removeValidationCheckout: vi.fn(),
         resolveCommit: vi.fn((ref) => (ref === "HEAD" ? HEAD_SHA : BASE_SHA)),
         runCommand,
       },
@@ -207,13 +253,12 @@ describe("release:prepush", () => {
     expect(status).toBe(0);
     expect(refreshMain).toHaveBeenCalledOnce();
     expect(currentBranch).toHaveBeenCalledTimes(2);
-    expect(runCommand.mock.calls[1]?.[0].args).toEqual([
-      "check:changed",
-      "--base",
-      RELEASE_SHA,
-      "--head",
-      HEAD_SHA,
-    ]);
+    expect(
+      runCommand.mock.calls.every(
+        ([command]) => command.env?.OPENCLAW_RELEASE_CONTEXT_REF === "release/2026.10.6",
+      ),
+    ).toBe(true);
+    expect(runCommand.mock.calls[0]?.[0].args).toEqual(["diff", "--check", RELEASE_SHA, HEAD_SHA]);
     expect(pushValidatedHead).toHaveBeenCalledWith(HEAD_SHA, "release/2026.10.6");
   });
 
@@ -235,12 +280,11 @@ describe("release:prepush", () => {
           .fn()
           .mockReturnValueOnce(MERGE_BASE_SHA)
           .mockReturnValueOnce(RELEASE_SHA),
-        createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
         currentBranch,
         pushValidatedHead,
         refreshMain: vi.fn(),
+        resolveInitialReleaseBase: vi.fn(),
         refreshReleaseBranch: vi.fn().mockReturnValue(RELEASE_SHA),
-        removeValidationCheckout: vi.fn(),
         resolveCommit,
         runCommand: vi.fn().mockResolvedValue(0),
       },
@@ -265,18 +309,17 @@ describe("release:prepush", () => {
       {
         assertCleanWorktree: vi.fn(),
         assertAuditBounds,
-        createValidationCheckout: vi.fn().mockReturnValue("/snapshot"),
         currentBranch: vi.fn(),
         pushValidatedHead,
         refreshMain: vi.fn(),
+        resolveInitialReleaseBase: vi.fn(),
         refreshReleaseBranch: vi.fn(),
-        removeValidationCheckout: vi.fn(),
         resolveCommit: vi.fn().mockReturnValue(HEAD_SHA),
         runCommand,
       },
     );
     expect(status).toBe(0);
-    expect(runCommand).toHaveBeenCalledTimes(4);
+    expect(runCommand).toHaveBeenCalledTimes(2);
     expect(pushValidatedHead).toHaveBeenCalledWith(HEAD_SHA, "release/2026.10.6");
   });
 
@@ -288,12 +331,11 @@ describe("release:prepush", () => {
         {
           assertCleanWorktree: vi.fn(),
           assertAuditBounds: vi.fn(),
-          createValidationCheckout: vi.fn(),
           currentBranch: vi.fn().mockReturnValue("release/2026.10.6"),
           pushValidatedHead: vi.fn(),
           refreshMain,
+          resolveInitialReleaseBase: vi.fn(),
           refreshReleaseBranch: vi.fn(),
-          removeValidationCheckout: vi.fn(),
           resolveCommit: vi.fn(),
           runCommand: vi.fn(),
         },

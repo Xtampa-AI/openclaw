@@ -45,7 +45,17 @@ const ACP_CRON_MCP_PROBE_VERIFY_POLLS = 5;
 const ACP_CRON_MCP_PROBE_VERIFY_POLL_MS = 1_000;
 const DEFAULT_LIVE_CODEX_MODEL = "gpt-5.6-luna";
 const DEFAULT_LIVE_PARENT_MODEL = "openai/gpt-5.4";
-type LiveAcpAgent = "claude" | "codex" | "droid" | "gemini" | "opencode";
+type LiveAcpAgent = "claude" | "codex" | "droid" | "gemini" | "grok-build" | "opencode";
+
+class AgentWaitFailure extends Error {
+  constructor(readonly result: { status?: string; [key: string]: unknown }) {
+    super(`agent.wait failed: ${formatAgentWaitFailure(result)}`);
+  }
+}
+
+function isRetryableAgentWaitTimeout(error: unknown): error is AgentWaitFailure {
+  return error instanceof AgentWaitFailure && error.result.status === "timeout";
+}
 
 function snapshotAcpBindLiveEnv(): LiveEnvSnapshot {
   return snapshotLiveEnv(["CODEX_HOME"]);
@@ -97,6 +107,9 @@ function normalizeAcpAgent(raw: string | undefined): LiveAcpAgent {
   }
   if (normalized === "opencode") {
     return "opencode";
+  }
+  if (normalized === "grok-build") {
+    return "grok-build";
   }
   return "claude";
 }
@@ -372,6 +385,12 @@ describe("ACP bind agent.wait diagnostics", () => {
       "ACP turn failed",
     );
   });
+
+  it("retries only terminal timeout results", () => {
+    expect(isRetryableAgentWaitTimeout(new AgentWaitFailure({ status: "timeout" }))).toBe(true);
+    expect(isRetryableAgentWaitTimeout(new AgentWaitFailure({ status: "error" }))).toBe(false);
+    expect(isRetryableAgentWaitTimeout(new Error("timeout"))).toBe(false);
+  });
 });
 
 function formatAssistantTextPreview(texts: string[], maxChars = 600): string {
@@ -476,7 +495,7 @@ async function waitForAgentRunOk(
     },
   );
   if (result?.status !== "ok") {
-    throw new Error(`agent.wait failed for ${runId}: ${formatAgentWaitFailure(result)}`);
+    throw new AgentWaitFailure({ runId, ...result });
   }
 }
 
@@ -767,7 +786,9 @@ describeLive("gateway live (ACP bind)", () => {
         const { mainAssistantTexts, spawnedSessionKey } = bindResult;
         logLiveStep("bind command completed");
         expect(mainAssistantTexts.join("\n\n")).toContain("Bound this conversation to");
-        expect(spawnedSessionKey).toMatch(new RegExp(`^agent:${liveAgent}:acp:`));
+        // Raw harness ids stay owned by the requesting `main` agent; this lane configures no agent
+        // named after the harness, which would keep its own namespace instead.
+        expect(spawnedSessionKey).toMatch(/^agent:main:acp:/);
         logLiveStep(`binding announced for session ${spawnedSessionKey ?? "missing"}`);
 
         let firstBoundHistory: Awaited<ReturnType<typeof waitForAssistantText>> | null = null;
@@ -924,23 +945,37 @@ describeLive("gateway live (ACP bind)", () => {
           const markerAssistantCount = assistantTexts.length;
           let imageHistory: Awaited<ReturnType<typeof waitForAssistantTurn>> | null = null;
           for (let attempt = 0; attempt < 2 && !imageHistory; attempt += 1) {
-            await sendChatAndWait({
-              client,
-              sessionKey: originalSessionKey,
-              idempotencyKey: `idem-image-${attempt}-${randomUUID()}`,
-              message:
-                "What animal is drawn in the attached image? Reply with only the lowercase animal name.",
-              originatingChannel: "slack",
-              originatingTo: conversationId,
-              originatingAccountId: accountId,
-              attachments: [
-                {
-                  mimeType: "image/png",
-                  fileName: `probe-${randomUUID()}.png`,
-                  content: renderCatFacePngBase64(),
-                },
-              ],
-            });
+            try {
+              await sendChatAndWait({
+                client,
+                sessionKey: originalSessionKey,
+                idempotencyKey: `idem-image-${attempt}-${randomUUID()}`,
+                message:
+                  "What animal is drawn in the attached image? Reply with only the lowercase animal name.",
+                originatingChannel: "slack",
+                originatingTo: conversationId,
+                originatingAccountId: accountId,
+                attachments: [
+                  {
+                    mimeType: "image/png",
+                    fileName: `probe-${randomUUID()}.png`,
+                    content: renderCatFacePngBase64(),
+                  },
+                ],
+              });
+            } catch (error) {
+              if (!isRetryableAgentWaitTimeout(error)) {
+                throw error;
+              }
+              // A timed-out wait leaves its run active on this session. A retry or the cron
+              // probe would queue behind it and spend the remaining test budget, so cancel it.
+              await client.request("chat.abort", {
+                sessionKey: originalSessionKey,
+                runId: String(error.result.runId),
+              });
+              logLiveStep("image turn timed out; aborted it and continuing to cron verification");
+              break;
+            }
             logLiveStep(`image turn completed (attempt ${String(attempt + 1)})`);
 
             try {

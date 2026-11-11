@@ -35,6 +35,7 @@ export function createCopilotToolBridge(input: CopilotToolBridgeTestInput) {
     spawnWorkspaceDir: undefined,
     ...baseInput,
     attemptParams: {
+      authProfileStore: { version: 1, profiles: {} },
       ...attemptParams,
       sessionKey: attemptParams?.sessionKey ?? sessionKey,
       abortSignal: abortSignal ?? attemptParams?.abortSignal,

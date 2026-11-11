@@ -6,6 +6,7 @@ import type { GatewayTailscaleMode } from "../config/types.gateway.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayActiveWorkInspectors } from "../infra/gateway-active-work.js";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import { withPluginRuntimeGatewayContextResolver } from "../plugins/runtime/gateway-request-scope.js";
 import type { GatewayDiscovery } from "./server-discovery-runtime.js";
@@ -17,11 +18,10 @@ type StartGatewayMaintenanceTimers =
   typeof import("./server-maintenance.js").startGatewayMaintenanceTimers;
 type GatewayMaintenanceParams = Parameters<StartGatewayMaintenanceTimers>[0];
 
-const loadRemoteSkillsRuntimeModule = async () => await import("../skills/runtime/remote.js");
-
 /** Start early Gateway side runtimes before the main server is fully ready. */
 export async function startGatewayEarlyRuntime(params: {
   scheduler: GatewayScheduler;
+  getCronStorePath: () => string;
   minimalTestGateway: boolean;
   isClosing: () => boolean;
   updateCanary?: boolean;
@@ -55,6 +55,7 @@ export async function startGatewayEarlyRuntime(params: {
     | "runManagedOutgoingMediaGc"
   >;
   getRuntimeConfig: () => OpenClawConfig;
+  getPluginMetadataSnapshot: () => PluginMetadataSnapshot | undefined;
   startupTrace?: GatewayStartupTrace;
 }) {
   await setSessionMcpRuntimeScheduler(params.scheduler);
@@ -93,12 +94,12 @@ export async function startGatewayEarlyRuntime(params: {
   if (startSideRuntimes) {
     const [{ primeRemoteSkillsCache, setSkillsRemoteRegistry }, { startCronMaintenance }] =
       await measureStartup(params.startupTrace, "runtime.early.lazy-runtime-imports", () =>
-        Promise.all([loadRemoteSkillsRuntimeModule(), import("../cron/maintenance.js")]),
+        Promise.all([import("../skills/runtime/remote.js"), import("../cron/maintenance.js")]),
       );
     setSkillsRemoteRegistry(params.nodeRegistry);
     void primeRemoteSkillsCache();
     if (!params.isClosing()) {
-      startCronMaintenance(params.scheduler);
+      startCronMaintenance(params.scheduler, params.getCronStorePath);
     }
   }
 
@@ -106,7 +107,7 @@ export async function startGatewayEarlyRuntime(params: {
     ? async () => {}
     : await measureStartup(params.startupTrace, "runtime.early.skills-listener", async () => {
         const skillsRuntimePromise = import("../skills/runtime/refresh.js");
-        const remoteSkillsRuntimePromise = loadRemoteSkillsRuntimeModule();
+        const remoteSkillsRuntimePromise = import("../skills/runtime/remote.js");
         const { closeSkillsWatchers, detachSkillsWatchers, registerSkillsChangeListener } =
           await skillsRuntimePromise;
         const { refreshRemoteBinsForConnectedNodes } = await remoteSkillsRuntimePromise;
@@ -124,6 +125,7 @@ export async function startGatewayEarlyRuntime(params: {
             params.broadcast("skills.changed", { reason: event.reason });
             return;
           }
+          params.broadcast("skills.changed", { reason: event.reason });
           // Coalesce local skill changes before refreshing connected remote
           // nodes so bulk plugin/skill updates do not stampede node refreshes.
           params.scheduler.schedule({
@@ -140,16 +142,11 @@ export async function startGatewayEarlyRuntime(params: {
                   `failed to refresh remote bins after skills change: ${String(error)}`,
                 );
               }
-              if (!params.isClosing()) {
-                params.broadcast("skills.changed", { reason: event.reason });
-              }
             },
           });
         });
         return async ({ exitAfterClose = false }: { exitAfterClose?: boolean } = {}) => {
           unregister();
-          // Process exit releases native watchers at once; retiring each one here
-          // blocks this thread on fseventsd for seconds apiece on macOS.
           await (exitAfterClose ? detachSkillsWatchers() : closeSkillsWatchers());
         };
       });
@@ -164,7 +161,21 @@ export async function startGatewayEarlyRuntime(params: {
       return null;
     }
     return await measureStartup(params.startupTrace, "post-ready.maintenance", async () => {
-      const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+      const [{ refreshSkillsDiscovery }, { startGatewayMaintenanceTimers }] = await Promise.all([
+        import("../skills/runtime/refresh.js"),
+        import("./server-maintenance.js"),
+      ]);
+      if (params.isClosing()) {
+        return null;
+      }
+      try {
+        await refreshSkillsDiscovery({
+          config: params.getRuntimeConfig(),
+          pluginMetadataSnapshot: params.getPluginMetadataSnapshot(),
+        });
+      } catch (error) {
+        params.log.warn(`failed to refresh skills during startup: ${String(error)}`);
+      }
       if (params.isClosing()) {
         return null;
       }

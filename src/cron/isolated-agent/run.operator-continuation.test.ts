@@ -1,6 +1,7 @@
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SessionGitHubPublicationPublished } from "../../../packages/gateway-protocol/src/schema/session-github-publication.js";
 import { createOpenClawCodingToolsAsync } from "../../agents/agent-tools.js";
 import { persistAuthProfileBatch } from "../../agents/auth-profiles/upsert-with-lock.js";
 import { withPreparedEmbeddedGatewayTools } from "../../agents/embedded-agent-runner/run/attempt-gateway-tools.js";
@@ -13,13 +14,13 @@ import {
   type CronCreatorToolAllowlistEntry,
   type CronToolsAllowCaptureRef,
 } from "../../agents/tools/cron-tool.js";
-import {
-  getGatewayToolCallerIdentity,
-  resolveGatewayToolOperatorSelection,
-} from "../../agents/tools/gateway-caller-context.js";
+import { getGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import * as publicationIdentity from "../../gateway/github-publication-availability.js";
+import * as publicationTransport from "../../gateway/github-publication-git-transport.js";
+import { createGitHubPublicationCoordinator } from "../../gateway/github-publication.js";
 import { captureGatewayOperatorRunAuthority } from "../../gateway/operator-run-authority.js";
 import { createOperatorRecoveryFixture } from "../../gateway/operator-run-recovery.test-support.js";
 import { createScheduledGatewayRunner } from "../../gateway/scheduled-run-gateway-context.js";
@@ -34,6 +35,7 @@ import {
   SESSION_ID,
   stateDir,
 } from "../../gateway/server-methods/requester-cron-authority.test-support.js";
+import { createWorkerSessionPlacementStore } from "../../gateway/worker-environments/placement-store.js";
 import {
   bindGatewayContextResolver,
   clearGatewayContextResolver,
@@ -49,6 +51,7 @@ import {
 } from "../../test-utils/gateway-scheduler-clock.js";
 import { createCronServiceWithStateForTest, createNoopLogger } from "../service.test-harness.js";
 import { onTimer } from "../service/timer.test-support.js";
+import { runCronSessionTurn } from "../session-run.js";
 import { resolveCronSessionTargetSessionKey } from "../session-target.js";
 import {
   ensureAgentWorkspaceMock,
@@ -63,12 +66,26 @@ import {
   runEmbeddedAgentMock,
 } from "./run.test-harness.js";
 
+const sessionRunner = vi.hoisted(() => ({
+  runEmbedded: vi.fn<typeof import("../../agents/embedded-agent-runner/run.js").runEmbeddedAgent>(),
+}));
+// mock-isolation: Only model execution is synthetic; scheduled admission and publication stay real.
+vi.mock("../../agents/embedded-agent-runner/run.js", () => ({
+  runEmbeddedAgent: sessionRunner.runEmbedded,
+}));
+
 const runCronIsolatedAgentTurn = await loadRunCronIsolatedAgentTurn();
 const { resolveAgentDir } = await import("./run.runtime.js");
+await Promise.all([
+  import("../../auto-reply/dispatch.js"),
+  import("../../auto-reply/reply/get-reply-from-config.runtime.js").then((runtime) =>
+    runtime.prewarmConfigDrivenReplyRuntime(),
+  ),
+]);
 const session = await vi.importActual<typeof import("./session.js")>("./session.js");
-const accessor = await vi.importActual<
-  typeof import("../../config/sessions/session-accessor.sqlite-entry.js")
->("../../config/sessions/session-accessor.sqlite-entry.js");
+const accessor = await vi.importActual<typeof import("../../config/sessions/session-accessor.js")>(
+  "../../config/sessions/session-accessor.js",
+);
 installRequesterCronAuthorityTestHooks();
 
 beforeEach(() => {
@@ -80,6 +97,9 @@ beforeEach(() => {
   ensureAgentWorkspaceMock.mockImplementation(async ({ dir }: { dir: string }) => ({ dir }));
   resolveCronDeliveryPlanMock.mockReturnValue({ requested: false, mode: "none" });
   mockRunCronFallbackPassthrough();
+  sessionRunner.runEmbedded
+    .mockReset()
+    .mockImplementation((params) => runEmbeddedAgentMock(params));
 });
 afterEach(() => {
   runEmbeddedAgentMock.mockReset();
@@ -88,9 +108,7 @@ afterEach(() => {
 
 // Existing recovery and manual-run tests miss this scheduled custody transfer:
 // authenticated creation, durable reload, a timer without a human request, normal
-// admission, and the Gateway tool caller authority every operator-gated tool reads.
-// Release adaptation: the main-branch regression observes GitHub inspect/merge, which
-// this release line does not ship; the restored operator source is the same owner.
+// admission, the offered schema, and the real guarded GitHub action owner.
 describe("same-conversation scheduled operator continuation", () => {
   it.each([
     "operator",
@@ -100,7 +118,7 @@ describe("same-conversation scheduled operator continuation", () => {
     "foreign target",
     "current tool deny",
     "role revoked",
-    "role revoked during run",
+    "role revoked during merge",
     "session replaced",
   ] as const)("preserves the %s boundary", async (scenario) => {
     const agentDir = path.join(stateDir, "agents", "main", "agent");
@@ -115,7 +133,7 @@ describe("same-conversation scheduled operator continuation", () => {
         profiles: { "openai:continuation": { provider: "openai", mode: "api_key" } },
         order: { openai: ["openai:continuation"] },
       },
-      tools: { allow: [AUTOMATIONS_TOOL_NAME, "sessions_list"] },
+      tools: { allow: [AUTOMATIONS_TOOL_NAME, "github_publish"] },
     };
     setRuntimeConfigSnapshot(config);
     vi.mocked(resolveAgentDir).mockReturnValue(agentDir);
@@ -142,6 +160,10 @@ describe("same-conversation scheduled operator continuation", () => {
       sessionId: SESSION_ID,
       scopes: scenario === "guest" ? ["operator.sessions.write"] : ["operator.admin"],
     });
+    // Ordinary admission retires a completed predecessor; an active claim keeps custody.
+    recovery.entry.status = "done";
+    recovery.entry.abortedLastRun = false;
+    await accessor.replaceSessionEntry(recovery.target, recovery.entry);
     // Capture fresh authenticated admission, not the released recovery fixture authority.
     // The legacy row has identical human attribution but no operator admission.
     const original =
@@ -186,7 +208,6 @@ describe("same-conversation scheduled operator continuation", () => {
                   sessionId: SESSION_ID,
                   agentHarnessId: "openclaw",
                 },
-                () => true,
                 async () => {
                   expectDefined(getGatewayToolCallerIdentity(), "creator caller");
                   const capturedTools: CronCreatorToolAllowlistEntry[] = [];
@@ -200,6 +221,7 @@ describe("same-conversation scheduled operator continuation", () => {
                     workspaceDir: stateDir,
                     operationalRunInstance: admitted.operationalRunInstance,
                     senderIsOwner: true,
+                    githubPublicationAvailable: true,
                     cronCreatorToolAllowlistRef: capturedTools,
                     cronCreatorToolAllowlistCaptureRef: capture,
                     toolConstructionPlan: {
@@ -223,7 +245,7 @@ describe("same-conversation scheduled operator continuation", () => {
                   await automations.execute("schedule-continuation", {
                     action: "add",
                     job: {
-                      name: "Finish authorized work",
+                      name: "Finish authorized landing",
                       enabled: scenario !== "paused force run",
                       schedule: {
                         kind: "at",
@@ -232,8 +254,8 @@ describe("same-conversation scheduled operator continuation", () => {
                       sessionTarget: "session:" + targetKey,
                       payload: {
                         kind: "agentTurn",
-                        message: "Finish the authorized task",
-                        toolsAllow: ["sessions_list"],
+                        message: "Inspect and land the reviewed PR",
+                        toolsAllow: ["github_publish"],
                       },
                       delivery: { mode: "none" },
                       deleteAfterRun: false,
@@ -272,16 +294,14 @@ describe("same-conversation scheduled operator continuation", () => {
     }
     // No operator request, original admitted run or human follow-up survives this point.
     const job = expectDefined((await fixture.read())[0], "durably stored continuation");
-    if (scenario === "foreign target" || scenario === "legacy attribution") {
+    if (scenario === "foreign target") {
       expect(job.operatorSource).toBeUndefined();
-    } else {
-      expect(job.operatorSource?.source.sessionKey).toBe(SESSION);
     }
     if (original) {
       expect(() => original.authority.assertCurrent()).toThrow();
     }
     if (scenario === "current tool deny") {
-      config.tools = { ...config.tools, deny: ["sessions_list"] };
+      config.tools = { ...config.tools, deny: ["github_publish"] };
       setRuntimeConfigSnapshot(config);
     } else if (scenario === "role revoked") {
       await setCanonicalUserProfileRole(profile.id, "blocked");
@@ -296,16 +316,93 @@ describe("same-conversation scheduled operator continuation", () => {
       );
     }
 
+    // A prior publication receipt is a fixed input to the action owner. Publication
+    // creation/storage and actual GitHub credentials are outside this regression.
+    const publication: SessionGitHubPublicationPublished = {
+      status: "published",
+      requestId: "27878d29-9f2e-462d-a68a-4e9b4ba27685",
+      repository: "fixture/repository",
+      branch: "reviewed-change",
+      headCommit: "a".repeat(40),
+      url: "https://github.com/fixture/repository/pull/7",
+      publisher: {
+        source: "agent-override",
+        accountId: 42,
+        login: "roboclaw-bot",
+      },
+    };
+    const coordinator = createGitHubPublicationCoordinator({
+      placements: createWorkerSessionPlacementStore(),
+      getCommittedRuntimeConfig: () => config,
+    });
+    context.githubPublicationService = coordinator;
+    const receipt = vi
+      .spyOn(coordinator, "latestShared")
+      .mockResolvedValue({ result: publication, confirmation: null });
+    vi.spyOn(publicationIdentity, "prepareCurrentGitHubPublicationIdentity").mockResolvedValue({
+      source: "agent-override",
+      account: { accountId: 42, login: "roboclaw-bot", avatarUrl: null },
+      env: {},
+    });
+    vi.spyOn(publicationIdentity, "matchesCurrentGitHubPublicationIdentity").mockReturnValue(true);
+    let merged = false;
+    let reads = 0;
+    const writes: unknown[] = [];
+    const github = vi
+      .spyOn(publicationTransport, "runPublicationCommand")
+      .mockImplementation(async (argv, options) => {
+        options?.beforeRun?.();
+        if (argv.includes("PUT") && argv.includes("repos/fixture/repository/pulls/7/merge")) {
+          writes.push(JSON.parse(String(options?.input)));
+          merged = true;
+        } else {
+          expect(argv).toContain("GET");
+          expect(argv).toContain("repos/fixture/repository/pulls/7");
+          reads++;
+          if (scenario === "role revoked during merge" && reads === 2) {
+            // Inspect already succeeded. Revoke while merge's preflight read is
+            // awaited, before the action owner can perform its final write.
+            await setCanonicalUserProfileRole(profile.id, "blocked");
+          }
+        }
+        return {
+          code: 0,
+          termination: "exit" as const,
+          signal: null,
+          killed: false,
+          stderr: Buffer.alloc(0),
+          stdout: Buffer.from(
+            JSON.stringify({
+              node_id: "fixture-pr",
+              html_url: publication.url,
+              title: "Reviewed change",
+              body: "Reviewed",
+              state: merged ? "closed" : "open",
+              draft: false,
+              merged,
+              head: { ref: publication.branch, sha: publication.headCommit },
+              base: { repo: { full_name: publication.repository } },
+              mergeable: true,
+              mergeable_state: "clean",
+              merge_commit_sha: merged ? "b".repeat(40) : null,
+            }),
+          ),
+        };
+      });
     let entered = 0;
     let offered: unknown;
-    let restored: { profileId: string; scopes: readonly string[] } | undefined;
-    let revokedDuringRun: string | undefined;
+    const results: unknown[] = [];
+    let rejected: string | undefined;
     runEmbeddedAgentMock.mockImplementation(async (params: RunEmbeddedAgentParams) => {
       entered++;
       const admitted = await expectDefined(
         params.preparedRunAdmission,
         "scheduled admission",
       ).admit("gateway", params.runId);
+      // Session admission settles only after the runner reports execution start.
+      params.onExecutionPhase?.({ phase: "model_call_started" });
+      await params.onExecutionStarted?.();
+      await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
       return withPreparedEmbeddedGatewayTools(
         {
           admittedRunContext: admitted,
@@ -314,8 +411,8 @@ describe("same-conversation scheduled operator continuation", () => {
           sessionId: params.sessionId,
           agentHarnessId: "openclaw",
         },
-        () => true,
         async () => {
+          // Schema projection reads session control authority from this admitted caller.
           expectDefined(getGatewayToolCallerIdentity(), "scheduled caller");
           const tools = applyEmbeddedAttemptToolsAllow(
             await createOpenClawCodingToolsAsync({
@@ -330,6 +427,7 @@ describe("same-conversation scheduled operator continuation", () => {
               abortSignal: params.abortSignal,
               runtimeToolAllowlist: params.toolsAllow,
               scheduledToolPolicy: params.scheduledToolPolicy,
+              githubPublicationAvailable: true,
               toolConstructionPlan: {
                 includeBaseCodingTools: false,
                 includeShellTools: false,
@@ -341,20 +439,25 @@ describe("same-conversation scheduled operator continuation", () => {
             params.toolsAllow,
             { toolMeta: getPluginToolMeta },
           );
-          offered = tools.find((tool) => tool.name === "sessions_list")?.parameters;
-          // Operator-gated tools resolve their requester through this selection owner.
-          const selection = resolveGatewayToolOperatorSelection();
-          const authority = selection.operatorAuthority;
-          if (authority) {
-            selection.assertCurrent();
-            restored = { profileId: authority.profileId, scopes: [...authority.scopes] };
-            if (scenario === "role revoked during run") {
-              await setCanonicalUserProfileRole(profile.id, "blocked");
-              try {
-                selection.assertCurrent();
-              } catch (error) {
-                revokedDuringRun = String(error);
+          const publish = tools.find((tool) => tool.name === "github_publish");
+          offered = publish?.parameters;
+          const authority = getGatewayToolCallerIdentity()?.operatorAuthority;
+          if (
+            scenario === "operator" ||
+            scenario === "paused force run" ||
+            scenario === "role revoked during merge"
+          ) {
+            try {
+              const admittedAuthority = expectDefined(authority, "scheduled operator authority");
+              admittedAuthority.assertCurrent();
+              if (scenario === "role revoked during merge") {
+                await setCanonicalUserProfileRole(profile.id, "blocked");
+                admittedAuthority.assertCurrent();
+              } else {
+                results.push({ authorized: true });
               }
+            } catch (error) {
+              rejected = String(error);
             }
           }
           return { payloads: [{ text: "Continuation complete" }], meta: { agentMeta: {} } };
@@ -377,15 +480,23 @@ describe("same-conversation scheduled operator continuation", () => {
       enqueueSystemEvent: vi.fn(),
       requestHeartbeat: vi.fn(),
       runSchedulerOwned: createScheduledGatewayRunner(() => context),
+      runSessionEvent: (request) =>
+        runCronSessionTurn({
+          ...request,
+          cfg: config,
+          agentId: "main",
+          sessionKey: expectDefined(
+            resolveCronSessionTargetSessionKey(request.job.sessionTarget),
+            "explicit continuation session target",
+          ),
+        }),
       runIsolatedAgentJob: (request) =>
         runCronIsolatedAgentTurn({
           ...request,
           cfg: config,
           deps: {},
           agentId: "main",
-          sessionKey:
-            resolveCronSessionTargetSessionKey(request.job.sessionTarget) ??
-            "cron:" + request.job.id,
+          sessionKey: "cron:" + request.job.id,
         }),
     });
     context.cron = execution;
@@ -411,30 +522,47 @@ describe("same-conversation scheduled operator continuation", () => {
             ? /operator identity changed/i
             : /authority|source|conversation|session|role/i,
         );
-        expect(restored).toBeUndefined();
-        return;
-      }
-      expect(state.lastRunStatus, state.lastError).toBe("ok");
-      expect(entered).toBe(1);
-      if (scenario === "foreign target" || scenario === "legacy attribution") {
-        expect(restored).toBeUndefined();
       } else {
-        expect(restored).toEqual({ profileId: profile.id, scopes: ["operator.admin"] });
+        // Session admission keeps live operator custody, so mid-run revocation fails the turn.
+        expect(state.lastRunStatus, state.lastError).toBe(
+          scenario === "role revoked during merge" ? "error" : "ok",
+        );
+        expect(entered).toBe(1);
+        if (scenario === "operator" || scenario === "paused force run") {
+          expect(rejected).toBeUndefined();
+          expect(results).toEqual([{ authorized: true }]);
+          if (scenario === "paused force run") {
+            expect(execution.getJob(job.id)).toMatchObject({
+              enabled: false,
+              schedule: job.schedule,
+            });
+          }
+        } else if (scenario === "role revoked during merge") {
+          expect(state.lastError).toMatch(/operator authority changed/i);
+          expect(reads).toBe(0);
+          expect(results).toHaveLength(0);
+          expect(rejected).toMatch(/operator authority changed/i);
+          expect(writes).toEqual([]);
+        } else if (scenario === "current tool deny") {
+          expect(offered).toBeUndefined();
+        } else {
+          expect(JSON.stringify(offered)).not.toContain("inspect");
+          expect(JSON.stringify(offered)).not.toContain("merge");
+          expect(results).toEqual([]);
+        }
       }
-      if (scenario === "role revoked during run") {
-        expect(revokedDuringRun).toMatch(/operator/i);
+      if (
+        scenario !== "operator" &&
+        scenario !== "paused force run" &&
+        scenario !== "role revoked during merge"
+      ) {
+        expect(writes).toEqual([]);
+        expect(github).not.toHaveBeenCalled();
+        expect(receipt).not.toHaveBeenCalled();
       }
-      if (scenario === "current tool deny") {
-        expect(offered).toBeUndefined();
-      } else {
-        expect(offered).toBeDefined();
-      }
-      if (scenario === "paused force run") {
-        expect(execution.getJob(job.id)).toMatchObject({
-          enabled: false,
-          schedule: job.schedule,
-        });
-      }
+      expect(writes).toEqual([]);
+      expect(github).not.toHaveBeenCalled();
+      expect(receipt).not.toHaveBeenCalled();
     } finally {
       execution.stop();
       await execution.waitForIdle();

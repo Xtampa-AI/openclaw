@@ -57,6 +57,10 @@ Standalone embedded runtimes publish the same snapshot shape at their activation
 
 Runtime selections resolve in the requesting agent's scope before becoming owner keys. Lease admission carries that prepared choice forward and reads the exact owner's snapshot. Retries must observe a changed owner or publication gate; unchanged publication state fails with a retryable error instead of blocking the Gateway event loop.
 
+If publication supersedes unfinished run preparation, admission prepares again on the current generation once before reporting a retryable error. A reply whose captured dispatch generation was replaced can also discard that initial selection before execution and enter current admission. These retries do not replay model requests or tools. Once execution begins, nested work stays pinned to its admitted generation; changing plugin owners at that point could mix callbacks and resources from different generations.
+
+Auth-triggered publication allows up to two fresh-generation retries for supersession. Exhaustion remains a typed, retryable error, and a later request can recover the configured owner through normal catalog recovery. Other lifecycle failures retain their existing single fresh-generation retry.
+
 ## Compute workers
 
 Code-mode execution, compaction planning, and file-tool planning use the reusable `WorkerTaskPool`.
@@ -84,8 +88,11 @@ serial. Pools create workers on demand and use their existing idle retirement.
 Physical session disk accounting uses the reader limit so independent stores can
 scan concurrently without creating a worker for each store.
 Shared-state readers retain at least two slots so a held settlement read cannot
-block a fresh catalog read. Foreground transcript and SQLite broker pools keep
-their separate sizing policies.
+block a fresh catalog read. Foreground transcript history and search also use the
+two-worker reader cap. The SQLite broker multiplexes independent database owners
+over two writer isolates, preserving per-database ordering without multiplying
+loaded backends on high-core hosts. These pools keep their existing admission and
+native-resource cleanup owners.
 
 File-tool workers perform pure edit matching, Unicode normalization, and diff
 computation. One prepared patch supplies both display and unified-patch receipts,

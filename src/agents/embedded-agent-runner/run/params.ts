@@ -55,6 +55,10 @@ export type ResolvedToolPromptFinalizer = (params: {
 }) => string;
 
 export type RunEmbeddedAgentParams = {
+  /** Cron-owned context admitted through the ordinary session execution path. */
+  scheduledAutomation?: import("../../../auto-reply/reply/session-event-contract.js").ScheduledSessionAutomation;
+  /** Settles the session's initial workspace attribution before tools can act. */
+  awaitSessionDiffBaseline?: () => Promise<void>;
   /** Host-minted parent audience inherited by a trusted internal child run. */
   memoryAudience?: import("../../../plugins/memory-provider-types.js").MemoryAudience;
   /** Detached runs may read session identity but never write its durable transcript or metadata. */
@@ -165,6 +169,13 @@ export type RunEmbeddedAgentParams = {
   /** Verified setup continuation: pin both the harness and its local implementation. */
   expectedAgentHarnessRuntimeArtifact?: ExpectedAgentHarnessRuntimeArtifact;
   authProfileIdSource?: "auto" | "user";
+  /** Caller-owned credential lifetime; independent of interactive pin provenance. */
+  authProfileBinding?: {
+    profileId: string;
+    authRequirement: import("../../../plugin-sdk/provider-model-types.js").ProviderModelRouteAuthRequirement;
+    assertCurrent(): void;
+    revalidate(): Promise<void>;
+  };
   /** Disable fallback from the user-selected auth profile for a verification run. */
   allowAuthProfileFallback?: boolean;
   verboseLevel?: VerboseLevel;
@@ -329,6 +340,7 @@ export type EmbeddedForegroundPromptContext = Pick<
   | "continuesConversation"
   | "allowGatewaySubagentBinding"
   | "extraSystemPrompt"
+  | "extraSystemPromptTurnContext"
   | "gitCoauthorPrompt"
   | "silentReplyPromptMode"
   | "ownerNumbers"

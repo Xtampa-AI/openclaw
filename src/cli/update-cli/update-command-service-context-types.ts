@@ -7,7 +7,6 @@ import type {
 } from "../../daemon/service-types.js";
 import type {
   PackageDirectoryIdentity,
-  PackageIntegrityFingerprint,
   PackageLauncherFingerprint,
 } from "../../infra/package-update-integrity.js";
 import type { UpdateFailureFact } from "../../infra/update-failure-facts.js";
@@ -49,6 +48,8 @@ export type PreManagedServiceStop = ManagedGatewayServiceObservation & {
   running: boolean;
   /** Verified native service process, used only to correlate legacy Gateway locks. */
   servicePid?: number;
+  /** Native enable policy captured before our stop; absence is unknown. */
+  serviceAutoStartEnabled?: boolean;
   serviceControlGroup?: string;
   /** Reporting fact only; membership is rechecked before the native stop. */
   serviceMembershipSourceAbsent?: boolean;
@@ -94,8 +95,6 @@ export type OriginalManagedServiceRuntime = {
   };
   service: ManagedGatewayServiceObservation;
   packageIdentity: PackageDirectoryIdentity;
-  packageFingerprint?: PackageIntegrityFingerprint;
-  packageFingerprintWarning?: string;
   launcher: {
     path: string;
     realPath: string;

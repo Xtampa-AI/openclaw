@@ -1,7 +1,7 @@
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { GATEWAY_SHUTDOWN_RESERVE_MS } from "../../../gateway-shutdown-budget.mjs";
 import { GATEWAY_OWNER_HEARTBEAT_MS } from "../../infra/gateway-lock-payload.js";
+import { GATEWAY_SHUTDOWN_RESERVE_MS } from "../../infra/gateway-shutdown-budget.js";
 import { readControlPlaneUpdateSentinelMeta } from "../../infra/update-control-plane-sentinel.js";
 import { resolveUpdateInstallRoot } from "../../infra/update-install-root.js";
 import type { ManagedCommandProcessAuthority } from "../../infra/update-managed-command-custody.js";
@@ -27,19 +27,6 @@ import {
 import { createUpdateIdentityWarningReporter } from "./update-command-identity-warning.js";
 import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-error.js";
 import { createUpdateOperationDeadline } from "./update-operation-deadline.js";
-
-let terminating = false;
-// Signal listeners own cancellation and rollback; escalate only after the shutdown reserve.
-function requestOrphanedWorkerTermination(): void {
-  if (terminating) {
-    return;
-  }
-  terminating = true;
-  setTimeout(() => process.kill(process.pid, "SIGKILL"), GATEWAY_SHUTDOWN_RESERVE_MS).unref();
-  if (!process.emit("SIGTERM", "SIGTERM")) {
-    process.kill(process.pid, "SIGTERM");
-  }
-}
 
 function memoizeSuccessfulLeaseCheck<T>(check: (lease: T) => boolean) {
   const checked: T[] = [];
@@ -217,11 +204,22 @@ export async function withDelegatedUpdateCommandExecutor<T>(
       );
       // A stalled await cannot recheck its fence. End orphaned maintenance through
       // the normal bounded shutdown; peers still wait for this process to exit.
+      let parentTerminationRequested = false;
+      const requestCliParentTermination = () => {
+        if (parentTerminationRequested) {
+          return;
+        }
+        parentTerminationRequested = true;
+        setTimeout(() => process.kill(process.pid, "SIGKILL"), GATEWAY_SHUTDOWN_RESERVE_MS).unref();
+        if (!process.emit("SIGTERM")) {
+          process.kill(process.pid, "SIGTERM");
+        }
+      };
       const parentWatch = setInterval(() => {
         for (const identity of processes.values()) {
           const state = store.inspectProcessIdentity(identity);
           if (state === "dead" || state === "mismatch") {
-            requestOrphanedWorkerTermination();
+            requestCliParentTermination();
             break;
           }
         }
@@ -231,10 +229,6 @@ export async function withDelegatedUpdateCommandExecutor<T>(
         return await withUpdateCommandExecutorOperation(
           {
             children: owner,
-            assertCurrent: () => {
-              fence.assertCurrent();
-              identityWarnings.flush();
-            },
             operation: () => {
               fence.assertCurrent();
               admittedAuthorities.set(fence, {
@@ -270,6 +264,7 @@ export async function withDelegatedUpdateCommandExecutor<T>(
         );
       } finally {
         clearInterval(parentWatch);
+        identityWarnings.flush();
         active = false;
         childOwners.delete(fence);
         slotReservations.delete(fence);

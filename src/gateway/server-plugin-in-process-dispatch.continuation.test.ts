@@ -11,6 +11,7 @@ import {
 } from "../agents/tools/in-process-gateway.js";
 import { runSessionsSendA2AFlow } from "../agents/tools/sessions-send-tool.a2a.js";
 import { createReplyTurnParticipants } from "../auto-reply/reply/reply-run-registry.tool-authority.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import { withPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -22,9 +23,13 @@ import {
 } from "./device-revocation.js";
 import { createGatewayMethodRegistry } from "./methods/registry.js";
 import * as operatorCapture from "./operator-run-authority.js";
-import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
+import type {
+  GatewayRequestHandler,
+  GatewayRequestHandlerOptions,
+} from "./server-methods/types.js";
 import {
   captureOperatorToolGatewayContinuationContext,
+  captureOperatorToolGatewayRequestContinuationContext,
   withOperatorToolGatewayAuthority,
 } from "./server-plugin-in-process-dispatch.js";
 import {
@@ -47,6 +52,68 @@ describe("typed in-process agent continuation authorization", () => {
     startTurn.mockReset();
     waitForTurn.mockReset();
   });
+
+  it("dispatches only the captured plugin reload once", () =>
+    withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const requests: unknown[] = [];
+      const reload: GatewayRequestHandler = async ({ params, respond }) => {
+        requests.push(params);
+        respond(true, { ok: true });
+      };
+      const context = createContext([["plugins.reload", "operator.admin", "plugins", reload]]);
+      await withPluginRuntimeGatewayRequestScope(
+        { context, resolveGatewayContext: () => context, isWebchatConnect: () => false },
+        async () => {
+          const plugin = { pluginId: "original" };
+          const request = {
+            method: "plugins.reload",
+            params: { plugins: [plugin] },
+          };
+          const captured = await captureOperatorToolGatewayRequestContinuationContext(
+            { sessionKey: "agent:main:reload" },
+            request,
+          );
+          if (!captured) {
+            throw new Error("Expected reload continuation");
+          }
+          try {
+            plugin.pluginId = "replacement";
+            request.method = "agent";
+            await expect(
+              captureOperatorToolGatewayRequestContinuationContext(
+                { sessionKey: "agent:main:reload" },
+                { method: "agent", params: {} },
+              ),
+            ).rejects.toThrow();
+            const options = { assertCurrent: () => {}, signal: new AbortController().signal };
+            await expect(captured.dispatch(options)).resolves.toEqual({ ok: true });
+            await expect(captured.dispatch(options)).rejects.toThrow("already dispatched");
+            expect(requests).toEqual([{ plugins: [{ pluginId: "original" }] }]);
+            captured.release();
+            await expect(captured.dispatch(options)).rejects.toThrow();
+            const aborted = await captureOperatorToolGatewayRequestContinuationContext(
+              { sessionKey: "agent:main:reload" },
+              { method: "plugins.reload", params: {} },
+            );
+            if (!aborted) {
+              throw new Error("Expected abortable continuation");
+            }
+            try {
+              const controller = new AbortController();
+              controller.abort(new Error("request cancelled"));
+              await expect(
+                aborted.dispatch({ ...options, signal: controller.signal }),
+              ).rejects.toThrow();
+              expect(requests).toHaveLength(1);
+            } finally {
+              aborted.release();
+            }
+          } finally {
+            captured.release();
+          }
+        },
+      );
+    }));
 
   it.each(["invocation", "receipt"] as const)(
     "rejects continuation transfer when its %s closes during preparation",
@@ -146,6 +213,7 @@ describe("typed in-process agent continuation authorization", () => {
             },
           },
         });
+        setRuntimeConfigSnapshot(context.getRuntimeConfig());
         const sessionKey = "agent:main:requester";
         await upsertSessionEntryCore(
           { agentId: "main", sessionKey },

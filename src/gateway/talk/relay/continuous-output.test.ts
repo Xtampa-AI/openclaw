@@ -47,7 +47,7 @@ describe("talk realtime relay continuous output", () => {
         controlSource: "transcript",
         instructions: "brief",
         tools: [],
-        sessionTarget: prepareTalkSessionTarget(cfg, "agent:main:main"),
+        sessionTarget: await prepareTalkSessionTarget(cfg, "agent:main:main"),
       });
       opened.push(relaySessionId);
       if (output === "audio") {

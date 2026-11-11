@@ -4,7 +4,13 @@ import type { PreparedModelRuntimeInput } from "./prepared-model-runtime.types.j
 
 export { PreparedModelRuntimeOwnerNotPublishedError };
 
-/** Only missing owners permit activation or catalog fallback; refused admission must settle work. */
+/** The embedded runner refused its initial admission before executing a generation. */
+export class PreparedModelRuntimeInitialRunAdmissionError extends PreparedModelRuntimeOwnerNotPublishedError {
+  constructor(error: PreparedModelRuntimeOwnerNotPublishedError) {
+    super(error.message, { cause: error, admissionBlocked: true });
+  }
+}
+
 export function isPreparedModelRuntimeMissingOwnerError(
   error: unknown,
 ): error is PreparedModelRuntimeOwnerNotPublishedError {

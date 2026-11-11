@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
+import { hasErrnoCode } from "../infra/errno.js";
 import { normalizeEnvVarKey } from "../infra/host-env-security.js";
 import { resolveGatewayServiceDescription } from "./constants.js";
 import { resolveLaunchAgentLabel } from "./launchd-label.js";
@@ -20,6 +21,7 @@ import { preserveServicePolicyXml } from "./service-policy-xml.js";
 import {
   publishServiceFile,
   matchesServiceFilePublication,
+  matchesServiceFileState,
   readServiceFileState,
   type GatewayServiceDefinitionTransactionHooks,
 } from "./service-stage.js";
@@ -267,7 +269,7 @@ export async function captureLaunchAgentInstallFiles(env: GatewayServiceEnv) {
     const expected = published.get(file);
     if (
       expected
-        ? !matchesServiceFilePublication(current, expected)
+        ? !matchesServiceFileState(current, expected)
         : !isDeepStrictEqual(current, originals.get(file)?.state)
     ) {
       throw new Error(`LaunchAgent artifact changed after capture or publication: ${file}`);
@@ -511,4 +513,27 @@ export async function rewriteLaunchAgentPlistForRestart({
     await publishLaunchAgentPlist({ label, plistPath, contents: plist, definitionTransaction });
     return true;
   }, publication.restore);
+}
+
+/**
+ * Removes a plist whose service is already booted out, keeping a copy in Trash when allowed.
+ * macOS privacy protection can deny ~/.Trash to an app-launched helper while the user's
+ * LaunchAgents directory stays writable; stopping halfway would leave the Gateway unloaded
+ * with its definition still in place.
+ */
+export async function removeBootedOutLaunchAgentPlist(
+  plistPath: string,
+  trashPath: string,
+): Promise<{ trashed: boolean }> {
+  try {
+    await fs.mkdir(path.dirname(trashPath), { recursive: true });
+    await fs.rename(plistPath, trashPath);
+    return { trashed: true };
+  } catch (error) {
+    if (!hasErrnoCode(error, "EPERM") && !hasErrnoCode(error, "EACCES")) {
+      throw error;
+    }
+  }
+  await fs.unlink(plistPath);
+  return { trashed: false };
 }

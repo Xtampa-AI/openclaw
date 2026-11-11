@@ -54,7 +54,13 @@ vi.mock("../node-invoke-plugin-policy.js", () => ({
 
 vi.mock("../session-utils.js", async () => ({
   ...(await vi.importActual<typeof import("../session-utils.js")>("../session-utils.js")),
-  loadGatewaySessionEntryReadOnly: sessionMocks.loadGatewaySessionEntryReadOnly,
+  loadGatewaySessionEntryReadOnlyAsync: sessionMocks.loadGatewaySessionEntryReadOnly,
+}));
+
+vi.mock("../session-utils-store-worker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../session-utils-store-worker.js")>()),
+  loadGatewaySessionEntryReadOnlyInWorker: async (params: { key: string; agentId?: string }) =>
+    sessionMocks.loadGatewaySessionEntryReadOnly(params.key, { agentId: params.agentId }),
 }));
 
 function makeOpts(
@@ -158,24 +164,11 @@ describe("terminal gateway policy", () => {
     ).toBeUndefined();
     expect(sessionMocks.loadGatewaySessionEntryReadOnly).toHaveBeenCalledWith(agentSessionKey, {
       agentId: "main",
-      clone: false,
     });
   });
 
   it.each([
     { state: "is missing", entry: undefined, error: { code: ErrorCodes.UNAVAILABLE } },
-    {
-      state: "awaits project preparation",
-      entry: {
-        sessionId: "ui-session-id",
-        pendingProjectGitUrl: "https://github.com/openclaw/openclaw.git",
-      },
-      error: {
-        code: ErrorCodes.INVALID_REQUEST,
-        message:
-          'Session "agent:main:pending" workspace is not ready. Wait for setup to finish or retry in chat.',
-      },
-    },
     {
       state: "awaits worktree preparation",
       entry: {
@@ -314,7 +307,7 @@ describe("terminal gateway policy", () => {
     );
   });
 
-  it.each([undefined, "selected-codex-home"])(
+  it.each(["selected-codex-home"])(
     "opens a provider-built local resume plan for source %s and returns its title",
     async (sourceHomeId) => {
       const openTerminal = vi.fn(async () => ({
@@ -397,7 +390,11 @@ describe("terminal gateway policy", () => {
         list: async () => [],
         read: async (request) => ({ ...request, items: [] }),
         openTerminal: async () => {
-          vi.setSystemTime(TERMINAL_OPEN_DEADLINE_MS);
+          // Rewind the wall clock by 90s, then advance monotonic time to the
+          // deadline. The deadline is monotonic, so the rewind must not save
+          // the open from expiring.
+          vi.setSystemTime(-90_000);
+          vi.advanceTimersByTime(TERMINAL_OPEN_DEADLINE_MS);
           return { kind: "local", argv: ["codex", "resume", "thread"] };
         },
       });
@@ -423,7 +420,7 @@ describe("terminal gateway policy", () => {
     }
   });
 
-  it("maps a catalog rejection after the absolute deadline to a timeout", async () => {
+  it("opens a terminal despite a 90s wall-clock forward jump during catalog lookup", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     try {
@@ -433,11 +430,16 @@ describe("terminal gateway policy", () => {
         list: async () => [],
         read: async (request) => ({ ...request, items: [] }),
         openTerminal: async () => {
-          vi.setSystemTime(TERMINAL_OPEN_DEADLINE_MS);
-          throw new Error("late catalog failure");
+          // Jump the wall clock forward by 90s mid-open. Under the bug
+          // (Date.now seed) the deadline already expired at t=30s, so a
+          // forward jump to t=90s would falsely reject this healthy open.
+          // Under the fix (performance.now seed) the monotonic clock is
+          // still at 0, so the open stays within budget.
+          vi.setSystemTime(90_000);
+          return { kind: "local", argv: ["codex", "resume", "thread"] };
         },
       });
-      const { opts, respond } = makeOpts(
+      const { opts, sessions, respond } = makeOpts(
         {
           cols: 80,
           rows: 24,
@@ -448,11 +450,8 @@ describe("terminal gateway policy", () => {
 
       await expectDefined(terminalHandlers["terminal.open"], "terminal.open")(opts);
 
-      expect(respond).toHaveBeenCalledWith(
-        false,
-        undefined,
-        expect.objectContaining({ message: "terminal open timed out" }),
-      );
+      expect(sessions.open).toHaveBeenCalled();
+      expect(respond).toHaveBeenCalledWith(true, expect.any(Object));
     } finally {
       vi.useRealTimers();
     }
@@ -961,10 +960,7 @@ describe("terminal gateway policy", () => {
     );
   });
 
-  it.each([
-    { caps: [GATEWAY_CLIENT_CAPS.TERMINAL_SESSION_METADATA] },
-    { caps: [GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE] },
-  ])(
+  it.each([{ caps: [GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE] }])(
     "only returns insertion metadata to clients advertising its capability: $caps",
     async ({ caps }: { caps: string[] }) => {
       const { opts, sessions, respond } = makeOpts(

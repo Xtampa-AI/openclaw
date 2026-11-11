@@ -651,7 +651,7 @@ describe("TelegramPollingSession", () => {
     });
   });
 
-  it("recovers offset persistence and suppresses restart replay", async (context) => {
+  it("suppresses restart replay after checkpoint persistence fails", async (context) => {
     await withTempSpool(async (tempDir) => {
       let durableUpdateId = 40;
       const writeUpdateId = vi
@@ -663,7 +663,7 @@ describe("TelegramPollingSession", () => {
         initialUpdateId: durableUpdateId,
         writeUpdateId,
         onInvalidUpdateId: vi.fn(),
-        onRetry: vi.fn(),
+        onError: vi.fn(),
       });
       const handleUpdate = vi.fn(async () => undefined);
       const firstAbort = new AbortController();
@@ -696,25 +696,23 @@ describe("TelegramPollingSession", () => {
           updateId: 42,
         });
         await waitForTelegramTestState(() => expect(handleUpdate).toHaveBeenCalledOnce());
-        await waitForTelegramTestState(() =>
-          expect(firstOffsetPersistence.getCommittedUpdateId()).toBe(42),
-        );
         await waitForTelegramTestState(async () =>
           expect(await pendingUpdateIds(tempDir, "all")).toEqual([]),
         );
+        expect(firstOffsetPersistence.getCommittedUpdateId()).toBe(40);
       } finally {
         await firstLifetime.close();
       }
 
-      expect(writeUpdateId).toHaveBeenCalledTimes(2);
-      expect(durableUpdateId).toBe(42);
+      expect(writeUpdateId).toHaveBeenCalledTimes(1);
+      expect(durableUpdateId).toBe(40);
 
       const restartWriteUpdateId = vi.fn(async () => undefined);
       const restartedOffsetPersistence = createTelegramUpdateOffsetPersistence({
         initialUpdateId: durableUpdateId,
         writeUpdateId: restartWriteUpdateId,
         onInvalidUpdateId: vi.fn(),
-        onRetry: vi.fn(),
+        onError: vi.fn(),
       });
       const restartAbort = new AbortController();
       const restartWorker = createListeningIngressWorker();
@@ -745,7 +743,9 @@ describe("TelegramPollingSession", () => {
           updateId: 42,
         });
         expect(handleUpdate).toHaveBeenCalledOnce();
-        expect(restartWriteUpdateId).not.toHaveBeenCalled();
+        await waitForTelegramTestState(() =>
+          expect(restartWriteUpdateId).toHaveBeenCalledExactlyOnceWith(42),
+        );
       } finally {
         await restartedLifetime.close();
       }
@@ -2062,6 +2062,65 @@ describe("TelegramPollingSession", () => {
     expect(createWorker).toHaveBeenCalledOnce();
     expect(cleanup).toHaveBeenCalledBefore(createWorker);
     expect(bot.stop).toHaveBeenCalledOnce();
+  });
+  it("settles aborted grammY initialization during network retry backoff without starting ingress", async () => {
+    vi.useFakeTimers();
+    const abort = new AbortController();
+    const transport = makeTelegramTransport();
+    const fetch = vi.fn(async () => {
+      throw new TypeError("offline Telegram fixture");
+    });
+    const bot = new Bot("tok", {
+      client: {
+        fetch: asTelegramClientFetch(
+          createTelegramClientFetch({
+            fetchImpl: asTelegramClientFetch(fetch),
+            shutdownSignal: abort.signal,
+          }),
+        ),
+      },
+    });
+    vi.spyOn(bot.api, "deleteWebhook").mockResolvedValue(true);
+    createTelegramBotMock.mockReturnValueOnce(bot);
+    const { createWorker } = createIdleIngressWorker();
+    const setStatus = vi.fn();
+    const session = createPollingSession({
+      abortSignal: abort.signal,
+      telegramTransport: transport,
+      setStatus,
+      ingress: { createWorker },
+    });
+    let settled = false;
+    const runPromise = session.runUntilAbort().then(() => {
+      settled = true;
+    });
+    try {
+      // grammY retries HttpError once immediately, then waits 100 ms. Keep
+      // that real dependency delay pending while the account is canceled.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(settled).toBe(false);
+      expect(bot.isInited()).toBe(false);
+      expect(transport.close).not.toHaveBeenCalled();
+
+      abort.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect(createWorker).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(transport.close).toHaveBeenCalledOnce();
+      expect(statusPatches(setStatus).at(-1)).toEqual({ mode: "polling", connected: false });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      abort.abort();
+      // Also settle the broken-base negative control without leaving a retry
+      // timer or an unobserved session behind after its assertion fails.
+      vi.spyOn(bot.api, "getMe").mockRejectedValue(new Error("test cleanup"));
+      await vi.advanceTimersByTimeAsync(100);
+      await runPromise;
+      vi.useRealTimers();
+    }
   });
 });
 

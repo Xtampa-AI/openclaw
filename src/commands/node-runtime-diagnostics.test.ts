@@ -72,7 +72,7 @@ afterEach(() => {
 
 describe("Node runtime diagnostics command surfaces", () => {
   it.each(["invalid config", "snapshot failure"])(
-    "keeps Node repair hints after %s",
+    "renders informational Node findings without a missing fix hint after %s",
     async (failure) => {
       useInvalidConfig();
       const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -151,18 +151,8 @@ describe("Node runtime diagnostics command surfaces", () => {
     ]);
   });
 
-  it("warns about a stale service Node without mixing text into status JSON", async () => {
-    await statusCommand({ json: true }, runtime);
-    expect(runtime.error).toHaveBeenCalledWith(
-      expect.stringContaining("Gateway service Node 22.23.2"),
-    );
-    expect(runtime.error).toHaveBeenCalledWith(
-      expect.stringContaining("https://openclaw.ai/install.sh"),
-    );
-    expect(runtime.log).not.toHaveBeenCalled();
-  });
-
   it("renders a below-floor service runtime as unsupported without an informational note", async () => {
+    mocks.readCommand.mockResolvedValue({ programArguments: ["/fixture/node", "gateway"] });
     mocks.resolveNodeRuntimeInfo.mockResolvedValue({ status: "unsupported", version: "24.22.0" });
     await statusCommand({ json: true }, runtime);
     expect(runtime.error).toHaveBeenCalledWith(

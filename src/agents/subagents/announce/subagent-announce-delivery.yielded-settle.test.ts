@@ -51,8 +51,31 @@ describe("yielded private settle outcomes", () => {
       expected: { delivered: false, reason: "visible_reply_missing" },
     },
     {
-      name: "empty successful turn",
+      name: "empty successful optional turn",
       response: { status: "ok", result: { payloads: [] } },
+      expected: { delivered: true },
+    },
+    {
+      name: "optional silence promoted to result-required",
+      response: {
+        status: "ok",
+        result: {
+          payloads: [],
+          meta: {
+            terminalReply: { disposition: "silent" },
+            terminalReplyExpectation: "required",
+          },
+        },
+      },
+      expected: { delivered: false, reason: "visible_reply_missing" },
+    },
+    {
+      name: "public required silence",
+      public: true,
+      response: {
+        status: "ok",
+        result: { payloads: [], meta: { terminalReply: { disposition: "silent" } } },
+      },
       expected: { delivered: false, reason: "visible_reply_missing" },
     },
     {
@@ -152,7 +175,11 @@ describe("yielded private settle outcomes", () => {
     const sessionKey = "agent:main:discord:dm:U123";
     const origin = { channel: "discord", to: "dm:U123", accountId: "acct-1" };
     const current = "replaced" in testCase ? "replacement-parent" : "requester-session-dm";
-    const dispatch = vi.fn(async function <T>(_method: string, _params: Record<string, unknown>) {
+    const dispatch = vi.fn(async function <T>(
+      _method: string,
+      _params: Record<string, unknown>,
+      _options?: unknown,
+    ) {
       return testCase.response as T;
     });
     const send = vi.fn<typeof sendMessage>();
@@ -187,6 +214,9 @@ describe("yielded private settle outcomes", () => {
     if ("replaced" in testCase) {
       expect(dispatch).not.toHaveBeenCalled();
     } else {
+      expect(dispatch.mock.calls[0]?.[2]).toMatchObject({
+        replyExpectation: "public" in testCase ? "required" : "optional",
+      });
       const agentParams = dispatch.mock.calls[0]?.[1];
       expect(agentParams).toMatchObject({
         deliver: true,

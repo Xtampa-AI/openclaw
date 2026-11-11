@@ -5,24 +5,28 @@ import {
   asOptionalRecord as asRecord,
 } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import {
-  parseReplyDirectives,
-  type ReplyDirectiveParseResult,
-} from "../auto-reply/reply/reply-directives.js";
+import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import { splitTrailingDirective } from "../auto-reply/reply/streaming-directives.js";
 import type { AssistantMessage } from "../llm/types.js";
-import { parseAssistantTextSignature } from "../shared/chat-message-content.js";
-import { trimTextPreservingCode } from "../shared/text/text-projection.js";
 import {
-  findDirectiveCodePrefix,
-  type StreamDirectiveCodePrefix,
-} from "../utils/directive-tags.js";
+  parseAssistantTextSignature,
+  readAssistantTextBlocksForPhase,
+} from "../shared/chat-message-content.js";
+import { toolCallXmlTextFilter } from "../shared/text/assistant-visible-text.js";
+import { downgradedToolCallTextFilter } from "../shared/text/downgraded-tool-call-text.js";
+import { createTextProjection, trimTextPreservingCode } from "../shared/text/text-projection.js";
+import { findDirectiveCodePrefix } from "../utils/directive-tags.js";
 import { runBestEffortCallback } from "./embedded-agent-subscribe.callback.js";
 import { hasReplyDirectiveMetadata } from "./embedded-agent-subscribe.handlers.messages.replies.js";
 import type {
   EmbeddedAgentSubscribeContext,
   EmbeddedAgentSubscribeState,
 } from "./embedded-agent-subscribe.handlers.types.js";
+import type {
+  StreamingReplyParams,
+  StreamingReplyResolver,
+  StreamingReplyResult,
+} from "./embedded-agent-subscribe.streaming-reply.types.js";
 import {
   extractAssistantCommentaryText,
   stripDowngradedToolCallText,
@@ -51,18 +55,6 @@ export function isResponsesApiAssistantMessage(message: AgentMessage | undefined
 export function isOpenAiCompletionsAssistantMessage(message: AgentMessage | undefined): boolean {
   const api = readAssistantMessageApi(message);
   return api === "openai-completions" || api === "openclaw-openai-completions-transport";
-}
-
-export function isAssistantTextPhasePending(
-  message: AgentMessage | undefined,
-  eventType: string,
-): boolean {
-  const api = readAssistantMessageApi(message);
-  return (
-    api === "ollama" ||
-    isOpenAiCompletionsAssistantMessage(message) ||
-    (api === "anthropic-messages" && eventType !== "text_end")
-  );
 }
 
 export function extractStandaloneMessageToolText(
@@ -170,25 +162,36 @@ export function emitAssistantCommentaryStreamData(
   ctx: EmbeddedAgentSubscribeContext,
   message: AssistantMessage,
   finalMessage = false,
-  preparedText?: string,
 ) {
   const isResponsesCommentary = isResponsesApiAssistantMessage(message);
   const { lastAssistantStreamContentIndex: index, lastAssistantStreamItemId: itemId } = ctx.state;
   // Non-text updates carry prior Responses items too; publish only the active item.
-  const commentaryMessage = isResponsesCommentary
-    ? scopeAssistantMessageToStreamBlock(message, index, itemId)
-    : message;
-  const text =
-    !isResponsesCommentary && preparedText !== undefined
-      ? preparedText
-      : extractAssistantCommentaryText(commentaryMessage);
-  if (text && (finalMessage || !isResponsesCommentary || ctx.state.deltaBuffer !== text)) {
-    // Generic commentary must carry the identity the phase tagger generated so
-    // the Control UI can key the live row to the persisted fallback row; without
-    // it every generic segment is unkeyed and survives as a duplicate.
+  let commentaryMessages = [scopeAssistantMessageToStreamBlock(message, index, itemId)];
+  if (!isResponsesCommentary) {
+    const blocks = readAssistantTextBlocksForPhase(message, "commentary");
+    // Generic partials retain earlier items; keep each snapshot under its original identity.
+    commentaryMessages = [message];
+    if (Array.isArray(message.content)) {
+      commentaryMessages = [];
+      for (const id of new Set(blocks.map((block) => parseAssistantTextSignature(block)?.id))) {
+        const content = message.content.filter(
+          (block) =>
+            block.type === "text" &&
+            blocks.some((selected) => selected === block) &&
+            parseAssistantTextSignature(block)?.id === id,
+        );
+        commentaryMessages.push({ ...message, content });
+      }
+    }
+  }
+  for (const commentaryMessage of commentaryMessages) {
+    const text = extractAssistantCommentaryText(commentaryMessage);
+    if (!text || (!finalMessage && isResponsesCommentary && ctx.state.deltaBuffer === text)) {
+      continue;
+    }
     const commentaryItemId = isResponsesCommentary
       ? itemId
-      : resolveAssistantStreamItemId({ message });
+      : resolveAssistantStreamItemId({ message: commentaryMessage });
     ctx.emitAssistantStreamData(
       { text, delta: "", replace: true, phase: "commentary", itemId: commentaryItemId },
       { finalMessage },
@@ -216,7 +219,7 @@ export function emitPersistentReasoning(ctx: EmbeddedAgentSubscribeContext, text
     !ctx.params.onBlockReply ||
     ctx.params.silentExpected ||
     shouldSuppressDeterministicApprovalOutput(ctx.state) ||
-    hasMessageToolOnlySourceDelivery(ctx) ||
+    shouldSuppressSourceReplyOutput(ctx) ||
     text === ctx.state.lastReasoningSent
   ) {
     return;
@@ -256,14 +259,15 @@ export function shouldSuppressDeterministicApprovalOutput(
   return state.deterministicApprovalPromptPending || state.deterministicApprovalPromptSent;
 }
 
-export function hasMessageToolOnlySourceDelivery(
+export function shouldSuppressSourceReplyOutput(
   ctx: Pick<EmbeddedAgentSubscribeContext, "params" | "state">,
 ): boolean {
   return (
-    ctx.params.sourceReplyDeliveryMode === "message_tool_only" &&
-    (ctx.state.messageToolOnlySourceReplyDelivered ||
-      ctx.params.hasDeliveredMessageToolOnlySourceReply?.() === true ||
-      (ctx.state.messagingToolSourceReplyPayloads?.length ?? 0) > 0)
+    ctx.state.sourceReplyDeliveryState === "delivered" ||
+    (ctx.params.sourceReplyDeliveryMode === "message_tool_only" &&
+      (ctx.state.messageToolOnlySourceReplyDelivered ||
+        ctx.params.hasDeliveredMessageToolOnlySourceReply?.() === true ||
+        (ctx.state.messagingToolSourceReplyPayloads?.length ?? 0) > 0))
   );
 }
 
@@ -288,26 +292,7 @@ export function resolveAssistantTextChunk(params: {
   return accumulatedText.includes(content) ? "" : content;
 }
 
-export function resolveStreamingReply(params: {
-  evtType: "text_delta" | "text_start" | "text_end";
-  next: string;
-  previousText: string;
-  previousCleaned: string;
-  visibleDelta: string;
-  appendDelta: string | null;
-  parsedStreamDirectives: ReplyDirectiveParseResult | null;
-  previousAudioDirectiveCount: number;
-  rawDirectiveSource?: string;
-  directiveCodePrefix?: StreamDirectiveCodePrefix;
-}): {
-  text: string;
-  delta: string;
-  replace: boolean;
-  hasText: boolean;
-  replyDirectives: ReplyDirectiveParseResult | null;
-  audioDirectiveCount: number;
-  directiveCodePrefix?: StreamDirectiveCodePrefix;
-} {
+export function resolveStreamingReply(params: StreamingReplyParams): StreamingReplyResult {
   let directiveCodePrefix = params.appendDelta !== null ? params.directiveCodePrefix : undefined;
   if (!params.parsedStreamDirectives && params.evtType === "text_delta") {
     const text = params.previousCleaned;
@@ -397,7 +382,12 @@ export function resolveStreamingReply(params: {
     const source =
       params.rawDirectiveSource === undefined
         ? params.next
-        : stripDowngradedToolCallText(params.rawDirectiveSource);
+        : params.evtType !== "text_end" && params.rawProjectionText !== undefined
+          ? params.rawProjectionText
+          : toolCallXmlTextFilter(
+              { stripFunctionCallsXmlPayloads: true },
+              params.evtType !== "text_end",
+            ).transform(stripDowngradedToolCallText(params.rawDirectiveSource));
     const parsed = parseReplyDirectives(
       params.evtType === "text_end" ? source : splitTrailingDirective(source).text,
       {
@@ -446,5 +436,22 @@ export function resolveStreamingReply(params: {
     replyDirectives,
     audioDirectiveCount,
     directiveCodePrefix,
+  };
+}
+
+/** Retain raw pre-trim XML ownership independently of visible directive trimming. */
+export function createStreamingReplyResolver(): StreamingReplyResolver {
+  const rawProjection = createTextProjection([
+    downgradedToolCallTextFilter(),
+    toolCallXmlTextFilter({ stripFunctionCallsXmlPayloads: true }, true),
+  ]);
+  return (params) => {
+    const rawProjectionText =
+      params.rawDirectiveSource === undefined
+        ? undefined
+        : params.rawDirectiveDelta === undefined
+          ? rawProjection.replace(params.rawDirectiveSource).text
+          : rawProjection.append(params.rawDirectiveDelta, params.rawDirectiveSource).text;
+    return resolveStreamingReply({ ...params, rawProjectionText });
   };
 }

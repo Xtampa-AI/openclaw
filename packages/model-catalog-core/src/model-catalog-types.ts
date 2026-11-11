@@ -13,6 +13,20 @@ import {
   type ModelRoutingSortConfig,
 } from "../../llm-core/src/model-data.js";
 
+// Tier capacity is separate from the model's full context window. Leave room
+// below the observed serving boundary for output and tool-round growth.
+const OPENAI_ULTRAFAST_CONTEXT_TOKENS = 260_000;
+
+/** Prompt capacity for models served through a context-limited processing tier. */
+export function resolveModelServiceTierContextTokens(
+  provider: string | undefined,
+  serviceTier: string | undefined,
+): number | undefined {
+  return provider === "openai" && serviceTier === "ultrafast"
+    ? OPENAI_ULTRAFAST_CONTEXT_TOKENS
+    : undefined;
+}
+
 export const MODEL_CATALOG_APIS = [...MODEL_DATA_APIS] as const;
 
 export type ModelCatalogApi = (typeof MODEL_CATALOG_APIS)[number];
@@ -65,6 +79,8 @@ export type ModelCatalogCompatConfig = {
   supportedReasoningEfforts?: string[];
   reasoningEffortMap?: Record<string, string>;
   visibleReasoningDetailTypes?: string[];
+  /** Thinking level a new session starts at. Its presence makes the row own the thinking profile. */
+  defaultThinkingLevel?: string;
 };
 
 /** OpenRouter routing preferences copied into request metadata. */
@@ -93,7 +109,7 @@ export type ModelCatalogImageInputConfig = ModelDataImageInputConfig;
 
 export type ModelCatalogMediaInputConfig = ModelDataMediaInputConfig;
 
-export type ModelCatalogInput = "text" | "image" | "document";
+export type ModelCatalogInput = "text" | "image" | "video" | "document";
 export const MODEL_CATALOG_THINKING_LEVELS = [...MODEL_DATA_THINKING_LEVELS] as const;
 export type ModelCatalogThinkingLevel = (typeof MODEL_CATALOG_THINKING_LEVELS)[number];
 export type ModelCatalogThinkingLevelMap = ModelDataThinkingLevelMap;

@@ -14,6 +14,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolvePathViaExistingAncestorSync } from "../infra/boundary-path.js";
 import { hasErrnoCode } from "../infra/errno.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
+import { decodeUtf8Input } from "../infra/utf8-input.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { isProviderCatalogSourceAllowed } from "../plugins/provider-config-owner.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
@@ -22,6 +23,7 @@ import {
   resolveAuthProfileDatabaseOwnerId,
   resolveAuthProfileDatabasePath,
 } from "./auth-profiles/sqlite.js";
+import { MODELS_JSON_STATE } from "./models-config-state.js";
 import type { PluginModelCatalogAuthSnapshot } from "./plugin-model-catalog-auth.js";
 import {
   withPluginModelCatalogPublicationLocks,
@@ -171,7 +173,7 @@ type PluginModelCatalogMigrationResult = {
 
 function readLegacyPluginModelCatalog(pathname: string): string | null {
   try {
-    return readFileSync(pathname, "utf8");
+    return decodeUtf8Input(readFileSync(pathname), "Legacy provider catalog");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
@@ -573,6 +575,40 @@ export async function replacePersistedPluginModelCatalogs(params: {
   );
 }
 
+/** Removes only cached endpoints known to belong to a just-removed config entry. */
+export async function pruneRemovedProviderPluginModelCatalogs(params: {
+  agentDir: string;
+  removedProviderBaseUrls: Readonly<Record<string, string>>;
+}): Promise<boolean> {
+  if (Object.keys(params.removedProviderBaseUrls).length === 0) {
+    return false;
+  }
+  // Discovery plans hold this queue through publication; prune after older plans settle.
+  return await MODELS_JSON_STATE.writeQueue.enqueue(
+    path.join(params.agentDir, "models.json"),
+    async () => {
+      const options = pluginModelCatalogDatabaseOptions(params.agentDir);
+      options.path = resolvePathViaExistingAncestorSync(options.path);
+      try {
+        await stat(options.path);
+      } catch (error) {
+        if (hasErrnoCode(error, "ENOENT")) {
+          return false;
+        }
+        throw error;
+      }
+      return await withPluginModelCatalogPublicationLocks([options.path], () =>
+        withPluginModelCatalogWorker(options, false, (scope) =>
+          scope.execute({
+            type: "catalog.pruneRemovedProviders",
+            input: { removedProviderBaseUrls: { ...params.removedProviderBaseUrls } },
+          }),
+        ),
+      );
+    },
+  );
+}
+
 export type PluginModelCatalogMetadataSnapshot = Pick<PluginMetadataSnapshot, "owners"> & {
   manifestRegistry?: Pick<PluginMetadataSnapshot["manifestRegistry"], "plugins">;
   index?: {
@@ -589,29 +625,21 @@ export function encodePluginModelCatalogRelativePath(pluginId: string): string {
   return `plugins/${encodeURIComponent(pluginId)}/${PLUGIN_MODEL_CATALOG_FILE}`;
 }
 
-/** Returns true only for canonical profile-relative generated catalog paths. */
-function isPluginModelCatalogRelativePath(relativePath: string): boolean {
-  const parts = relativePath.split(/[\\/]/);
-  return (
-    !path.isAbsolute(relativePath) &&
-    parts.length === 3 &&
-    parts[0] === "plugins" &&
-    parts[1] !== "" &&
-    parts[1] !== "." &&
-    parts[1] !== ".." &&
-    parts[2] === PLUGIN_MODEL_CATALOG_FILE
-  );
-}
-
 /** Decodes the plugin id from a canonical generated catalog path. */
 export function decodePluginModelCatalogRelativePathPluginId(
   relativePath: string,
 ): string | undefined {
-  if (!isPluginModelCatalogRelativePath(relativePath)) {
-    return undefined;
-  }
-  const encodedPluginId = relativePath.split(/[\\/]/)[1];
-  if (!encodedPluginId) {
+  const parts = relativePath.split(/[\\/]/);
+  const encodedPluginId = parts[1];
+  if (
+    path.isAbsolute(relativePath) ||
+    parts.length !== 3 ||
+    parts[0] !== "plugins" ||
+    !encodedPluginId ||
+    encodedPluginId === "." ||
+    encodedPluginId === ".." ||
+    parts[2] !== PLUGIN_MODEL_CATALOG_FILE
+  ) {
     return undefined;
   }
   try {

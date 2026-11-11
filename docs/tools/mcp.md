@@ -39,10 +39,9 @@ access. A successful listing replaces the catalog, including tools removed by
 the server. Explicit config changes, removals, and plugin reloads retire the
 changed runtime immediately; unchanged servers keep their catalogs.
 
-If a Streamable HTTP server does not confirm its session DELETE, OpenClaw logs a
-warning and continues local cleanup. Once the local transport and client close,
-the next turn can replace the runtime. Failed local cleanup still blocks
-replacement. The remote server may retain the abandoned session until it expires it.
+For legacy SSE servers, reconnecting to the same session endpoint preserves the
+session. If the server announces a new endpoint, OpenClaw reconnects and
+initializes a fresh session before sending further tool calls.
 
 When OpenClaw's built-in MCP client cannot start a server, new runtimes skip it during an exponential backoff: 30 seconds, doubling up to 10 minutes. The runtime that encountered the first failure can retry once on its normal five-second catalog schedule, using a fresh connection after retiring the failed one. If that recovery attempt also fails, the same exponential backoff applies to it. Failure state survives ordinary session cleanup and is scoped to the server configuration and requester. The effective tool inventory shows the server as unavailable, with that runtime's next retry time and a reachability check as the next step. Each failed retry logs once; skipped runs do not repeat the warning. A successful connection, config publication, or explicit MCP reload clears the backoff. Reload the process that owns the connection; a CLI reload does not reset a separate Gateway.
 
@@ -175,3 +174,10 @@ Follow the printed authorization URL. OpenClaw normally captures the loopback re
 - [MCP CLI reference](/cli/mcp)
 - [Manage plugins](/plugins/manage-plugins)
 - [Tool policies](/tools)
+
+### Remote session cleanup
+
+A Streamable HTTP server that does not confirm its session DELETE produces a warning,
+not a permanent local cleanup failure. Once the local transport and client close,
+the next turn can replace the runtime. Unconfirmed local cleanup still blocks
+replacement. A remote server may retain an abandoned session until it expires.

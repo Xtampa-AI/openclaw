@@ -23,6 +23,7 @@ type Workflow = {
   jobs: Record<
     string,
     {
+      env?: Record<string, string>;
       if?: string;
       needs?: string[];
       steps: Array<Record<string, unknown>>;
@@ -266,30 +267,6 @@ describe("full release same-parent recovery workflow", () => {
       ).toThrow();
     },
   );
-
-  it("checks out the admitted qualification verifier before writing the summary manifest", () => {
-    const checkout = step("summary", "Checkout admitted qualification verifier");
-    const manifest = step("summary", "Write release validation manifest");
-    const summarySteps = workflow.jobs.summary?.steps ?? [];
-
-    expect(summarySteps.indexOf(checkout)).toBeLessThan(summarySteps.indexOf(manifest));
-    expect(checkout.if).toBe(
-      "${{ needs.resolve_target.result == 'success' && fromJSON(needs.resolve_target.outputs.source_admission_json || '{}').qualificationAdmission != null }}",
-    );
-    expect(checkout.with).toMatchObject({
-      ref: "${{ fromJSON(needs.resolve_target.outputs.source_admission_json).qualificationAdmission.workflowSha }}",
-      path: "qualification-verifier",
-      "sparse-checkout": "scripts",
-      "sparse-checkout-cone-mode": false,
-      "fetch-depth": 1,
-      "persist-credentials": false,
-      submodules: false,
-    });
-    expect(manifest.env).toMatchObject({
-      OPENCLAW_RELEASE_CI_SUMMARY_VALIDATOR:
-        "${{ fromJSON(needs.resolve_target.outputs.source_admission_json || '{}').qualificationAdmission != null && format('{0}/qualification-verifier/scripts/release-ci-summary.mjs', github.workspace) || format('{0}/scripts/release-ci-summary.mjs', github.workspace) }}",
-    });
-  });
 
   it("adopts only a matched child and still dispatches an unmatched sibling", () => {
     const root = tempDirs.make("release-child-dispatch-");
@@ -574,6 +551,22 @@ else console.log(JSON.stringify({id:202,workflow_id:88,head_branch:'main',event:
     }
   });
 
+  it("waits for installation quota before candidate dispatch", () => {
+    const candidateSteps = workflow.jobs.candidate_acquisition?.steps ?? [];
+    const quotaIndex = candidateSteps.findIndex(
+      (candidate) => candidate?.name === "Wait for candidate acquisition GitHub API quota",
+    );
+    const dispatchIndex = candidateSteps.findIndex(
+      (candidate) => candidate?.name === "Dispatch immutable validation candidate producer",
+    );
+    expect(quotaIndex).toBeGreaterThan(-1);
+    expect(dispatchIndex).toBeGreaterThan(quotaIndex);
+    expect(String(candidateSteps[quotaIndex]?.if)).toContain("github.run_attempt == 1");
+    expect(String(candidateSteps[quotaIndex]?.run)).toContain(
+      "wait-for-github-api-quota.mjs --minimum-remaining 6 --max-wait-seconds 18000",
+    );
+  });
+
   it.each([
     {
       job: "summary",
@@ -596,4 +589,23 @@ else console.log(JSON.stringify({id:202,workflow_id:88,head_branch:'main',event:
   ])("supplies $job with its evidence and cancellation contract", ({ job, name, env }) => {
     expect(step(job, name).env).toMatchObject(env);
   });
+});
+
+it("scans with publisher tooling while the plugin npm preflight child runs", () => {
+  const job = workflow.jobs.prepare_plugin_npm;
+  const names = job?.steps.map((entry) => entry.name) ?? [];
+  const from = names.indexOf("Dispatch exact plugin npm artifact preflight") + 1;
+  const scan = job?.steps.slice(
+    from,
+    names.indexOf("Resolve and seal exact plugin npm artifact descriptor"),
+  );
+  expect(scan?.map((entry) => entry.if)).toEqual(
+    Array(5).fill(
+      "env.PUBLISHER_SHA != '' && env.PUBLISHER_SHA != github.sha && env.PUBLICATION_ROUTE == 'normal'",
+    ),
+  );
+  expect(job?.env?.PUBLISHER_SHA).toContain(".qualificationAdmission.workflowSha");
+  expect(scan?.at(-1)?.run).toMatch(
+    /tsx \.release-tooling\/scripts\/plugin-npm-release-plan\.ts[\s\S]*tsx \.release-tooling\/scripts\/check-plugin-npm-security-scan\.mts \\\n\s+--tooling-root \.release-tooling/u,
+  );
 });

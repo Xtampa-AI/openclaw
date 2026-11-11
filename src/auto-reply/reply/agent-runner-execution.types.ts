@@ -1,4 +1,7 @@
-import type { CompactionAccountingFact } from "../../agents/embedded-agent-runner/run/internal-params.js";
+import type {
+  CompactionAccountingFact,
+  CompactionAccountingTarget,
+} from "../../agents/embedded-agent-runner/run/internal-params.js";
 import type { runEmbeddedAgent } from "../../agents/embedded-agent.js";
 import type { FailoverReason } from "../../agents/failover/signal.js";
 import type { CompactionRequestBudget } from "../../agents/sessions/compaction/request-budget.js";
@@ -46,6 +49,7 @@ export type AgentTurnCompaction = {
 type AbortedAgentTurn = {
   kind: "aborted";
   reason: "user" | "restart" | "superseded";
+  sessionWriter?: CompactionAccountingTarget;
   compaction?: AgentTurnCompaction;
 };
 
@@ -55,6 +59,7 @@ export type AgentTurnInternalResult =
   | SettledAgentTurn
   | {
       kind: "final";
+      sessionWriter?: CompactionAccountingTarget;
       payload: ReplyPayload;
       resolved?: { provider: string; model: string };
       postCompactionModelFailure?: true;
@@ -62,6 +67,8 @@ export type AgentTurnInternalResult =
 
 type SettledAgentTurnBase = {
   kind: "settled";
+  /** The runtime's claimed writer, independent of whether it compacted. */
+  sessionWriter?: CompactionAccountingTarget;
   maintenanceAuthProfile?: CompletedAgentAuthSelection;
   compactionRequestBudget?: CompactionRequestBudget;
   result: Awaited<ReturnType<typeof runEmbeddedAgent>>;
@@ -98,6 +105,7 @@ export type AgentTurnExecutionResult = {
     | AbortedAgentTurn
     | {
         kind: "rejected";
+        sessionWriter?: CompactionAccountingTarget;
         compaction?: AgentTurnCompaction;
         payload: ReplyPayload;
         resolved?: { provider: string; model: string };

@@ -20,9 +20,9 @@ import { normalizeProviderTransportWithPlugin } from "../../plugins/provider-run
 import { isRecord } from "../../utils.js";
 import { normalizeSecretInput } from "../../utils/normalize-secret-input.js";
 import { createProviderErrorTextRedactor } from "../provider-http-errors.js";
+import { resolveProviderTransportSsrFPolicy } from "../provider-network-policy.js";
 import type { ModelProviderRequestTransportOverrides } from "../provider-request-config.types.js";
 import { unwrapSecretSentinelsForProviderEgress } from "../provider-secret-egress.js";
-import { resolveProviderTransportSsrFPolicy } from "../provider-transport-fetch.js";
 
 const NATIVE_PDF_PROVIDER_FETCH_TIMEOUT_MS = 120_000;
 const NATIVE_PDF_ERROR_BODY_MAX_BYTES = 8 * 1024;
@@ -134,7 +134,7 @@ export async function anthropicAnalyzePdf(
 
   const request = params.requestConfig?.request;
   const headers = new Headers(params.requestConfig?.headers);
-  for (const [name, value] of new Headers(request?.headers)) {
+  for (const [name, value] of Object.entries(request?.headers ?? {})) {
     headers.set(name, value);
   }
   const hasExplicitAuthOverride =
@@ -188,7 +188,7 @@ export async function anthropicAnalyzePdf(
         },
       ],
     },
-    request: request ? { ...request, headers: requestHeaders } : undefined,
+    request,
     defaultAuthHeader: usesOAuthApiKey ? "authorization" : "x-api-key",
     signal: params.signal,
   });

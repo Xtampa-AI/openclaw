@@ -537,9 +537,12 @@ suite.define(() => {
           textIncludes: `${nonOwnerMarker}:`,
           timeoutMs: 60_000,
         });
-        expect(provider.toolAvailability.get(nonOwnerMarker)).toBe(false);
-        expect(provider.results.has(nonOwnerMarker)).toBe(false);
-        expect(nonOwnerReply.text).toContain("Automation tools are unavailable for this caller.");
+        // Retain the definition for caching, but refuse execution without owner authority.
+        const nonOwnerRefusal =
+          "automations needs the owner's authority, and this turn was not started by the owner. Do not retry automations.";
+        expect(provider.toolAvailability.get(nonOwnerMarker)).toBe(true);
+        expect(provider.results.get(nonOwnerMarker)).toBe(nonOwnerRefusal);
+        expect(nonOwnerReply.text).toContain(nonOwnerRefusal);
         expect(await gateway.call("cron.get", { id: jobId })).toEqual(jobBeforeNonOwner);
         expect(await gateway.call("cron.runs", { id: jobId })).toEqual(runsBeforeNonOwner);
         expect(managementAuditEvents()).toHaveLength(0);
@@ -673,6 +676,11 @@ suite.define(() => {
                 .getByText(new RegExp(`^${marker}:`, "u"))
                 .first()
                 .waitFor();
+              // Persisted replies can precede the browser's terminal event; the next
+              // send must start from an idle composer instead of joining this run.
+              await page.getByRole("button", { name: "Stop generating", exact: true }).waitFor({
+                state: "hidden",
+              });
               if (captureUiProof) {
                 await page.screenshot({ path: path.join(proofDir, `${marker}-result.png`) });
               }
@@ -695,6 +703,7 @@ suite.define(() => {
               configuredTelegramOwner: ownerResults,
               nonOwnerTelegramConversation: {
                 automationsAvailable: provider.toolAvailability.get(nonOwnerMarker),
+                refusal: provider.results.get(nonOwnerMarker),
                 remove: "unavailable visibly; job and runs unchanged",
               },
               adminManagementAuditEvents: auditEvents.length,

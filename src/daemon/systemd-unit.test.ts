@@ -62,10 +62,10 @@ it("round-trips escaped and quoted ExecStart arguments", () => {
 });
 
 it("quotes empty ExecStart arguments without shifting later arguments", () => {
-  const unit = buildSystemdUnit({
-    programArguments: ["/usr/bin/node", "gateway", "--label", "", "--port", "18789", ""],
-  });
+  const programArguments = ["/usr/bin/node", "gateway", "--label", "", "--port", "18789", ""];
+  const unit = buildSystemdUnit({ programArguments });
   expect(execStart(unit)).toBe('/usr/bin/node gateway --label "" --port 18789 ""');
+  expect(parseSystemdExecStart(execStart(unit))).toEqual(programArguments);
 });
 
 it("preserves explicit NODE_OPTIONS while omitting other empty values", () => {
@@ -125,6 +125,10 @@ it("rejects environment values with line breaks", () => {
 
 it("splits command arguments using the platform's escaping rules", () => {
   const cases = [
+    ['  "" run "" tail ""  ', "none", ["", "run", "", "tail", ""]],
+    ['  "" run "" tail ""  ', "backslash", ["", "run", "", "tail", ""]],
+    ['  "" run "" tail ""  ', "backslash-quote-only", ["", "run", "", "tail", ""]],
+
     [
       '/usr/bin/openclaw gateway start --name "My Bot"',
       "none",
@@ -151,6 +155,10 @@ it("splits command arguments using the platform's escaping rules", () => {
       splitArgsPreservingQuotes(input, escapeMode === "none" ? undefined : { escapeMode }),
     ).toEqual(expected);
   }
+});
+
+it("preserves empty single-quoted ExecStart arguments", () => {
+  expect(parseSystemdExecStart("run '' next ''")).toEqual(["run", "", "next", ""]);
 });
 
 it("parses quoted assignments while preserving unquoted apostrophes", () => {

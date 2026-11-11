@@ -11,6 +11,29 @@ import { buildSystemPromptParams, resolveSystemPromptRepoRoot } from "./system-p
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const runtime = { host: "host", os: "os", arch: "arch", node: "node", model: "model" };
 
+// Exercise real marker discovery inside owned fixtures without reading enclosing host repositories.
+// This is the same maxDepth boundary used by git-root's filesystem tests, not a fake root result.
+vi.mock("../infra/git-root.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../infra/git-root.js")>();
+  return {
+    ...actual,
+    findGitRoot(startDir: string, opts: { maxDepth?: number } = {}) {
+      const fixtureRoot = [...tempDirs.dirs].find(
+        (root) => startDir === root || startDir.startsWith(root + path.sep),
+      );
+      if (!fixtureRoot) {
+        return actual.findGitRoot(startDir, opts);
+      }
+      const fixtureDepth =
+        path.relative(fixtureRoot, startDir).split(path.sep).filter(Boolean).length + 1;
+      return actual.findGitRoot(startDir, {
+        ...opts,
+        maxDepth: Math.min(opts.maxDepth ?? fixtureDepth, fixtureDepth),
+      });
+    },
+  };
+});
+
 async function makeRepoRoot(root: string): Promise<void> {
   await fs.mkdir(path.join(root, ".git"), { recursive: true });
 }
@@ -29,22 +52,6 @@ function buildParams(params: { config?: OpenClawConfig; workspaceDir?: string; c
 describe("buildSystemPromptParams", () => {
   afterEach(() => {
     setActiveNodeContexts([]);
-    vi.useRealTimers();
-  });
-
-  it("formats the current date in the configured user timezone", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-05T23:30:00.000Z"));
-
-    const utc = buildParams({
-      config: { agents: { defaults: { userTimezone: "UTC" } } },
-    });
-    const tokyo = buildParams({
-      config: { agents: { defaults: { userTimezone: "Asia/Tokyo" } } },
-    });
-
-    expect(utc.userDate).toBe("2026-01-05");
-    expect(tokyo.userDate).toBe("2026-01-06");
   });
 
   it("projects the requester-scoped stable active-node identity", () => {

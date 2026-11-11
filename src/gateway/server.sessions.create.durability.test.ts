@@ -10,14 +10,23 @@ import {
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { loadSessionEntry, loadTranscriptEvents } from "../config/sessions/session-accessor.js";
+import * as sessionInputActors from "../config/sessions/session-input-actor.js";
 import { listSessionPendingInputs } from "../config/sessions/session-pending-input-history.js";
+import { recordSessionParticipantInWorker } from "../config/sessions/session-sharing-store.async.js";
 import { clearAgentRunContext } from "../infra/agent-run-registry.js";
 import * as workerAdmission from "../infra/sqlite-worker-operation-admission.js";
 import { sqliteWorkerOwnerProbe as probe } from "../infra/sqlite-worker-owner-probe.test-support.js";
+import { classifyWorkerRequest } from "../infra/worker-request-diagnostics.js";
 import { readLoggingConfig } from "../logging/config.js";
 import { applyLoggingConfig } from "../logging/logger.js";
-import { getSessionWorkAdmissionRelease } from "../sessions/session-lifecycle-admission.js";
+import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import {
+  getActiveSessionWorkAdmissionCount,
+  getSessionWorkAdmissionRelease,
+} from "../sessions/session-lifecycle-admission.js";
 import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
+import { runOutsideStoreWriterContext } from "../shared/store-writer-queue.js";
+import { agentDatabaseWriteAdmissionState } from "../state/openclaw-agent-write-admission-state.js";
 import { invalidateGatewayDeviceRevocation } from "./device-revocation.js";
 import type { StartChatDispatchParams } from "./server-methods/chat-send-agent-dispatch.types.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
@@ -29,6 +38,10 @@ import {
 } from "./server.sessions.create.test-support.js";
 import { agentCommandMock, rpcReq, testState } from "./test-helpers.js";
 
+// Diagnostic only: fixed labels/classified commands, never request payloads or paths.
+let durabilityTrace: ((phase: string, detail?: string, operation?: number) => void) | undefined;
+let durabilityTraceOperation = 0;
+let stopDurabilityTrace: (() => void) | undefined;
 const dispatch = vi.hoisted(() => ({ start: vi.fn<(params: StartChatDispatchParams) => void>() }));
 const turnBoundary = vi.hoisted(() => ({
   committing: false,
@@ -54,20 +67,34 @@ vi.mock("../state/openclaw-agent-execution.js", async (importOriginal) => {
             (worker) =>
               operation({
                 execute: async (command, commandOptions) => {
-                  const committing = command.type === "session.turn.commit";
+                  const committing =
+                    (command.type === "session.actor.acceptInput" ||
+                      command.type === "session.actor.adoptRun") &&
+                    typeof command.input === "object" &&
+                    command.input !== null &&
+                    "turn" in command.input &&
+                    command.input.turn !== undefined;
                   if (committing) {
                     turnBoundary.committing = true;
                   }
+                  const traceOperation = ++durabilityTraceOperation;
                   try {
-                    const result = await worker.execute(command, commandOptions);
-                    if (command.type === "session.turn.prepare") {
+                    if (committing) {
                       turnBoundary.afterPrepare?.();
                     }
+                    durabilityTrace?.(
+                      "worker.begin",
+                      classifyWorkerRequest(command.type),
+                      traceOperation,
+                    );
+                    const result = await worker.execute(command, commandOptions);
+                    durabilityTrace?.("worker.end", undefined, traceOperation);
                     if (committing) {
                       turnBoundary.afterCommit?.();
                     }
                     return result;
                   } finally {
+                    durabilityTrace?.("worker.settled", undefined, traceOperation);
                     if (committing) {
                       turnBoundary.committing = false;
                     }
@@ -90,10 +117,246 @@ const { createSessionStoreDir, openClient } = setupSessionCreateTestHarness(asyn
 });
 
 afterEach(() => {
+  stopDurabilityTrace?.();
   turnBoundary.committing = false;
   turnBoundary.afterPrepare = undefined;
   turnBoundary.afterCommit = undefined;
   vi.restoreAllMocks();
+});
+
+test("persists and dispatches concurrent Gateway inputs while participant writes queue", async ({
+  signal,
+}) => {
+  let sequence = 0;
+  let events = 0;
+  let heartbeats = 0;
+  let awaited = "setup.store";
+  const startedAt = performance.now();
+  const workers = new Map<number, string>();
+  durabilityTraceOperation = 0;
+  durabilityTrace = (phase, detail, operation) => {
+    try {
+      if (phase === "worker.begin" && operation !== undefined && workers.size < 8) {
+        workers.set(operation, detail ?? "other");
+      } else if (phase === "worker.settled" && operation !== undefined) {
+        workers.delete(operation);
+      }
+      // Keep heartbeats and the timeout snapshot even after the event budget is exhausted.
+      if (phase !== "watchdog" && phase !== "test.abort" && ++events > 256) {
+        return;
+      }
+      const queues = [];
+      for (const queue of agentDatabaseWriteAdmissionState.queues.values()) {
+        const workerOperations = [];
+        for (const label of queue.holder?.worker?.operations ?? []) {
+          workerOperations.push(classifyWorkerRequest(label));
+          if (workerOperations.length === 4) {
+            break;
+          }
+        }
+        queues.push({
+          pending: queue.pending.length,
+          draining: Boolean(queue.drainPromise),
+          holder: Boolean(queue.holder),
+          operation: queue.holder?.operation,
+          started: queue.holder?.startedAt !== undefined,
+          finished: queue.holder?.finishedAt !== undefined,
+          workerOperations,
+        });
+        if (queues.length === 4) {
+          break;
+        }
+      }
+      console.error(
+        "DURABILITY_PHASE " +
+          JSON.stringify({
+            sequence: ++sequence,
+            phase,
+            detail,
+            operation,
+            awaited,
+            elapsedMs: Math.round(performance.now() - startedAt),
+            roots: getActiveGatewayRootWorkCount(),
+            sessions: getActiveSessionWorkAdmissionCount(),
+            dispatches: dispatch.start.mock.calls.length,
+            workers: [...workers].map(([id, command]) => ({ id, command })),
+            queueCount: agentDatabaseWriteAdmissionState.queues.size,
+            queues,
+          }),
+      );
+    } catch {
+      // Observability must never replace a result, refusal or original failure.
+    }
+  };
+  const traceTimer = setInterval(() => {
+    durabilityTrace?.("watchdog");
+    if (++heartbeats >= 36) {
+      clearInterval(traceTimer);
+    }
+  }, 5000);
+  traceTimer.unref();
+  const stopTrace = () => {
+    clearInterval(traceTimer);
+    signal.removeEventListener("abort", onAbort);
+    durabilityTrace = undefined;
+    stopDurabilityTrace = undefined;
+  };
+  const onAbort = () => {
+    durabilityTrace?.("test.abort");
+    stopTrace();
+  };
+  stopDurabilityTrace = stopTrace;
+  signal.addEventListener("abort", onAbort, { once: true });
+  durabilityTrace("setup.store.begin");
+  const { storePath } = await createSessionStoreDir();
+  durabilityTrace?.("setup.store.end");
+  awaited = "setup.client";
+  durabilityTrace?.("setup.client.begin");
+  const { ws } = await openClient();
+  durabilityTrace?.("setup.client.end");
+  probe.admission(workerAdmission, (request, grant, callback) => {
+    const operation = ++durabilityTraceOperation;
+    const stage = ["open", "prepare", "transaction", "commit"].includes(request.stage)
+      ? request.stage
+      : "other";
+    durabilityTrace?.("admission.callback.begin", stage, operation);
+    try {
+      // Preserve both original objects and the callback's synchronous behavior.
+      callback(request, grant);
+      durabilityTrace?.("admission.callback.return", stage, operation);
+    } catch (error) {
+      durabilityTrace?.("admission.callback.error", stage, operation);
+      throw error;
+    }
+  });
+  const inputs = Array.from({ length: 2 }, (_, index) => ({
+    agentId: "main",
+    key: `agent:main:dashboard:concurrent-initial-${index}`,
+    message: `Persist concurrent Gateway initial input ${index}.`,
+  }));
+  const competingWrites: Promise<unknown>[] = [];
+  const intervenedInputs = new Set<string>();
+  const acquire = sessionInputActors.acquireSessionInputActor;
+  vi.spyOn(sessionInputActors, "acquireSessionInputActor").mockImplementation(async (...args) => {
+    const operation = ++durabilityTraceOperation;
+    durabilityTrace?.("acquire.begin", undefined, operation);
+    const input = await acquire(...args);
+    durabilityTrace?.("acquire.end", input ? "present" : "absent", operation);
+    if (input) {
+      const accept = input.actor.acceptInput;
+      vi.spyOn(input.actor, "acceptInput").mockImplementationOnce(async (...command) => {
+        const recordParticipant = (promptedAt: number) =>
+          recordSessionParticipantInWorker(
+            { agentId: "main", storePath, sessionKey: input.actor.target.sessionKey },
+            {
+              identity: {
+                type: "observation",
+                pluginId: null,
+                accountId: null,
+                senderKind: "unknown",
+                id: "gateway-client",
+              },
+              promptedAt,
+              sessionAgentId: "main",
+            },
+          );
+        durabilityTrace?.("participant1.begin", undefined, operation);
+        await recordParticipant(1);
+        durabilityTrace?.("participant1.end", undefined, operation);
+        intervenedInputs.add(input.actor.target.sessionKey);
+        durabilityTrace?.("accept.begin", undefined, operation);
+        const pending = accept(...command);
+        void pending.then(
+          () => durabilityTrace?.("accept.end", undefined, operation),
+          () => durabilityTrace?.("accept.error", undefined, operation),
+        );
+        // This independent writer must wait behind the complete input admission.
+        competingWrites.push(
+          runOutsideStoreWriterContext(() => {
+            durabilityTrace?.("participant2.begin", undefined, operation);
+            const pendingWriter = recordParticipant(2);
+            void pendingWriter.then(
+              () => durabilityTrace?.("participant2.end", undefined, operation),
+              () => durabilityTrace?.("participant2.error", undefined, operation),
+            );
+            return pendingWriter;
+          }),
+        );
+        return pending;
+      });
+    }
+    return input;
+  });
+  let cleanupStarted = false;
+  const cleanedTurns = new Set<StartChatDispatchParams>();
+  const cleanupTurn = (turn: StartChatDispatchParams) => {
+    if (cleanedTurns.has(turn)) {
+      return;
+    }
+    cleanedTurns.add(turn);
+    durabilityTrace?.("cleanup.release.begin");
+    turn.replyAdmissionTicket?.release();
+    turn.admission.cleanupAdmittedRun();
+    clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
+  };
+  dispatch.start.mockClear();
+  dispatch.start.mockImplementation((turn) => {
+    // An RPC timeout does not cancel admission; late mock-owned dispatches still need cleanup.
+    if (cleanupStarted) {
+      cleanupTurn(turn);
+    }
+  });
+  dashboardTitleScheduleMocks.schedule.mockImplementation(() => {});
+  try {
+    awaited = "rpc";
+    durabilityTrace?.("rpc.begin");
+    const created = await Promise.all(
+      inputs.map((params) =>
+        rpcReq<{ sessionId: string; runStarted: boolean }>(ws, "sessions.create", params),
+      ),
+    );
+    durabilityTrace?.("rpc.end");
+    for (const [index, response] of created.entries()) {
+      expect(response.ok, JSON.stringify(response)).toBe(true);
+      expect(response.payload?.runStarted, JSON.stringify(response)).toBe(true);
+      const input = inputs[index]!;
+      const scope = {
+        agentId: input.agentId,
+        sessionKey: input.key,
+        sessionId: expectDefined(response.payload?.sessionId, "created session ID"),
+        storePath,
+      };
+      awaited = index === 0 ? "transcript.0" : "transcript.1";
+      durabilityTrace?.("transcript.begin", awaited);
+      expect(
+        (await loadTranscriptEvents(scope)).filter((event) =>
+          JSON.stringify(event).includes(input.message),
+        ),
+      ).toHaveLength(1);
+      durabilityTrace?.("transcript.end", awaited);
+    }
+    expect(intervenedInputs).toEqual(new Set(inputs.map((input) => input.key)));
+    expect(dispatch.start).toHaveBeenCalledTimes(inputs.length);
+  } finally {
+    cleanupStarted = true;
+    const released = getSessionWorkAdmissionRelease({
+      scope: storePath,
+      identities: inputs.map((input) => input.key),
+    });
+    for (const [turn] of dispatch.start.mock.calls) {
+      cleanupTurn(turn);
+    }
+    awaited = "cleanup.admission";
+    durabilityTrace?.("cleanup.admission.begin");
+    await released;
+    durabilityTrace?.("cleanup.admission.end");
+    awaited = "cleanup.writers";
+    durabilityTrace?.("cleanup.writers.begin");
+    await Promise.all(competingWrites);
+    durabilityTrace?.("cleanup.writers.end");
+    ws.close();
+    stopTrace();
+  }
 });
 
 test.for([
@@ -419,12 +682,12 @@ test.for(["lost-worker-response", "restart-before-ack"] as const)(
   },
 );
 
-test("retains idle chat input custody when its separate transcript commit is refused", async () => {
+test("retries idle chat input after its atomic commit is refused", async () => {
   const { storePath } = await createSessionStoreDir();
   const { ws } = await openClient();
-  const key = "agent:main:dashboard:idle-staging-preserved";
-  const message = "Idle input keeps its separately accepted bytes.";
-  const runId = "idle-staging-preserved";
+  const key = "agent:main:dashboard:idle-commit-retry";
+  const message = "Idle input retries its original bytes.";
+  const runId = "idle-commit-retry";
   const target = { agentId: "main", sessionKey: key, storePath };
   dispatch.start.mockClear();
   dashboardTitleScheduleMocks.schedule.mockImplementation(() => {});
@@ -449,22 +712,49 @@ test("retains idle chat input custody when its separate transcript commit is ref
     expect(dispatch.start).not.toHaveBeenCalled();
     const entry = expectDefined(loadSessionEntry(target), "idle session");
     expect(entry.restartRecoveryDeliveryRunId).toBeUndefined();
+    expect(entry.restartRecoveryDeliverySourceRunId).toBeUndefined();
     const scope = { ...target, sessionId: entry.sessionId };
-    const pending = await listSessionPendingInputs(scope);
-    expect(pending).toMatchObject({ total: 1, items: [{ state: "interrupted" }] });
-    expect(JSON.stringify(pending.items)).toContain(message);
+    expect(await listSessionPendingInputs(scope)).toEqual({ items: [], total: 0 });
+    expect(await loadTranscriptEvents(scope)).toEqual([
+      expect.objectContaining({ type: "session", id: entry.sessionId }),
+    ]);
+
+    refuse.mockRestore();
+    const retried = await rpcReq<{ status: string }>(ws, "chat.send", {
+      sessionKey: key,
+      message,
+      idempotencyKey: runId,
+    });
+    expect(retried.ok, JSON.stringify(retried)).toBe(true);
+    expect(retried.payload?.status).toBe("started");
+    expect(loadSessionEntry(target)).toMatchObject({
+      sessionId: entry.sessionId,
+      restartRecoveryDeliveryRunId: runId,
+      restartRecoveryDeliverySourceRunId: runId,
+    });
+    expect(await listSessionPendingInputs(scope)).toEqual({ items: [], total: 0 });
     expect(
       (await loadTranscriptEvents(scope)).filter((event) =>
         JSON.stringify(event).includes(message),
       ),
-    ).toHaveLength(0);
+    ).toMatchObject([
+      { message: { role: "user", content: message, idempotencyKey: `${runId}:user` } },
+    ]);
+    expect(dispatch.start).toHaveBeenCalledOnce();
   } finally {
     refuse.mockRestore();
+    const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
+    for (const [turn] of dispatch.start.mock.calls) {
+      turn.replyAdmissionTicket?.release();
+      turn.admission.cleanupAdmittedRun();
+      clearAgentRunContext(turn.session.clientRunId, turn.admission.lifecycleGeneration);
+    }
+    await released;
     ws.close();
   }
 });
 
-test("dispatches the canonical redacted bytes of a committed initial input", async () => {
+test("dispatches the original bytes of a committed initial input", async () => {
   const { storePath } = await createSessionStoreDir();
   const { ws } = await openClient();
   const key = "agent:main:dashboard:initial-redaction";
@@ -490,9 +780,7 @@ test("dispatches the canonical redacted bytes of a committed initial input", asy
       turn.userTurn.recorder.getPersistedMessage?.(),
       "canonical input",
     );
-    expect(persisted.content).not.toContain("initial-secret");
-    expect(persisted.content).toContain("Check ");
-    expect(persisted.content).toContain(" before execution.");
+    expect(persisted.content).toBe(message);
     expect(turn.turn.ctx).toMatchObject({
       Body: persisted.content,
       BodyForAgent: persisted.content,
@@ -501,7 +789,7 @@ test("dispatches the canonical redacted bytes of a committed initial input", asy
     });
     const history = await rpcReq<{ messages: unknown[] }>(ws, "chat.history", { sessionKey: key });
     expect(history.ok, JSON.stringify(history)).toBe(true);
-    expect(JSON.stringify(history.payload?.messages)).not.toContain("initial-secret");
+    expect(JSON.stringify(history.payload?.messages)).toContain("initial-secret");
     expect(JSON.stringify(history.payload?.messages)).toContain(JSON.stringify(persisted.content));
   } finally {
     const released = getSessionWorkAdmissionRelease({ scope: storePath, identities: [key] });
@@ -515,6 +803,9 @@ test("dispatches the canonical redacted bytes of a committed initial input", asy
     ws.close();
   }
 });
+
+// Cold reply runtime and worktree setup can exceed the 10s default on hosted runners.
+const RECOVERY_RPC_TIMEOUT_MS = 60_000;
 
 test.for([
   { id: "openclaw-control-ui", mode: "webchat", worktree: true },
@@ -530,6 +821,7 @@ test.for([
     const { ws } = await openClient({
       client: { id, mode, platform: "test", version: "1.0.0" },
       browserOrigin: mode === "webchat" ? "http://localhost" : undefined,
+      timeoutMs: RECOVERY_RPC_TIMEOUT_MS,
     });
     const key = `agent:main:dashboard:durable-${id}-${worktree}`;
     const message = "Reply with exactly: retained first message.";
@@ -555,14 +847,19 @@ test.for([
         sessionId: string;
         runId: string;
         runStarted: boolean;
-      }>(ws, "sessions.create", {
-        agentId: "main",
-        key,
-        cwd: workspace,
-        worktree,
-        worktreeName: worktree ? `durability-${id}` : undefined,
-        message,
-      });
+      }>(
+        ws,
+        "sessions.create",
+        {
+          agentId: "main",
+          key,
+          cwd: workspace,
+          worktree,
+          worktreeName: worktree ? `durability-${id}` : undefined,
+          message,
+        },
+        RECOVERY_RPC_TIMEOUT_MS,
+      );
       expect(created.ok, JSON.stringify(created)).toBe(true);
       expect(created.payload?.runStarted).toBe(true);
       captured = expectDefined(dispatch.start.mock.calls[0]?.[0], "accepted dispatch");
@@ -571,15 +868,25 @@ test.for([
       expect(before.pendingWorktree !== undefined).toBe(worktree);
       const followup = "Also retain this queued follow-up.";
       if (worktree) {
-        const sent = await rpcReq(ws, "chat.send", {
-          sessionKey: key,
-          message: followup,
-          idempotencyKey: `followup-${id}`,
-        });
+        const sent = await rpcReq(
+          ws,
+          "chat.send",
+          {
+            sessionKey: key,
+            message: followup,
+            idempotencyKey: `followup-${id}`,
+          },
+          RECOVERY_RPC_TIMEOUT_MS,
+        );
         expect(sent.ok, JSON.stringify(sent)).toBe(true);
-        const pending = await rpcReq<{ pendingInputs: { items: unknown[] } }>(ws, "chat.history", {
-          sessionKey: key,
-        });
+        const pending = await rpcReq<{ pendingInputs: { items: unknown[] } }>(
+          ws,
+          "chat.history",
+          {
+            sessionKey: key,
+          },
+          RECOVERY_RPC_TIMEOUT_MS,
+        );
         expect(JSON.stringify(pending.payload?.pendingInputs.items)).toContain(followup);
       }
       // Drop process-only dispatches; do not run their terminal/error persistence.
@@ -615,9 +922,14 @@ test.for([
       const history = await rpcReq<{
         messages: unknown[];
         pendingInputs: { items: Array<{ state: string; message: unknown }> };
-      }>(ws, "chat.history", {
-        sessionKey: key,
-      });
+      }>(
+        ws,
+        "chat.history",
+        {
+          sessionKey: key,
+        },
+        RECOVERY_RPC_TIMEOUT_MS,
+      );
       expect(history.ok, JSON.stringify(history)).toBe(true);
       expect(JSON.stringify(history.payload?.messages)).toContain(message);
       if (worktree) {

@@ -137,7 +137,7 @@ Rerun with `--overwrite` only when replacing the existing target is intentional.
 
 Conflicts are unusual on a fresh install. They typically show up when you re-run the import against a setup that already has user edits.
 
-If a conflict surfaces mid-apply (for example, an unexpected race on a config file), that item is reported as a conflict while independent files, skills, credentials, archives, and config entries continue. Resolve the conflicted item and rerun the import; identical memory imports are idempotent.
+If a conflict surfaces mid-apply (for example, an unexpected race on a config file), that item is reported as a conflict while independent files, skills, credentials, archives, and config entries continue. Resolve the conflicted item and rerun the import; repeating an identical memory import does not create duplicates.
 
 ## Secrets
 
@@ -183,3 +183,12 @@ If source directory inspection or skill listing fails, preview stops with the fi
 - [Migrating](/install/migrating): move an OpenClaw install between machines.
 - [Doctor](/gateway/doctor): post-migration health check.
 - [Agent workspace](/concepts/agent-workspace): where `SOUL.md`, `AGENTS.md`, and memory files live.
+
+### Special text files
+
+Migration text readers do not wait for a named-pipe writer or read devices as
+text streams. Memory append sources and destinations must be ordinary files;
+replace an unexpected special file and retry. Symlinks to ordinary source text
+files remain supported. Optional text reads retain their existing unreadable-file
+fallback behavior. Memory imports preserve UTF-8 validation and repeat-import
+deduplication.

@@ -85,9 +85,11 @@ import {
   countRetainedSessionSources,
   prepareRetainedSessionImport,
   retireDeferredPluginSessionImport,
+  collectRetainedTrajectoryPointers,
 } from "./doctor-session-sqlite-retained.js";
 import { settleDuplicateSessionSqliteArchives } from "./doctor-session-sqlite-retirement.js";
 import {
+  assertDoctorSessionSqliteTargetsNotAliased,
   createMigrationTargetInput,
   filterLegacySessionStoreTargets,
   prepareDoctorSessionSqliteTargets,
@@ -655,16 +657,12 @@ export async function reconcileDoctorSessionSqlitePublication(
 ): Promise<void> {
   const env = options.env ?? process.env;
   const cfg = resolveDoctorSessionSqliteConfig(options);
-  const { targets } = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
-  assertDoctorSqliteMaintenancePathsNotAliased(
-    `session SQLite ${options.mode}`,
-    resolveDoctorSessionSqliteMaintenancePaths(targets),
-    resolveDoctorSessionSqliteMaintenanceRoots(targets, env),
-  );
+  const resolved = resolveDoctorSessionSqliteTargets({ ...options, cfg, env });
+  assertDoctorSessionSqliteTargetsNotAliased({ ...options, ...resolved, env });
   await reconcileSessionSqliteMigrationPublications({
     env,
     sourcePath,
-    trustedTargets: targets.map(createMigrationTargetInput),
+    trustedTargets: resolved.targets.map(createMigrationTargetInput),
   });
 }
 
@@ -991,7 +989,7 @@ async function inspectOrMigrateTarget(params: {
         if (indexless) {
           report.issues.push({
             code: "retained_plugin_source_index_rebuilt",
-            message: `Derived the retained source index from verified transcripts for ${path.dirname(params.target.storePath)}. Recorded their identities in the completed import receipt without creating sessions.json or replaying canonical metadata.`,
+            message: `Derived the retained source index from verified transcripts for ${path.dirname(params.target.storePath)}. Recorded their identities in the completed import receipt without creating sessions.json or replaying existing metadata.`,
           });
         }
       }
@@ -1291,18 +1289,11 @@ async function archiveLegacyArtifacts(
         pointers.add(pointer);
       }
     }
-    // A pointer sidecar only locates its transcript's trajectory, so it settles with that
-    // transcript, including a receipt-verified one an earlier run archived without it.
-    for (const transcript of receiptSources) {
-      const pointer = resolveTrajectoryPointerPath(transcript);
-      if (
-        pointer &&
-        receiptSources.has(pointer) &&
-        !owner.sourceConflicts?.has(transcript) &&
-        !fs.existsSync(transcript)
-      ) {
-        pointers.add(pointer);
-      }
+    for (const pointer of collectRetainedTrajectoryPointers(
+      receiptSources,
+      owner.sourceConflicts,
+    )) {
+      pointers.add(pointer);
     }
     for (const pointer of pointers) {
       const source = canonicalMigrationFilePath(pointer);

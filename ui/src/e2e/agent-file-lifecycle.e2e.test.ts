@@ -1,5 +1,4 @@
 // Control UI E2E tests cover visible agent-file save outcomes and agent ownership.
-import type WaTooltip from "@awesome.me/webawesome/dist/components/tooltip/tooltip.js";
 import { expect, it } from "vitest";
 import { waitForControlUiProofSurface } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
@@ -68,6 +67,88 @@ function fileGetResponses(mainContent: string) {
 }
 
 suite.define(() => {
+  it.each([false, true])(
+    "announces a failed file save (conflict: %s) without losing the draft",
+    async (conflict) => {
+      const draft = "# Garden helper\n\nKeep these synthetic instructions.";
+      const message = conflict
+        ? "Synthetic workspace changed; Reload or Overwrite to recover."
+        : "Synthetic write rejected; retry Save.";
+      await suite.withPage(
+        { locale: "en-US", viewport: { width: 1440, height: 900 } },
+        async ({ page }) => {
+          const gateway = await installMockGateway(page, {
+            featureMethods: [
+              "agents.files.get",
+              "agents.files.list",
+              "agents.files.set",
+              "agents.list",
+            ],
+            operatorScopes: ["operator.admin", "operator.read", "operator.write"],
+            methodResponses: {
+              "agents.list": {
+                defaultId: "main",
+                mainKey: "main",
+                scope: "per-sender",
+                agents: [{ id: "main", name: "Main" }],
+              },
+              "agents.files.get": fileGetResponses("Original synthetic instructions"),
+              "agents.files.list": fileListResponses,
+              "agents.files.set": { ok: true, ...fileGet("main", draft) },
+            },
+          });
+          await page.goto(suite.server.baseUrl + "settings/agents/main/files");
+          const editor = page.locator(".agent-file-textarea");
+          const save = page
+            .locator(".agent-file-actions")
+            .getByRole("button", { name: "Save", exact: true });
+          const confirmSave = async (content: string) => {
+            await gateway.setMethodResponse("agents.files.set", {
+              ok: true,
+              ...fileGet("main", content),
+            });
+          };
+          await expect.poll(() => editor.inputValue()).toBe("Original synthetic instructions");
+          expect(await page.locator(".agents-main").getByRole("alert").count()).toBe(0);
+          await editor.fill(draft);
+          await gateway.deferNext("agents.files.set", { agentId: "main", name: "AGENTS.md" });
+          await save.click();
+          await gateway.waitForRequest("agents.files.set");
+          await editor.fill(draft + "\nA newer edit.");
+          await gateway.resolveDeferred("agents.files.set", {
+            __mockError: {
+              code: conflict ? "INVALID_REQUEST" : "UNAVAILABLE",
+              message,
+              ...(conflict ? { details: { type: "agent_file_conflict", name: "AGENTS.md" } } : {}),
+            },
+          });
+          await page.getByText(message, { exact: true }).waitFor();
+          expect(await editor.inputValue()).toBe(draft + "\nA newer edit.");
+          expect(await editor.isEnabled()).toBe(true);
+          await captureAgentFileScreenshot(
+            page,
+            conflict ? "save-conflict.png" : "save-failure.png",
+          );
+          const alert = page.locator(".agents-main").getByRole("alert");
+          await expect.poll(() => alert.count()).toBe(1);
+          expect(await alert.textContent()).toContain(message);
+          if (conflict) {
+            expect(
+              await alert.getByRole("button", { name: "Reload", exact: true }).isEnabled(),
+            ).toBe(true);
+            expect(
+              await alert.getByRole("button", { name: "Overwrite", exact: true }).isEnabled(),
+            ).toBe(true);
+          }
+          await confirmSave(draft + "\nA newer edit.");
+          await save.click();
+          await expect.poll(() => save.isDisabled()).toBe(true);
+          expect(await alert.count()).toBe(0);
+          expect(await editor.inputValue()).toBe(draft + "\nA newer edit.");
+        },
+      );
+    },
+  );
   it("keeps preview tooltip aligned with its expand state", async () => {
     await suite.withPage(
       {
@@ -115,9 +196,7 @@ suite.define(() => {
         const tooltipHost = modal.locator("openclaw-tooltip:has(.md-preview-expand-btn)");
         // Hover-intent timing is covered by the tooltip owner's fake-clock tests.
         await tooltipHost.evaluate((element) => element.setAttribute("delay", "0"));
-        const tooltip = tooltipHost.locator("wa-tooltip");
-        const body = tooltip.locator('[part="body"]');
-        const popup = tooltip.locator('wa-popup [part="popup"]');
+        const tooltip = tooltipHost.locator(".tooltip-surface[popover]");
         const hint = tooltip.locator(".tooltip-content");
         const settlePreview = async () => {
           await waitForControlUiProofSurface(dialog, [reader]);
@@ -126,15 +205,20 @@ suite.define(() => {
         const assertHint = async (label: string, screenshot: string) => {
           await reader.hover();
           await expand.hover();
-          await waitForControlUiProofSurface(popup, [body, hint, expand]);
+          await waitForControlUiProofSurface(tooltip, [hint, expand]);
           const trigger = await expand.elementHandle();
           expect(trigger).not.toBeNull();
           try {
             expect(
-              await tooltip.evaluate(
-                (element, anchor) => (element as WaTooltip).anchor === anchor,
-                trigger,
-              ),
+              await tooltipHost.evaluate((element, anchor) => {
+                const host = element as HTMLElement & { anchor?: Element | null };
+                const tooltipAnchor =
+                  host.anchor ??
+                  host.shadowRoot
+                    ?.querySelector<HTMLSlotElement>("slot:not([name])")
+                    ?.assignedElements({ flatten: true })[0];
+                return tooltipAnchor === anchor;
+              }, trigger),
             ).toBe(true);
           } finally {
             await trigger?.dispose();

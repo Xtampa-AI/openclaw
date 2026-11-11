@@ -5,7 +5,7 @@ import { connect, type AddressInfo, type Socket } from "node:net";
 import { pathToFileURL } from "node:url";
 import { MessageChannel, Worker } from "node:worker_threads";
 import { rawDataToString } from "openclaw/plugin-sdk/realtime-voice-provider";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { OpenAIQuicksilverAudioClock } from "./realtime-quicksilver-audio-buffer.js";
 import { closeOpenAILiveSocket } from "./realtime-quicksilver-protocol.js";
@@ -17,7 +17,23 @@ import { OpenAIQuicksilverWorkerSocket } from "./realtime-quicksilver-socket.js"
 const receiverSource =
   "const { parentPort, workerData } = require('node:worker_threads');\nconst { fileURLToPath } = require('node:url');\nconst { WebSocketServer } = require(fileURLToPath(workerData.wsUrl));\nconst counts = new Int32Array(workerData.count);\nconst times = new Float64Array(workerData.times);\nconst outputCounts = new Int32Array(workerData.outputCount);\nconst outputState = new Int32Array(workerData.outputState);\nworkerData.outputPort.on('message', message => {\n  if (message.type === 'audio') {\n    if (Atomics.load(outputState, 0) === 0 && message.audio instanceof Uint8Array && message.audio.byteLength === 960 && message.audio[0] === 1 && message.audio[1] === 1) Atomics.add(outputCounts, 0, 1);\n    workerData.outputPort.postMessage({ type: 'ack' });\n  }\n});\nconst server = new WebSocketServer({ host: '127.0.0.1', port: 0 });\nserver.on('connection', socket => socket.on('message', data => {\n  const event = JSON.parse(data.toString());\n  if (event.type === 'session.input_audio.append') {\n    const index = Atomics.load(counts, 0);\n    times[index] = performance.now();\n    Atomics.store(counts, 0, index + 1);\n    socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: event.audio }));\n  }\n  if (event.type === 'session.close') {\n    socket.send(JSON.stringify({ type: 'session.input_transcript.delta', delta: 'final transcript', start_ms: 0, end_ms: 100 }));\n    socket.send(JSON.stringify({ type: 'session.closed', reason: 'close_requested' }));\n  }\n}));\nserver.on('listening', () => parentPort.postMessage('ws://127.0.0.1:' + server.address().port));";
 
+afterEach(() => vi.unstubAllEnvs());
+
 describe("GPT-Live socket worker", () => {
+  beforeEach(() => {
+    // Direct loopback fixtures must not inherit the host's external proxy route.
+    for (const key of [
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+    ]) {
+      vi.stubEnv(key, undefined);
+    }
+  });
+
   it("keeps actual PCM packets paced during a blocked Gateway and drains final transcripts", async () => {
     const count = new Int32Array(new SharedArrayBuffer(4));
     const times = new Float64Array(new SharedArrayBuffer(4096 * 8));

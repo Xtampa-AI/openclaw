@@ -5,6 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
 import { SessionManager } from "../sessions/session-manager.js";
@@ -34,8 +38,10 @@ import { resolveClaudeCliProjectDirForWorkspace } from "./claude-cli-project-dir
 
 function formatClaudeCliFallbackPrelude(
   seed: NonNullable<
-    ReturnType<
-      typeof import("../../gateway/cli-session-history.claude.js").readClaudeCliFallbackSeed
+    Awaited<
+      ReturnType<
+        typeof import("../../gateway/cli-session-history.claude.js").readClaudeCliFallbackSeed
+      >
     >
   >,
   options?: { charBudget?: number },
@@ -62,10 +68,10 @@ describe("resolveFallbackRetryPrompt", () => {
 });
 
 describe("formatClaudeCliFallbackPrelude", () => {
-  it("formats user/assistant turns and tags tool blocks with compact hints", () => {
+  it("formats user/assistant turns and tags tool blocks with compact hints", async () => {
     // Tool-use blocks are represented as compact hints because fallback prompts
     // should preserve intent without replaying full tool schemas or outputs.
-    const out = formatClaudeCliFallbackPrelude({
+    const out = await formatClaudeCliFallbackPrelude({
       summaryText: "Earlier summary",
       recentTurns: [
         {
@@ -100,9 +106,9 @@ describe("formatClaudeCliFallbackPrelude", () => {
     expect(out).toContain("(tool result: Earlier tool output)");
   });
 
-  it("truncates an oversized summary instead of dropping it silently", () => {
+  it("truncates an oversized summary instead of dropping it silently", async () => {
     const huge = "x ".repeat(10_000).trim();
-    const out = formatClaudeCliFallbackPrelude(
+    const out = await formatClaudeCliFallbackPrelude(
       { summaryText: huge, recentTurns: [] },
       { charBudget: 600 },
     );
@@ -113,8 +119,8 @@ describe("formatClaudeCliFallbackPrelude", () => {
 
   it.each([["a surrogate boundary", `${"x".repeat(21)}😀${"y".repeat(100)}`, "x".repeat(21)]])(
     "preserves %s when truncating an oversized summary",
-    (_label, summaryText, expected) => {
-      const out = formatClaudeCliFallbackPrelude(
+    async (_label, summaryText, expected) => {
+      const out = await formatClaudeCliFallbackPrelude(
         { summaryText, recentTurns: [] },
         { charBudget: 128 },
       );
@@ -123,8 +129,8 @@ describe("formatClaudeCliFallbackPrelude", () => {
     },
   );
 
-  it("keeps the recent turn window contiguous when an adjacent turn is oversized", () => {
-    const out = formatClaudeCliFallbackPrelude(
+  it("keeps the recent turn window contiguous when an adjacent turn is oversized", async () => {
+    const out = await formatClaudeCliFallbackPrelude(
       {
         recentTurns: [
           { role: "user", content: "older small turn" },
@@ -146,11 +152,11 @@ describe("buildClaudeCliFallbackContextPrelude", () => {
     mocks.readClaudeCliFallbackSeed.mockReset();
   });
 
-  it("returns empty string when the Claude session loader finds no seed", () => {
+  it("returns empty string when the Claude session loader finds no seed", async () => {
     mocks.readClaudeCliFallbackSeed.mockReturnValue(undefined);
 
     expect(
-      buildClaudeCliFallbackContextPrelude({
+      await buildClaudeCliFallbackContextPrelude({
         cliSessionId: "missing-session",
         homeDir: "/tmp/test-home",
       }),
@@ -180,7 +186,12 @@ describe("sessionTranscriptHasContent", () => {
       sessionKey: "agent:audit:main",
       storePath: path.join(tmpDir, "openclaw-agent.sqlite"),
     };
+    setRuntimeConfigSnapshot({ session: { store: target.storePath } });
     await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
+  });
+
+  afterEach(() => {
+    clearRuntimeConfigSnapshot();
   });
 
   const assistantMessage = () =>
@@ -354,56 +365,60 @@ describe("claudeCliSessionTranscriptHasOrphanedToolUse", () => {
   const longPrefix = Array.from({ length: 600 }, (_, i) => message("user", `ping ${i}`));
 
   it.each([
-    [
-      "hosted results inside the assistant message",
-      false,
-      [
+    {
+      name: "hosted results inside the assistant message",
+      expected: false,
+      lines: [
         message("assistant", [
           tool("server", "server_tool_use"),
           result("server", "web_search_tool_result"),
           { type: "text", text: "found it" },
         ]),
       ],
-    ],
-    [
-      "a string assistant superseding an orphan past record 500",
-      false,
-      [message("assistant", [tool("old")]), ...longPrefix, message("assistant", "moving on")],
-    ],
-    [
-      "answered calls repeated by a request echo before the final reply",
-      false,
-      [
+    },
+    {
+      name: "a string assistant superseding an orphan past record 500",
+      expected: false,
+      lines: [
+        message("assistant", [tool("old")]),
+        ...longPrefix,
+        message("assistant", "moving on"),
+      ],
+    },
+    {
+      name: "answered calls repeated by a request echo before the final reply",
+      expected: false,
+      lines: [
         message("assistant", [tool("spawn")]),
         message("user", [result("spawn")]),
         { type: "api-request-blob", message: { role: "assistant", content: [tool("spawn")] } },
         { type: "api-request" },
       ],
-    ],
-    [
-      "an orphan followed only by a request echo",
-      true,
-      [
+    },
+    {
+      name: "an orphan followed only by a request echo",
+      expected: true,
+      lines: [
         message("assistant", [tool("orphan")]),
         { type: "api-request-blob", message: { role: "user", content: [result("orphan")] } },
       ],
-    ],
-    [
-      "main-conversation orphans with sidechain results",
-      true,
-      [message("assistant", [tool("main")]), message("user", [result("main")], true)],
-    ],
-    [
-      "a trailing orphan past record 500",
-      true,
-      [
+    },
+    {
+      name: "main-conversation orphans with sidechain results",
+      expected: true,
+      lines: [message("assistant", [tool("main")]), message("user", [result("main")], true)],
+    },
+    {
+      name: "a trailing orphan past record 500",
+      expected: true,
+      lines: [
         ...longPrefix,
         message("assistant", [tool("resolved")]),
         message("user", [result("resolved")]),
         message("assistant", [tool("orphan")]),
       ],
-    ],
-  ] satisfies [string, boolean, object[]][])("detects %s", async (_name, expected, lines) => {
+    },
+  ])("detects $name", async ({ lines, expected }) => {
     await writeJsonlSession("fixture", lines);
     expect(
       await claudeCliSessionTranscriptHasOrphanedToolUse({

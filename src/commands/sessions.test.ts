@@ -436,6 +436,27 @@ describe("sessionsCommand", () => {
     expect(row).toContain("think:high");
   });
 
+  it.skipIf(process.platform === "win32")(
+    "escapes terminal controls in store headers without changing JSON paths",
+    async () => {
+      const store = await writeStore(
+        {},
+        "sessions-café\u001b[31m\noperator-forged\tend\rrow\u0007",
+      );
+
+      const { runtime, logs } = makeRuntime();
+      await sessionsCommand({ store }, runtime);
+      const header = logs.find((line) => line.includes("Session store:"));
+      expect(header).not.toMatch(/\p{Cc}/u);
+      expect(header).toContain("sessions-café\\noperator-forged\\tend\\rrow");
+      expect(logs).toContain("No sessions found.");
+      expect(await runSessionsJson(sessionsCommand, store)).toMatchObject({
+        path: store,
+        count: 0,
+      });
+    },
+  );
+
   it("sanitizes persisted identifiers only for terminal output", async () => {
     const key = "agent:main:\u001B[31mpeer\nrow";
     const sessionId = "session-\u001B[31mid\r\nforged-id";
@@ -808,6 +829,64 @@ describe("sessionsCommand model resolution", () => {
     resetMockSessionsConfig();
     vi.useRealTimers();
   });
+
+  it.each([false, true])(
+    "resolves fallback aliases with the store owner (agent-scoped=%s)",
+    async (agentScoped) => {
+      const store = await writeStore(
+        {
+          global: { sessionId: "alias-fallback", updatedAt: Date.now() - 60_000 },
+          recorded: {
+            sessionId: "recorded-model",
+            updatedAt: Date.now() - 60_000,
+            modelProvider: "custom",
+            model: "recorded-model",
+          },
+        },
+        "sessions-model-alias",
+        { agentId: "ops" },
+      );
+      setMockSessionsConfig(() => ({
+        session: { scope: "global", store },
+        agents: {
+          ownership: "explicit",
+          defaults: {
+            model: { primary: "selected" },
+            models: { "anthropic/default-model": { alias: "selected" } },
+            sessionStore: { agentId: "ops" },
+          },
+          entries: {
+            ops: agentScoped
+              ? {
+                  model: { primary: "selected" },
+                  models: { "custom/agent-model": { alias: "selected" } },
+                }
+              : {},
+          },
+        },
+      }));
+
+      const payload = await runSessionsJson<{
+        sessions?: Array<{
+          key: string;
+          sessionId: string;
+          agentId?: string;
+          modelProvider?: string;
+          model?: string;
+        }>;
+      }>(sessionsCommand, store);
+
+      expect(payload.sessions?.find((row) => row.key === "global")).toMatchObject({
+        agentId: "ops",
+        modelProvider: agentScoped ? "custom" : "anthropic",
+        model: agentScoped ? "agent-model" : "default-model",
+      });
+      expect(payload.sessions?.find((row) => row.sessionId === "recorded-model")).toMatchObject({
+        modelProvider: "custom",
+        model: "recorded-model",
+      });
+    },
+  );
 
   it("preserves nested override models when their provider is recorded separately", async () => {
     const model = await resolveSubagentModel(

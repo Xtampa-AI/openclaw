@@ -44,6 +44,7 @@ export function registerManagedCampaignFailureTests(
             status: "error",
             mode: "npm",
             reason,
+            after: { version: "2.0.0" },
             recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" },
             steps: [
               {
@@ -64,11 +65,20 @@ export function registerManagedCampaignFailureTests(
       expect(parentSignal).toBeNull();
       expect(state.parked).toBeUndefined();
       expect(state.restored).toBeUndefined();
-      expect(state).toMatchObject({ healthProbeCount: 1, recoveryProbeTimeoutMs: 3_000 });
       expect(sentinel).toBeNull();
       expect(sensitiveFilesRemoved).toBe(true);
+      expect(state).toMatchObject({
+        healthProbeCount: 1,
+        expectedVersion: "1.0.0",
+        recoveryProbeTimeoutMs: 3000,
+      });
       const recorded = expectDefined(run, "closed campaign run");
-      expect(recorded).toMatchObject({ status: "failed", phase: "finished", reason });
+      expect(recorded).toMatchObject({
+        status: "failed",
+        phase: "finished",
+        reason,
+        after: { version: "2.0.0" },
+      });
       expect(recorded.steps).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -88,6 +98,21 @@ export function registerManagedCampaignFailureTests(
       expect(report).toContain(reason);
       expect(report).toContain("Package publication is incomplete.");
       expect(recorded.verification.recovery).toMatchObject({ serviceRestartSafe: false });
+      if (gatewayHealth === "ready") {
+        expect(recorded.verification).toMatchObject({
+          runningVersion: "1.0.0",
+          versionMatch: true,
+          coreReady: true,
+          settled: true,
+        });
+      }
+      expect(report).toContain(
+        gatewayHealth === "ready"
+          ? "Recorded recovery: verified serving 1.0.0; restart remains unsafe (runtime-verification-failed)."
+          : gatewayHealth === "exited"
+            ? "Recorded recovery: not serving (service-not-running)"
+            : "Recorded recovery: recovery check failed (gateway-probe-failed)",
+      );
       expect(state.triageInput).toMatchObject({
         error: expect.stringContaining(
           gatewayHealth === "ready" ? "Service recovery succeeded." : "Service recovery failed.",
@@ -139,21 +164,13 @@ export function registerManagedCampaignFailureTests(
               .spyOn(handoff, "transferManagedServiceUpdateHandoff")
               .mockImplementationOnce(async () => {
                 if (diagnosticFailure) {
-                  const codec = await import("./update-run-codec.js");
-                  const encode = codec.encodeRun;
+                  const worker = await import("../state/openclaw-state-worker-store.js");
+                  const execute = worker.runOpenClawStateWorkerOperation;
                   const write = vi
-                    .spyOn(codec, "encodeRun")
-                    .mockImplementation((record, options) => {
-                      if (
-                        record.steps.some((step) =>
-                          step.failureFacts?.some((fact) => fact.check === "managed-service"),
-                        )
-                      ) {
-                        write.mockRestore();
-                        throw new Error("diagnostic ledger is read-only");
-                      }
-                      return encode(record, options);
-                    });
+                    .spyOn(worker, "runOpenClawStateWorkerOperation")
+                    // Keep the requested failure durable, then reject its optional diagnostics.
+                    .mockImplementationOnce(execute)
+                    .mockRejectedValueOnce(new Error("diagnostic ledger is read-only"));
                   restoreDiagnosticFailure = () => write.mockRestore();
                 }
                 throw new Error("automatic transfer failed");

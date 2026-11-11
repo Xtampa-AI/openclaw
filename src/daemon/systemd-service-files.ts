@@ -20,17 +20,16 @@ import type {
   GatewayServiceCommandConfig,
   GatewayServiceCommandSnapshot,
   GatewayServiceEnv,
-  GatewayServiceEnvironmentValueSource,
   GatewayServiceManagedOverrides,
   GatewayServiceReadOptions,
   SystemdServiceReadTarget,
 } from "./service-types.js";
 import { systemdUnitCallArgs } from "./systemd-bus-query.js";
 import { createSystemdCommandQuery } from "./systemd-command-query.js";
+import { buildSystemdCommandSnapshot } from "./systemd-command-snapshot.js";
 import {
   resolveSystemdEnvironmentFiles,
   type SystemdEnvironmentFileSpec,
-  type SystemdEnvironmentFilesParams,
 } from "./systemd-environment-files.js";
 import { assertSystemdServiceAccount } from "./systemd-service-identity.js";
 import {
@@ -42,13 +41,6 @@ import {
 
 const SYSTEMD_GATEWAY_DOTENV_FILENAME = "gateway.systemd.env";
 const SYSTEMD_NODE_DOTENV_FILENAME = "node.systemd.env";
-
-type SystemdCommandSnapshotParams = SystemdEnvironmentFilesParams & {
-  programArguments: string[];
-  workingDirectory: string;
-  inlineEnvironment: Record<string, string>;
-  unsetEnvironment: string[];
-};
 
 export function resolveSystemdUnitPathForName(env: GatewayServiceEnv, name: string): string {
   const home = normalizeWindowsPathSeparators(resolveDaemonHomeDir(env));
@@ -86,33 +78,6 @@ const UNKNOWN_SYSTEMD_OVERRIDES = {
   launcher: "command",
   environment: true,
 } satisfies GatewayServiceManagedOverrides;
-
-async function buildSystemdCommandSnapshot(
-  params: SystemdCommandSnapshotParams,
-): Promise<GatewayServiceCommandSnapshot> {
-  const fileEnvironment = await resolveSystemdEnvironmentFiles(params);
-  const environment = { ...params.inlineEnvironment, ...fileEnvironment };
-  const environmentValueSources: Record<string, GatewayServiceEnvironmentValueSource> =
-    Object.fromEntries(Object.keys(params.inlineEnvironment).map((key) => [key, "inline"]));
-  for (const key of Object.keys(fileEnvironment)) {
-    environmentValueSources[key] = Object.hasOwn(params.inlineEnvironment, key)
-      ? "inline-and-file"
-      : "file";
-  }
-  for (const assignment of params.unsetEnvironment) {
-    const separator = assignment.indexOf("=");
-    const key = separator < 0 ? assignment : assignment.slice(0, separator);
-    if (separator < 0 || environment[key] === assignment.slice(separator + 1)) {
-      delete environment[key];
-      delete environmentValueSources[key];
-    }
-  }
-  return {
-    programArguments: params.programArguments,
-    ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
-    ...(Object.keys(environment).length > 0 ? { environment, environmentValueSources } : {}),
-  };
-}
 
 async function readSystemdManagerCommand(
   env: GatewayServiceEnv,
@@ -258,7 +223,10 @@ async function readSystemdManagerCommand(
       typeof execution[0] !== "string" ||
       execution[0].length === 0 ||
       typeof execution[2] !== "boolean" ||
-      !execution.slice(3).every(Number.isInteger) ||
+      !execution
+        .slice(3, 7)
+        .every((value) => typeof value === "bigint" || Number.isInteger(value)) ||
+      !execution.slice(7).every(Number.isInteger) ||
       !isStringArray(programArguments) ||
       programArguments.length === 0 ||
       typeof workingDirectory !== "string" ||

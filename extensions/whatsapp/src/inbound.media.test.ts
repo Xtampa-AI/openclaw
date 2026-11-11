@@ -122,7 +122,7 @@ vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
   >("openclaw/plugin-sdk/runtime-config-snapshot");
   return {
     ...actual,
-    getRuntimeConfig: vi.fn().mockReturnValue({
+    readRuntimeConfig: vi.fn().mockReturnValue({
       channels: {
         whatsapp: {
           allowFrom: ["*"], // Allow all in tests

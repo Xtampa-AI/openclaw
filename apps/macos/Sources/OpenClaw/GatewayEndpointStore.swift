@@ -135,20 +135,37 @@ actor GatewayEndpointStore {
         env: [String: String],
         launchdSnapshot: LaunchAgentPlistSnapshot? = nil) -> String?
     {
+        let serviceEnv = launchdSnapshot?.environment ?? [:]
+        if !isRemote,
+           self.localAuthSurface(root: root, env: env, launchdSnapshot: launchdSnapshot) != kind.rawValue
+        { return nil }
+
+        let gateway = root["gateway"] as? [String: Any]
+        let auth = gateway?["auth"] as? [String: Any]
+        if !isRemote, let configured = auth?[kind.rawValue], !(configured is String) {
+            return self.resolveLocalConfigAuthValue(
+                configured,
+                root: root,
+                env: env,
+                serviceEnv: serviceEnv)
+        }
+
         let envVar = "OPENCLAW_GATEWAY_\(kind.rawValue.uppercased())"
         let override = env[envVar]?.nonEmpty
-        let configured: String?
-        if isRemote {
-            configured = switch kind {
+        let configured: String? = if isRemote {
+            switch kind {
             case .token: GatewayRemoteConfig.resolveTokenString(root: root)
             case .password: GatewayRemoteConfig.resolvePasswordString(root: root)
             }
         } else {
-            let gateway = root["gateway"] as? [String: Any]
-            let auth = gateway?["auth"] as? [String: Any]
-            configured = (auth?[kind.rawValue] as? String).flatMap {
-                self.resolveLocalConfigAuthString($0, env: env, serviceEnv: launchdSnapshot?.environment ?? [:])
+            (auth?[kind.rawValue] as? String).flatMap {
+                self.resolveLocalConfigAuthString($0, env: env, serviceEnv: serviceEnv)
             }
+        }
+        // Local clients must match Gateway startup's config-first credential precedence.
+        // An inherited app environment must not replace the configured local secret.
+        if !isRemote, let configured {
+            return configured
         }
         if let override {
             // Password overrides always warn; token overrides warn only when different.
@@ -165,7 +182,69 @@ actor GatewayEndpointStore {
         }
         guard !isRemote else { return nil }
         let serviceValue = kind == .token ? launchdSnapshot?.token : launchdSnapshot?.password
-        return serviceValue?.nonEmpty
+        if let serviceValue = serviceValue?.nonEmpty {
+            return serviceValue
+        }
+        if kind == .password, self.localAuthMode(root: root) == "trusted-proxy" {
+            return nil
+        }
+        return switch kind {
+        case .token: GatewayRemoteConfig.resolveTokenString(root: root)
+        case .password: GatewayRemoteConfig.resolvePasswordString(root: root)
+        }
+    }
+
+    private static func localAuthMode(root: [String: Any]) -> String? {
+        let gateway = root["gateway"] as? [String: Any]
+        let auth = gateway?["auth"] as? [String: Any]
+        return auth?["mode"] as? String
+    }
+
+    private static func localAuthSurface(
+        root: [String: Any],
+        env: [String: String],
+        launchdSnapshot: LaunchAgentPlistSnapshot?) -> String?
+    {
+        let mode = self.localAuthMode(root: root)
+        if mode == "token" { return "token" }
+        if mode == "password" || mode == "trusted-proxy" { return "password" }
+        guard mode == nil else { return nil }
+        let gateway = root["gateway"] as? [String: Any]
+        let auth = gateway?["auth"] as? [String: Any]
+        let serviceEnv = launchdSnapshot?.environment ?? [:]
+        let modeEnv = launchdSnapshot == nil ? env : serviceEnv
+        func configuredInput(_ key: String) -> (configured: Bool, isSecretRef: Bool) {
+            guard let value = auth?[key] else { return (false, false) }
+            guard let string = value as? String else { return (true, true) }
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (!trimmed.isEmpty, self.envSecretRefName(trimmed) != nil)
+        }
+        func hasAmbientCandidate(_ envKey: String, _ launchdValue: String?) -> Bool {
+            [modeEnv[envKey], launchdValue]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .contains { !$0.isEmpty }
+        }
+        let configuredToken = configuredInput("token")
+        let configuredPassword = configuredInput("password")
+        let remote = gateway?["remote"] as? [String: Any]
+        let hasConfiguredRemoteToken = remote?["token"].map { value in
+            guard let token = value as? String else { return true }
+            return !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } ?? false
+        guard !(configuredToken.configured && configuredPassword.configured) else { return nil }
+
+        let ambientToken = hasAmbientCandidate("OPENCLAW_GATEWAY_TOKEN", launchdSnapshot?.token)
+        let ambientPassword = hasAmbientCandidate("OPENCLAW_GATEWAY_PASSWORD", launchdSnapshot?.password)
+        let passwordRefSuppressed = configuredPassword.isSecretRef && ambientToken
+        let remotePassword = (remote?["password"] as? String)
+            .map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
+        let hasConfiguredRemotePassword = !passwordRefSuppressed && remotePassword
+        let hasToken = ambientToken || hasConfiguredRemoteToken ||
+            (configuredToken.configured && !(configuredToken.isSecretRef && ambientPassword))
+        let hasPassword = !passwordRefSuppressed &&
+            (ambientPassword || hasConfiguredRemotePassword || configuredPassword.configured)
+        if hasPassword { return "password" }
+        return hasToken ? "token" : nil
     }
 
     private static func resolveLocalConfigAuthString(
@@ -181,6 +260,43 @@ actor GatewayEndpointStore {
         return env[envName]?.nonEmpty ?? serviceEnv[envName]?.nonEmpty
     }
 
+    private static func resolveLocalConfigAuthValue(
+        _ raw: Any,
+        root: [String: Any],
+        env: [String: String],
+        serviceEnv: [String: String]) -> String?
+    {
+        guard let ref = raw as? [String: Any],
+              Set(ref.keys) == Set(["source", "provider", "id"]),
+              ref["source"] as? String == "env",
+              let provider = ref["provider"] as? String,
+              provider.range(of: #"^[a-z][a-z0-9_-]{0,63}$"#, options: .regularExpression) != nil,
+              let envName = ref["id"] as? String,
+              self.isValidEnvSecretRefID(envName)
+        else { return nil }
+
+        let secrets = root["secrets"] as? [String: Any] ?? [:]
+        let providers = secrets["providers"] as? [String: Any] ?? [:]
+        let defaults = secrets["defaults"] as? [String: Any]
+        let defaultEnvProvider = defaults?["env"] as? String ?? "default"
+        let providerConfig = providers[provider] as? [String: Any]
+        let configuredSource = providerConfig?["source"] as? String
+        let usesBuiltInDefault = provider == defaultEnvProvider && configuredSource != "env"
+        if !usesBuiltInDefault {
+            guard configuredSource == "env" else { return nil }
+            if let configuredAllowlist = providerConfig?["allowlist"] {
+                guard let allowlist = configuredAllowlist as? [String], allowlist.contains(envName)
+                else { return nil }
+            }
+        }
+
+        for source in [serviceEnv, env] {
+            let value = source[envName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
     private static func envSecretRefName(_ value: String) -> String? {
         let name: Substring
         if value.hasPrefix("${"), value.hasSuffix("}") {
@@ -191,7 +307,11 @@ actor GatewayEndpointStore {
             return nil
         }
         let candidate = String(name)
-        return candidate.range(of: #"^[A-Z][A-Z0-9_]{0,127}$"#, options: .regularExpression) != nil ? candidate : nil
+        return self.isValidEnvSecretRefID(candidate) ? candidate : nil
+    }
+
+    private static func isValidEnvSecretRefID(_ value: String) -> Bool {
+        value.range(of: #"^[A-Z][A-Z0-9_]{0,127}$"#, options: .regularExpression) != nil
     }
 
     private static func warnEnvOverrideOnce(
@@ -812,26 +932,24 @@ extension GatewayEndpointStore {
             sshRouteIdentity = nil
         }
         let deviceAuthGatewayID = GatewayDiscoveryPreferences.deviceAuthGatewayID(root: root, connectionMode: mode)
+        func credential(_ kind: Credential) -> String? {
+            if mode == .local {
+                return kind == .token ? localConfig?.token : localConfig?.password
+            }
+            guard mode != .unconfigured else { return nil }
+            return self.resolveGatewayCredential(
+                kind,
+                isRemote: isRemote,
+                root: root,
+                env: env,
+                launchdSnapshot: launchdSnapshot)
+        }
 
         let source = SourceSnapshot(
             routingGeneration: app.generation,
             mode: mode,
-            token: mode == .local ? localConfig?.token : mode == .unconfigured
-                ? nil
-                : self.resolveGatewayCredential(
-                    .token,
-                    isRemote: isRemote,
-                    root: root,
-                    env: env,
-                    launchdSnapshot: launchdSnapshot),
-            password: mode == .local ? localConfig?.password : mode == .unconfigured
-                ? nil
-                : self.resolveGatewayCredential(
-                    .password,
-                    isRemote: isRemote,
-                    root: root,
-                    env: env,
-                    launchdSnapshot: launchdSnapshot),
+            token: credential(.token),
+            password: credential(.password),
             deviceAuthGatewayID: deviceAuthGatewayID,
             localPort: localPort,
             localHost: localConfig?.url.host ?? self.resolveLocalGatewayHost(
@@ -988,18 +1106,16 @@ extension GatewayEndpointStore {
             bindMode: bind,
             customBindHost: customBindHost,
             tailscaleIP: tailscaleIP)
-        let token = self.resolveGatewayCredential(
-            .token,
-            isRemote: false,
-            root: root,
-            env: env,
-            launchdSnapshot: launchdSnapshot)
-        let password = self.resolveGatewayCredential(
-            .password,
-            isRemote: false,
-            root: root,
-            env: env,
-            launchdSnapshot: launchdSnapshot)
+        func credential(_ kind: Credential) -> String? {
+            self.resolveGatewayCredential(
+                kind,
+                isRemote: false,
+                root: root,
+                env: env,
+                launchdSnapshot: launchdSnapshot)
+        }
+        let token = credential(.token)
+        let password = credential(.password)
         return (
             url: URL(string: "\(scheme)://\(host):\(port)")!,
             token: token,
@@ -1036,6 +1152,7 @@ extension GatewayEndpointStore {
         for config: GatewayConnection.Config,
         mode: AppState.ConnectionMode,
         localBasePath: String? = nil,
+        remoteBasePath: String? = nil,
         authToken: String? = nil) throws -> URL
     {
         guard var components = URLComponents(url: config.url, resolvingAgainstBaseURL: false) else {
@@ -1059,7 +1176,8 @@ extension GatewayEndpointStore {
             let fallbackPath = localBasePath ?? self.localControlUiBasePath()
             components.path = self.normalizeDashboardPath(fallbackPath)
         } else {
-            components.path = "/"
+            // Tunnels and bare host:port URLs carry no mount; the connected Gateway advertises it.
+            components.path = self.normalizeDashboardPath(remoteBasePath)
         }
 
         let tokenCandidate = authToken ?? config.token

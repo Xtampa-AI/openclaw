@@ -1061,6 +1061,97 @@ describe("delivery-queue recovery", () => {
     });
     expect(entry?.lastError).toContain("provider lookup timed out");
   });
+
+  it.each([
+    ["permanent", "chat not found", undefined],
+    ["transient", "provider lookup timed out", 1],
+  ] as const)(
+    "classifies a thrown %s unknown-send reconciliation with the delivery error policy",
+    async (_kind, error, retryCount) => {
+      const id = await enqueueUnknownRecovery({ text: "unknown" });
+      const reconcileUnknownSend = vi.fn().mockRejectedValue(new Error(error));
+      installUnknownSendAdapter(reconcileUnknownSend);
+      const deliver = vi.fn().mockResolvedValue([]);
+      const { result } = await runRecovery({ deliver });
+      expect(reconcileUnknownSend).toHaveBeenCalledOnce();
+      expect(deliver).not.toHaveBeenCalled();
+      expect(result.failed).toBe(1);
+      if (retryCount === undefined) {
+        await expectFailedQueue(id);
+      } else {
+        await expectPendingEntry({ id, retryCount, recoveryState: "unknown_after_send" });
+      }
+    },
+  );
+
+  it.each(["recovered", "exhausted", "untyped"] as const)(
+    "preserves bounded final-text recovery across storage restart: %s",
+    async (outcome) => {
+      const id = await enqueueRecoveryDelivery({
+        payloads: [{ text: "Saved **final answer**" }],
+        retryAmbiguousFinalText: true,
+        requiresProducerClaim: true,
+      });
+      const claimId = await claimDeliveryPlatformSendAttempt(id, tmpDir());
+      expect(claimId).toEqual(expect.any(String));
+      await reserveDeliveryAttempt(id, 2, tmpDir(), claimId);
+      await markDeliveryPlatformSendAttemptStarted(id, tmpDir(), undefined, claimId);
+      await deliveryQueueStorage.failDeliveryAfterPlatformSend(
+        id,
+        "socket reset",
+        tmpDir(),
+        claimId,
+        undefined,
+        outcome === "untyped" ? undefined : true,
+      );
+      await expectPendingEntry({ id, attemptCount: 1, retryCount: 1 });
+      setQueuedEntryState(tmpDir(), id, {
+        retryCount: 1,
+        lastAttemptAt: Date.now() - 60_000,
+      });
+      await closeStateDatabaseForTest();
+      const transportError = Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+      const deliver = vi.fn<DeliverFn>(async (params) => {
+        await markDeliveryPlatformSendAttemptStarted(
+          id,
+          tmpDir(),
+          undefined,
+          params.deliveryProducerClaimId,
+        );
+        await params.onPlatformSendStart?.({});
+        if (outcome === "exhausted") {
+          const failure: OutboundPayloadDeliveryOutcome = {
+            index: 0,
+            status: "failed",
+            error: transportError,
+            sentBeforeError: true,
+            stage: "platform_send",
+          };
+          params.onPayloadDeliveryOutcome?.(failure);
+          throw new OutboundDeliveryError("socket reset", {
+            cause: transportError,
+            payloadOutcomes: [failure],
+            stage: "platform_send",
+          });
+        }
+        return [{ channel: "demo-channel-a", messageId: "recovered-final" }];
+      });
+      await runRecovery({ deliver });
+      expect(deliver).toHaveBeenCalledTimes(outcome === "untyped" ? 0 : 1);
+      if (outcome === "exhausted") {
+        const pending = await expectPendingEntry({ id, attemptCount: 2, retryCount: 2 });
+        expect(pending?.ambiguousTransportError).toBe(true);
+        setQueuedEntryState(tmpDir(), id, {
+          retryCount: 2,
+          lastAttemptAt: Date.now() - 60_000,
+        });
+      }
+      await closeStateDatabaseForTest();
+      await runRecovery({ deliver });
+      expect(deliver).toHaveBeenCalledTimes(outcome === "untyped" ? 0 : 1);
+      expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
+    },
+  );
   it("dead-letters an exhausted unknown send after retryable reconciliation fails", async () => {
     const artifact = path.join(
       tmpDir(),

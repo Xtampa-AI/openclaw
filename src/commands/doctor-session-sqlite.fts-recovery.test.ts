@@ -37,12 +37,14 @@ it.each(["fix", "recover"])(
       /openclaw doctor --fix/,
     );
     // Released builds persisted this refusal; the current opener also latches it in memory.
-    recordOpenClawDatabaseQuarantine({
-      env: store.env,
-      kind: "agent",
-      path: sqlitePath,
-      reason: "malformed inverted index for FTS5 table main.session_transcript_fts",
-    });
+    expect(
+      recordOpenClawDatabaseQuarantine({
+        env: store.env,
+        kind: "agent",
+        path: sqlitePath,
+        reason: "malformed inverted index for FTS5 table main.session_transcript_fts",
+      }),
+    ).toBe(true);
     expect(readPersistedQuarantineRow(sqlitePath, { env: store.env })).toBeDefined();
     if (mode === "recover") {
       const report = await runDoctorSessionSqlite({ env: store.env, store: store.storePath, mode });

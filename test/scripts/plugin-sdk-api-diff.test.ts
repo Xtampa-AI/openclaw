@@ -5,12 +5,10 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  realpathSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   expandPluginSdkApiDiffSet,
@@ -31,6 +29,7 @@ import {
 import { withinTest } from "../helpers/promise.js";
 import { withRuntimePreload } from "../helpers/runtime-preload.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { materializeNativeCompiler } from "./native-boundary-fixture.js";
 
 const pendingChildCompletions = new Set<Promise<unknown>>();
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
@@ -54,19 +53,6 @@ const emptyDiff = {
   exports: [],
   digest: "ff7b090f43d2d90e4cd883d95840d6b752475a7a1769e295fb4cbb558a6ffb64",
 };
-
-// The native compiler package follows the host platform; CI uses linux-x64.
-const typescriptPlatformPackage = `@typescript/typescript-${process.platform}-${process.arch}`;
-const trustedCompilerEnv = {
-  TRUSTED_TYPESCRIPT_PATH: resolve("node_modules/typescript"),
-  TRUSTED_TYPESCRIPT_PLATFORM_PATH: join(
-    dirname(realpathSync(resolve("node_modules/typescript"))),
-    typescriptPlatformPackage,
-  ),
-};
-const installRevisionCompiler = `mkdir -p node_modules/@typescript
-cp -RL "$TRUSTED_TYPESCRIPT_PATH" node_modules/typescript
-cp -RL "$TRUSTED_TYPESCRIPT_PLATFORM_PATH" node_modules/${typescriptPlatformPackage}`;
 
 function git(repo: string, args: string[]): string {
   return execFileSync("git", args, { cwd: repo, encoding: "utf8" });
@@ -104,10 +90,8 @@ function runCli(repo: string, runnerTemp: string, binDir: string, args: string[]
       encoding: "utf8",
       env: {
         ...process.env,
-        ...trustedCompilerEnv,
         PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         PNPM_MARKER: join(binDir, "installs"),
-        REVISION_RENDER_MARKER: join(binDir, "revision-renderer"),
         RUNNER_TEMP: runnerTemp,
         TSX_TSCONFIG_PATH: resolve("tsconfig.json"),
       },
@@ -136,6 +120,23 @@ fixtureReceiptSocket.end();
 `,
   );
   return `'${process.execPath.replace(/'/gu, `'\\''`)}' '${receiptPath.replace(/'/gu, `'\\''`)}'`;
+}
+
+function writeRevisionInstall(binDir: string): string {
+  // Each revision needs physical compiler inputs, not the caller's shared install.
+  materializeNativeCompiler(binDir);
+  const installer = join(binDir, "install-revision.mjs");
+  writeFileSync(
+    installer,
+    `import { cpSync, constants } from "node:fs";
+cpSync(${JSON.stringify(join(binDir, "node_modules"))}, "node_modules", {
+  recursive: true,
+  mode: constants.COPYFILE_FICLONE,
+  filter: () => true,
+});
+`,
+  );
+  return `'${process.execPath.replace(/'/gu, `'\\''`)}' '${installer.replace(/'/gu, `'\\''`)}'`;
 }
 
 async function installBeforeSettlement(
@@ -188,14 +189,6 @@ describe("Plugin SDK API diff CLI", () => {
     );
     writeFileSync(join(repo, "scripts/lib/plugin-sdk-entrypoints.json"), '["fixture"]');
     writeFileSync(join(repo, "scripts/lib/plugin-sdk-private-local-only-subpaths.json"), "[]");
-    writeFileSync(
-      join(repo, "scripts/plugin-sdk-api-diff.mts"),
-      `import fs from "node:fs";
-if (process.env.REVISION_RENDER_MARKER) fs.writeFileSync(process.env.REVISION_RENDER_MARKER, "revision renderer\\n");
-process.argv[1] = ${JSON.stringify(resolve("scripts/plugin-sdk-api-diff.mts"))};
-await import(${JSON.stringify(pathToFileURL(resolve("scripts/plugin-sdk-api-diff.mts")).href)});
-`,
-    );
     const source = join(repo, "src/plugin-sdk/fixture.ts");
     writeFileSync(source, "export type Fixture = string;\n");
     const baseSha = commit(repo, "base");
@@ -207,7 +200,8 @@ await import(${JSON.stringify(pathToFileURL(resolve("scripts/plugin-sdk-api-diff
     writeFileSync(
       fakePnpm,
       `#!/bin/sh
-${installRevisionCompiler}
+set -e
+${writeRevisionInstall(binDir)}
 if mkdir "$PNPM_MARKER" 2>/dev/null; then
   while [ ! -e "$PNPM_BLOCKED" ]; do sleep 0.05; done
   exit 0
@@ -267,14 +261,12 @@ if (process.argv.includes("--render-root")) {
         cwd: repo,
         env: {
           ...withRuntimePreload(process.env, renderProbe),
-          ...trustedCompilerEnv,
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
           PNPM_MARKER: installClaim,
           PNPM_BLOCKED: blockedMarker,
           PNPM_RELEASE: releaseMarker,
           RENDER_DURING_INSTALL: renderDuringInstall,
           RENDER_STARTED: renderStarted,
-          REVISION_RENDER_MARKER: join(binDir, "revision-renderer"),
           RUNNER_TEMP: runnerTemp,
           TSX_TSCONFIG_PATH: resolve("tsconfig.json"),
         },
@@ -317,7 +309,6 @@ if (process.argv.includes("--render-root")) {
     expect(existsSync(blockedMarker)).toBe(true);
     expect(existsSync(renderStarted)).toBe(true);
     expect(existsSync(renderDuringInstall)).toBe(false);
-    expect(existsSync(join(binDir, "revision-renderer"))).toBe(false);
   }, 50_000);
 
   it("reports identical commit aliases without installing or changing a dirty caller", () => {
@@ -559,7 +550,8 @@ if (process.argv.includes("--render-root")) {
       writeFileSync(
         fakePnpm,
         `#!/bin/sh
-${installRevisionCompiler}
+set -e
+${writeRevisionInstall(binDir)}
 printf "%s\\n" "$PWD" >> "$PNPM_MARKER"
 `,
       );

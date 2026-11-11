@@ -41,6 +41,8 @@ import {
   expireStaleReplyOperation,
   isReplyRunEvidenceStale,
   lifecycleAdmissionByOperation,
+  markReplyOperationExecutionStarted,
+  waitForReplyBarrierSettlement,
 } from "./reply-run-registry.state.js";
 import {
   createTestReplyOperation,
@@ -96,6 +98,23 @@ describe("reply run registry", () => {
 
       await expect(oldWaitPromise).resolves.toBe(true);
     });
+  });
+
+  it("distinguishes queued ownership from started execution, including lane waits", () => {
+    const operation = createTestReplyOperation({ sessionId: "session-queued" });
+    const executing = () =>
+      resolveActiveReplyRunSessionId(operation.key, { executionStartedOnly: true });
+    expect(resolveActiveReplyRunSessionId(operation.key)).toBe(operation.sessionId);
+    expect(executing()).toBeUndefined();
+    operation.markWaitingForGlobalLane();
+    expect(executing()).toBeUndefined();
+    operation.markGlobalLaneWaitEnded();
+    markReplyOperationExecutionStarted(operation);
+    operation.setPhase("running");
+    operation.markWaitingForGlobalLane();
+    expect(executing()).toBe(operation.sessionId);
+    operation.complete();
+    expect(executing()).toBeUndefined();
   });
 
   it("keeps repeated request evidence across reply-operation progress", () => {
@@ -538,6 +557,32 @@ describe("reply run registry", () => {
       next.complete();
     });
   });
+
+  it.each([-60_000, 60_000])(
+    "keeps the extendable barrier deadline after a %s ms wall-clock step",
+    async (wallClockStepMs) => {
+      await withFakeReplyTimers(async () => {
+        const pending = createDeferred();
+        let settled = false;
+        const settlement = waitForReplyBarrierSettlement(pending.promise, {
+          maxTimeoutMs: 30_000,
+          shouldExtend: () => true,
+        }).then(() => {
+          settled = true;
+        });
+        try {
+          vi.setSystemTime(Date.now() + wallClockStepMs);
+          await vi.advanceTimersByTimeAsync(15_000);
+          expect(settled).toBe(false);
+          await vi.advanceTimersByTimeAsync(15_000);
+          expect(settled).toBe(true);
+        } finally {
+          pending.resolve();
+          await settlement;
+        }
+      });
+    },
+  );
 
   it("keeps follow-up admission blocked during an unsettled inter-block delay", async () => {
     await withFakeReplyTimers(async () => {

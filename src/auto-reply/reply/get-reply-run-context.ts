@@ -9,8 +9,8 @@ import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawn
 import type { SilentReplyPromptMode } from "../../agents/system-prompt.types.js";
 import { resolveEffectiveAgentRuntime } from "../../agents/thinking-runtime.js";
 import { copyChannelParticipantAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
-import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
 import { resolveSilentReplySettings } from "../../config/silent-reply.js";
+import { resolveCronSessionWorkspaceOwnershipError } from "../../cron/run-authority.js";
 import { logVerbose } from "../../globals.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { isFastTestRuntimeEnv } from "../../infra/env.js";
@@ -87,7 +87,6 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     resetTriggered,
     systemSent,
     sessionKey,
-    storePath,
     workspaceDir: configuredWorkspaceDir,
     sessionEntryHandle,
     sessionStore,
@@ -137,7 +136,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const sessionPromptSourceReplyDeliveryMode =
     opts?.sessionPromptSourceReplyDeliveryMode ??
     (isSyntheticTurn && sessionEntry
-      ? resolveSessionStableReplyMode({
+      ? await resolveSessionStableReplyMode({
           cfg,
           ctx: { ...promptSessionCtx, CommandAuthorized: false },
           sessionEntry,
@@ -251,6 +250,13 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     execOverridePromptHint,
   ].filter(Boolean);
   const extraSystemPromptParts = [inboundMetaPrompt, ...staticSystemPromptParts].filter(Boolean);
+  // Metadata and conversation guidance vary per turn; configured policy and exec hints do not.
+  const turnContextText = [inboundMetaPrompt, sessionStableConversationContext, groupIntro]
+    .filter(Boolean)
+    .join("\n\n");
+  const extraSystemPromptTurnContext = turnContextText
+    ? { start: 0, text: turnContextText }
+    : undefined;
   const sourceConversationContextPromptOffset = sessionStableConversationContext
     ? inboundMetaPrompt
       ? inboundMetaPrompt.length + 2
@@ -314,6 +320,28 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     workspaceDir: sessionEntry?.spawnedWorkspaceDir,
     cwd: sessionEntry?.spawnedCwd,
   });
+  if (opts?.scheduledAutomation) {
+    opts.operatorAuthority?.assertCurrent();
+    opts.abortSignal?.throwIfAborted();
+    opts.queuedFollowupAbortSignal?.throwIfAborted();
+    opts.replyOperation?.abortSignal.throwIfAborted();
+    opts.internalEventExecution?.assertCurrent?.();
+    opts.scheduledAutomation.assertCurrent();
+    if (!sessionKey) {
+      throw new Error("A scheduled session turn requires its admitted session key");
+    }
+    const ownershipError = resolveCronSessionWorkspaceOwnershipError({
+      cfg,
+      agentId,
+      sessionKey,
+      admissionSource: opts.scheduledAutomation.admissionSource,
+      ownerSessionKey: opts.scheduledAutomation.job.owner?.sessionKey,
+      hasWorkspaceBinding: Boolean(sessionWorkspaceOverride || sessionEntry?.worktree),
+    });
+    if (ownershipError) {
+      throw new Error(ownershipError);
+    }
+  }
   const workspaceDir = sessionWorkspaceOverride ?? configuredWorkspaceDir;
   const bareResetPromptState =
     isBareSessionReset && workspaceDir
@@ -388,16 +416,14 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
           ),
   });
   let { activeGoalContext, inboundUserContext } = buildInboundContextState();
-  const refreshInboundContextAfterAdmissionWait = async () => {
+  const refreshInboundContextAfterAdmissionWait = () => {
     if (isHeartbeat || isInternalEvent) {
       return;
     }
     inboundContextSessionEntry =
-      storePath && sessionKey
-        ? loadSessionEntry({ storePath, sessionKey, readConsistency: "latest" })
-        : (sessionEntryHandle?.getCurrent() ??
-          (sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
-          sessionEntry);
+      sessionEntryHandle?.getCurrent() ??
+      (sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
+      sessionEntry;
     ({ activeGoalContext, inboundUserContext } = buildInboundContextState());
   };
   const inboundUserContextPromptJoiner = resolveInboundUserContextPromptJoiner(sessionCtx);
@@ -443,6 +469,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     fullAccessState,
     isFirstTurnInSession,
     extraSystemPromptParts,
+    extraSystemPromptTurnContext,
     sourceConversationContextByMode,
     sourceConversationContextPromptOffset,
     extraSystemPromptStatic,

@@ -45,6 +45,7 @@ import {
   preparePostCorePluginConfig,
   persistValidatedDowngradeConfig,
   readPostCorePreUpdateSourceConfig,
+  readUpdateConfigFileSnapshot,
 } from "./update-command-config.js";
 import { withUpdateCommandExecutor } from "./update-command-executor.js";
 import {
@@ -338,9 +339,10 @@ async function resumePostCoreUpdateInternal(
           runtime: { ...defaultRuntime, log: defaultRuntime.error },
           ...(params.opts.run ? { assertCurrent } : {}),
         });
-        assertCurrent?.();
-        // Each fresh Doctor holds its own database fences after admission.
+        // Each fresh Doctor holds its own database fences after admission. Release
+        // this scope before unscoped requester policy reads reopen shared state.
         await maintenance?.releaseState();
+        assertCurrent?.();
         await completeSourceUpdateRuntime({
           root: params.root,
           sourceRuntimePrepared: params.opts.sourceRuntimePrepared,
@@ -361,7 +363,7 @@ async function resumePostCoreUpdateInternal(
           }
         }
 
-        const configSnapshot = await readConfigFileSnapshot({
+        const configSnapshot = await readUpdateConfigFileSnapshot({
           skipPluginValidation: true,
           suppressFutureVersionWarning: true,
           observe: false,

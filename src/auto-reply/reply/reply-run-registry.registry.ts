@@ -87,13 +87,15 @@ export function resolveReplyOperationsForSession(params: ReplyOperationSessionTa
 
 export async function waitForReplyOperationOwnerSettlement(
   operation: ReplyOperation,
-  timeoutMs: number,
+  timeoutMs: number | null,
 ): Promise<boolean> {
   const settlement = operation.ownerSettlement;
   if (!settlement) {
     return true;
   }
-  return settlesWithin(settlement, resolveTimerTimeoutMs(timeoutMs, 100, 100));
+  return timeoutMs === null
+    ? settlement.then(() => true)
+    : settlesWithin(settlement, resolveTimerTimeoutMs(timeoutMs, 100, 100));
 }
 
 export function expireStaleReplyRunBySessionId(
@@ -253,8 +255,15 @@ export async function interruptReplyRunTarget(
   return { aborted, settled };
 }
 
-export function resolveActiveReplyRunSessionId(sessionKey: string): string | undefined {
-  return replyRunRegistry.resolveSessionId(sessionKey);
+export function resolveActiveReplyRunSessionId(
+  sessionKey: string,
+  options?: { executionStartedOnly?: boolean },
+): string | undefined {
+  const operation = getReplyRun(sessionKey);
+  return operation &&
+    (!options?.executionStartedOnly || hasReplyOperationExecutionStarted(operation))
+    ? operation.sessionId
+    : undefined;
 }
 
 /** Cancels the current reply backend only when its native run identity matches exactly. */
@@ -493,22 +502,8 @@ function evictPriorLifecycleReplyRuns(): void {
       continue;
     }
     const evict = evictReplyOperationByOperation.get(operation);
-    if (evict) {
-      if (attempt(evict)) {
-        continue;
-      }
-    } else {
-      // Pre-generation hot-loaded operations have no retained callback, but their
-      // public method still closes over the module instance that owns the backend.
-      attempt(() => {
-        if (!operation.abortForRestart()) {
-          throw new Error(`Stale reply operation was not abortable: ${operation.key}`);
-        }
-      });
-      // Admission stays occupied until the old closure clears it. If abort
-      // synchronously clears and replaces the slot, its captured stateCleared
-      // makes this completion idempotent instead of erasing the replacement.
-      attempt(() => operation.complete());
+    if (evict && attempt(evict)) {
+      continue;
     }
     attempt(() => clearReplyRunState(operation));
   }
@@ -532,7 +527,6 @@ const replyRunRegistryTestApi = {
     replyRunState.activeKeysBySessionId.clear();
     replyRunState.waitKeysBySessionId.clear();
     replyRunState.sourceTurnByKey.clear();
-    replyRunState.completionObservationsByKey?.clear();
     replyRunSettle.resetReplyRunSettleTimersForTesting();
     for (const waiters of replyRunState.waitersByKey.values()) {
       for (const waiter of waiters) {

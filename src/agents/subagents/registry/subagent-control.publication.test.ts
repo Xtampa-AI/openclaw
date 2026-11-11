@@ -2,9 +2,10 @@
 // oxfmt-ignore
 import { useSubagentControlFixture } from "./subagent-control.test-support.js";
 /** A cancellation result cannot publish a predecessor's task outcome after admitted reactivation. */
-import { expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { getRuntimeConfig } from "../../../config/config.js";
+import { setRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
 import { loadExactSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 import { reactivateCompletedSubagentSession } from "../../../gateway/session-subagent-reactivation.js";
 import {
@@ -12,7 +13,13 @@ import {
   getActiveSessionLifecycleMutationCount,
   getActiveSessionWorkAdmissionCount,
 } from "../../../sessions/session-lifecycle-admission.js";
+import { mergeAcceptedSessionSpawnsForRun } from "../../accepted-session-spawn.js";
+import { prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
 import type { AgentWaitResult } from "../../run-wait.js";
+import {
+  createAdmittedGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+} from "../../tools/gateway-caller-context.js";
 import type { KillPublicationPreparation } from "./subagent-control-kill-scope.js";
 import * as killSession from "./subagent-control-session.js";
 import { killSubagentRunAdmin } from "./subagent-control.js";
@@ -29,6 +36,9 @@ import {
 import { resolveSubagentSessionStatus } from "./subagent-session-metrics.js";
 
 const fixture = useSubagentControlFixture();
+beforeEach(() => {
+  setRuntimeConfigSnapshot({ agents: { defaults: { workspace: fixture.stateDir } } });
+});
 const rootKey = "agent:main:subagent:publication-root";
 const childKey = "agent:main:subagent:publication-drain";
 
@@ -69,11 +79,14 @@ it("revalidates the session after held publication preparation permits retiremen
     agentId: "main",
     sessionKey: rootKey,
     defaultSessionId: "prepared-publication-session",
+    lifecycleRevision: "prepared-publication-revision",
   };
-  await writeSubagentSessionEntry(target);
+  const storePath = await writeSubagentSessionEntry(target);
   await registerSubagentRun({
     runId: "prepared-publication",
     childSessionKey: rootKey,
+    childAgentId: "main",
+    sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: rootKey })?.entry,
     requesterSessionKey: "agent:main:main",
     requesterAgentId: "main",
     requesterDisplayKey: "main",
@@ -142,6 +155,11 @@ it.each([
     await registerSubagentRun({
       runId: "publication-b0",
       childSessionKey: rootKey,
+      childAgentId: "main",
+      sessionEntry: {
+        sessionId: "publication-root-session",
+        lifecycleRevision: "publication-root-revision",
+      },
       requesterSessionKey: "agent:main:main",
       requesterAgentId: "main",
       requesterDisplayKey: "main",
@@ -237,10 +255,13 @@ it.each([
         agentId: "main",
         sessionKey,
         defaultSessionId: `${runId}-session`,
+        lifecycleRevision: `${runId}-revision`,
       });
       await registerSubagentRun({
         runId,
         childSessionKey: sessionKey,
+        childAgentId: "main",
+        sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey })?.entry,
         requesterSessionKey: rootKey,
         requesterAgentId: "main",
         requesterDisplayKey: "main",
@@ -451,6 +472,134 @@ it.each([
       await pending;
       expect(getActiveSessionWorkAdmissionCount()).toBe(0);
       expect(getActiveSessionLifecycleMutationCount()).toBe(0);
+    }
+  },
+);
+
+// Admission identity and final cancellation publication are separate owners: an
+// admin kill can succeed without consuming another requester's inline receipt.
+it.each([
+  "current",
+  "revoked",
+  "wrong-run",
+  "wrong-session",
+  "wrong-agent",
+  "wrong-child-receipt",
+  "cancel-refused",
+  "replaced-session",
+  "late-publication-error",
+] as const)(
+  "retires only the exact live requester receipt after acknowledged cancellation (%s)",
+  async (owner) => {
+    const target = {
+      stateDir: fixture.stateDir,
+      agentId: "main",
+      sessionKey: rootKey,
+      defaultSessionId: "receipt-child",
+      lifecycleRevision: "receipt-child-revision",
+    };
+    const storePath = await writeSubagentSessionEntry(target);
+    const admission = prepareSystemAgentRunAdmission({}, "receipt-parent", "main", "receipt-test");
+    const admitted = await admission.admit("embedded");
+    const accepted = {
+      runId: "receipt-child",
+      childSessionKey: owner === "wrong-child-receipt" ? childKey : rootKey,
+      expectsCompletionMessage: true,
+    };
+    mergeAcceptedSessionSpawnsForRun(admission.operationalRunInstance, [accepted]);
+    try {
+      await registerSubagentRun({
+        runId: "receipt-child",
+        childSessionKey: rootKey,
+        childAgentId: "main",
+        sessionEntry: loadExactSessionEntryReadOnly({ storePath, sessionKey: rootKey })?.entry,
+        requesterSessionKey: "agent:main:main",
+        requesterAgentId: "main",
+        requesterTurnRunId: owner === "wrong-run" ? "other-parent" : "receipt-parent",
+        requesterDisplayKey: "main",
+        task: "receipt cancellation",
+        cleanup: "keep",
+        expectsCompletionMessage: true,
+      });
+      const identity = createAdmittedGatewayToolCallerIdentity({
+        admittedRunContext: admitted,
+        agentId: "main",
+        sessionKey: "agent:main:main",
+      });
+      if (!identity) {
+        throw new Error("Missing admitted requester identity");
+      }
+      let publications = 0;
+      const operation = withGatewayToolCallerIdentity(
+        {
+          ...identity,
+          ...(owner === "wrong-session" ? { sessionKey: childKey } : {}),
+          ...(owner === "wrong-agent" ? { agentId: "other" } : {}),
+        },
+        () =>
+          killSubagentRunAdmin(
+            {
+              cfg: getRuntimeConfig(),
+              sessionKey: rootKey,
+              agentId: "main",
+              expectedRunId: "receipt-child",
+            },
+            {
+              assertCurrent: () => {},
+              beforeSessionKill:
+                owner === "cancel-refused"
+                  ? () => {
+                      throw new Error("stop refused");
+                    }
+                  : undefined,
+              preparePublication: {
+                prepare: async (publish) => {
+                  publications += 1;
+                  if (owner === "revoked") {
+                    admission.close();
+                  }
+                  if (owner === "replaced-session") {
+                    await removeSubagentSessionEntry(target);
+                  }
+                  if (owner === "late-publication-error" && publications === 2) {
+                    throw new Error("final publication refused");
+                  }
+                  await publish();
+                  if (publications === 1) {
+                    expect(
+                      mergeAcceptedSessionSpawnsForRun(admission.operationalRunInstance),
+                    ).toEqual([accepted]);
+                  }
+                },
+              },
+            },
+          ),
+      );
+      if (owner === "late-publication-error") {
+        await expect(operation).rejects.toThrow("final publication refused");
+        expect(
+          mergeAcceptedSessionSpawnsForRun(admission.operationalRunInstance, [accepted]),
+        ).toEqual([accepted]);
+        return;
+      }
+      const result = await operation;
+      if (!result.found) {
+        throw new Error("Missing cancellation target");
+      }
+      if (owner === "cancel-refused" || owner === "replaced-session") {
+        expect(result.error).toBeDefined();
+      } else {
+        expect(result).toMatchObject({
+          targetState: { state: "terminal", task: { status: "cancelled" } },
+        });
+        expect(result.error).toBeUndefined();
+      }
+      expect(
+        mergeAcceptedSessionSpawnsForRun(admission.operationalRunInstance, [accepted]),
+      ).toEqual([{ ...accepted, expectsCompletionMessage: owner !== "current" }]);
+      expect(accepted.expectsCompletionMessage).toBe(true);
+    } finally {
+      admission.close();
     }
   },
 );

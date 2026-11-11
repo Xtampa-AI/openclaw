@@ -1,5 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, StatementSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { observeSqliteReadSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { cronRunLogEntryToDetail, cronRunStorageStatus } from "../cron/run-history-detail.js";
 import { readCronRunHistoryPageForTests } from "../cron/run-history.test-support.js";
 import type { CronRunLogEntry } from "../cron/run-log-types.js";
@@ -11,10 +12,35 @@ import {
   prepareOpenClawStateDatabaseSchema,
 } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { openNodeSqliteDatabase } from "./node-sqlite.js";
+import { admitSqliteSchema } from "./sqlite-schema-facts.js";
+import { hasLegacyCronRunLogs } from "./state-migrations.cron-run-logs.js";
 
 const CRON_RUN_LOG_TASK_IMPORT_MIGRATION_ID = "state:cron-run-logs-to-task-runs:v1";
 
 describe("cron run-log task import", () => {
+  it("reuses admitted legacy-table presence and observes committed or rolled-back DDL", () => {
+    using database = openNodeSqliteDatabase(":memory:");
+    expect(hasLegacyCronRunLogs(database)).toBe(false);
+    admitSqliteSchema(database);
+    const observation = observeSqliteReadSql(StatementSync.prototype);
+    try {
+      expect(hasLegacyCronRunLogs(database)).toBe(false);
+      expect(hasLegacyCronRunLogs(database)).toBe(false);
+      expect(observation.queries).toEqual([]);
+      database.exec("CREATE TABLE cron_run_logs (entry_json TEXT)");
+      expect(hasLegacyCronRunLogs(database)).toBe(true);
+      database.exec("BEGIN; DROP TABLE cron_run_logs");
+      expect(hasLegacyCronRunLogs(database)).toBe(false);
+      database.exec("ROLLBACK");
+      expect(hasLegacyCronRunLogs(database)).toBe(true);
+      database.exec("DROP TABLE cron_run_logs");
+      expect(hasLegacyCronRunLogs(database)).toBe(false);
+    } finally {
+      observation.restore();
+    }
+  });
+
   it("preserves legacy cron history on runtime refusal, then Doctor imports it once", async () => {
     await withOpenClawTestState(
       { layout: "state-only", prefix: "openclaw-cron-run-log-import-" },
@@ -133,7 +159,6 @@ describe("cron run-log task import", () => {
         } finally {
           fixture.close();
         }
-
         expect(await prepareOpenClawStateDatabaseSchema()).toEqual({
           changes: [],
           warnings: [expect.stringMatching(/legacy-cron-run-logs.*doctor --fix/u)],
@@ -180,7 +205,16 @@ describe("cron run-log task import", () => {
           summary,
           error,
         });
-        expect(ledgerEntries.map(publicFields)).toEqual(entries.map(publicFields));
+        const receiptBackedRunIds = new Map<number, string>([
+          [1, "cron-runlog-import:legacy-history-job:2100:1"],
+          [2, "cron-runlog-import:legacy-history-job:2100:2"],
+          [5, "cron:legacy-history-job:4000:mirrored"],
+        ]);
+        expect(ledgerEntries.map(publicFields)).toEqual(
+          entries.map((logEntry, index) =>
+            publicFields({ ...logEntry, runId: logEntry.runId ?? receiptBackedRunIds.get(index) }),
+          ),
+        );
         expect(
           reopened.db
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cron_run_logs'")

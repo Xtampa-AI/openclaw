@@ -2,11 +2,11 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { stripInternalMetadataForDisplay } from "../../auto-reply/reply/display-text-sanitize.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import { hasRestartRecoveryTerminalRun } from "../../config/sessions/restart-recovery-state.js";
-import {
-  loadSessionEntry,
-  type SessionTranscriptTurnExpectedState,
-  type SessionTranscriptTurnLifecyclePatch,
+import type {
+  SessionTranscriptTurnExpectedState,
+  SessionTranscriptTurnLifecyclePatch,
 } from "../../config/sessions/session-accessor.js";
+import { readSessionEntryReadOnlyInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import { buildRestartRecoveryExpectedState } from "../../config/sessions/session-transcript-turn-state.js";
 import { appendAssistantMessageToSessionTranscript } from "../../config/sessions/transcript.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -15,11 +15,35 @@ import type { DeliveryContext } from "../../utils/delivery-context.shared.js";
 import { buildMainSessionRecoverySettlementPatch } from "./main-session-recovery-clear.js";
 import type { MainSessionRecoveryObservation } from "./main-session-recovery-state.js";
 import { commitMainSessionRecovery } from "./main-session-recovery-store.js";
+import type { readMainSessionRecoveryCheckpoint } from "./main-session-restart-recovery-checkpoint.js";
 import { resolveRestartRecoveryDeliveryContext } from "./main-session-restart-recovery-delivery.js";
 import {
   mainSessionRecoveryLog,
   resolveRestartRecoveryTerminalClientRunId,
 } from "./main-session-restart-recovery-shared.js";
+
+/** Whether recovery must re-prove delegated sender authority before resuming. */
+export function requiresDelegatedRecoverySource(
+  entry: SessionEntry,
+  source: Awaited<ReturnType<typeof readMainSessionRecoveryCheckpoint>>["source"],
+): boolean {
+  // Steering is context, not a new admission. A non-browser operator can have
+  // internal ingress too; its durable source goes through the Gateway's exact
+  // claim and current-policy restoration before any recovery turn executes.
+  if (
+    entry.restartRecoveryDeliverySourceRunId &&
+    (entry.restartRecoveryOperatorSource ||
+      entry.restartRecoverySourceIngress === "control-ui" ||
+      entry.restartRecoverySourceIngress === "channel")
+  ) {
+    return false;
+  }
+  return (
+    source === "inter_session" ||
+    (entry.restartRecoverySourceIngress === "internal" &&
+      (source === undefined || source === "internal_system" || source === "harness_completion"))
+  );
+}
 
 /** Publish one local interruption notice and retire the exact input without replay or delivery. */
 async function settleInterruptedRestartRecovery(
@@ -222,7 +246,7 @@ export async function tombstoneMainRestartRecoveryWithNotice(params: {
       if (notice === "failed") {
         return "notice_failed";
       }
-      const current = loadSessionEntry({
+      const current = await readSessionEntryReadOnlyInWorker({
         agentId: params.agentId,
         sessionKey: params.sessionKey,
         storePath: params.storePath,

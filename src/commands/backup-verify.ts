@@ -122,8 +122,8 @@ function formatResult(result: BackupVerifyResult): string {
     `Archive entries scanned: ${result.entryCount}`,
     `Symbolic links checked: ${result.symlinkCount}`,
     result.sqliteInventoryVerified
-      ? "Canonical SQLite inventory verified."
-      : "Canonical SQLite completeness unknown: this legacy archive has no database inventory.",
+      ? "SQLite database inventory verified."
+      : "SQLite database coverage unknown: this legacy archive has no database inventory.",
   ].join("\n");
 }
 
@@ -227,7 +227,9 @@ function listSqliteSnapshotEntries(
       continue;
     }
     if (entry.normalized !== owner.archivePath) {
-      throw new Error(`Backup contains a case-mangled canonical SQLite path: ${entry.normalized}`);
+      throw new Error(
+        `Backup contains a SQLite path with incorrect letter casing: ${entry.normalized}`,
+      );
     }
     if (!isRegularArchiveFile(entry.type)) {
       throw new Error(`SQLite snapshot must be a regular archive file: ${entry.normalized}`);
@@ -539,16 +541,16 @@ async function verifyResolvedBackupArchive(
   const symbolicLinks = rawEntries
     .filter((entry) => entry.type === "SymbolicLink")
     .map((entry) => ({ entryPath: entry.path, linkpath: entry.linkpath }));
-  const rawEntryPaths = new Map<string, string>();
+  const entriesByPath = new Map<string, NormalizedArchiveEntry>();
   let duplicateEntryPath: string | undefined;
   // Keep the first duplicate for validation below; manifest-count errors still win.
   for (const entry of entries) {
-    if (rawEntryPaths.has(entry.normalized)) {
+    if (entriesByPath.has(entry.normalized)) {
       duplicateEntryPath ??= entry.normalized;
     }
-    rawEntryPaths.set(entry.normalized, entry.raw);
+    entriesByPath.set(entry.normalized, entry);
   }
-  const normalizedEntrySet = new Set(rawEntryPaths.keys());
+  const normalizedEntrySet = new Set(entriesByPath.keys());
 
   const manifestMatches = entries.filter((entry) => isRootBackupManifestEntry(entry.normalized));
   if (manifestMatches.length !== 1) {
@@ -584,7 +586,29 @@ async function verifyResolvedBackupArchive(
       const resolved = isArchivePathWithin(target, archiveRoot)
         ? target
         : path.posix.join(archiveRoot, target);
-      const rawTarget = rawEntryPaths.get(resolved);
+      let rawTarget = entriesByPath.get(resolved)?.raw;
+      if (!rawTarget && !isArchivePathWithin(target, archiveRoot)) {
+        // Historical writers remapped member names but retained cwd-relative link targets.
+        // Only an exact, unambiguous regular-file match can recover that lost prefix.
+        const candidates = new Set<string>();
+        for (
+          let parent = path.posix.dirname(normalizeArchivePath(entry.path, "Archive entry"));
+          isArchivePathWithin(parent, archiveRoot);
+          parent = path.posix.dirname(parent)
+        ) {
+          const candidate = entriesByPath.get(path.posix.join(parent, target));
+          if (candidate && isRegularArchiveFile(candidate.type)) {
+            candidates.add(candidate.raw);
+          }
+          if (parent === archiveRoot) {
+            break;
+          }
+        }
+        if (candidates.size > 1) {
+          throw new Error(`Archive hardlink target is ambiguous: ${entry.path} -> ${target}`);
+        }
+        rawTarget = candidates.values().next().value;
+      }
       if (!rawTarget) {
         throw new Error(
           `Archive hardlink target is missing from archive entries: ${entry.path} -> ${resolved}`,

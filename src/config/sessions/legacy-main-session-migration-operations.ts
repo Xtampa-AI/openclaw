@@ -1,4 +1,4 @@
-import { readSqliteDataVersion } from "../../infra/sqlite-schema-facts.js";
+import { readSqliteDatabaseWriteRevision } from "../../infra/sqlite-database-admission.js";
 import {
   isOpenClawAgentDatabasePathCurrent,
   readOpenClawAgentDatabaseIdentity,
@@ -228,8 +228,8 @@ async function deleteCopiedClaims(params: {
     const assertCopied = () => {
       params.beforePersistentApply?.();
       assertCurrent();
-      const version = readSqliteDataVersion(destinationReader.db);
-      if (version === verifiedVersion) {
+      const version = readSqliteDatabaseWriteRevision(destinationReader.db);
+      if (version !== undefined && version === verifiedVersion) {
         return;
       }
       if (!hasOpenClawAgentReadOnlySchema(destinationReader)) {
@@ -245,10 +245,10 @@ async function deleteCopiedClaims(params: {
         throw changed();
       }
       assertCurrent();
-      if (readSqliteDataVersion(destinationReader.db) !== version) {
+      if (readSqliteDatabaseWriteRevision(destinationReader.db) !== version) {
         throw changed();
       }
-      // Only this dedicated reader can reuse its counter; no snapshot survives the assertion.
+      // Only settled in-process writes can certify reuse; no snapshot survives the assertion.
       verifiedVersion = version;
     };
     assertCopied();

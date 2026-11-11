@@ -2,9 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { OpenAsyncKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  PluginStateActionAuthority,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
   createPluginStateKeyedStoreForTests,
+  createPluginStateKeyedStoreV2ForTests,
   createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
@@ -15,11 +19,7 @@ import type {
 } from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  legacyConfigRules,
-  normalizeCompatibilityConfig,
-  stateMigrations,
-} from "./doctor-contract-api.js";
+import { normalizeCompatibilityConfig, stateMigrations } from "./doctor-contract-api.js";
 import { base64url, generateIdentity, type ReviewRequest } from "./protocol/index.js";
 import { MemoryAuditStore } from "./protocol/memory-stores.test-support.js";
 import { ReefChannelConfigSchema } from "./src/config-schema.js";
@@ -63,6 +63,7 @@ import {
   type ReefIdentityMigrationRecord,
   type ReefReviewRecord,
 } from "./src/state.js";
+import { expectReefStateOperationError } from "./src/state.test-support.js";
 import {
   REEF_TRUST_STORE_MAX_ENTRIES,
   REEF_TRUST_STORE_NAMESPACE,
@@ -101,6 +102,15 @@ function createRuntime(env: NodeJS.ProcessEnv) {
       ...options,
       env: options.env ?? env,
     });
+  runtime.state.openKeyedStoreV2 = <T>(
+    options: OpenAsyncKeyedStoreOptions,
+    authority?: PluginStateActionAuthority,
+  ) =>
+    createPluginStateKeyedStoreV2ForTests<T>(
+      "reef",
+      { ...options, env: options.env ?? env },
+      authority ?? { assertCurrent() {} },
+    );
   return runtime;
 }
 
@@ -166,46 +176,85 @@ describe("Reef doctor contract", () => {
     return dir;
   }
 
-  it("detects and removes retired config fields", () => {
-    const cfg = legacyConfig();
-    expect(legacyConfigRules[0]?.match?.(cfg.channels?.reef, cfg)).toBe(true);
-
-    const result = normalizeCompatibilityConfig({ cfg });
-
-    expect(result.changes).toEqual([
-      "Removed retired Reef dmPolicy field.",
-      "Removed retired Reef allowFrom field.",
-    ]);
-    expect(result.config.channels?.reef).toEqual({
-      enabled: true,
-      handle: "owner",
-      relayUrl: "https://reefwire.ai",
-      requestPolicy: "code-only",
-      friends: expect.any(Object),
-    });
+  it.each([
+    "keys.json",
+    "identity.json",
+    "setup-session.json",
+    "audit.jsonl",
+    "replay.jsonl",
+    "reviews.json",
+    "delivered.json",
+  ])("preserves malformed UTF-8 %s without importing replacement text", async (filename) => {
+    const dir = createLegacyDir();
+    const marker = "utf8-marker";
+    const review = {
+      id: marker,
+      from: "alice#1",
+      to: "bob#1",
+      direction: "outbound",
+      bodyHash: "b".repeat(64),
+      approvalDigest: "c".repeat(64),
+      verdict: {
+        decision: "review",
+        category: "ambiguous",
+        reason: marker,
+        model: "test-model",
+        policyVersion: "v1",
+      },
+    };
+    const audit = new MemoryAuditStore(new Uint8Array(32).fill(1));
+    await audit.appendEvent(marker, { id: 1 }, 10);
+    const data: Record<string, unknown> = {
+      "keys.json": { ...reefKeys(), opaque: marker },
+      "identity.json": { handle: marker, relayUrl: "https://reefwire.ai" },
+      "setup-session.json": {
+        session: marker,
+        relayUrl: "https://reefwire.ai",
+        email: "a@example.com",
+      },
+      "audit.jsonl": (await audit.entries())[0],
+      "replay.jsonl": {
+        op: "claim",
+        peer: marker,
+        id: "01JZ0000000000000000000000",
+        envelopeHash: "a".repeat(64),
+      },
+      "reviews.json": { [review.approvalDigest]: { review, approved: true } },
+      "delivered.json": [marker],
+    };
+    const bytes = Buffer.from(JSON.stringify(data[filename]));
+    const offset = bytes.indexOf(marker);
+    expect(offset).toBeGreaterThanOrEqual(0);
+    bytes[offset] = 0xff;
+    const source = path.join(dir, filename);
+    fs.writeFileSync(source, bytes);
+    const id =
+      filename === "keys.json"
+        ? "reef-keys-json-to-plugin-state"
+        : ["identity.json", "setup-session.json"].includes(filename)
+          ? "reef-registration-json-to-plugin-state"
+          : filename === "audit.jsonl"
+            ? "reef-audit-jsonl-to-plugin-state"
+            : "reef-runtime-files-to-plugin-state";
+    const result = await migrationById(id).migrateLegacyState(migrationParams());
+    expect(result.warningDisposition).toBe("recoverable");
+    expect(result.warnings.join("\n")).toContain("UTF-8");
+    expect(fs.readFileSync(source)).toEqual(bytes);
+    expect(fs.existsSync(source + ".migrated")).toBe(false);
   });
 
-  it("moves stray plugin-entry config into channels.reef and clears the entry", () => {
-    const cfg = {
-      plugins: {
-        entries: {
-          reef: { enabled: true, config: { handle: "owner", requestPolicy: "code-only" } },
-        },
-      },
-    } as never;
-    expect(
-      legacyConfigRules[1]?.match?.({ handle: "owner", requestPolicy: "code-only" }, cfg),
-    ).toBe(true);
-    expect(legacyConfigRules[1]?.match?.({}, cfg)).toBe(false);
-
-    const result = normalizeCompatibilityConfig({ cfg });
-
-    expect(result.changes).toEqual([
-      "Moved plugins.entries.reef.config.handle to channels.reef.handle.",
-      "Moved plugins.entries.reef.config.requestPolicy to channels.reef.requestPolicy.",
-    ]);
-    expect(result.config.channels?.reef).toEqual({ handle: "owner", requestPolicy: "code-only" });
-    expect(result.config.plugins?.entries?.reef).toEqual({ enabled: true });
+  it("retains refusal for mixed malformed UTF-8 and invalid JSON runtime sources", async () => {
+    const dir = createLegacyDir();
+    const bytes = Buffer.from([0xff]);
+    fs.writeFileSync(path.join(dir, "replay.jsonl"), bytes);
+    fs.writeFileSync(path.join(dir, "reviews.json"), "{");
+    const result = await migrationById("reef-runtime-files-to-plugin-state").migrateLegacyState(
+      migrationParams(),
+    );
+    expect(result.warnings.length).toBeGreaterThan(1);
+    expect(result.warningDisposition).toBeUndefined();
+    expect(fs.readFileSync(path.join(dir, "replay.jsonl"))).toEqual(bytes);
+    expect(fs.readFileSync(path.join(dir, "reviews.json"), "utf8")).toBe("{");
   });
 
   it("keeps channels.reef authoritative over conflicting stray entry config", () => {
@@ -222,18 +271,6 @@ describe("Reef doctor contract", () => {
     ]);
     expect(result.config.channels?.reef).toEqual({ handle: "canonical", email: "o@example.com" });
     expect(result.config.plugins?.entries?.reef).toEqual({});
-  });
-
-  it("leaves unmergeable stray entry config in place instead of corrupting channels.reef", () => {
-    const cfg = {
-      plugins: { entries: { reef: { config: { unknownKey: true } } } },
-    } as never;
-
-    const result = normalizeCompatibilityConfig({ cfg });
-
-    expect(result.changes).toEqual([]);
-    expect(result.config.channels?.reef).toBeUndefined();
-    expect(result.config.plugins?.entries?.reef).toEqual({ config: { unknownKey: true } });
   });
 
   it("does not import the default home's Reef identity into an isolated state", async () => {
@@ -317,8 +354,9 @@ describe("Reef doctor contract", () => {
     expect(missingSourceResult.warnings).toEqual([
       expect.stringContaining("migration is incomplete and keys.json is missing"),
     ]);
-    await expect(generateAndStoreKeys(createRuntime(env))).rejects.toThrow(
-      "migration is incomplete",
+    await expectReefStateOperationError(
+      generateAndStoreKeys(createRuntime(env)),
+      /migration is incomplete/,
     );
   });
 
@@ -347,8 +385,9 @@ describe("Reef doctor contract", () => {
       pending: true,
       identityBindingRequired: true,
     });
-    await expect(loadKeys(createRuntime(env))).rejects.toThrow(
-      "durable state migration is incomplete",
+    await expectReefStateOperationError(
+      loadKeys(createRuntime(env)),
+      "Reef durable state migration is incomplete; repair the legacy state files and rerun openclaw doctor --fix",
     );
 
     const registrationResult = await migrationById(
@@ -360,8 +399,9 @@ describe("Reef doctor contract", () => {
       "Verified Reef identity keys and binding; cleared migration marker",
     );
     await expect(migrationStore.lookup(REEF_KEYS_MIGRATION_KEY)).resolves.toBeUndefined();
-    await expect(loadKeys(createRuntime(env))).rejects.toThrow(
-      "durable state migration is incomplete",
+    await expectReefStateOperationError(
+      loadKeys(createRuntime(env)),
+      "Reef durable state migration is incomplete; repair the legacy state files and rerun openclaw doctor --fix",
     );
     await migrationById("reef-runtime-files-to-plugin-state").migrateLegacyState(params);
     await expect(loadKeys(createRuntime(env))).resolves.toEqual(keys);
@@ -555,8 +595,9 @@ describe("Reef doctor contract", () => {
     await expect(migrationStore.lookup(REEF_AUDIT_MIGRATION_KEY)).resolves.toEqual({
       pending: true,
     });
-    expect(() => openStores(createRuntime(env), reefKeys())).toThrow(
-      "Reef durable state migration is incomplete",
+    await expectReefStateOperationError(
+      openStores(createRuntime(env), reefKeys()),
+      "Reef durable state migration is incomplete; repair the legacy state files and rerun openclaw doctor --fix",
     );
 
     const audit = new MemoryAuditStore(new Uint8Array(32).fill(1));
@@ -569,7 +610,7 @@ describe("Reef doctor contract", () => {
     expect(repaired.warnings).toEqual([]);
     await expect(migrationStore.lookup(REEF_AUDIT_MIGRATION_KEY)).resolves.toBeUndefined();
     await migrationById("reef-runtime-files-to-plugin-state").migrateLegacyState(params);
-    expect(() => openStores(createRuntime(env), reefKeys())).not.toThrow();
+    await expect(openStores(createRuntime(env), reefKeys())).resolves.toBeDefined();
   });
 
   it("imports registration and durable runtime state before archiving files", async () => {
@@ -633,7 +674,10 @@ describe("Reef doctor contract", () => {
     const runtimeState = await migrationById(
       "reef-runtime-files-to-plugin-state",
     ).migrateLegacyState(params);
-    await expect(generateAndStoreKeys(createRuntime(env))).rejects.toThrow("has no canonical keys");
+    await expectReefStateOperationError(
+      generateAndStoreKeys(createRuntime(env)),
+      /has no stored keys/,
+    );
 
     expect(registration.warnings).toEqual([]);
     expect(registration.changes).toHaveLength(4);
@@ -716,6 +760,9 @@ describe("Reef doctor contract", () => {
       expect.stringContaining(
         `${REEF_DELIVERED_MAX_ENTRIES + 1} delivered markers exceed plugin-state capacity`,
       ),
+    ]);
+    expect(result.warningDisposition).toBeUndefined();
+    expect(result.notices).toEqual([
       expect.stringContaining("Reef durable state migration is incomplete"),
     ]);
     for (const filePath of [replayPath, deliveredPath]) {

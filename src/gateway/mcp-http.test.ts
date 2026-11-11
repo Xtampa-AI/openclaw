@@ -120,13 +120,13 @@ vi.mock("../config/sessions.js", async (importOriginal) => ({
   resolveMainSessionKey: () => "agent:main:main",
 }));
 
-vi.mock("../config/sessions/session-accessor.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../config/sessions/session-accessor.js")>();
+vi.mock("../config/sessions/session-accessor.entry.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../config/sessions/session-accessor.entry.js")>();
   return {
     ...actual,
-    resolveSessionEntryAccessTarget: (params: { sessionKey: string }) => ({
-      entry: sessionEntries.get(params.sessionKey),
-    }),
+    readResolvedSessionEntryInWorker: async (params: { sessionKey: string }) =>
+      sessionEntries.get(params.sessionKey),
   };
 });
 
@@ -1973,6 +1973,21 @@ describe("mcp loopback server", () => {
       body: "{}",
     });
     expect(response.status).toBe(415);
+  });
+
+  it.each([
+    ["Application/JSON", 200],
+    ["Application/XML", 415],
+  ] as const)("handles mixed-case content type %s", async (contentType, status) => {
+    const { port } = await startLoopbackServerForTest();
+    const runtime = getActiveMcpLoopbackRuntime();
+    const response = await sendRaw({
+      port,
+      token: runtime?.ownerToken,
+      headers: { "content-type": contentType },
+      body: mcpToolsListBody(),
+    });
+    expect(response.status).toBe(status);
   });
 
   it("returns JSON-RPC parse errors only for invalid JSON", async () => {

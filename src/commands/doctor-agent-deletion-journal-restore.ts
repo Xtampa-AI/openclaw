@@ -22,6 +22,7 @@ import {
   resolveOpenClawAgentSqlitePath,
 } from "../state/openclaw-agent-db.paths.js";
 import { getOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
+import { isStatePostgres } from "../state/openclaw-state-db-engine.js";
 import { withExistingOpenClawStateDatabaseCurrentReadOnly } from "../state/openclaw-state-db-readonly.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
@@ -70,7 +71,7 @@ export async function restoreDoctorMissingJournalStores(params: {
   const changes: string[] = [];
   const warnings: string[] = [];
   const restored: HeldAgentDatabase[] = [];
-  if (params.held.length === 0) {
+  if (params.held.length === 0 || isStatePostgres()) {
     return { changes, warnings, restored };
   }
   const maintenance = getOpenClawDatabaseMaintenanceScope();

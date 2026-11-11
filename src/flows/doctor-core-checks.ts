@@ -37,6 +37,7 @@ import { hasActiveGatewayExecCredential } from "./doctor-gateway-exec-credential
 import { gatewayServicesExtraCheck } from "./doctor-gateway-services-check.js";
 import type { DoctorHealthCheckContext } from "./doctor-health-contribution-types.js";
 import { legacyOwnedRepair } from "./doctor-health-contribution.js";
+import { legacyOutputCapCheck } from "./doctor-legacy-output-cap-check.js";
 import { createModelReferenceCheck } from "./doctor-model-reference-check.js";
 import { removedWorkspacesStateCheck } from "./doctor-removed-workspaces-state-check.js";
 import {
@@ -541,7 +542,7 @@ const codexSessionRoutesCheck: CoreHealthCheck = {
 
 const telegramGeneralTopicConversationsCheck: CoreHealthCheck = {
   id: TELEGRAM_GENERAL_TOPIC_CONVERSATIONS_CHECK_ID,
-  description: "Telegram General-topic conversation bindings use the canonical chat target.",
+  description: "Telegram General-topic conversation bindings use the chat target.",
   async detect(ctx) {
     const { detectTelegramGeneralTopicConversationRepairs } =
       await import("../commands/doctor-telegram-general-topic-conversations.js");
@@ -554,7 +555,7 @@ const telegramGeneralTopicConversationsCheck: CoreHealthCheck = {
       severity: "warning" as const,
       message: `Agent ${repair.agentId} has a stale Telegram General-topic conversation identity.`,
       target: repair.agentId,
-      requirement: "One canonical chat-scoped conversation binding for Telegram General topic.",
+      requirement: "One chat-scoped conversation binding for Telegram General topic.",
       fixHint: "Run `openclaw doctor --fix` to merge the stale topic-qualified identity.",
     }));
   },
@@ -833,6 +834,7 @@ export function createCoreHealthChecks(): readonly DoctorHealthCheck[] {
     bootstrapSizeCheck,
     createModelReferenceCheck(),
     createAcpAgentModelCheck(),
+    legacyOutputCapCheck,
     {
       id: "core/doctor/provider-catalog-projection",
       description: "Provider catalog hooks project into unified text model catalog rows.",

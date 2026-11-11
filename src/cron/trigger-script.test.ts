@@ -175,8 +175,7 @@ describe("cron trigger script evaluator", () => {
     "honors current host $host for a canonically captured pinned exec cap",
     async ({ host, expected }) => {
       const workspaceDir = tempDirs.make("openclaw-cron-canonical-cap-");
-      // Automatic placement must honor the pin despite the script's node request;
-      // an explicit current node restriction must reject the captured Gateway host.
+      // Conflicting requests fail at the pin; targetless calls still honor current host restrictions.
       const config: OpenClawConfig = {
         agents: { defaults: { workspace: workspaceDir } },
         tools: {
@@ -189,16 +188,32 @@ describe("cron trigger script evaluator", () => {
         },
       };
       const evaluate = createCronScriptRuntime({ config }).evaluateTrigger;
+      const input = {
+        jobId: "job-canonical-pinned-exec",
+        state: null,
+        toolsAllow: ["exec", "process"],
+        scheduledToolPolicy: { version: 1, mode: "trusted" },
+        execTarget: { version: 1, host: "gateway" },
+      } satisfies Omit<Parameters<typeof evaluate>[0], "script">;
 
       await expect(
         evaluate({
-          jobId: "job-canonical-pinned-exec",
+          ...input,
           script:
-            'await exec({ command: "printf openclaw-canonical-ok", host: "gateway" }); return { fire: false };',
-          state: null,
-          toolsAllow: ["exec", "process"],
-          scheduledToolPolicy: { version: 1, mode: "trusted" },
-          execTarget: { version: 1, host: "gateway" },
+            'await exec({ command: "printf openclaw-canonical-ok", host: "node", node: "remote" }); return { fire: false };',
+        }),
+      ).resolves.toEqual({
+        kind: "error",
+        code: "internal_error",
+        error: expect.stringContaining(
+          "exec is pinned to host=gateway; the requested host or node is not allowed for this job.",
+        ),
+      });
+      await expect(
+        evaluate({
+          ...input,
+          script:
+            'await exec({ command: "printf openclaw-canonical-ok" }); return { fire: false };',
         }),
       ).resolves.toEqual(expected);
     },
@@ -400,6 +415,59 @@ describe("cron trigger script evaluator", () => {
       },
     ]);
   });
+
+  it.each(["policy change", "capacity eviction"] as const)(
+    "retains an active runtime through %s and disposes it after its last evaluation",
+    async (retirement) => {
+      const config: OpenClawConfig = {};
+      const entered = createDeferred();
+      const release = createDeferred();
+      const disposed: number[] = [];
+      let generation = 0;
+      const prepareRuntime = vi.fn(async () => {
+        const current = ++generation;
+        return {
+          ...createPreparedRuntime(config),
+          createTools: async () => [],
+          [Symbol.dispose]: () => disposed.push(current),
+        };
+      });
+      let first = true;
+      const evaluate = createCronTriggerEvaluator({
+        config,
+        prepareRuntime,
+        runHeadless: async () => {
+          if (first) {
+            first = false;
+            entered.resolve();
+            await release.promise;
+          }
+          return completed({ value: { fire: false } });
+        },
+      });
+      const request = { jobId: "active-cache", script: "return {}", state: null };
+      const active = evaluate(request);
+      try {
+        await entered.promise;
+        if (retirement === "policy change") {
+          await evaluate({ ...request, toolsAllow: [] });
+          await evaluate({ ...request, toolsAllow: [] });
+          expect(prepareRuntime).toHaveBeenCalledTimes(2);
+        } else {
+          for (let index = 0; index < 128; index++) {
+            await evaluate({ ...request, jobId: `cache-${index}` });
+          }
+        }
+        expect(disposed).toEqual([]);
+        release.resolve();
+        await expect(active).resolves.toMatchObject({ kind: "evaluated", fire: false });
+        expect(disposed).toEqual([1]);
+      } finally {
+        release.resolve();
+        await active;
+      }
+    },
+  );
 
   it.each([
     completed({ value: { fire: "yes" } }),

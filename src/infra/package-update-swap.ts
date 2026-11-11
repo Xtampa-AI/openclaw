@@ -274,14 +274,15 @@ export async function swapStagedPackageInstall(
     return messages;
   };
   const readBaseline = async () => {
-    hadPackage = await (native ? pathEntryExists(targetSwapRoot) : baseline.exists(targetSwapRoot));
-    previousVersion =
-      hadPackage && native
+    if (native) {
+      hadPackage = await pathEntryExists(targetSwapRoot);
+      previousVersion = hadPackage
         ? await readPackageVersionIfPresent(params.installTarget.packageRoot)
         : null;
-    if (hadPackage && !native) {
+    } else {
       try {
-        previousRoot = await baseline.rootEntry(targetSwapRoot);
+        hadPackage = await baseline.exists(targetSwapRoot);
+        previousRoot = hadPackage ? await baseline.rootEntry(targetSwapRoot) : undefined;
       } catch (error) {
         // Preserve the scan cause if the identity fallback also fails.
         baselineError = new Error("Baseline package scan failed", { cause: error });
@@ -289,13 +290,12 @@ export async function swapStagedPackageInstall(
           throw error;
         }
         // Capture the identity before mutation even when the full walk exhausted its budget.
-        previousIdentity =
-          (await createPackageIntegrityReader(params.timeoutMs).directoryIdentity(
-            targetSwapRoot,
-          )) ?? undefined;
+        const fallback = createPackageIntegrityReader(params.timeoutMs);
+        previousIdentity = (await fallback.directoryIdentity(targetSwapRoot)) ?? undefined;
         if (!previousIdentity) {
           throw error;
         }
+        hadPackage = true;
         warnings.push(
           `baseline package fingerprint incomplete (${error.message}); rollback requires the retained directory identity, package version and launchers; full package contents are unverified`,
         );
@@ -448,9 +448,9 @@ export async function swapStagedPackageInstall(
             }
           }
         : rootLink?.verifyRuntime;
-      await params.onTransaction({
+      const transaction: PackageUpdateTransaction = {
         backupRoot,
-        ...(activation ? { databaseBackupRoot } : {}),
+        databaseBackupRoot,
         ...(assertRollbackSafe ? { assertRollbackSafe } : {}),
         rollback: (assertion) => {
           const assertCurrent = retainAuthority(assertion);
@@ -528,7 +528,7 @@ export async function swapStagedPackageInstall(
             previousRoot,
             backupRoot,
             // Rollback snapshots remain recovery evidence even after successful restoration.
-            databaseBackupRoot: rollbackResult ? undefined : databaseBackupRoot,
+            databaseBackupRoot: rollbackResult ? undefined : transaction.databaseBackupRoot,
             retireLegacyBackups: rollbackResult ? undefined : retireLegacyBackups,
             launchers,
             packageBackedUp,
@@ -538,7 +538,8 @@ export async function swapStagedPackageInstall(
           });
           return await retirement;
         },
-      });
+      };
+      await params.onTransaction(transaction);
     }
     const restorePackage = async (assertCurrent: () => void) => {
       if (!native && hadPackage) {

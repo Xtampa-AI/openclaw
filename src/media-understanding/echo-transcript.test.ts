@@ -25,7 +25,7 @@ vi.mock("../utils/message-channel.js", () => ({
     channel === "voicechat" || channel === "telegram",
 }));
 
-import { DEFAULT_ECHO_TRANSCRIPT_FORMAT, sendTranscriptEcho } from "./echo-transcript.js";
+import { sendTranscriptEcho } from "./echo-transcript.js";
 
 const EMPTY_CONFIG = {} as OpenClawConfig;
 
@@ -45,46 +45,6 @@ describe("sendTranscriptEcho", () => {
       status: "sent",
       results: [{ channel: "voicechat", messageId: "echo-1" }],
       receipt: { platformMessageIds: ["echo-1"], parts: [], sentAt: 1 },
-    });
-  });
-
-  it("sends the default formatted transcript to the resolved origin", async () => {
-    await sendTranscriptEcho({
-      ctx: createCtx(),
-      cfg: EMPTY_CONFIG,
-      transcript: "hello world",
-    });
-
-    expect(mockDeliverOutboundPayloads).toHaveBeenCalledOnce();
-    expect(mockDeliverOutboundPayloads).toHaveBeenCalledWith({
-      cfg: EMPTY_CONFIG,
-      channel: "voicechat",
-      to: "+10000000001",
-      accountId: "acc1",
-      threadId: undefined,
-      payloads: [{ text: DEFAULT_ECHO_TRANSCRIPT_FORMAT.replace("{transcript}", "hello world") }],
-      bestEffort: true,
-      durability: "best_effort",
-    });
-  });
-
-  it("uses a custom format when provided", async () => {
-    await sendTranscriptEcho({
-      ctx: createCtx(),
-      cfg: EMPTY_CONFIG,
-      transcript: "custom message",
-      format: "🎙️ Heard: {transcript}",
-    });
-
-    expect(mockDeliverOutboundPayloads).toHaveBeenCalledWith({
-      cfg: EMPTY_CONFIG,
-      channel: "voicechat",
-      to: "+10000000001",
-      accountId: "acc1",
-      threadId: undefined,
-      payloads: [{ text: "🎙️ Heard: custom message" }],
-      bestEffort: true,
-      durability: "best_effort",
     });
   });
 
@@ -122,31 +82,62 @@ describe("sendTranscriptEcho", () => {
     expect(mockDeliverOutboundPayloads).not.toHaveBeenCalled();
   });
 
-  it("forwards Telegram account and thread metadata to outbound delivery", async () => {
+  it("requires durable ownership for complete Telegram source identities", async () => {
     await sendTranscriptEcho({
       ctx: createCtx({
         Provider: "telegram",
-        From: undefined,
-        OriginatingTo: "telegram:42",
-        AccountId: "primary",
-        MessageThreadId: 77,
+        OriginatingTo: "telegram:group:-123:topic:7",
+        MessageSid: "42",
       }),
       cfg: EMPTY_CONFIG,
-      transcript: "threaded voice note",
+      transcript: "same body",
     });
+    expect(mockDeliverOutboundPayloads).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bestEffort: false,
+        durability: "required",
+        deliveryIntentId: expect.stringMatching(/^transcript-echo:v1:[a-f0-9]{64}$/),
+        completionRetention: {
+          idPrefix: "transcript-echo:v1:",
+          maxAgeMs: 86_400_000,
+          maxEntries: 2_000,
+        },
+      }),
+    );
+  });
 
-    expect(mockDeliverOutboundPayloads).toHaveBeenCalledWith({
+  it.each([
+    { AccountId: undefined },
+    { MessageSid: undefined },
+    { OriginatingTo: "telegram:bad chat" },
+  ])("keeps incomplete Telegram identities best effort: %j", async (overrides) => {
+    await sendTranscriptEcho({
+      ctx: createCtx({
+        Provider: "telegram",
+        OriginatingTo: "telegram:-123",
+        MessageSid: "42",
+        ...overrides,
+      }),
       cfg: EMPTY_CONFIG,
-      channel: "telegram",
-      to: "telegram:42",
-      accountId: "primary",
-      threadId: 77,
-      payloads: [
-        { text: DEFAULT_ECHO_TRANSCRIPT_FORMAT.replace("{transcript}", "threaded voice note") },
-      ],
+      transcript: "same body",
+    });
+    expect(mockDeliverOutboundPayloads).toHaveBeenCalledWith(
+      expect.objectContaining({ bestEffort: true, durability: "best_effort" }),
+    );
+    expect(mockDeliverOutboundPayloads.mock.calls[0]?.[0]).not.toHaveProperty("deliveryIntentId");
+  });
+
+  it("does not deduplicate other providers using Telegram source identity rules", async () => {
+    await sendTranscriptEcho({
+      ctx: createCtx({ MessageSid: "42" }),
+      cfg: EMPTY_CONFIG,
+      transcript: "same body",
+    });
+    expect(mockDeliverOutboundPayloads.mock.calls[0]?.[0]).toMatchObject({
       bestEffort: true,
       durability: "best_effort",
     });
+    expect(mockDeliverOutboundPayloads.mock.calls[0]?.[0]).not.toHaveProperty("deliveryIntentId");
   });
 
   it("swallows delivery failures", async () => {

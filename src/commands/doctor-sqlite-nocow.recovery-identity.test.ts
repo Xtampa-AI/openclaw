@@ -26,15 +26,12 @@ vi.mock("../infra/sqlite-wal-filesystem.js", async (importOriginal) => ({
   setSqliteDirectoryNoCow: vi.fn(),
 }));
 // Supply only the later-update gate; backup, rewrite, and retirement use their real owners.
-vi.mock("../infra/update-run-reader.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../infra/update-run-reader.js")>()),
-  listUpdateRuns: () => [
-    {
-      status: "succeeded",
-      finishedAtMs: Date.now() + 86_400_000,
-      createdAtMs: Date.now() + 86_400_000,
-    },
-  ],
+vi.mock("./update-capture-cleanup.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./update-capture-cleanup.js")>()),
+  readCompletedUpdateHistory: () => ({
+    runs: [],
+    latestCompletedStartedAt: Date.now() + 86_400_000,
+  }),
 }));
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);

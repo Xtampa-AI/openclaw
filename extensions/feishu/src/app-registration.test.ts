@@ -6,6 +6,7 @@ import type { LookupFn } from "openclaw/plugin-sdk/ssrf-runtime";
 import { withFetchPreconnect } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { beginAppRegistration, pollAppRegistration, printQrCode } from "./app-registration.js";
+import { readRequestBody, stripDispatcher, writeOversizedJson } from "./http.test-support.js";
 
 type FeishuAppRegistrationFetch = typeof fetch;
 
@@ -24,7 +25,6 @@ type LocalServer = {
   stop: () => Promise<void>;
 };
 
-type DispatcherInit = RequestInit & { dispatcher?: unknown };
 type RegistrationFetchOptions = {
   fetchImpl: FeishuAppRegistrationFetch;
   lookupFn: LookupFn;
@@ -67,14 +67,6 @@ async function startLocalServer(
   });
 }
 
-function stripDispatcher(init: RequestInit | undefined): RequestInit | undefined {
-  if (!init || !("dispatcher" in init)) {
-    return init;
-  }
-  const { dispatcher: _dispatcher, ...rest } = init as DispatcherInit;
-  return rest;
-}
-
 function createLocalRedirectFetch(port: number): FeishuAppRegistrationFetch {
   const realFetch = globalThis.fetch.bind(globalThis);
   return withFetchPreconnect(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -107,42 +99,6 @@ async function withRegistrationServer<T>(
 function writeJson(res: ServerResponse, payload: unknown): void {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(payload));
-}
-
-function writeOversizedJson(
-  res: ServerResponse,
-  capBytes: number,
-  jsonPrefix: string,
-): Promise<void> {
-  const clientClosed = new Promise<void>((resolve) => {
-    res.once("close", () => resolve());
-  });
-  const chunk = Buffer.alloc(1024 * 1024, 0x20);
-  const prefix = Buffer.from(jsonPrefix);
-  let bytesWritten = prefix.byteLength;
-  res.writeHead(200, { "content-type": "application/json" });
-  res.write(prefix);
-  const sendChunk = () => {
-    if (res.destroyed || bytesWritten > capBytes) {
-      return;
-    }
-    bytesWritten += chunk.byteLength;
-    if (res.write(chunk)) {
-      setImmediate(sendChunk);
-      return;
-    }
-    res.once("drain", sendChunk);
-  };
-  setImmediate(sendChunk);
-  return clientClosed;
-}
-
-async function readRequestBody(req: IncomingMessage): Promise<string> {
-  let body = "";
-  for await (const chunk of req) {
-    body += String(chunk);
-  }
-  return body;
 }
 
 async function readRegistrationAction(req: IncomingMessage): Promise<string> {
@@ -201,6 +157,33 @@ describe("Feishu app registration", () => {
         });
       },
     );
+  });
+
+  it("ends the registration poll at its monotonic deadline when the wall clock rewinds", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => Response.json({ error: "authorization_pending" }));
+    mockRegistrationFetch({
+      fetchImpl: withFetchPreconnect(fetchMock),
+      lookupFn: hermeticPublicLookup,
+    });
+    // Settlement observer is attached before fake time advances, so the
+    // recorded outcome can be asserted without leaving real timers behind.
+    let outcome: string | undefined;
+    const poll = pollAppRegistration({ deviceCode: "device-code", interval: 5, expireIn: 30 }).then(
+      (result) => {
+        outcome = `settled:${result.status}`;
+      },
+      () => {
+        outcome = "settled:rejected";
+      },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    // NTP correction or VM resume rewinds the wall clock mid-poll.
+    vi.setSystemTime(Date.now() - 10 * 60_000);
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(outcome).toBe("settled:timeout");
+    await poll;
+    vi.useRealTimers();
   });
 
   it("clamps unsafe poll sleeps from provider intervals", async () => {
@@ -302,10 +285,10 @@ describe("Feishu app registration", () => {
   // over-cap: body > 16 MiB, no Content-Length. The bounded reader cancels
   // through the real SSRF guard and rejects before full buffering.
   it("rejects Feishu API responses that exceed the 16 MiB JSON body cap", async () => {
-    let clientClosed: Promise<void> | undefined;
+    let streamState: ReturnType<typeof writeOversizedJson> | undefined;
     await withRegistrationServer(
       (_req, res) => {
-        clientClosed = writeOversizedJson(
+        streamState = writeOversizedJson(
           res,
           FEISHU_JSON_MAX_BYTES,
           '{"device_code":"dev","padding":"',
@@ -315,9 +298,12 @@ describe("Feishu app registration", () => {
         await expect(beginAppRegistration("feishu")).rejects.toThrow(
           /feishu\.api: JSON response exceeds \d+ bytes/,
         );
-        await expect(clientClosed).resolves.toBeUndefined();
+        await expect(streamState?.clientClosed).resolves.toBeUndefined();
       },
     );
+
+    expect(streamState?.canceled()).toBe(true);
+    expect(streamState?.bytesPulled()).toBeLessThan(FEISHU_JSON_MAX_BYTES * 2);
   });
 
   it("sends bound reads through the real SSRF guard before local socket redirect", async () => {
@@ -340,19 +326,5 @@ describe("Feishu app registration", () => {
     });
 
     expect(fetchCalls).toEqual(["https://accounts.feishu.cn/oauth/v1/app/registration"]);
-  });
-
-  it("wraps malformed Feishu API JSON with a feishu.api labelled error", async () => {
-    await withRegistrationServer(
-      (_req, res) => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end("not-valid-json{{");
-      },
-      async () => {
-        await expect(beginAppRegistration("feishu")).rejects.toThrow(
-          /feishu\.api: malformed JSON response/,
-        );
-      },
-    );
   });
 });

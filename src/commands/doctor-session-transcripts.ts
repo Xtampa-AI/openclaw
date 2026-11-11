@@ -24,6 +24,7 @@ import type {
   PreparedPostSessionPluginMigration,
 } from "../infra/state-migrations.types.js";
 import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.js";
+import { repairLegacyDashboardChatTypes } from "./doctor-session-dashboard-chat-type.js";
 import {
   repairCanonicalSessionDeliveryStates,
   repairLegacySessionEntryStates,
@@ -250,6 +251,7 @@ export async function noteSessionTranscriptHealth(options?: {
     const reservedKeyReport = await repairReservedIncognitoSessionKeys(rowRepairParams);
     const deliveryReport = repairCanonicalSessionDeliveryStates(rowRepairParams);
     repairLegacySessionExecPolicy(rowRepairParams);
+    repairLegacyDashboardChatTypes(rowRepairParams);
     const acpKeyReport = await repairAcpSessionMetaKeysForDoctor({
       ...rowRepairParams,
       authority: maintenanceAuthority,
@@ -392,8 +394,8 @@ export async function noteSessionTranscriptHealth(options?: {
   if (worktreeWorkspaceReport.found > 0) {
     note(
       params.shouldRepair
-        ? `- Repaired canonical workspace metadata for ${worktreeWorkspaceReport.repaired} of ${worktreeWorkspaceReport.found} managed-worktree session(s). Check project/worktree ownership for any remaining entries.`
-        : `- Found ${worktreeWorkspaceReport.found} managed-worktree session(s) missing canonical workspace metadata. Run "openclaw doctor --fix" to repair them.`,
+        ? `- Repaired saved workspace metadata for ${worktreeWorkspaceReport.repaired} of ${worktreeWorkspaceReport.found} managed-worktree session(s). Check project/worktree ownership for any remaining entries.`
+        : `- Found ${worktreeWorkspaceReport.found} managed-worktree session(s) missing saved workspace metadata. Run "openclaw doctor --fix" to repair them.`,
       "Session worktrees",
     );
   }
@@ -433,7 +435,7 @@ export async function noteSessionTranscriptHealth(options?: {
     note(
       params.shouldRepair
         ? `- Canonicalized ${canonicalKeyReport.repairedGroups} session-key group(s) in ${canonicalKeyReport.repairBatches} transaction batch(es), removed ${canonicalKeyReport.removedRows} duplicate or alias row(s), and preserved cross-store history in ${canonicalKeyReport.archivedTranscriptDirectories.length} archive director${canonicalKeyReport.archivedTranscriptDirectories.length === 1 ? "y" : "ies"}.`
-        : `- Found ${canonicalKeyReport.foundGroups} non-canonical or duplicate session-key group(s). Run "openclaw doctor --fix" to preserve their history and canonicalize the rows.`,
+        : `- Found ${canonicalKeyReport.foundGroups} outdated or duplicate session-key group(s). Run "openclaw doctor --fix" to preserve their history and update the rows to use the current keys.`,
       "Session SQLite",
     );
   }

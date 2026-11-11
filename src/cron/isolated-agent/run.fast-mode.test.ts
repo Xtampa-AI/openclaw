@@ -93,14 +93,15 @@ describe("runCronIsolatedAgentTurn invocation ownership", () => {
     { schedule: "at", target: "isolated", eligible: false },
     { schedule: "at", target: "current", eligible: false },
     { schedule: "cron", target: "session:agent:default:main", eligible: false },
-  ])(
+  ] as const)(
     "accepts next_check only for an explicit one-shot continuation ($schedule, $target)",
     async ({ schedule, target, eligible }) => {
       mockRunCronFallbackPassthrough();
       let invocationRunId = "";
       runEmbeddedAgentMock.mockImplementationOnce(async (runParams) => {
         invocationRunId = runParams.runId;
-        const propose = () => recordCronNextCheckProposal(runParams.runId, "test-job", 60_000);
+        const propose = () =>
+          recordCronNextCheckProposal(runParams.runId, "message-tool-policy", 60_000);
         if (eligible) {
           propose();
         } else {
@@ -111,21 +112,25 @@ describe("runCronIsolatedAgentTurn invocation ownership", () => {
       const result = await runCronIsolatedAgentTurn(
         makeIsolatedAgentParamsFixture({
           job: makeIsolatedAgentJobFixture({
-            sessionTarget: target,
+            id: "message-tool-policy",
+            name: "Message Tool Policy",
             schedule:
               schedule === "at"
                 ? { kind: "at", at: "2026-07-27T12:00:00.000Z" }
                 : { kind: "cron", expr: "0 9 * * *", tz: "UTC" },
+            payload: { kind: "agentTurn", message: "send a message" },
             delivery: { mode: "none" },
+            sessionTarget: target,
           }),
-          ...(target.startsWith("session:") ? { sessionKey: target.slice(8) } : {}),
+          message: "send a message",
+          sessionKey: target.startsWith("session:") ? target.slice(8) : "cron:message-tool-policy",
         }),
       );
       expect(result.status, result.error).toBe("ok");
       expect(result.nextCheck).toEqual(eligible ? { delayMs: 60_000 } : undefined);
-      expect(() => recordCronNextCheckProposal(invocationRunId, "test-job", 60_000)).toThrow(
-        "cron next_check is only available to the currently running job",
-      );
+      expect(() =>
+        recordCronNextCheckProposal(invocationRunId, "message-tool-policy", 60_000),
+      ).toThrow("cron next_check is only available to the currently running job");
     },
   );
 

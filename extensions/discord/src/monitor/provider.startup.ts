@@ -82,7 +82,7 @@ export async function createDiscordMonitorClient(params: {
   const readyListener = new (class DiscordStatusReadyListener extends ReadyListener {
     async handle(_data: unknown, client: Client) {
       if (autoPresenceController?.enabled) {
-        autoPresenceController.refresh();
+        void autoPresenceController.refresh();
         return;
       }
       client.getPlugin("gateway")?.updatePresence(resolveDiscordPresenceUpdate(readyDiscordConfig));
@@ -114,28 +114,51 @@ export async function createDiscordMonitorClient(params: {
     }
   }
   const gateway = client.getPlugin("gateway");
-  await waitForDiscordGatewayPluginRegistration(gateway);
-  const gatewaySupervisor = createDiscordGatewaySupervisor({
-    ...params,
-    gateway,
-  });
-
-  if (gateway) {
-    autoPresenceController = createDiscordAutoPresenceController({
+  let gatewaySupervisor: ReturnType<typeof createDiscordGatewaySupervisor> | undefined;
+  try {
+    await waitForDiscordGatewayPluginRegistration(gateway);
+    gatewaySupervisor = createDiscordGatewaySupervisor({
       ...params,
       gateway,
-      log: (message) => params.runtime.log?.(message),
     });
-    autoPresenceController.start();
-  }
 
-  return {
-    client,
-    gateway,
-    gatewaySupervisor,
-    autoPresenceController,
-    eventQueueOpts,
-  };
+    if (gateway) {
+      autoPresenceController = createDiscordAutoPresenceController({
+        ...params,
+        gateway,
+        log: (message) => params.runtime.log?.(message),
+      });
+      void autoPresenceController.start();
+    }
+
+    return {
+      client,
+      gateway,
+      gatewaySupervisor,
+      autoPresenceController,
+      eventQueueOpts,
+    };
+  } catch (err) {
+    try {
+      gateway?.disconnect();
+    } catch (cleanupErr) {
+      params.runtime.error?.(
+        danger(
+          "discord: failed to disconnect gateway during startup cleanup: " + String(cleanupErr),
+        ),
+      );
+    }
+    try {
+      gatewaySupervisor?.dispose();
+    } catch (cleanupErr) {
+      params.runtime.error?.(
+        danger(
+          "discord: failed to dispose supervisor during startup cleanup: " + String(cleanupErr),
+        ),
+      );
+    }
+    throw err;
+  }
 }
 
 export async function fetchDiscordBotIdentity(params: {

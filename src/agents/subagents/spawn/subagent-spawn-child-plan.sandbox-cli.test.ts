@@ -6,9 +6,10 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getRuntimeConfig,
   clearConfigCache,
   clearRuntimeConfigSnapshot,
-  getRuntimeConfig,
+  captureRuntimeConfigAsyncReader,
 } from "../../../config/config.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { LegacyContextEngine } from "../../../context-engine/legacy.js";
@@ -21,21 +22,6 @@ import { resolveSubagentSpawnRequest } from "./subagent-spawn-request.js";
 import { testing as spawnTesting } from "./subagent-spawn.test-support.js";
 
 const fixture = installSpawnAuthorityFixture();
-
-async function configure(cfg: OpenClawConfig) {
-  await writeFile(path.join(fixture.stateDir, "openclaw.json"), JSON.stringify(cfg));
-  clearConfigCache();
-  clearRuntimeConfigSnapshot();
-}
-
-async function writeSession(sessionKey: string, defaultSessionId: string) {
-  return await writeSubagentSessionEntry({
-    stateDir: fixture.stateDir,
-    agentId: "main",
-    sessionKey,
-    defaultSessionId,
-  });
-}
 
 function useInProcessSpawns() {
   spawnTesting.setDepsForTest({
@@ -126,7 +112,10 @@ describe("subagent spawn sandbox-CLI admission", () => {
         },
       },
     };
-    await configure(cfg);
+    await writeFile(path.join(stateDir, "openclaw.json"), JSON.stringify(cfg));
+    clearConfigCache();
+    clearRuntimeConfigSnapshot();
+    await captureRuntimeConfigAsyncReader()();
   }
 
   async function planChildSpawn(params: {
@@ -138,7 +127,12 @@ describe("subagent spawn sandbox-CLI admission", () => {
       sandboxMode: params.sandboxMode,
       childModel: params.childModel,
     });
-    await writeSession(fixture.parentSessionKey, "sandbox-cli-requester");
+    await writeSubagentSessionEntry({
+      stateDir: fixture.stateDir,
+      agentId: "main",
+      sessionKey: fixture.parentSessionKey,
+      defaultSessionId: "sandbox-cli-requester",
+    });
     const request = { task: "delegated containment work", context: "isolated" as const };
     const ctx = { agentSessionKey: fixture.parentSessionKey };
     const preparation = await resolveSubagentSpawnRequest(request, ctx);
@@ -214,7 +208,12 @@ describe("subagent spawn sandbox-CLI admission", () => {
     useInProcessSpawns();
     await configureSpawnConfig({ visibleWorker: true });
     const controllerKey = "agent:main:dashboard:controller";
-    await writeSession(controllerKey, "controller-session");
+    await writeSubagentSessionEntry({
+      stateDir: fixture.stateDir,
+      agentId: "main",
+      sessionKey: controllerKey,
+      defaultSessionId: "controller-session",
+    });
     const callGateway = vi.fn(async () => {
       throw new Error("sessions.create must not run for a CLI-backed sandboxed child");
     });

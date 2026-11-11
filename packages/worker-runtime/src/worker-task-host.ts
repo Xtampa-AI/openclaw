@@ -1,4 +1,4 @@
-import type { WorkerOptions } from "node:worker_threads";
+import type { Transferable, WorkerOptions } from "node:worker_threads";
 import type { RetainedOperation } from "./retained-operation.js";
 import type { WorkerLifecycle, RetainedNativeWorker } from "./worker-lifecycle.js";
 import type { WorkerComputeCapacity } from "./worker-task-capacity.js";
@@ -32,9 +32,13 @@ export type WorkerTaskHost = {
   serviceNativeWorkers(workers: readonly RetainedNativeWorker[]): void;
   prepareResources(): Promise<unknown>;
   releaseTemporaryDirectory(directory: string): Promise<void>;
-  captureTaskContext(): unknown;
+  captureTaskContext(worker: WorkerLifecycle): unknown;
+  taskContextTransferList?(context: unknown): readonly Transferable[];
   createTaskObserver?(url: URL): (operation?: string) => WorkerTaskObservation;
+  /** Return only bounded, privacy-safe labels; never retain or serialize task input. */
+  describeTask?(url: URL, input: unknown): string;
   receiveMessage(worker: WorkerLifecycle, message: unknown): boolean;
+  observeResourceReply?(this: void): void;
   workerStarted(worker: WorkerLifecycle, pool: object): void;
   workerRetiring(worker: WorkerLifecycle, reason: WorkerRetirementReason): void;
   computeCapacity: WorkerComputeCapacity;

@@ -26,6 +26,8 @@ Related: [Browser tool](/tools/browser)
   `openclaw browser status --json` also works when the selected child command does not
   define its own `--json`.
 
+With --json, invalid tab indexes and local action-input refusals write one standard structured CLI error document to stdout (ok: false, error.type: "cli_error") and exit with status 1 before any browser action is sent. Without --json, the diagnostic remains on stderr.
+
 The CLI reserves 10 additional seconds beyond the request timeout for node and
 Gateway transport, allowing browser timeout diagnostics to reach the caller.
 
@@ -204,7 +206,7 @@ openclaw browser extension cdp --json
 - `extension pair` remains the advanced manual flow. `--gateway-url` creates a
   direct remote-Gateway pairing URL. Non-loopback URLs must use `wss://`.
 - `extension pair --local-gateway --json` lets desktop native helpers obtain
-  the canonical local pairing through the Gateway’s `/browser/extension` wake-up
+  the existing local pairing through the Gateway’s `/browser/extension` wake-up
   route. It requires a local Gateway configuration and cannot be combined with
   `--gateway-url`. The JSON contains a credential: consume it privately, never log it.
 - `extension cdp` prints non-secret Browser Relay Authentication v2 metadata:
@@ -360,6 +362,9 @@ If navigation or a closed page stops the batch, text output reports the action n
 `fill --fields-file`, `batch --actions-file`, and batch stdin require valid UTF-8.
 Malformed bytes are rejected before any browser action runs. Save the input as
 UTF-8 and retry; valid Unicode values, including emoji and CJK text, are preserved.
+
+`fill --fields-file` requires a regular file or a symlink to one. Pipes and other
+special files are rejected before dispatch. Fields files have no size cap.
 
 ## State and storage
 

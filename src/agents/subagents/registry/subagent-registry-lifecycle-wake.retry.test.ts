@@ -48,13 +48,16 @@ vi.mock("../completion/subagent-completion-admission.store.js", async (importOri
   blockSubagentCompletionDelivery: completionDeliveryMocks.blockSubagentCompletionDelivery,
   mutateRequesterCompletionBatch: completionDeliveryMocks.mutateRequesterCompletionBatch,
 }));
+// mock-isolation: Retry policy does not own a process-wide MCP runtime.
 vi.mock("../../agent-bundle-mcp-tools.js", () => ({
-  retireSessionMcpRuntimeForSessionKey: vi.fn(),
+  retireSessionMcpRuntime: vi.fn(),
 }));
 vi.mock("../../internal-session-effects.js", () => ({
   removeInternalSessionEffectsSession: vi.fn(),
 }));
+// mock-isolation: Retry policy does not own requester cron or follow-up authority state.
 vi.mock("../requester-cron-authority.js", () => ({
+  retireRequesterFollowupAuthority: vi.fn(),
   revokeRequesterCronAuthorityBatch: vi.fn(),
 }));
 vi.mock("../../../runtime.js", () => ({ defaultRuntime: { log: vi.fn() } }));

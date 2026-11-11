@@ -10,7 +10,9 @@ import {
   createDeferred,
   withinTest,
 } from "../../test/helpers/promise.js";
+import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { resetConfigRuntimeState } from "../config/runtime-snapshot.js";
+import { writeGatewayRestartHandoff } from "../infra/restart-handoff.js";
 import { readLoggingConfig } from "../logging/config.js";
 import { resetLogger } from "../logging/logger.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -27,6 +29,24 @@ import { getFreePort } from "../test-utils/ports.js";
 // surfacing on unrelated UI PRs.
 const BOOT_BUDGET_MS = 90_000;
 
+async function readTimelineAtReady(port: number, timelinePath: string): Promise<string> {
+  const deadline = Date.now() + BOOT_BUDGET_MS;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/readyz`);
+      if (response.ok) {
+        return await fs.readFile(timelinePath, "utf8");
+      }
+    } catch {
+      // The HTTP listener comes up before the readiness boundary.
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+  throw new Error("Gateway did not become ready within the minimal boot budget");
+}
+
 afterEach(() => {
   resetLogger();
   vi.unstubAllEnvs();
@@ -42,6 +62,7 @@ describe("gateway minimal boot smoke", () => {
       label: "gateway-bootstrap-ambient-default",
       layout: "home",
       env: {
+        OPENCLAW_GATEWAY_RESTART_TRACE: "0",
         OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
         OPENCLAW_SKIP_CANVAS_HOST: "1",
         OPENCLAW_SKIP_CHANNELS: "1",
@@ -61,6 +82,14 @@ describe("gateway minimal boot smoke", () => {
     state.applyEnv();
 
     try {
+      await expect(
+        writeGatewayRestartHandoff({
+          env: state.env,
+          reason: "gateway.restart",
+          restartKind: "full-process",
+          supervisorMode: "launchd",
+        }),
+      ).resolves.toMatchObject({ source: "operator-restart", supervisorMode: "launchd" });
       const [{ prepareGatewayServerBootstrap }, subagents, pluginContext] = await Promise.all([
         import("./server-startup-bootstrap.js"),
         import("../agents/subagents/registry/subagent-registry.js"),
@@ -83,6 +112,7 @@ describe("gateway minimal boot smoke", () => {
           return publishPluginContext(...args);
         });
       const log = createSubsystemLogger("gateway/bootstrap-test");
+      const sql = observeHostDataSql();
       const pendingBootstrap = prepareGatewayServerBootstrap({
         port,
         opts: {
@@ -111,6 +141,9 @@ describe("gateway minimal boot smoke", () => {
         const bootstrap = await withinTest(pendingBootstrap, signal);
         expect(publish).toHaveBeenCalled();
         expect(bootstrap.ambientEnvTriggers).toBe("suppress");
+        expect(
+          sql.queries.filter((query) => /\bfrom\s+"?gateway_restart_handoff\b/iu.test(query)),
+        ).toEqual([]);
         vi.stubEnv(
           "OPENCLAW_CONFIG_PATH",
           `/tmp/openclaw-bootstrap-missing-${process.pid}-${Date.now()}.json`,
@@ -119,6 +152,7 @@ describe("gateway minimal boot smoke", () => {
       } finally {
         releaseRecovery.resolve();
         await pendingBootstrap.catch(() => {});
+        sql.restore();
         init.mockRestore();
         publish.mockRestore();
       }
@@ -165,23 +199,38 @@ describe("gateway minimal boot smoke", () => {
         let snapshotVersion = getSkillsSnapshotVersion();
         for (const startup of [1, 2]) {
           await fs.writeFile(timelinePath, "");
-          const server = await startGatewayServer(port, {
+          const pendingServer = startGatewayServer(port, {
             auth: { mode: "token", token },
             bind: "loopback",
             controlUiEnabled: false,
-            sidecarStartup: "defer",
+            sidecarStartup: "start",
           });
+          const timelineAtReadiness = readTimelineAtReady(port, timelinePath);
+          const server = await pendingServer;
           try {
+            const readinessEvents = (await timelineAtReadiness)
+              .trim()
+              .split("\n")
+              .map((line) => JSON.parse(line) as Record<string, unknown>);
+            expect(
+              readinessEvents.findIndex(
+                (event) =>
+                  event.type === "span.end" &&
+                  (event.attributes as { traceName?: string } | undefined)?.traceName ===
+                    "runtime.post-attach",
+              ),
+            ).toBeGreaterThan(-1);
             const nextVersion = getSkillsSnapshotVersion();
             expect(
               nextVersion,
               `startup ${startup} must invalidate restored skills`,
             ).toBeGreaterThan(snapshotVersion);
             snapshotVersion = nextVersion;
-            const startupMeasures = (await fs.readFile(timelinePath, "utf8"))
+            const startupEvents = (await fs.readFile(timelinePath, "utf8"))
               .trim()
               .split("\n")
-              .map((line) => JSON.parse(line) as Record<string, unknown>)
+              .map((line) => JSON.parse(line) as Record<string, unknown>);
+            const startupMeasures = startupEvents
               .filter((event) => event.type === "span.start" && event.phase === "startup")
               .map((event) => {
                 const attributes = event.attributes as { traceName?: string } | undefined;
@@ -191,6 +240,25 @@ describe("gateway minimal boot smoke", () => {
             expect(startupMeasures.indexOf("runtime.early")).toBeGreaterThan(
               startupMeasures.indexOf("http.listen"),
             );
+            const requestProjectionEnd = startupEvents.findIndex(
+              (event) => event.type === "span.end" && event.name === "sessions.projection",
+            );
+            const postAttachEnd = startupEvents.findIndex(
+              (event) =>
+                event.type === "span.end" &&
+                (event.attributes as { traceName?: string } | undefined)?.traceName ===
+                  "runtime.post-attach",
+            );
+            const readyMark = startupEvents.findIndex(
+              (event) =>
+                event.type === "mark" &&
+                event.phase === "startup" &&
+                event.name === "gateway.ready",
+            );
+            expect(requestProjectionEnd).toBeGreaterThan(-1);
+            expect(postAttachEnd).toBeGreaterThan(-1);
+            expect(readyMark).toBeGreaterThan(requestProjectionEnd);
+            expect(readyMark).toBeGreaterThan(postAttachEnd);
           } finally {
             await server.close({ reason: "minimal boot smoke complete" });
           }

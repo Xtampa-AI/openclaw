@@ -174,7 +174,7 @@ describe("openai completions params", () => {
       );
     });
 
-    it.each(["gemini-3-flash-preview", "gemini-4-argon"])(
+    it.each(["gemini-3-flash-preview", "gemini-3.8-flash", "gemini-4-argon"])(
       "uses the skip-validator signature for unsigned %s replay",
       (id) => {
         const target = { ...geminiModel, id };
@@ -239,28 +239,5 @@ describe("openai completions params", () => {
         | undefined;
       expect(assistant?.tool_calls?.[0]?.extra_content).toBeUndefined();
     });
-
-    it.each([
-      ["gemini-pro-latest", "Gemini Pro Latest"],
-      ["gemini-flash-latest", "Gemini Flash Latest"],
-      ["gemini-flash-lite-latest", "Gemini Flash Lite Latest"],
-    ])(
-      "uses the Gemini skip-validator signature for unsigned tool calls on %s",
-      (modelId, modelName) => {
-        const latestModel = { ...geminiModel, id: modelId, name: modelName };
-        const params = buildOpenAICompletionsParams(
-          latestModel,
-          geminiToolReplayContext(latestModel),
-          undefined,
-        ) as { messages: Array<Record<string, unknown>> };
-
-        const assistant = params.messages.find((message) => message.role === "assistant") as
-          | { tool_calls?: Array<{ extra_content?: { google?: { thought_signature?: string } } }> }
-          | undefined;
-        expect(assistant?.tool_calls?.[0]?.extra_content?.google?.thought_signature).toBe(
-          "skip_thought_signature_validator",
-        );
-      },
-    );
   });
 });

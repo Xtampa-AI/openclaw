@@ -1,5 +1,9 @@
 // Memory Host SDK module owns derived FTS schema and rebuild behavior.
 import type { DatabaseSync } from "node:sqlite";
+import {
+  buildSqliteMemoryBodyFtsSchema,
+  buildSqliteMemoryPathFtsSchema,
+} from "./openclaw-runtime-sqlite.js";
 
 export const MEMORY_INDEX_SOURCES_TABLE = "memory_index_sources";
 export const MEMORY_INDEX_CHUNKS_TABLE = "memory_index_chunks";
@@ -180,39 +184,31 @@ export function rebuildMemoryChunkFts(db: DatabaseSync, ftsTable: string): void 
   `);
 }
 
-function buildMemoryChunkFtsSchemaSql(ftsTable: string, tokenizeClause: string): string {
-  return (
-    `CREATE VIRTUAL TABLE IF NOT EXISTS ${ftsTable} USING fts5(\n` +
-    `  text,\n` +
-    `  id UNINDEXED,\n` +
-    `  path UNINDEXED,\n` +
-    `  source UNINDEXED,\n` +
-    `  model UNINDEXED,\n` +
-    `  start_line UNINDEXED,\n` +
-    `  end_line UNINDEXED\n` +
-    `${tokenizeClause});`
-  );
+export function reconcileMemoryChunkFtsRows(
+  db: DatabaseSync,
+  ftsTable: string,
+  force = false,
+): void {
+  const rowCounts = db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM ${MEMORY_INDEX_CHUNKS_TABLE}) AS canonical_count,
+         (SELECT COUNT(*) FROM ${ftsTable}) AS derived_count`,
+    )
+    // SAFETY: both scalar aggregate subqueries always return their named numeric columns.
+    .get() as { canonical_count: number; derived_count: number };
+  if (force || rowCounts.canonical_count !== rowCounts.derived_count) {
+    rebuildMemoryChunkFts(db, ftsTable);
+  }
 }
 
-function buildMemoryPathFtsSchemaSql(tokenizeClause: string): string {
-  return `CREATE VIRTUAL TABLE IF NOT EXISTS ${MEMORY_INDEX_PATHS_FTS_TABLE} USING fts5(
-        path,
-        source UNINDEXED
-        ${tokenizeClause}
-      );`;
-}
-
-/** Canonical FTS definitions, including the deployed explicit unicode61 spellings. */
-export function getMemoryFtsSchemaSqlVariants(): string[] {
-  return [
-    "",
-    ", tokenize='unicode61'",
-    ', tokenize="unicode61"',
-    ", tokenize='trigram case_sensitive 0'",
-  ].flatMap((tokenizeClause) => [
-    buildMemoryChunkFtsSchemaSql(MEMORY_INDEX_FTS_TABLE, tokenizeClause),
-    buildMemoryPathFtsSchemaSql(tokenizeClause),
-  ]);
+export function backfillMemoryPathFtsRows(db: DatabaseSync): void {
+  db.exec(`
+    INSERT INTO ${MEMORY_INDEX_PATHS_FTS_TABLE} (rowid, path, source)
+    SELECT id, path, source
+    FROM ${MEMORY_INDEX_SOURCES_TABLE}
+    WHERE NOT EXISTS (SELECT 1 FROM ${MEMORY_INDEX_PATHS_FTS_TABLE} LIMIT 1);
+  `);
 }
 
 /** Reconcile and backfill the derived body index in one atomic savepoint. */
@@ -235,15 +231,12 @@ export function ensureMemoryChunkFtsSchema(params: {
       expectedColumns: ["text", "id", "path", "source", "model", "start_line", "end_line"],
       tokenizeClause: params.tokenizeClause,
     });
-    params.db.exec(buildMemoryChunkFtsSchemaSql(params.ftsTable, params.tokenizeClause));
-    const rowCounts = params.db
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM ${MEMORY_INDEX_CHUNKS_TABLE}) AS canonical_count,
-           (SELECT COUNT(*) FROM ${params.ftsTable}) AS derived_count`,
-      )
-      // SAFETY: both scalar aggregate subqueries always return their named numeric columns.
-      .get() as { canonical_count: number; derived_count: number };
+    params.db.exec(
+      buildSqliteMemoryBodyFtsSchema({
+        tableName: params.ftsTable,
+        tokenizeClause: params.tokenizeClause,
+      }),
+    );
     // FTS is fully derived. A cardinality mismatch proves that an ordinary
     // schema ensure cannot leave the populated index untouched.
     const canonical = params.ftsTable === MEMORY_INDEX_FTS_TABLE;
@@ -256,9 +249,7 @@ export function ensureMemoryChunkFtsSchema(params: {
       );
     // Pre-rowid indexes can have matching counts but unrelated FTS identities.
     // Installing their maintenance contract owns the one-time identity rebuild.
-    if (!hasRowidMaintenance || rowCounts.canonical_count !== rowCounts.derived_count) {
-      rebuildMemoryChunkFts(params.db, params.ftsTable);
-    }
+    reconcileMemoryChunkFtsRows(params.db, params.ftsTable, !hasRowidMaintenance);
     if (canonical) {
       ensureMemoryChunkFtsTriggers(params.db);
     }
@@ -314,15 +305,10 @@ export function ensureMemoryPathFtsSchema(params: {
       expectedColumns: ["path", "source"],
       tokenizeClause: params.tokenizeClause,
     });
-    params.db.exec(`
-      ${buildMemoryPathFtsSchemaSql(params.tokenizeClause)}
-      -- The initial copy and trigger installation share this savepoint. Once
-      -- populated, the triggers own completeness; per-row FTS probes are too costly.
-      INSERT INTO ${MEMORY_INDEX_PATHS_FTS_TABLE} (rowid, path, source)
-      SELECT id, path, source
-      FROM ${MEMORY_INDEX_SOURCES_TABLE}
-      WHERE NOT EXISTS (SELECT 1 FROM ${MEMORY_INDEX_PATHS_FTS_TABLE} LIMIT 1);
-    `);
+    params.db.exec(buildSqliteMemoryPathFtsSchema({ tokenizeClause: params.tokenizeClause }));
+    // The initial copy and trigger installation share this savepoint. Once
+    // populated, the triggers own completeness; per-row FTS probes are too costly.
+    backfillMemoryPathFtsRows(params.db);
     ensureMemoryPathFtsTriggers(params.db);
     params.db.exec("RELEASE ensure_memory_index_paths_fts");
   } catch (err) {

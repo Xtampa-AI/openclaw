@@ -34,7 +34,7 @@ export function sendFailure(
   });
 }
 
-function sendReplyResult(
+export function sendReplyResult(
   receipt: { runId: string; sessionKey: string; watched?: boolean },
   result: { replyText?: string; replyTruncated?: true; sourceReplyDelivered?: boolean },
 ) {
@@ -76,30 +76,8 @@ export async function resolveSessionsSendReply(
     return { replyText };
   }
   const stored = await readLatestAssistantReply(params).catch(() => undefined);
-  const snapshot = stored === undefined ? undefined : sanitizeAgentRunTerminalReplyText(stored);
-  return snapshot && snapshot === replyText
-    ? { replyText: stored }
-    : { replyText, replyTruncated: true };
-}
-
-/** Settle a terminal inline wait: report its failure, or recover and return its reply. */
-export async function settleSessionsSendReply(
-  receipt: { runId: string; sessionKey: string; watched?: boolean },
-  result: AgentWaitResult & { replyText?: string },
-  read: Parameters<typeof readLatestAssistantReply>[0],
-) {
-  if (result.status === "timeout" || result.status === "error") {
-    const { runId, sessionKey, ...watchField } = receipt;
-    return jsonResult({
-      runId,
-      status: result.status,
-      error: result.error ?? (result.status === "timeout" ? "agent run timed out" : "agent error"),
-      sentBeforeError: true,
-      sessionKey,
-      ...watchField,
-    });
-  }
-  return sendReplyResult(receipt, { ...result, ...(await resolveSessionsSendReply(result, read)) });
+  const bounded = stored === undefined ? undefined : sanitizeAgentRunTerminalReplyText(stored);
+  return bounded === replyText ? { replyText: stored } : { replyText, replyTruncated: true };
 }
 
 export function resolveSessionDeliveryTargetFromKey(

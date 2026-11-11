@@ -12,7 +12,7 @@ import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { createAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
-import { persistAuthProfileBatch } from "../auth-profiles/upsert-with-lock.js";
+import * as authProfileRuntime from "../auth-profiles/store-runtime.js";
 import * as modelResolution from "../embedded-agent-runner/model.js";
 import * as modelAuth from "../model-auth.js";
 import { prepareOperatorModelPolicy } from "../operator-model-policy.js";
@@ -51,6 +51,13 @@ beforeEach(() => {
   agentDir = tempDirs.make("openclaw-pdf-");
   resetPdfToolAuthEnv();
   completeMock.mockReset();
+  // PDF orchestration uses synthetic credentials; both async readers share that empty store.
+  const authStore = { version: 1, profiles: {} };
+  vi.spyOn(authProfileRuntime, "ensureAuthProfileStoreAsync").mockResolvedValue(authStore);
+  vi.spyOn(
+    authProfileRuntime,
+    "ensureAuthProfileStoreWithoutExternalProfilesAsync",
+  ).mockResolvedValue(authStore);
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -342,22 +349,23 @@ it.each(["bedrock-converse-stream", "openai-completions"])(
 
 it("reports omitted images for a text-only model and supplies Codex instructions", async () => {
   // Codex is the subscription route: a ChatGPT catalog row with only an API key is
-  // stale and resolves to the Platform contract (#181356), so the fixture holds the OAuth login.
-  await persistAuthProfileBatch({
-    agentDir,
-    profiles: [
-      {
-        profileId: "openai:default",
-        credential: {
-          type: "oauth",
-          provider: "openai",
-          access: "test-access",
-          refresh: "test-refresh",
-          expires: 4_102_444_800_000,
-        },
+  // stale and resolves to the Platform contract, so the fixture holds the OAuth login.
+  const codexLogin = {
+    version: 1,
+    profiles: {
+      "openai:default": {
+        provider: "openai",
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: 4_102_444_800_000,
       },
-    ],
-  });
+    },
+  };
+  vi.mocked(authProfileRuntime.ensureAuthProfileStoreAsync).mockResolvedValue(codexLogin);
+  vi.mocked(
+    authProfileRuntime.ensureAuthProfileStoreWithoutExternalProfilesAsync,
+  ).mockResolvedValue(codexLogin);
   const { pdf, extract } = await extraction("openai-chatgpt-responses", pdfConfig(FALLBACK));
   vi.mocked(modelAuth.getApiKeyForModelCore).mockResolvedValue({
     apiKey: "test-access",

@@ -1,14 +1,15 @@
 import { isExperimentalClawsEnabled } from "../claws/experimental.js";
 import { shouldDeferConfiguredPluginInstallRepair } from "../commands/doctor/shared/update-phase.js";
+import { runFinalConfigValidationHealth } from "./doctor-config-validation-findings.js";
 import { hasActiveGatewayExecCredential } from "./doctor-gateway-exec-credential.js";
 import { runCoreHealthFindingNote } from "./doctor-health-contribution-core.js";
 import {
   collectWriteConfigHealthFindings,
-  runFinalConfigValidationHealth,
   runWriteConfigHealth,
 } from "./doctor-health-contribution-runners.config.js";
 import {
   runBrowserHealth,
+  runBundleLspEnvHealth,
   runDevicePairingHealth,
   runGatewayDaemonHealth,
   runGatewayServicesHealth,
@@ -163,6 +164,10 @@ export function resolveFinalDoctorHealthContributions(params: {
       updateWork: { kind: "inspection", scope: "run" },
       run: runWebFetchProxyHealth,
     }),
+    createDoctorHealthContribution("doctor:bundle-lsp-env", "Bundle LSP environment", {
+      updateWork: { kind: "inspection", scope: "agent" },
+      run: runBundleLspEnvHealth,
+    }),
     createDoctorHealthContribution("doctor:github-projects", "GitHub projects", {
       updateWork: { kind: "standalone" },
       run: runGitHubProjectHealth,
@@ -180,6 +185,11 @@ export function resolveFinalDoctorHealthContributions(params: {
       updateWork: { kind: "inspection", scope: "run" },
       healthCheckIds: ["core/doctor/hooks-model"],
       run: runHooksModelHealth,
+    }),
+    createDoctorHealthContribution("doctor:legacy-output-cap", "Saved model output caps", {
+      updateWork: { kind: "inspection", scope: "run" },
+      healthCheckIds: ["core/doctor/legacy-output-cap"],
+      run: (ctx) => runCoreHealthFindingNote(ctx, "core/doctor/legacy-output-cap"),
     }),
     ...(
       [
@@ -238,7 +248,7 @@ export function resolveFinalDoctorHealthContributions(params: {
     createDoctorHealthContribution("doctor:workspace-alias", "Workspace alias", {
       healthChecks: {
         description:
-          "Persisted workspace aliases must resolve to the canonical target that owns their stored state.",
+          "Persisted workspace aliases must resolve to the resolved target that owns their stored state.",
         defaultEnabled: true,
         async detect(ctx) {
           const { collectRepointedWorkspaceAliasFindings } =

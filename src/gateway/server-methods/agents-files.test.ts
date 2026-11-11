@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { GatewayRequestError } from "../../../ui/src/api/gateway.ts";
 import {
@@ -13,6 +13,9 @@ import {
 } from "../../../ui/src/pages/agents/agent-file-state.test-helpers.ts";
 import {
   loadAgentFileContent,
+  overwriteAgentFile,
+  reloadAgentFile,
+  retainAgentFileDrafts,
   saveAgentFile,
   type AgentFilesState,
 } from "../../../ui/src/pages/agents/files.ts";
@@ -47,6 +50,7 @@ for (const storage of ["local", "remote"] as const) {
       let storageDir: string;
       let release: (() => void) | undefined;
       let remoteBridge: ReturnType<typeof createRemoteShellSandboxFsBridge> | undefined;
+      const broadcast = vi.fn();
 
       afterEach(() => {
         release?.();
@@ -54,6 +58,7 @@ for (const storage of ["local", "remote"] as const) {
       });
 
       beforeEach(() => {
+        broadcast.mockReset();
         workspace = fs.realpathSync(tempDirs.make("openclaw-agent-files-"));
         storageDir = workspace;
         remoteBridge = undefined;
@@ -86,6 +91,7 @@ for (const storage of ["local", "remote"] as const) {
           },
           context: {
             getRuntimeConfig: () => ({ agents: { defaults: { workspace } } }),
+            broadcast,
           } as never,
         });
         expect(calls).toHaveLength(1);
@@ -123,6 +129,42 @@ for (const storage of ["local", "remote"] as const) {
         },
       );
 
+      it.each([
+        { name: "IDENTITY.md", conflict: false },
+        { name: "AGENTS.md", conflict: false },
+        { name: "IDENTITY.md", conflict: true },
+      ])(
+        "publishes only committed identity writes ($name, conflict=$conflict)",
+        async ({ name, conflict }) => {
+          const original = "- Name: Before\n";
+          const replacement = "- Name: After\n";
+          fs.writeFileSync(path.join(storageDir, name), original);
+          let publishedContent: string | undefined;
+          broadcast.mockImplementation(() => {
+            publishedContent = fs.readFileSync(path.join(storageDir, name), "utf8");
+          });
+          const result = await invokeAgentFilesHandler("agents.files.set", {
+            agentId: "main",
+            name,
+            content: replacement,
+            expectedHash: hashContent(conflict ? "stale" : original),
+          });
+
+          expect(result.ok).toBe(!conflict);
+          expect(fs.readFileSync(path.join(storageDir, name), "utf8")).toBe(
+            conflict ? original : replacement,
+          );
+          if (name === "IDENTITY.md" && !conflict) {
+            expect(broadcast).toHaveBeenCalledExactlyOnceWith("agent.identity.changed", {
+              agentId: "main",
+            });
+            expect(publishedContent).toBe(replacement);
+          } else {
+            expect(broadcast).not.toHaveBeenCalled();
+          }
+        },
+      );
+
       function createFileEditor(): AgentFilesState {
         return {
           client: createTestGatewayClient(async (method, params) => {
@@ -150,6 +192,57 @@ for (const storage of ["local", "remote"] as const) {
           agentFileWriteRevisions: new Map(),
         };
       }
+
+      it.each(["existing", "missing", "matching draft"])(
+        "keeps a retained draft bound to its original workspace (%s)",
+        async (variant) => {
+          const name = "MEMORY.md";
+          const original = "original";
+          const edited = "operator draft";
+          if (variant !== "missing") {
+            fs.writeFileSync(path.join(storageDir, name), original);
+          }
+          const originalStorage = storageDir;
+          const editor = createFileEditor();
+          expect(await loadAgentFileContent(editor, "main", name)).toBe(true);
+          setAgentFileValues(editor, "draft", { [name]: edited });
+          const retained = expectDefined(
+            retainAgentFileDrafts({ ...editor, agentFileActive: name }),
+            "retained draft",
+          );
+          workspace = fs.realpathSync(tempDirs.make("openclaw-replacement-workspace-"));
+          storageDir = workspace;
+          const replacement = variant === "matching draft" ? edited : original;
+          if (variant !== "missing") {
+            fs.writeFileSync(path.join(storageDir, name), replacement);
+          }
+          editor.agentFileEditors = retained.editors;
+          expect(await loadAgentFileContent(editor, "main", name)).toBe(true);
+          expect(await saveAgentFile(editor, "main", name, edited)).toBe(false);
+          expect(editor.agentFileConflict).toBe(name);
+          expect(editor.agentFilesError).toContain("workspace changed");
+          expect(editor.agentFileEditors[name]?.draft).toBe(edited);
+          expect(retainAgentFileDrafts({ ...editor, agentFileActive: name })).not.toBeNull();
+          expect(
+            variant === "missing" ? fs.existsSync(path.join(storageDir, name)) : readMemory(),
+          ).toBe(variant === "missing" ? false : replacement);
+          if (variant === "missing") {
+            expect(await reloadAgentFile(editor, "main", name)).toBe(true);
+            expect(editor.agentFileEditors[name]?.draft).toBe("");
+            expect(fs.existsSync(path.join(storageDir, name))).toBe(false);
+          } else {
+            expect(await overwriteAgentFile(editor, "main", name, edited)).toBe(true);
+            expect(readMemory()).toBe(edited);
+          }
+          expect(editor.agentFileConflict).toBeNull();
+          expect(editor.agentFilesError).toBeNull();
+          expect(
+            variant === "missing"
+              ? fs.existsSync(path.join(originalStorage, name))
+              : fs.readFileSync(path.join(originalStorage, name), "utf8"),
+          ).toBe(variant === "missing" ? false : original);
+        },
+      );
 
       it("preserves the first creation when two editors loaded a missing document", async () => {
         const first = createFileEditor();

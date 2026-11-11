@@ -7,6 +7,7 @@ import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js"
 import * as tempRoot from "../../infra/tmp-openclaw-dir.js";
 import {
   captureManagedUpdateLeaseDatabaseIdentity,
+  prepareManagedHandoffLeaseDatabaseIdentity,
   createManagedHandoffLeaseDatabase,
 } from "../../infra/update-managed-service-handoff-database.js";
 import { createManagedHandoffLeaseStore } from "../../infra/update-managed-service-handoff-lease.js";
@@ -17,6 +18,24 @@ import {
 
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
+
+it.skipIf(process.platform === "win32")(
+  "rejects an aliased immediate lease directory before creating storage",
+  async () => {
+    const root = fs.realpathSync(dirs.make("identity-unsafe-alias-"));
+    const real = path.join(root, "real");
+    fs.mkdirSync(real, { mode: 0o700 });
+    const alias = path.join(root, "alias");
+    fs.symlinkSync(real, alias, "dir");
+    await expect(
+      prepareManagedHandoffLeaseDatabaseIdentity(
+        path.join(alias, "managed-update-handoffs.sqlite"),
+      ),
+    ).rejects.toThrow("managed handoff lease directory is unsafe");
+    expect(fs.readdirSync(real)).toEqual([]);
+    expect(fs.readlinkSync(alias)).toBe(real);
+  },
+);
 
 it.skipIf(process.platform === "win32")(
   "admits a legacy parent through an aliased lease path without changing its row",
@@ -71,5 +90,25 @@ it.skipIf(process.platform === "win32")(
     );
     expect(readRows()).toEqual([original]);
     expect(fence.assertCurrent).toThrow("no longer current");
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "captures the admitted canonical lease path instead of its caller alias",
+  async () => {
+    const root = fs.realpathSync(dirs.make("identity-alias-"));
+    const real = path.join(root, "real");
+    fs.mkdirSync(real, { mode: 0o700 });
+    const alias = path.join(root, "alias");
+    fs.symlinkSync(real, alias, "dir");
+    // An ancestor may be aliased, but the immediate lease directory must be real.
+    const directory = path.join(real, "private-tmp");
+    fs.mkdirSync(directory, { mode: 0o700 });
+    const canonical = path.join(directory, "managed-update-handoffs.sqlite");
+    const callerPath = path.join(alias, "private-tmp", "managed-update-handoffs.sqlite");
+    const identity = await prepareManagedHandoffLeaseDatabaseIdentity(callerPath);
+    expect(identity.databasePath).toBe(canonical);
+    expect(identity.databasePath).not.toBe(callerPath);
+    expect(identity).toEqual(captureManagedUpdateLeaseDatabaseIdentity(canonical));
   },
 );

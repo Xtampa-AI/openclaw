@@ -114,6 +114,29 @@ export function toPublicUpdateRun(record: UpdateRunRecord): PublicUpdateRunRecor
 export type UpdateRunPhase = UpdateRunRecord["phase"];
 export type UpdateRunStep = UpdateRunRecord["steps"][number];
 
+export type CreateUpdateRunInput = Partial<
+  Pick<UpdateRunRecord, "origin" | "target" | "before" | "after">
+> & {
+  runId?: string;
+  trigger: UpdateRunRecord["trigger"];
+  supersedeStaleIdentityless?: boolean;
+  /** Preview history must not repair canonical task data. */
+  preview?: boolean;
+  /** Record an already completed repair without publishing a transient running row. */
+  settlement?: { reason: string; detail: string };
+  /** Record an update its external supervisor accepted, from the time the update started. */
+  accepted?: { startedAtMs: number };
+};
+
+export type UpdateRunDiagnostics = Pick<
+  UpdateRunRecord["verification"],
+  "recovery" | "rollbackOutcome"
+> & {
+  verification?: Omit<UpdateRunRecord["verification"], "recovery" | "rollbackOutcome">;
+  steps?: UpdateStepResult[];
+  failure?: Pick<UpdateRunStep, "step" | "detail" | "failureFacts" | "exitCode">;
+};
+
 // Record recovery depends on legacy expiry for its reason; both use the leaf recovery-state type.
 export function isAbandonedUpdateRun(
   record: Pick<UpdateRunRecoveryState, "status" | "reason">,
@@ -141,6 +164,11 @@ export type FinishUpdateRunResult = {
   nextAction?: string;
   after?: UpdateRunRecord["after"];
   downtimeMs?: number;
+};
+
+export type FinishUpdateRunInput = FinishUpdateRunResult & {
+  before?: UpdateRunRecord["before"];
+  diagnostics?: UpdateRunDiagnostics;
 };
 
 export function finishUpdateRunRecord(

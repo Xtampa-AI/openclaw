@@ -21,7 +21,6 @@ import { createCommandResult } from "../../test-utils/npm-spec-install-test-help
 import { quoteCliArg, quotePowerShellArg } from "../quote-cli-arg.js";
 import { registerUpdateCli } from "../update-cli.js";
 import * as shared from "./shared.js";
-import { runtimeFixture } from "./update-command-fixtures.test-support.js";
 import { installFreshUpdateFixture, targetMetadata } from "./update-command-fresh.test-support.js";
 import * as packageDestination from "./update-command-package-destination.js";
 import * as packageUpdate from "./update-command-package.js";
@@ -34,7 +33,6 @@ import { updateCommand } from "./update-command.js";
 
 vi.mock("../../infra/container-environment.js", () => ({ isContainerEnvironment: () => false }));
 const { fixture } = installFreshUpdateFixture();
-const runtimeQuote = process.platform === "win32" ? quotePowerShellArg : quoteCliArg;
 
 it("keeps npm updates on the resolved installation when another npm prefix is occupied", async () => {
   vi.mocked(packageDestination.inspectNpmGlobalDestination).mockRestore();
@@ -337,6 +335,16 @@ it.each([
 );
 
 const lastJsonCall = () => vi.mocked(defaultRuntime.writeJson).mock.lastCall;
+const quote = process.platform === "win32" ? quotePowerShellArg : quoteCliArg;
+function runtimeFixture(version: string, sqliteVersion: string) {
+  return {
+    status: "supported" as const,
+    version,
+    sqliteVersion,
+    nodeSharedSqlite: false,
+    sqliteProbe: { available: true, version: sqliteVersion, text: true, blob: true, json: true },
+  };
+}
 function preflightOutcome(
   preflight: MockInstance<typeof runtimePlan.resolvePackageRuntimePreflight>,
 ) {
@@ -418,7 +426,7 @@ it.each([
       throw new Error("Runtime recovery did not provide a continuation command");
     }
     const command = continuation.command;
-    const launcher = `node ${runtimeQuote(path.join(fixture.root, "openclaw.mjs"))} `;
+    const launcher = `node ${quote(path.join(fixture.root, "openclaw.mjs"))} `;
     expect(command.slice(0, launcher.length)).toBe(launcher);
     runtime.mockResolvedValue(runtimeFixture("26.1.0", "3.53.0"));
     const program = new Command();

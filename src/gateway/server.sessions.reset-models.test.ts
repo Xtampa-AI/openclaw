@@ -7,6 +7,7 @@ import { expect, test } from "vitest";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { MODEL_SELECTION_LOCKED_RESET_MESSAGE } from "../sessions/model-overrides.js";
+import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
@@ -26,10 +27,24 @@ type ModelResetEntry = Pick<
 >;
 type ResolvedSessionModel = { modelProvider: string; model: string };
 
+test("sessions.reset preserves a person-linked model account", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const selection = {
+    authProfileOverride: "openai:linked-person",
+    authProfileOverrideSource: "user-link",
+  } satisfies Partial<SessionEntry>;
+  await writeSessionStore({ entries: { main: sessionStoreEntry("linked-account", selection) } });
+  const reset = await directSessionReq<{ entry: SessionEntry }>("sessions.reset", { key: "main" });
+  expect(reset.ok).toBe(true);
+  expect(reset.payload?.entry).toMatchObject(selection);
+  expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })).toMatchObject(selection);
+});
+
 test("sessions.reset stamps the creator's required sandbox only when materializing a new row", async () => {
   const { storePath } = await createSessionStoreDir();
   const profile = ensureProfileForEmail("sandboxed-reset-creator@example.test");
   setUserProfileRole(profile.id, "guest");
+  using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
   const { writeConfigFile } = await import("../config/config.js");
   await writeConfigFile({
     gateway: {
@@ -85,6 +100,7 @@ const ownedChildMetadata = {
   space: "hq",
   spawnedBy: "agent:main:main",
   completionOwnerSessionKey: "agent:main:discord:direct:alice",
+  sidebarRoot: true,
   inheritedToolPolicyVersion: 1,
   inheritedToolAllow: ["read", "message"],
   inheritedToolDeny: ["exec"],
@@ -106,6 +122,7 @@ const ownedChildMetadata = {
   authProfileOverrideSource: "user",
   authProfileOverrideCompactionCount: 7,
   sendPolicy: "deny",
+  communication: { send: "never", receive: "ask" },
   queueMode: "interrupt",
   queueDebounceMs: 250,
   queueCap: 9,
@@ -296,10 +313,12 @@ test("sessions.reset preserves spawned session ownership metadata", async () => 
     await fs.realpath(path.dirname(storePath)),
     "custom-owned-child-transcript.jsonl",
   );
+  // Preserve the legacy persisted field while testing reset compatibility.
+  const legacySessionMetadata = { sessionFile: customSessionFile };
   await writeSessionStore({
     entries: {
       "subagent:child": sessionStoreEntry("sess-owned-child", {
-        sessionFile: customSessionFile,
+        ...legacySessionMetadata,
         ...ownedChildMetadata,
         forkedFromParent: undefined,
         createdVia: "spawn",

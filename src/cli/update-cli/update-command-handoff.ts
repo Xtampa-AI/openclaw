@@ -176,10 +176,11 @@ export async function handoffUpdateFromGateway(params: {
     return false;
   }
   const parentPid = parsePositivePid(params.state.runtime?.pid);
-  if (
-    !parentPid ||
-    !inspectSelfAndAncestorPidsSync(undefined, { requireVerifiedParent: true }).pids.has(parentPid)
-  ) {
+  const ancestry = inspectSelfAndAncestorPidsSync(undefined, {
+    requireVerifiedParent: true,
+    throughPid: parentPid ?? undefined,
+  });
+  if (!parentPid || !ancestry.complete || !ancestry.pids.has(parentPid)) {
     return false;
   }
   const supervisor =
@@ -223,10 +224,7 @@ export async function handoffUpdateFromGateway(params: {
     meta: { runId: params.opts.run?.runId },
   });
   if (started.status === "joined") {
-    throw new UpdatePreMutationError(
-      "managed-service-handoff-already-running",
-      "Another managed update is already running. Check progress with `openclaw update status`.",
-    );
+    throw new UpdatePreMutationError("managed-service-handoff-already-running", started.message);
   }
   const identity = {
     kind: "managed-update-handoff" as const,

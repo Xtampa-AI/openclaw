@@ -50,13 +50,15 @@ export async function createDoctorMaintenanceState(options: {
     : env;
   let captureAdmitted = false;
   let liveAuthorityReadsAdmitted = false;
-  const capture = createUpdateDoctorDatabaseWriteCapture(params.databaseGenerations, {
-    env: selectedEnv,
-    root: params.root ?? undefined,
-    signal: options.signal,
-    assertCurrent: () => owner!.assertCurrent(options.assertCurrent),
-    warn: options.warn,
-  });
+  const capture =
+    params.databaseWriteCapture ??
+    createUpdateDoctorDatabaseWriteCapture(params.databaseGenerations, {
+      env: selectedEnv,
+      root: params.root ?? undefined,
+      signal: options.signal,
+      assertCurrent: () => owner!.assertCurrent(options.assertCurrent),
+      warn: options.warn,
+    });
   const closeResources = async (agentRoot?: string | null) => {
     const drainRoot =
       agentRoot === null
@@ -134,15 +136,21 @@ export async function createDoctorMaintenanceState(options: {
   const settleCapture = async () => {
     if (owner && capture && captureAdmitted) {
       // Settle the original receipt keys before their canonical path can change.
+      owner.assertCurrent(options.assertCurrent);
       await settle(() => capture.settle());
+      owner.assertCurrent(options.assertCurrent);
       captureAdmitted = false;
     }
   };
-  const enterResources = async (acquired: NonNullable<typeof owner>) => {
+  const enterResources = async (
+    acquired: NonNullable<typeof owner>,
+    assertAdmission?: () => void,
+  ) => {
     // Transfer can retire the source owner before caller revalidation runs.
     owner = acquired;
     try {
       acquired.assertCurrent(options.assertCurrent);
+      assertAdmission?.();
       resourcesParent = getOpenClawDatabaseMaintenanceScope();
       resources = createOpenClawDatabaseMaintenanceScope({
         schemaMaintenance: true,
@@ -169,7 +177,9 @@ export async function createDoctorMaintenanceState(options: {
       throw error;
     }
     if (capture && !captureAdmitted) {
+      acquired.assertCurrent(options.assertCurrent);
       await settle(() => resources!.run(() => capture.admit()));
+      acquired.assertCurrent(options.assertCurrent);
       captureAdmitted = true;
     }
   };
@@ -205,7 +215,8 @@ export async function createDoctorMaintenanceState(options: {
       // Cancellation stops read-only inspections; admitted writers retain their resource scope.
       return resources!.run(() => inspections!.run(operation));
     },
-    async acquire() {
+    async acquire(assertAdmission?: () => void) {
+      assertAdmission?.();
       if (resources) {
         return;
       }
@@ -220,17 +231,20 @@ export async function createDoctorMaintenanceState(options: {
         {
           ...params,
           assertCurrent: options.assertCurrent,
+          assertAdmission,
           deadlineMs: options.deadline(),
         },
       );
-      await enterResources(acquired);
+      await enterResources(acquired, assertAdmission);
     },
-    async prepareRepair() {
+    async prepareRepair(assertAdmission?: () => void) {
+      assertAdmission?.();
       const beforeStateMutation = params.beforeStateMutation;
       if (beforeStateMutation) {
         await resources!.run(() =>
           beforeStateMutation({ env: selectedEnv, signal: options.signal }),
         );
+        assertAdmission?.();
         resources!.assertAdmission();
       }
       resources!.run(() =>
@@ -260,12 +274,13 @@ export async function createDoctorMaintenanceState(options: {
       await owner!.release();
       owner = undefined;
       options.assertCurrent?.();
+      assertAdmission?.();
       const migration = prepareLegacyStateDirMigration({ env });
       if (migration && !migration.result.migrated) {
         throw new Error(migration.result.warnings.join("\n"));
       }
       selectedEnv = env;
-      await state.acquire();
+      await state.acquire(assertAdmission);
       if (migration) {
         const { loadDotEnv } = await import("../infra/dotenv.js");
         loadDotEnv({ quiet: true });

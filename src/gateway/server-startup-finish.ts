@@ -8,6 +8,7 @@ import {
 import { hashConfigRaw } from "../config/io.read-helpers.js";
 import { isNixMode } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { flushDiagnosticsTimeline } from "../infra/diagnostics-timeline.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -59,7 +60,6 @@ export async function finishGatewayStartup(params: {
   const {
     kernelRuntime: runtime,
     port,
-    bootId,
     opts,
     log,
     logHealth,
@@ -145,19 +145,6 @@ export async function finishGatewayStartup(params: {
   const startupPluginRuntimeClaim = kernel.pluginRuntimeGeneration.currentClaim();
   const databaseStartupAdmission = getAgentDatabaseStartupAdmission();
   const databasePreparationReady = createDeferredCore();
-  const activateAgentDatabases = () => {
-    if (databaseStartupAdmission && !opts.updateCanary && !lifecycle.closePreludeStarted) {
-      activateGatewayAgentDatabaseStartup({
-        admission: databaseStartupAdmission,
-        preparationReady: databasePreparationReady.promise,
-        getConfig: getRuntimeConfig,
-        getPluginRegistry: () => pluginRuntime.registry,
-        getPluginMetadataSnapshot,
-        isCurrent: () => !lifecycle.closePreludeStarted,
-        log,
-      });
-    }
-  };
   const getReadiness = runtime.createHttpTransportOptions().getReadiness;
   const { attachGatewayWsConnectionHandler } = await startupTrace.measure(
     "gateway.ws-imports",
@@ -176,7 +163,7 @@ export async function finishGatewayStartup(params: {
       wss,
       clients,
       connectionWork: runtime.connectionWork,
-      bootId,
+      bootId: params.bootId,
       preauthConnectionBudget,
       port,
       gatewayHost: bindHost ?? undefined,
@@ -204,18 +191,36 @@ export async function finishGatewayStartup(params: {
     }),
   );
   await startupTrace.measure("http.listen", () => startListening());
-  kernel.setDispatchReady(true);
   startupTrace.mark("http.bound");
-  if (!minimalTestGateway && !opts.updateCanary) {
-    const { startOpenClawDatabaseIntegrityVerifier } =
-      await import("../state/openclaw-database-verify.js");
-    registerGatewayLifetimeSidecars(startOpenClawDatabaseIntegrityVerifier({ env: process.env }));
-  }
-  activateAgentDatabases();
-  // Health can answer as soon as the listener binds. Discovery, remote-skill
-  // setup, and maintenance do not determine liveness, so keep them off that
-  // critical path while still completing before usable readiness.
-  const earlyRuntime = await startEarlyRuntime();
+  // Projection preparation and early services are independent. Join both before
+  // failure cleanup so early-service handles are installed before they are closed.
+  const requestRuntimeReady = runtime.ensureRequestRuntimeReady().then(async () => {
+    // Readiness is also the performance collector's evidence boundary. Flush the
+    // terminal events for request-runtime spans before /readyz can become green.
+    flushDiagnosticsTimeline();
+    kernel.setDispatchReady(true);
+    if (!minimalTestGateway && !opts.updateCanary) {
+      const { startOpenClawDatabaseIntegrityVerifier } =
+        await import("../state/openclaw-database-verify.js");
+      registerGatewayLifetimeSidecars(startOpenClawDatabaseIntegrityVerifier({ env: process.env }));
+    }
+    if (databaseStartupAdmission && !opts.updateCanary && !lifecycle.closePreludeStarted) {
+      activateGatewayAgentDatabaseStartup({
+        admission: databaseStartupAdmission,
+        preparationReady: databasePreparationReady.promise,
+        waitForPostReadyWork: params.waitForPostReadyWork,
+        getConfig: getRuntimeConfig,
+        getPluginRegistry: () => pluginRuntime.registry,
+        getPluginMetadataSnapshot,
+        isCurrent: () => !lifecycle.closePreludeStarted,
+        log,
+      });
+    }
+  });
+  const earlyRuntimeReady = startEarlyRuntime();
+  await Promise.allSettled([requestRuntimeReady, earlyRuntimeReady]);
+  await requestRuntimeReady;
+  const earlyRuntime = await earlyRuntimeReady;
   const sessionDeliveryRecoveryMaxEnqueuedAt = Date.now();
   let postAttachRuntimeReturned = false;
   let scheduledServicesActivated = false;
@@ -257,6 +262,8 @@ export async function finishGatewayStartup(params: {
     const operation = Promise.resolve().then(() => run(runtime.connectionWork.signal));
     return runtime.connectionWork.track(() => operation);
   };
+  let postAttachSpanSettled = false;
+  let postAttachSidecarsReady = false;
   const postAttachHandles = await trackStartupWork(() =>
     startupTrace.measure("runtime.post-attach", () =>
       import("./server-startup-post-attach.js").then(({ startGatewayPostAttachRuntime }) =>
@@ -271,6 +278,7 @@ export async function finishGatewayStartup(params: {
           isNixMode,
           startupStartedAt: opts.startupStartedAt,
           broadcastToConnIds,
+          broadcast,
           getClientConnIds: gatewayRequestContext.getClientConnIds!,
           broadcastPluginEvent,
           controlUiRootLifecycle,
@@ -348,15 +356,12 @@ export async function finishGatewayStartup(params: {
             }
           },
           getCronService: kernel.getCronService,
-          onChannelsStarted: () => {
-            releaseStartupAccountStarts();
-          },
-          onPluginServices: (pluginServices) => {
+          onChannelsStarted: releaseStartupAccountStarts,
+          onPluginServices: (pluginServices) =>
             kernel.pluginRuntimeGeneration.publishServices(
               startupPluginRuntimeClaim,
               pluginServices,
-            );
-          },
+            ),
           onPostReadySidecars: registerPostReadySidecars,
           onGatewayLifetimeSidecars: registerGatewayLifetimeSidecars,
           trackStartupWork,
@@ -378,7 +383,10 @@ export async function finishGatewayStartup(params: {
               }
             : {}),
           onSidecarsReady: () => {
-            kernel.markSidecarsReady();
+            postAttachSidecarsReady = true;
+            if (sidecarStartup === "defer" || postAttachSpanSettled) {
+              kernel.markSidecarsReady();
+            }
             databasePreparationReady.resolve();
             activateScheduledServicesWhenReady();
           },
@@ -392,6 +400,19 @@ export async function finishGatewayStartup(params: {
       ),
     ),
   );
+  // The post-attach span ends inside startupTrace.measure(), but its timeline
+  // event is batched. Flush it before postAttachSettled can make /readyz green;
+  // performance collectors stop their startup interval at that response.
+  flushDiagnosticsTimeline();
+  postAttachSpanSettled = true;
+  // Do not publish /readyz while the post-attach startup span is still open.
+  // Performance collectors end their startup interval at readiness, so an
+  // earlier response loses the span's terminal CPU sample and reports
+  // incomplete product evidence even though startup settles moments later.
+  startupState.postAttachSettled = true;
+  if (postAttachSidecarsReady && sidecarStartup !== "defer") {
+    kernel.markSidecarsReady();
+  }
   kernel.setPostAttachHandles(postAttachHandles);
   if (minimalTestGateway) {
     databasePreparationReady.resolve();
@@ -404,9 +425,10 @@ export async function finishGatewayStartup(params: {
   ]);
   if (getReadiness().ready) {
     startupTrace.mark("ready");
-    if (sidecarStartup === "defer") {
-      logGatewayReady({ getReadiness, log });
-    }
+    logGatewayReady(
+      { getReadiness, log },
+      opts.updateCanary ? "candidate gateway ready; autonomous sidecars suppressed" : undefined,
+    );
   }
   finishGatewayRestartTrace("restart.ready", collectGatewayProcessMemoryUsageMb());
   if (opts.updateCanary) {
@@ -670,6 +692,7 @@ export async function finishGatewayStartup(params: {
         scheduler: runtime.scheduler,
         delayMs: RETAINED_PLUGIN_CLEANUP_DELAY_MS,
         retryDelayMs: RETAINED_PLUGIN_CLEANUP_DELAY_MS,
+        repeatDelayMs: 60 * 60_000,
         isClosing: () => lifecycle.closePreludeStarted,
         isBusy: () => getActiveGatewayRootWorkCount({ excludeCurrent: true }) > 0,
         run: async () => {
@@ -679,6 +702,7 @@ export async function finishGatewayStartup(params: {
           await cleanupGatewayRetiredPluginArtifacts({
             log,
             startupInstallPaths,
+            startupConfig: cfgAtStart,
             signal: runtime.connectionWork.signal,
             assertCurrent: () => {
               if (lifecycle.closePreludeStarted) {
@@ -702,7 +726,7 @@ export async function finishGatewayStartup(params: {
         repeatDelayMs: 15 * 60_000,
         run: async () => {
           const { reclaimAbandonedSqliteSnapshotsAsync } =
-            await import("../infra/sqlite-snapshot-staging.js");
+            await import("../infra/sqlite-snapshot-reclamation.js");
           await reclaimAbandonedSqliteSnapshotsAsync();
         },
         log,

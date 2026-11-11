@@ -1,8 +1,10 @@
+import { getRuntimeConfigSnapshot } from "../../../config/config.js";
 import {
   assertContextEngineHostSupport,
   OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
 } from "../../../context-engine/host-compat.js";
 import { resolveContextEngineOwnerPluginId } from "../../../context-engine/registry.js";
+import { resolveDiagnosticModelContentCapturePolicy } from "../../../infra/diagnostic-llm-content.js";
 import { runWithAsyncWorkResources } from "../../../shared/async-work-resources.js";
 import { getAsyncWorkSignal } from "../../../shared/async-work-scope.js";
 import { createStageTimingTracker } from "../../../shared/stage-timing.js";
@@ -52,6 +54,7 @@ import { prepareEmbeddedAttemptSystemPrompt } from "./attempt-system-prompt-prep
 import { prepareEmbeddedAttemptToolCatalog } from "./attempt-tool-catalog.js";
 import { prepareEmbeddedAttemptToolBase } from "./attempt-tool-prepare.js";
 import { prepareEmbeddedAttemptTranscriptLifecycle } from "./attempt-transcript-lifecycle-prepare.js";
+import { resolveFinalMessageRawText } from "./helpers.js";
 import type { EmbeddedRunAttemptInternalParams } from "./internal-params.js";
 import { measureEmbeddedAgentPreparation } from "./preparation-timing.js";
 import type {
@@ -135,10 +138,7 @@ async function runEmbeddedAttemptOwned(
   let toolSearchCatalogApplied = false;
   let releasePreparedTools: ((reason: string) => Promise<void>) | undefined;
   let unsubscribeYieldTurnEnd: (() => void) | undefined;
-  const sessionResources = createEmbeddedAttemptSessionResources(
-    params.config,
-    runAbortController.signal,
-  );
+  const sessionResources = createEmbeddedAttemptSessionResources(runAbortController.signal);
   const cleanupStep = (step: string, cleanup: () => Promise<void>) =>
     runOwnedAgentCleanup({ ...params, step, cleanup, log });
   const cleanupEmbeddedPrepResourcesAfterEarlyExit = async () => {
@@ -325,7 +325,6 @@ async function runEmbeddedAttemptOwned(
         setup,
         bootstrap: preparedBootstrap,
         capabilityToolNames: toolSearchRunPlan.capabilityToolNames,
-        requireExplicitMessageTarget: preparedToolBase.requireExplicitMessageTarget,
         effectiveTools,
         isRawModelRun,
         modelToolsEnabled: toolsEnabled,
@@ -450,6 +449,16 @@ async function runEmbeddedAttemptOwned(
           },
         },
       });
+      // Run-completed diagnostics carry the model's raw final-answer text for
+      // content capture; the finally-phase cleanup reads it from the shared state.
+      executionState.diagnosticFinalResponse = resolveDiagnosticModelContentCapturePolicy(
+        getRuntimeConfigSnapshot(),
+      ).outputMessages
+        ? resolveFinalMessageRawText(
+            executionResult.currentAttemptAssistant ??
+              executionResult.currentAttemptCompletedAssistant,
+          )
+        : undefined;
       // Read catalog counters before the finally-phase cleanup clears the
       // run-scoped catalog session; afterwards the counts are gone.
       const catalogSession = toolSearchCatalogRef?.current;
@@ -535,6 +544,7 @@ async function runEmbeddedAttemptOwned(
           }
         });
       } finally {
+        setup[Symbol.dispose]();
         externalAbortController.dispose();
       }
     };

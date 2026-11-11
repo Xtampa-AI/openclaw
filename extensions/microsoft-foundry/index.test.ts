@@ -72,7 +72,7 @@ vi.mock("openclaw/plugin-sdk/provider-auth", async () => {
   );
   return {
     ...actual,
-    ensureAuthProfileStore: ensureAuthProfileStoreMock,
+    ensureAuthProfileStoreAsync: ensureAuthProfileStoreMock,
   };
 });
 
@@ -238,8 +238,10 @@ function mockAzureCliToken(params: {
   accessToken: string;
   expiresInMs: number;
   response?: Promise<void>;
+  started?: () => void;
 }) {
   execFileMock.mockImplementationOnce(async () => {
+    params.started?.();
     if (params.response) {
       await params.response;
     }
@@ -251,8 +253,9 @@ function mockAzureCliTokenRaw(stdout: string) {
   execFileMock.mockResolvedValueOnce({ stdout, stderr: "" });
 }
 
-function mockAzureCliLoginFailure(response?: Promise<void>) {
+function mockAzureCliLoginFailure(response?: Promise<void>, started?: () => void) {
   execFileMock.mockImplementationOnce(async () => {
+    started?.();
     if (response) {
       await response;
     }
@@ -647,11 +650,14 @@ describe("microsoft-foundry plugin", () => {
     const prepareRuntimeAuth = prepareAuth();
     const failedResponse = createDeferred<void>();
     const recoveryResponse = createDeferred<void>();
-    mockAzureCliLoginFailure(failedResponse.promise);
+    const failedStarted = createDeferred<void>();
+    const recoveryStarted = createDeferred<void>();
+    mockAzureCliLoginFailure(failedResponse.promise, failedStarted.resolve);
     mockAzureCliToken({
       accessToken: "recovered-token",
       expiresInMs: 10 * 60_000,
       response: recoveryResponse.promise,
+      started: recoveryStarted.resolve,
     });
     ensureAuthProfileStoreMock.mockReturnValue(entraStore());
 
@@ -659,6 +665,7 @@ describe("microsoft-foundry plugin", () => {
     const pending = [prepareRuntimeAuth(runtimeContext), prepareRuntimeAuth(runtimeContext)];
     let settled = Promise.allSettled(pending);
     try {
+      await failedStarted.promise;
       expect(execFileMock).toHaveBeenCalledTimes(1);
       failedResponse.resolve();
       const failed = await settled;
@@ -673,6 +680,7 @@ describe("microsoft-foundry plugin", () => {
       const retries = [prepareRuntimeAuth(runtimeContext), prepareRuntimeAuth(runtimeContext)];
       pending.push(...retries);
       settled = Promise.allSettled(pending);
+      await recoveryStarted.promise;
       expect(execFileMock).toHaveBeenCalledTimes(2);
       recoveryResponse.resolve();
       const [first, second] = await Promise.all(retries);
@@ -730,6 +738,28 @@ describe("microsoft-foundry plugin", () => {
       "image",
     ]);
   });
+
+  it.each([undefined, { canonicalModelId: "gpt-5-mini" }])(
+    "preserves manual limits through repeated selection and normalization with params %j",
+    async (params) => {
+      const config = makeConfig({
+        models: [makeModel({ id: "prod-mini", name: "gpt-5-mini", params })],
+      });
+      const provider = registerProvider();
+      for (let selection = 0; selection < 2; selection++) {
+        await selectModel(provider, config, "prod-mini");
+        const model = config.models!.providers![providerId]!.models[0]!;
+        expect(model).toMatchObject({ contextWindow: 128_000, maxTokens: 16_384 });
+        expect(
+          provider.normalizeResolvedModel?.({
+            provider: providerId,
+            modelId: model.id,
+            model: makeModel({ id: model.id, name: model.name, params: model.params }),
+          }),
+        ).toMatchObject({ contextWindow: 128_000, maxTokens: 16_384 });
+      }
+    },
+  );
 
   it("preserves an explicit per-model Foundry endpoint when switching models", async () => {
     const provider = registerProvider();

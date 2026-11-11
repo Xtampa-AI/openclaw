@@ -1,9 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { Command } from "commander";
 import { createDeferred } from "openclaw/plugin-sdk/concurrency-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { readRegularFile } from "openclaw/plugin-sdk/file-access-runtime";
 import { MAX_TCP_PORT } from "openclaw/plugin-sdk/number-runtime";
 import {
   isRecord,
@@ -47,7 +48,9 @@ async function readCliBrief(options: {
     throw new Error("Use either --brief or --brief-file");
   }
   const raw = options.briefFile
-    ? await readFile(resolveUserPath(options.briefFile), "utf8")
+    ? (
+        await readRegularFile({ filePath: await realpath(resolveUserPath(options.briefFile)) })
+      ).buffer.toString("utf8")
     : options.brief;
   if (raw === undefined) {
     return undefined;
@@ -311,36 +314,32 @@ export function registerVoiceCallCli(params: {
         writeCliJson({ callId });
       });
 
-  root
-    .command("call")
-    .description("Initiate an outbound voice call")
-    .requiredOption("-m, --message <text>", "Message to speak when call connects")
-    .option(
-      "-t, --to <phone>",
-      "Phone number to call (E.164 format, uses config toNumber if not set)",
-    )
-    .option(
-      "--mode <mode>",
-      "Call mode: notify (hangup after message) or conversation (stay open)",
-      "conversation",
-    )
-    .option("--brief <text-or-json>", "Per-call task or structured JSON brief")
-    .option("--brief-file <path>", "Read a structured JSON brief from a file")
-    .action(callAction("voicecall.initiate"));
-
-  root
-    .command("start")
-    .description("Alias for voicecall call")
-    .requiredOption("--to <phone>", "Phone number to call")
-    .option("--message <text>", "Message to speak when call connects")
-    .option(
-      "--mode <mode>",
-      "Call mode: notify (hangup after message) or conversation (stay open)",
-      "conversation",
-    )
-    .option("--brief <text-or-json>", "Per-call task or structured JSON brief")
-    .option("--brief-file <path>", "Read a structured JSON brief from a file")
-    .action(callAction("voicecall.start"));
+  for (const name of ["call", "start"] as const) {
+    const command = root.command(name);
+    if (name === "call") {
+      command
+        .description("Initiate an outbound voice call")
+        .requiredOption("-m, --message <text>", "Message to speak when call connects")
+        .option(
+          "-t, --to <phone>",
+          "Phone number to call (E.164 format, uses config toNumber if not set)",
+        );
+    } else {
+      command
+        .description("Alias for voicecall call")
+        .requiredOption("--to <phone>", "Phone number to call")
+        .option("--message <text>", "Message to speak when call connects");
+    }
+    command
+      .option(
+        "--mode <mode>",
+        "Call mode: notify (hangup after message) or conversation (stay open)",
+        "conversation",
+      )
+      .option("--brief <text-or-json>", "Per-call task or structured JSON brief")
+      .option("--brief-file <path>", "Read a structured JSON brief from a file")
+      .action(callAction(name === "call" ? "voicecall.initiate" : "voicecall.start"));
+  }
 
   root
     .command("continue")

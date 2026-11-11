@@ -6,7 +6,10 @@ import {
 import { embeddedAgentLog, formatErrorMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { defineCodexBuildState } from "../build-state.js";
-import { interruptCodexTurnAndWaitBestEffort } from "./attempt-client-cleanup.js";
+import {
+  interruptCodexTurnAndWaitBestEffort,
+  terminateCodexBackgroundTerminals,
+} from "./attempt-client-cleanup.js";
 import {
   claimCodexAppServerLiveThread,
   hasCodexAppServerLiveThread,
@@ -15,8 +18,14 @@ import {
 } from "./client-runtime.js";
 import type { CodexAppServerLiveThreadOwnership } from "./client-thread-owner.js";
 import type { CodexAppServerClient } from "./client.js";
+import {
+  getCodexNativeProcessClient,
+  type CodexNativeProcessAuthority,
+} from "./native-process-authority.js";
 import type {
   MonitorOptions,
+  NativeDescendantCancellation,
+  NativeDescendantCancellationResult,
   NativeSubagentMonitorClient,
   NativeSubagentMonitorRuntime,
   NativeModelToolInputRequest,
@@ -27,6 +36,10 @@ import type {
 import type { NativeParentRegistration } from "./native-subagent-parent-owner.js";
 
 type NativeMonitor = {
+  withDescendantCancellation<T>(
+    params: NativeDescendantCancellation,
+    run: (cancel: () => Promise<NativeDescendantCancellationResult>) => Promise<T>,
+  ): Promise<T>;
   registerParent(params: NativeParentRegistration): Promise<ParentRegistrationHandle>;
   retireParent(parentThreadId: string): Promise<void>;
   captureModelSource(
@@ -71,10 +84,12 @@ export function createCodexNativeSubagentMonitorRuntime<T extends NativeMonitorC
     runtime,
     retainClient,
     retainParentThread,
+    nativeProcessAuthority,
     ...registration
   }: NativeParentRegistration &
     Pick<MonitorOptions, "retainClient" | "retainParentThread"> & {
       client: CodexAppServerClient;
+      nativeProcessAuthority?: CodexNativeProcessAuthority;
       runtime?: NativeSubagentMonitorRuntime;
     }): Promise<ParentRegistrationHandle> {
     let monitor = monitors.get(client);
@@ -137,6 +152,13 @@ export function createCodexNativeSubagentMonitorRuntime<T extends NativeMonitorC
       };
       monitor = new Monitor(client, runtime ?? defaultNativeSubagentMonitorRuntime, {
         retainClient,
+        interruptChildAndWait: (threadId, turnId, assertCurrent, timeoutMs) =>
+          interruptCodexTurnAndWaitBestEffort(client, {
+            threadId,
+            turnId,
+            assertCurrent,
+            timeoutMs,
+          }),
         interruptModelExecution: (threadId, turnId) => {
           void interruptCodexTurnAndWaitBestEffort(client, { threadId, turnId });
         },
@@ -223,7 +245,23 @@ export function createCodexNativeSubagentMonitorRuntime<T extends NativeMonitorC
       });
       monitors.set(client, monitor);
     }
-    return monitor.registerParent(registration);
+    return monitor.registerParent({
+      ...registration,
+      cancelChildProcesses: async (childThreadId, childTurnId, assertCurrent) => {
+        assertCurrent();
+        if (nativeProcessAuthority?.requiresProcessAdmission) {
+          await getCodexNativeProcessClient(client).cancelTurn(childThreadId, childTurnId);
+        } else {
+          await terminateCodexBackgroundTerminals(
+            client,
+            childThreadId,
+            false,
+            undefined,
+            assertCurrent,
+          );
+        }
+      },
+    });
   }
 
   return {
@@ -246,6 +284,13 @@ export function createCodexNativeSubagentMonitorRuntime<T extends NativeMonitorC
       }
       return monitor.prepareModelInput(request);
     },
+    withDescendantCancellation: <Result>(
+      client: CodexAppServerClient,
+      params: NativeDescendantCancellation,
+      run: (cancel: () => Promise<NativeDescendantCancellationResult>) => Promise<Result>,
+    ): Promise<Result> =>
+      monitors.get(client)?.withDescendantCancellation(params, run) ??
+      run(async () => ({ killed: 0, cancelledRequesters: [] })),
     retireParent: (client: CodexAppServerClient, parentThreadId: string): Promise<void> =>
       monitors.get(client)?.retireParent(parentThreadId) ?? Promise.resolve(),
   };

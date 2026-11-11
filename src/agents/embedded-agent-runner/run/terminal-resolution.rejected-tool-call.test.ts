@@ -1,8 +1,6 @@
-import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { emitToolResultMessage } from "../../../../packages/agent-core/src/agent-stream-response.js";
-import { copyInternalToolResultState } from "../../../../packages/agent-core/src/internal-hooks.js";
-import { createErrorToolResult } from "../../../../packages/agent-core/src/tool-call-outcome.js";
+import { createToolExecutionErrorResult } from "../../../../packages/agent-core/src/tool-call-outcome.js";
 import { validateScriptFileForShellBleed } from "../../bash-tools.exec-script-preflight.js";
 import {
   buildEmbeddedRunnerAssistant,
@@ -21,13 +19,6 @@ vi.mock("./auth-profile-success.js", () => ({
 }));
 
 const REJECTED_TOOL_CALL_MESSAGE = "Provider returned an incomplete or malformed tool call";
-
-function createToolExecutionErrorResult(error: unknown) {
-  const result = createErrorToolResult(coerceErrorMessage(error));
-  return typeof error === "object" && error !== null
-    ? copyInternalToolResultState(error, result)
-    : result;
-}
 
 // The reported turn: an exec call completed, then the provider streamed a second
 // call whose arguments were not valid JSON. The transport removed that call

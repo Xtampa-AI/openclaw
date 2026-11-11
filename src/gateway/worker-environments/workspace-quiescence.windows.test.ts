@@ -7,10 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
-import {
-  legacyWindowsWorkspaceQuiescenceAcquireArgv,
-  workspaceQuiescenceArgv,
-} from "./workspace-quiescence-scripts.js";
+import { legacyWindowsWorkspaceQuiescenceAcquireArgv } from "./workspace-quiescence-lease-scripts.js";
+import { workspaceQuiescenceArgv } from "./workspace-quiescence-scripts.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 

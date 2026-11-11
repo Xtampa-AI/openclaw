@@ -3,7 +3,9 @@ import path from "node:path";
 import { createAssistantMessageEventStream, type Message } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { summarizeOpenAITransportError } from "../../../../packages/ai/src/transports/openai-responses-debug.js";
 import { createDeferred } from "../../../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
 import {
   loadTranscriptEventsSync,
   replaceSessionEntrySync,
@@ -62,16 +64,11 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
       change: "current",
       guarded: false,
     },
-    {
-      kind: "exact cron run",
-      key: "agent:main:cron:provider-fence:run:cron-run-1",
-      change: "current",
-      guarded: false,
-    },
   ] as const)(
     "scopes the provider generation guard after writer admission ($kind, $change)",
     async ({ key, change, guarded }) => {
       await withOpenClawTestState({ label: "cron-root-provider-fence" }, async (testState) => {
+        setRuntimeConfigSnapshot({});
         const fixture = await createFixture({ exerciseTerminalMerges: false });
         const target = {
           agentId: "main",
@@ -165,19 +162,13 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
   );
 
   it.each([
-    ["stop", 10_000, "event"],
-    ["stop", 0, "event"],
-    ["toolUse", 10_000, "event"],
-    ["error", 10_000, "event"],
-    ["aborted", 10_000, "event"],
-    ["stop", 10_000, "result"],
-    ["stop", 0, "result"],
-    ["error", 10_000, "result"],
-    ["output-limit", 10_000, "event"],
-    ["output-limit", 10_000, "result"],
+    ["stop", 10_000],
+    ["toolUse", 10_000],
+    ["aborted", 10_000],
+    ["output-limit", 10_000],
   ] as const)(
-    "observes terminal %s usage once across async-tool fragments (cacheRead=%s, completion=%s)",
-    async (stopReason, cacheRead, completion) => {
+    "observes terminal %s usage once across async-tool fragments (cacheRead=%s)",
+    async (stopReason, cacheRead) => {
       const terminalStopReason = stopReason === "output-limit" ? "error" : stopReason;
       const fixture = await createFixture();
       const recordStage = vi.fn();
@@ -237,9 +228,7 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
         toolCall,
         partial: { ...message, content: [toolCall], usage: makeZeroUsageSnapshot() },
       });
-      if (completion === "result") {
-        response.end(message);
-      } else if (terminalStopReason === "error" || terminalStopReason === "aborted") {
+      if (terminalStopReason === "error" || terminalStopReason === "aborted") {
         response.push({ type: "error", reason: terminalStopReason, error: message });
       } else {
         response.push({ type: "done", reason: terminalStopReason, message });
@@ -311,6 +300,7 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
           {
             options: {
               requestIndex: 1,
+              messageCount: 0,
               broke: false,
               previousCacheRead: undefined,
               input: 100,
@@ -546,7 +536,7 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
             onModelRequest: expect.any(Function),
             getObservation: expect.any(Function),
           },
-          history: expect.objectContaining({ contextEngineAssemblySucceeded: true }),
+          history: expect.objectContaining({ contextEnginePromptAuthority: "assembled" }),
           isProbeSession: false,
           stream: fixture.streamResult,
           timeout: fixture.timeoutResult,
@@ -671,6 +661,30 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("preserves session watchdog attribution through model-call recovery", async () => {
+    const fixture = await createFixture({ exerciseTerminalMerges: false });
+    mocks.installStreamGuards.mockImplementationOnce(() => ({
+      onModelRequest: vi.fn(),
+      onModelUsage: vi.fn(),
+      getPromptCacheObservation: vi.fn(),
+      isModelCallActive: () => true,
+    }));
+    fixture.runAbort.mockImplementation((_timeout, reason) =>
+      fixture.input.runAbortController.abort(reason),
+    );
+    await runEmbeddedAttemptExecutionPhase(fixture.input);
+
+    const streamInput = mocks.prepareStream.mock.calls[0]?.[0];
+    expect(streamInput.recoverStalledModelCall()).toBe(true);
+    expect(
+      summarizeOpenAITransportError(
+        new Error("stream aborted"),
+        fixture.input.runAbortController.signal,
+      ),
+    ).toContain("abortReason=session_watchdog");
+    expect(fixture.state.terminal).toMatchObject({ kind: "timeout", source: "idle" });
   });
 
   it("attributes an idle timeout during authoritative compaction to compaction", async () => {

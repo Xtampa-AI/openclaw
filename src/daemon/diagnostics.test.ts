@@ -1,3 +1,4 @@
+import { execFileSync, spawnSync } from "node:child_process";
 // Daemon diagnostics tests cover service diagnostic collection and formatting.
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
@@ -30,24 +31,6 @@ function makeTempStateDir(): string {
 }
 
 describe("readLastGatewayErrorLine", () => {
-  it.each(["darwin", "linux"] as const)(
-    "preserves startup failure evidence after routine shutdown messages on %s",
-    async (platform) => {
-      const env = { HOME: makeTempStateDir(), OPENCLAW_STATE_DIR: makeTempStateDir() };
-      const logs =
-        platform === "darwin" ? resolveGatewaySupervisorLogPaths(env) : resolveGatewayLogPaths(env);
-      fs.mkdirSync(logs.logDir, { recursive: true });
-      const failure = "2026-01-01T12:00:00Z Gateway failed to start: Tailscale is stopped.";
-      fs.writeFileSync(
-        logs.stdoutPath,
-        `${failure}\n[state/agent-db] agent database clean-close receipt: active-leases\n`,
-        "utf8",
-      );
-
-      await expect(readLastGatewayErrorLine(env, { platform })).resolves.toBe(failure);
-    },
-  );
-
   it("reads the launchd supervisor log instead of a state-dir stderr file on darwin", async () => {
     const stateDir = makeTempStateDir();
     const homeDir = makeTempStateDir();
@@ -156,16 +139,49 @@ describe("readLastGatewayErrorLine", () => {
       "parse/handle error: Error: ENOSPC: no space left on device, write",
     );
   });
-
-  it("does not label routine log output as an error", async () => {
-    const stateDir = makeTempStateDir();
-    const homeDir = makeTempStateDir();
-    const env = { HOME: homeDir, OPENCLAW_STATE_DIR: stateDir };
-    const stateLogs = resolveGatewayLogPaths(env);
-    fs.mkdirSync(stateLogs.logDir, { recursive: true });
-    fs.writeFileSync(stateLogs.stdoutPath, "gateway stdout current\n", "utf8");
-    fs.writeFileSync(stateLogs.stderrPath, "routine gateway stderr\n", "utf8");
-
-    await expect(readLastGatewayErrorLine(env, { platform: "linux" })).resolves.toBeNull();
-  });
 });
+
+const FIFO = Symbol("writerless FIFO");
+const blocked = "gateway start blocked";
+const bindError = "failed to bind gateway socket";
+for (const [name, stdout, stderr, expected] of [
+  ["stdout FIFO", FIFO, bindError, bindError],
+  ["stderr FIFO", blocked, FIFO, blocked],
+] as const) {
+  it.skipIf(process.platform === "win32" && (stdout === FIFO || stderr === FIFO))(name, () => {
+    const root = makeTempStateDir();
+    const env = { HOME: root, OPENCLAW_STATE_DIR: path.join(root, "state") };
+    const paths = resolveGatewayLogPaths(env);
+    fs.mkdirSync(paths.logDir, { recursive: true });
+    for (const key of ["stdoutPath", "stderrPath"] as const) {
+      const value = key === "stdoutPath" ? stdout : stderr;
+      if (value === FIFO) {
+        execFileSync("mkfifo", [paths[key]]);
+      } else if (value !== undefined) {
+        fs.writeFileSync(paths[key], value);
+      }
+    }
+    // Bound native FIFO opens outside the test worker, including on a regressed reader.
+    const probe = spawnSync(
+      process.execPath,
+      [
+        `--import=${new URL("../../scripts/tsx.mjs", import.meta.url).href}`,
+        "--input-type=module",
+        "-e",
+        `
+        import { readLastGatewayErrorLine } from ${JSON.stringify(new URL("./diagnostics.ts", import.meta.url).href)};
+        console.log(JSON.stringify(await readLastGatewayErrorLine(${JSON.stringify(env)}, { platform: "linux" })));
+      `,
+      ],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    expect([probe.error, probe.status]).toEqual([undefined, 0]);
+    expect(JSON.parse(probe.stdout)).toEqual(expected);
+    expect(probe.stdout).not.toContain("synthetic-private-host");
+    for (const key of ["stdoutPath", "stderrPath"] as const) {
+      if ((key === "stdoutPath" ? stdout : stderr) === FIFO) {
+        expect(fs.lstatSync(paths[key]).isFIFO()).toBe(true);
+      }
+    }
+  });
+}

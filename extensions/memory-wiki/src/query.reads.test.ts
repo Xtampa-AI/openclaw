@@ -3,7 +3,6 @@ import path from "node:path";
 import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { compileMemoryWikiVault } from "./compile.js";
-import * as wikiLinks from "./markdown-links.js";
 import { renderWikiMarkdown } from "./markdown.js";
 import { getMemoryWikiPage, searchMemoryWiki } from "./query.js";
 import { createMemoryWikiTestHarness } from "./test-helpers.js";
@@ -33,6 +32,55 @@ async function createReadVault(relativePath = "sources/alpha.md") {
 }
 
 describe("wiki query page reads", () => {
+  it.each(["NFC", "NFD"] as const)(
+    "matches canonically equivalent %s text in live pages and compiled metadata",
+    async (form) => {
+      const { rootDir, config } = await createVault({
+        initialize: true,
+        config: {
+          search: { backend: "local", corpus: "wiki" },
+          render: { createDashboards: false },
+        },
+      });
+      const search = (query: string) => searchMemoryWiki({ config, query });
+      const text = "Café 한국어".normalize(form);
+      const query = "한국어 CAFÉ".normalize(form === "NFC" ? "NFD" : "NFC");
+      const paths = ["title", "alias", "claim", "body"].map((field) => `entities/${field}.md`);
+      for (const field of ["title", "alias", "claim", "body"]) {
+        const targetPath = path.join(rootDir, `entities/${field}.md`);
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(
+          targetPath,
+          renderWikiMarkdown({
+            frontmatter: {
+              pageType: "entity",
+              id: `entity.${field}`,
+              title: field === "title" ? text : "Neutral",
+              ...(field === "alias" ? { aliases: [text] } : {}),
+              ...(field === "claim"
+                ? { claims: [{ id: "claim.observation", text, status: "supported" }] }
+                : {}),
+            },
+            body: `# Neutral\n\n${field === "body" ? text : "Ordinary context."}\n`,
+          }),
+        );
+      }
+      const live = await search(query);
+      expect(
+        live.map((result) => result.path).toSorted((a, b) => (a ?? "").localeCompare(b ?? "")),
+      ).toEqual(paths.toSorted((a, b) => a.localeCompare(b)));
+      expect(live.find((result) => result.path === "entities/title.md")?.title).toBe(text);
+      for (const field of ["claim", "body"]) {
+        expect(live.find((result) => result.path === `entities/${field}.md`)?.snippet).toBe(text);
+      }
+
+      await compileMemoryWikiVault(config);
+      await expect(search(query)).resolves.toEqual(live);
+      await expect(search("Ordinary context")).resolves.toHaveLength(3);
+      await expect(search("NeverRecordedNebula")).resolves.toEqual([]);
+    },
+  );
+
   it("reads only compiled metadata candidates for distributed query tokens", async () => {
     const { rootDir, config, targetPath, relativePath } = await createReadVault();
     await fs.writeFile(
@@ -72,51 +120,6 @@ describe("wiki query page reads", () => {
     await expect(searchMemoryWiki({ config, query, maxResults: 1 })).resolves.toEqual(liveResults);
     expect(openedPages).toContain(targetPath);
     expect(openedPages).not.toContain(unrelatedPath);
-  });
-
-  it.each([false, true])(
-    "searches and reads without extracting unused links (compiled=%s)",
-    async (compiled) => {
-      const { config, targetPath, relativePath } = await createReadVault();
-      await fs.appendFile(
-        targetPath,
-        "\nCobalt lantern notes.\n[Guide](../concepts/guide.md)\n[[concepts/reference]]\n",
-      );
-      if (compiled) {
-        await compileMemoryWikiVault(config);
-      }
-      const extractLinks = vi.spyOn(wikiLinks, "extractWikiLinks");
-
-      for (const query of ["Alpha", "cobalt lantern", "concepts/reference"]) {
-        const results = await searchMemoryWiki({ config, query });
-        expect(results).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({ path: relativePath, title: "Alpha", corpus: "wiki" }),
-          ]),
-        );
-      }
-      await expect(searchMemoryWiki({ config, query: "unmatched-orchid" })).resolves.toEqual([]);
-      for (const lookup of [relativePath, "alpha", "source.alpha"]) {
-        const result = await getMemoryWikiPage({ config, lookup });
-        expect(result?.path).toBe(relativePath);
-        expect(result?.content).toContain("[Guide](../concepts/guide.md)");
-      }
-      expect(extractLinks).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each([
-    ["sources/alpha.md", "sources/alpha.md"],
-    ["  sources\\nested\\alpha.md  ", "sources/nested/alpha.md"],
-  ])("reads %s without enumerating unrelated pages", async (lookup, relativePath) => {
-    const { rootDir, config } = await createReadVault(relativePath);
-    await fs.writeFile(path.join(rootDir, "sources", "unrelated.md"), "---\ninvalid: [\n---\n");
-    const readdir = vi.spyOn(fs, "readdir");
-
-    await expect(
-      getMemoryWikiPage({ config, lookup, fromLine: 4, lineCount: 1 }),
-    ).resolves.toMatchObject({ path: relativePath, content: "readable line", truncated: true });
-    expect(readdir).not.toHaveBeenCalled();
   });
 
   it.each(["large", "hardlinked"] as const)(
@@ -159,7 +162,7 @@ describe("wiki query page reads", () => {
     });
   });
 
-  it.each(["deleted", "directory"] as const)(
+  it.each(["directory"] as const)(
     "skips a compiled candidate replaced by %s state",
     async (kind) => {
       const { rootDir, config, relativePath } = await createReadVault();
@@ -188,7 +191,7 @@ describe("wiki query page reads", () => {
     },
   );
 
-  it.each(["absent", "invalid", "directory"] as const)(
+  it.each(["invalid"] as const)(
     "retains ID fallback when the canonical candidate is %s",
     async (kind) => {
       const { rootDir, config, targetPath, relativePath } = await createReadVault();

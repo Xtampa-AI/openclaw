@@ -101,16 +101,26 @@ that can feed validation, run the integrated exact-HEAD gate:
 pnpm release:push
 ```
 
-This wrapper refreshes and pins `origin/main`, requires a clean canonical
-`release/YYYY.M.PATCH` worktree, captures `HEAD`, and runs changed
-static/type checks, production dead-code analysis, and changed tests from a
-fresh detached worktree with a frozen dependency install. It pushes that
-captured SHA itself only after every gate passes and the source branch,
-worktree, and HEAD remain unchanged. Do not use a separate `git push`:
-validation and push must stay one operation. A failed gate, concurrent commit,
-or non-fast-forward remote update blocks the push and FRV dispatch. Record the
-passing SHA and comparison base in the handoff; do not substitute
-`release:prepush`, a worker's partial check, or an earlier branch state.
+This wrapper refreshes and pins `origin/main` and release tags, requires a clean canonical
+`release/YYYY.M.PATCH` worktree, captures `HEAD`, verifies that it fast-forwards
+the remote release branch, and runs only a short `git diff --check` plus the
+dependency-free release-changelog layout check. It pushes that captured SHA
+only if the source branch, worktree, and HEAD remain unchanged. The first push
+compares against the newest stable release tag published on `origin` between the main audit merge base
+and the candidate, falling back to the audit merge base if none exists. Later
+pushes compare against the refreshed canonical release head. Already-shipped
+patch-file bytes are not new whitespace errors; changed whitespace and conflict
+markers still fail the same check. Do not use a
+separate `git push`: exact-SHA verification and push stay one operation. A
+failed preflight, concurrent commit, or non-fast-forward remote update blocks
+the push and FRV dispatch. Record the pushed SHA and comparison base in the
+handoff; do not substitute `release:prepush` or an earlier branch state.
+
+PR CI and Full Release Validation own formatting, lint, type checking, Knip,
+and test coverage. Do not run those broad gates locally before a release push
+or delay FRV for them. Use focused local checks only to diagnose a concrete
+remote failure, then push the repaired exact SHA and start remote validation
+immediately.
 
 Then run deterministic source preflight and validate the same exact Code SHA:
 
@@ -128,13 +138,19 @@ This example qualifies a final version for beta-first publication. Select
 for the prepared button. A beta prerelease uses the beta profile and soak policy.
 Keep that intended selection on later notes-only parents. This admits committed
 publication source, not registry eligibility or publication authority.
-Publish-purpose dispatches first run the `pnpm release:candidate` release-notes
-and contribution-record gates at the Code SHA and refuse to dispatch on failure.
-A record target lost to a squash merge needs a corrected record and a new Code SHA.
+Publish-purpose dispatches run the shared candidate release-notes,
+contribution-record provenance, and changelog-attribution gates at the Code SHA
+before dispatch. A failure prevents dispatch. A record target lost to a squash
+merge needs a corrected record and a new Code SHA. The candidate checklist uses
+the same validators; do not run both dispatch routes. For an existing
+qualification, use the retained-run consumption path below rather than launching
+another run.
 
-Record and reuse C/Q and independently trusted P. The helper defaults Q=C;
-`--workflow-sha`, if explicit here, must equal C. P performs lightweight admission
-before this same helper creates the Q transport and dispatches FRV. Missing Q
+Record and reuse C/Q and independently trusted P. For the direct SHA-pinned
+dispatcher, `--workflow-sha`, if explicit, must equal C; its default is Q=C.
+The candidate checklist instead uses `--workflow-sha` for P, as shown above.
+P performs lightweight admission before the dispatcher creates the Q transport
+and dispatches FRV. Missing Q
 contracts need deliberate backports; never borrow future-main requirements.
 Beta-publish uses
 `release_profile=beta`, `run_release_soak=false` (`npm-beta-v1` for a qualifying
@@ -206,6 +222,9 @@ With publication/tag-push authority, pass `--workflow-sha <tooling-sha>` to
 `pnpm release:candidate --` or `pnpm release:publish-preflight --` to reuse or
 mint the protected lightweight `release-publish/<tooling-sha12>-<epoch>` tag
 through the git refs API, verify it, and print the dispatch with `--ref <tag>`.
+The checklist requires `--workflow-sha` or `--publish-workflow-ref`. Without
+either, it fails right after any FRV dispatch, before waiting, and names every
+missing flag (including a required SDK acknowledgement) in one exact rerun command.
 Manual tag creation remains the fallback. The push may print a
 `Cannot create ref due to creations being restricted` ruleset warning while the
 tag still exists: verify with `gh api repos/openclaw/openclaw/git/ref/tags/<tag>`
@@ -373,8 +392,10 @@ and its readiness receipt; do not also dispatch the normal publisher.
 For `normal`, dispatch `.github/workflows/openclaw-release-publish.yml` using the candidate
 helper's protected `release-publish/<tooling-sha12>-<epoch>` ref. Pass matching
 `npm_dist_tag`, `preflight_run_id`, `full_release_validation_run_id` and its
-exact successful `full_release_validation_run_attempt`. The sealed manifest
-supplies SDK evidence and npm decisions;
+exact successful `full_release_validation_run_attempt`. For an FRV-qualified
+candidate, both run-ID inputs are the **FRV parent run ID**, not its
+`artifact:npm` child; use the exact successful FRV parent attempt. The sealed
+manifest supplies SDK evidence and npm decisions;
 explicit publisher inputs override them. The candidate helper retains its
 explicit SDK acknowledgement when needed. Optional Windows source tag and
 candidate-approved digests are supplied together or both omitted.

@@ -3,6 +3,7 @@ import {
   createAcceptedChannelDeliveryResult,
   createChannelPartialDeliveryError,
 } from "openclaw/plugin-sdk/channel-inbound";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
 import { dispatchReplyWithBufferedBlockDispatcher as dispatchThroughSharedOwner } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { asNonArrayRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
@@ -122,6 +123,8 @@ describeTelegramDispatch("dispatchTelegramMessage final-delivery-lifecycle", () 
     { failure: "retired instance", mode: "progress" },
     { failure: "definite no-send", mode: "progress" },
     { failure: "rejected tail", mode: "off" },
+    { failure: "network failure", mode: "off" },
+    { failure: "opaque fetch failure", mode: "off" },
   ] as const)(
     "preserves accepted content and reports $failure with streaming $mode",
     async ({ failure, mode }) => {
@@ -152,6 +155,12 @@ describeTelegramDispatch("dispatchTelegramMessage final-delivery-lifecycle", () 
         });
       } else if (failure === "retired instance") {
         deliverInboundReplyWithMessageSendContext.mockRejectedValueOnce(retiredPluginError());
+      } else if (failure === "network failure" || failure === "opaque fetch failure") {
+        const error = new Error("fetch failed");
+        if (failure === "network failure") {
+          error.cause = Object.assign(new Error("socket closed"), { code: "ECONNRESET" });
+        }
+        deliverInboundReplyWithMessageSendContext.mockRejectedValueOnce(error);
       } else {
         // A confirmed non-send may be retried without rerunning the model.
         deliverInboundReplyWithMessageSendContext.mockResolvedValue({ status: "handled_no_send" });
@@ -181,7 +190,11 @@ describeTelegramDispatch("dispatchTelegramMessage final-delivery-lifecycle", () 
 
       expect([...messages.values()]).toEqual([
         ...(partial ? [prefix] : []),
-        expect.stringMatching(mode === "progress" ? /Exec|chat history/i : /chat history/i),
+        mode === "progress"
+          ? expect.stringMatching(/Exec|I couldn't deliver my reply/i)
+          : failure === "network failure"
+            ? "I couldn't deliver my reply because of a network problem. Please ask again."
+            : "I couldn't deliver my reply. Please ask again.",
       ]);
       expect(sendMessage.mock.calls.some(([, text]) => text === finalText)).toBe(false);
       expect(replyResolver).toHaveBeenCalledOnce();
@@ -199,7 +212,7 @@ describeTelegramDispatch("dispatchTelegramMessage final-delivery-lifecycle", () 
         expect(sendMessage.mock.calls.map(([, text]) => text)).toEqual([
           prefix,
           tail,
-          expect.stringMatching(/chat history/i),
+          "I couldn't deliver my reply. Please ask again.",
         ]);
         return;
       }
@@ -397,7 +410,9 @@ describeTelegramDispatch("dispatchTelegramMessage final-delivery-lifecycle", () 
     expect(visible[0]?.[1]).toBe(first);
     expect(sendMessage.mock.calls.filter(([, text]) => text === first)).toHaveLength(1);
     expect(visible.some(([, text]) => text === second)).toBe(false);
-    expect(visible.some(([, text]) => text.includes("OpenClaw chat history"))).toBe(true);
+    expect(
+      visible.some(([, text]) => text === "I couldn't deliver my reply. Please ask again."),
+    ).toBe(true);
     expect(sendMessage.mock.calls.filter(([, text]) => text === second)).toHaveLength(1);
     expect(status.setError).toHaveBeenCalledOnce();
     expect(status.setDone).not.toHaveBeenCalled();
@@ -409,7 +424,93 @@ const question = {
   channelData: { askUser: { questionId: "ask_0123456789abcdef0123456789abcdef" } },
 };
 
+const buttons = [[{ text: "Continue", callback_data: "ask:continue" }]];
+
 describeTelegramDispatch("dispatchTelegramMessage native questions", () => {
+  it("delivers a question once while an in-flight progress draft is retired", async () => {
+    vi.useFakeTimers();
+    const editStarted = createDeferred<void>();
+    const releaseEdit = createDeferred<void>();
+    let questionDelivery: unknown;
+    const register = vi
+      .spyOn(questionGatewayRuntime, "registerChannelDelivery")
+      .mockImplementation(() => {});
+    try {
+      const { bot, messages, sendMessage, editMessageText, deleteMessage } =
+        await setupObservedProgressTransport();
+      dispatchReplyWithBufferedBlockDispatcher.mockImplementationOnce(
+        async ({ dispatcherOptions, replyOptions }) => {
+          await replyOptions?.onPlanUpdate?.({
+            phase: "update",
+            steps: [{ step: "Check the workspace before asking the user", status: "in_progress" }],
+          });
+          const draftResult = createTelegramDraftStream.mock.results[0];
+          if (draftResult?.type !== "return") {
+            throw new Error("Expected the Telegram draft factory to return a stream");
+          }
+          const draft: TelegramDraftStream = draftResult.value;
+          await draft.flush();
+          expect(sendMessage).toHaveBeenCalledOnce();
+
+          const edit = editMessageText.getMockImplementation()!;
+          editMessageText.mockImplementationOnce(async (...args) => {
+            editStarted.resolve();
+            await releaseEdit.promise;
+            return edit(...args);
+          });
+          await replyOptions?.onPlanUpdate?.({
+            phase: "update",
+            steps: [{ step: "Verify the workspace before asking the user", status: "in_progress" }],
+          });
+          const flushing = draft.flush();
+          await editStarted.promise;
+          const retirement = replyOptions?.onPlanUpdate?.({ phase: "update", steps: [] });
+          const delivery = dispatcherOptions.deliver(
+            { ...question, channelData: { ...question.channelData, telegram: { buttons } } },
+            { kind: "tool" },
+          );
+          releaseEdit.resolve();
+          await Promise.all([flushing, retirement]);
+          questionDelivery = await delivery;
+          return { queuedFinal: true };
+        },
+      );
+
+      await dispatchWithContext({
+        bot,
+        context: progressContext(),
+        telegramCfg: progressConfig,
+        streamMode: "progress",
+        cfg: { channels: { telegram: { botToken: "123456:question-fixture" } } },
+      });
+      await vi.runOnlyPendingTimersAsync();
+      expect(questionDelivery).toMatchObject({ visibleReplySent: true });
+      expect(sendMessage.mock.calls.filter(([, text]) => text === question.text)).toHaveLength(1);
+      expect([...messages.values()]).toEqual([question.text]);
+      const [messageId] = messages.keys();
+      expect(editMessageText).toHaveBeenCalledWith(
+        "123",
+        messageId,
+        question.text,
+        expect.objectContaining({ reply_markup: { inline_keyboard: buttons } }),
+      );
+      expect(register).toHaveBeenCalledOnce();
+      expect(register).toHaveBeenCalledWith(
+        expect.objectContaining({
+          questionId: question.channelData.askUser.questionId,
+          deliveryId: `telegram:default:123:${messageId}`,
+        }),
+      );
+      expect(deleteMessage).toHaveBeenCalledWith(123, 1001);
+      expect(deleteMessage).not.toHaveBeenCalledWith(123, messageId);
+    } finally {
+      releaseEdit.resolve();
+      register.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     { streamMode: "progress", controls: "buttonless", rejectControls: false },
     { streamMode: "partial", controls: "buttons", rejectControls: true },

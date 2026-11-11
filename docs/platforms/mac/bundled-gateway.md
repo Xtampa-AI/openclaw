@@ -28,6 +28,12 @@ duplicated. Existing independently managed installations keep their current
 lifecycle. Eligible app-managed Node services move to bundled Bun while keeping
 their always-on service.
 
+For local connections, the app prefers the configured `gateway.auth.token` or
+`gateway.auth.password` over `OPENCLAW_GATEWAY_TOKEN` or
+`OPENCLAW_GATEWAY_PASSWORD` inherited by the app, matching Gateway startup.
+Environment credentials remain fallbacks when no configured credential resolves.
+Remote connections retain their environment overrides.
+
 Before launching an app-hosted Gateway, the app saves a local authentication
 token when neither configuration nor the child environment supplies credentials
 and token authentication is selected or implicit. Existing credentials, secret
@@ -44,8 +50,17 @@ for the default state directory, `~/.config/openclaw/gateway.env`.
 The app first copies its runtime to `<state>/runtime/<runtimeBuildId>/`, where
 `<state>` is `~/.openclaw` or `~/.openclaw-<profile>`. Copies use one APFS
 directory clone when available, falling back to a file copy, and are published atomically after provenance and
-Bun checks succeed. The child and app-managed Bun service use the concrete
-build directory so each process keeps its matching package and SQLite library.
+Bun checks succeed. The child uses the concrete build directory so it keeps its
+matching package and SQLite library. An app-managed Bun service also loads its
+package and SQLite library from that directory, but runs a copy of that build's
+Bun at the stable path `<state>/runtime/service/bun`. macOS records the
+Messages Automation grant for a standalone executable by its path, so a stable
+path lets later app updates keep it. The first update that moves a service onto
+this path, including a move from Node, still needs Automation approved once for
+the new executable. Full Disk Access is also checked against the executable's
+code signature, so an update that replaces an ad-hoc or source-built Bun can
+lose it while System Settings still shows `bun` as enabled; grant it again for
+`<state>/runtime/service/bun`.
 The `runtime/current` symlink selects the runtime for the terminal CLI shim.
 The app retains the current and previous builds; older copies are removed only
 after Gateway health succeeds and no process runs from them.
@@ -71,7 +86,7 @@ retain their existing startup policies.
 
 When the native app creates identity, device-auth, or approval tables before
 the worker starts, node startup completes that recognized version-zero database
-through the canonical initializer before plugins read their state. Existing
+through the shared initializer before plugins read their state. Existing
 native rows are preserved. This does not migrate an already-versioned shared
 Gateway database or adopt unknown or occupied bootstrap state.
 
@@ -81,13 +96,19 @@ On a fresh Mac, choose **This Mac** during onboarding. **Getting things ready**
 prepares the included runtime, starts the Gateway, and verifies that it is
 ready. This setup needs no runtime download, Node installation, Terminal,
 Homebrew, or administrator access. Connecting an AI provider can still require
-internet access.
+internet access. The first-run handoff keeps waiting while the app retries
+Gateway startup, then opens automatic setup once the Gateway is ready. A terminal
+failure or cancellation leaves onboarding unfinished.
 
 The app creates `<state>/bin/openclaw`, a small shell wrapper that runs the
-current bundled CLI with Bun and the included SQLite library. It also links
-`openclaw-mac` beside it and adds that bin directory to the usual shell profile
-files. An existing operator-created `openclaw` file is preserved; only the
-app's own wrapper or a recognized `install-cli.sh` wrapper is replaced.
+current bundled CLI with Bun and the included SQLite library. When the app runs
+from a persistent location, it also links `openclaw-mac` beside it, and the
+default profile adds that bin directory to the usual shell profile files. Named
+profiles, and copies running from Downloads, the Desktop, a disk image, or a
+temporary directory such as `/tmp`, leave shell profiles unchanged; run their
+wrapper by its full path, such as `~/.openclaw-<profile>/bin/openclaw`. An
+existing operator-created `openclaw` file is preserved; only the app's own
+wrapper or a recognized `install-cli.sh` wrapper is replaced.
 
 Unbundled DEBUG builds retain the developer installer and channel chooser.
 That installer uses a private temporary directory for downloads and build tools,
@@ -102,12 +123,14 @@ is no longer available on reattachment, local setup becomes available again.
 An unreadable service ownership record blocks automatic installation instead
 of being treated as a missing service; check the LaunchAgent and retry.
 
-Chrome-extension preparation also runs automatically for the default app
-profile, including remote-only and attach-only Macs. It uses the validated
-private runtime, registers the native helper before requesting the Store
-extension, and leaves Chrome’s permission approval to you. Browser setup does not
-run Gateway-wide Doctor or migrate Gateway state. The Dashboard’s **Set up Chrome
-on this device** action retries the same serialized operation. See
+Choose **Settings → This Mac → Set up Chrome on this device** in the Dashboard to
+prepare the Chrome extension, including on remote-only and attach-only Macs.
+Startup does not inspect or change Chrome data. After you start setup, the default
+app profile maintains registration on CLI updates during that app session.
+Setup uses the validated private runtime, registers the native helper before
+requesting the Store extension, and leaves Chrome’s permission approval to you.
+It does not run Gateway-wide Doctor or migrate Gateway state. The same action
+retries setup when needed. See
 [Chrome extension](/tools/chrome-extension).
 
 ## Manual recovery
@@ -335,6 +358,12 @@ updated and verified through its own captured CLI. The app-owned local companion
 Gateway is then updated separately; the update receipt stays pending until both
 required runtimes are healthy. The bundled private worker is not a Node LaunchAgent,
 and absent node services or named profiles do not trigger legacy node lifecycle work.
+
+To install a local rebuild over a release app, package it with the release
+identity. A default debug package keeps separate permissions, default-profile
+preferences, and saved Gateway profiles, and raises login-keychain prompts for
+the release app's Keychain items. See
+[Replace an installed release app](/platforms/mac/dev-setup#replace-an-installed-release-app).
 
 ### Existing app-managed Node services
 

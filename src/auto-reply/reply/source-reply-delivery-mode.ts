@@ -29,6 +29,7 @@ export type SourceReplyDeliveryModeContext = Pick<
   | "CommandTurn"
   | "BotUsername"
   | "WasMentioned"
+  | "MentionSource"
   | "InputProvenance"
 >;
 
@@ -118,7 +119,8 @@ export function resolveSourceReplyExpectation(params: {
   });
   if (
     conversationType === "group" &&
-    params.ctx.WasMentioned !== true &&
+    // Thread participation admits the message but does not explicitly request a reply.
+    (params.ctx.WasMentioned !== true || params.ctx.MentionSource === "implicit_thread") &&
     resolveSilentReplySettings({
       cfg: params.cfg,
       surface: params.ctx.Surface ?? params.ctx.Provider,
@@ -169,8 +171,7 @@ export function resolveSourceReplyVisibilityPolicy(params: {
       inputProvenance: params.ctx.InputProvenance,
       isHeartbeat: params.isHeartbeat,
     }) &&
-    // Channel room-event requests force tool-only delivery for that turn, but
-    // must not split the session-stable CLI policy hash against mentioned turns.
+    // Room-event delivery overrides are transient, not session-stable CLI policy.
     (isExplicitCommandTurnContext(params.ctx, params.cfg) ||
       (params.requested !== undefined && params.ctx.InboundEventKind !== "room_event"));
   const sessionStableSourceReplyDeliveryMode = hasStableTurnOverride

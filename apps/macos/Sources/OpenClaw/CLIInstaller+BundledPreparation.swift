@@ -171,8 +171,7 @@ extension CLIInstaller {
         }
         let versionSatisfied = status.isReady ||
             Self.satisfiesUpdateTarget(installedVersion: found, targetVersion: required)
-        let repair = versionSatisfied &&
-            (pending?.coreUpdate == .gateway || pending?.coreUpdate == .legacyCanonical)
+        let repair = versionSatisfied && (pending?.coreUpdate == .gateway || pending?.coreUpdate == .legacyCanonical)
         if versionSatisfied, !repair { return cli.prefix.last ?? status.location }
         let checkCurrent: @MainActor @Sendable () async throws -> Void = {
             let hasRuntimePin = try await GatewayLaunchAgentManager.hasRuntimePin(
@@ -212,7 +211,7 @@ extension CLIInstaller {
             installedCLI: cli,
             checkCurrent: checkCurrent,
             onDispatch: {
-                dispatchedReceipt = try PostAppUpdateReceiptStore.recordSetupRecovery(
+                dispatchedReceipt = PostAppUpdateReceiptStore.recordSetupRecovery(
                     fromVersion: found,
                     toVersion: required,
                     runtimeBuildID: Bundle.main.infoDictionary?["OpenClawRuntimeBuildID"] as? String)
@@ -228,7 +227,6 @@ extension CLIInstaller {
             throw GatewayHostingError(
                 message: "The Node update did not verify a compatible Gateway version; retry setup.")
         }
-        // A newer runtime found before dispatch records no receipt; it has no repair to complete.
         if let dispatchedReceipt {
             PostAppUpdateReceiptStore.completeCoreRepair(receipt: dispatchedReceipt, owner: .gateway)
         }

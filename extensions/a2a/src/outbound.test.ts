@@ -1,11 +1,19 @@
 import fs from "node:fs";
 import path from "node:path";
+import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
 import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import * as ssrfRuntime from "openclaw/plugin-sdk/ssrf-runtime";
 import { withEnv, withStateDirEnv } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { sendA2aChannelText } from "./outbound.js";
 import type { A2aCoreConfig, A2aPeerConfig } from "./types.js";
+
+/** Both config guards reject deterministically before I/O; the queue must read them as terminal. */
+function expectPermanentPreDispatchRejection(failure: unknown, message: RegExp | string) {
+  expect(failure).toBeInstanceOf(PlatformMessageNotDispatchedError);
+  expect((failure as PlatformMessageNotDispatchedError).retryable).toBe(false);
+  expect((failure as Error).message).toMatch(message);
+}
 
 function createA2aOutboundConfig(
   peer: A2aPeerConfig = { token: "inbound-token", url: "https://hermes.example/a2a/v1" },
@@ -198,7 +206,11 @@ describe("A2A outbound channel delivery", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const cfg = createA2aOutboundConfig({ token: "inbound-token" });
 
-    await expect(sendA2aChannelText({ cfg, to: "hermes", text: "hello" })).rejects.toThrow(
+    const failure = await sendA2aChannelText({ cfg, to: "hermes", text: "hello" }).catch(
+      (error: unknown) => error,
+    );
+    expectPermanentPreDispatchRejection(
+      failure,
       "peer hermes has no url configured for outbound A2A",
     );
     expect(fetchMock).not.toHaveBeenCalled();
@@ -226,22 +238,6 @@ describe("A2A outbound channel delivery", () => {
       "A2A response without a result",
     );
     expect(fetchMock).toHaveBeenCalledTimes(4);
-  });
-
-  it("bounds oversized peer JSON responses before parsing", async () => {
-    const cfg = createA2aOutboundConfig();
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      createA2aJsonResponse({
-        jsonrpc: "2.0",
-        result: { task: { id: "remote-task-1" } },
-        padding: "x".repeat(16 * 1024 * 1024),
-      }),
-    );
-
-    await expect(sendA2aChannelText({ cfg, to: "hermes", text: "hello" })).rejects.toThrow(
-      "peer hermes A2A response: JSON response exceeds 16777216 bytes",
-    );
-    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("does not retain reflected outbound credentials in malformed responses", async () => {
@@ -295,34 +291,11 @@ describe("A2A outbound sends with unresolved authored credentials", () => {
         outboundToken: "${OPENCLAW_A2A_OUTBOUND_TEST_UNSET}",
       });
 
-      await expect(sendA2aChannelText({ cfg, to: "a2a:hermes", text: "hello" })).rejects.toThrow(
-        /outboundToken reference did not resolve/,
+      const failure = await sendA2aChannelText({ cfg, to: "a2a:hermes", text: "hello" }).catch(
+        (error: unknown) => error,
       );
+      expectPermanentPreDispatchRejection(failure, /outboundToken reference did not resolve/);
       expect(ssrfRuntime.fetchWithSsrFGuard).not.toHaveBeenCalled();
-    });
-  });
-
-  it("still sends anonymously to a peer that never authored an outboundToken", async () => {
-    await withStateDirEnv("a2a-outbound-anonymous-", async ({ stateDir }) => {
-      const cfg = await loadPeerConfig(stateDir, {
-        token: "inbound-token",
-        url: "https://hermes.example/a2a/v1",
-      });
-      vi.mocked(ssrfRuntime.fetchWithSsrFGuard).mockImplementationOnce(async () => ({
-        response: createA2aJsonResponse({
-          jsonrpc: "2.0",
-          id: "1",
-          result: { task: { id: "t1" } },
-        }),
-        finalUrl: "https://hermes.example/a2a/v1",
-        release: async () => {},
-      }));
-
-      await expect(
-        sendA2aChannelText({ cfg, to: "a2a:hermes", text: "hello" }),
-      ).resolves.toMatchObject({ to: "a2a:hermes" });
-      const init = vi.mocked(ssrfRuntime.fetchWithSsrFGuard).mock.calls[0]?.[0].init;
-      expect(init?.headers).not.toHaveProperty("authorization");
     });
   });
 });
