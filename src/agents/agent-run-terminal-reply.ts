@@ -1,7 +1,11 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
 import { stripInternalMetadataForDisplay } from "../auto-reply/reply/display-text-sanitize.js";
-import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
+import {
+  isSilentReplyPayloadText,
+  isSilentReplyText,
+  SILENT_REPLY_TOKEN,
+} from "../auto-reply/tokens.js";
 import { normalizeAgentRunRouteChange } from "./agent-run-terminal-receipt.js";
 import type { AgentRunTerminalReplySnapshot } from "./agent-run-terminal-reply.types.js";
 
@@ -40,6 +44,32 @@ export function buildAgentRunTerminalReplySnapshot(params: {
   }
   const text = sanitizeAgentRunTerminalReplyText(params.visibleText ?? "");
   return text ? { disposition: "visible", text } : { disposition: "empty" };
+}
+
+/**
+ * (kairos fork) An explicit silent token is the model's deliberate terminal
+ * answer — the run replied with intentional silence rather than missing its
+ * reply. Distinguishes a NO_REPLY final from genuinely empty output; callers
+ * use it to resolve silent completion instead of a missing-reply error.
+ */
+export function isExplicitSilentTerminalRun(params: {
+  meta?: {
+    terminalReply?: AgentRunTerminalReplySnapshot;
+    terminalReplyKind?: string;
+    finalAssistantRawText?: string;
+    finalAssistantVisibleText?: string;
+  } | null;
+  payloads?: readonly { text?: string }[];
+}): boolean {
+  const meta = params.meta;
+  return (
+    meta?.terminalReply?.disposition === "silent" ||
+    meta?.terminalReplyKind === "silent-empty" ||
+    isSilentReplyPayloadText(meta?.finalAssistantRawText ?? meta?.finalAssistantVisibleText) ||
+    (params.payloads !== undefined &&
+      params.payloads.length > 0 &&
+      params.payloads.every((payload) => isSilentReplyPayloadText(payload.text)))
+  );
 }
 
 /** Normalizes lifecycle/RPC evidence without allowing raw or unbounded text through. */

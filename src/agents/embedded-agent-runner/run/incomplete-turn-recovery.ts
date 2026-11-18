@@ -397,6 +397,11 @@ export function resolveEmptyResponseRetryInstruction(
   params: IncompleteTurnRecoveryParams & { payloadCount: number },
 ): string | null {
   const assistantState = classifyAssistantTurn(params);
+  // (kairos fork) An explicit silent token is a deliberate terminal answer, not
+  // a missing one — re-asking only repeats the token and burns another call.
+  if (assistantState.silent) {
+    return null;
+  }
   const assistant = assistantState.assistant ?? null;
   // A pre-dispatch rejection ran nothing. Error turns are never silent replies,
   // so inspect model output directly rather than the host's failure notice.

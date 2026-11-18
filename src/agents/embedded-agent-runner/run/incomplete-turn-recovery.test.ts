@@ -114,6 +114,55 @@ describe("incomplete-turn recovery policy", () => {
     },
   );
 
+  it("honors an explicit silent token without retry or visible error", () => {
+    // (kairos fork) NO_REPLY is a deliberate terminal answer even under a
+    // "required" reply expectation: no visible-answer retry, no error payload.
+    const assistant = emptyAssistant({
+      provider: "anthropic",
+      model: "claude-opus-4.7",
+      content: [{ type: "text", text: "NO_REPLY" }],
+      stopReason: "stop",
+    });
+    const attempt = makeEmbeddedRunnerAttempt({
+      assistantTexts: ["NO_REPLY"],
+      lastAssistant: assistant,
+      currentAttemptAssistant: assistant,
+      replayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+    });
+    const state = {
+      provider: "anthropic",
+      modelId: "claude-opus-4.7",
+      modelApi: "messages",
+      payloadCount: 0,
+      aborted: false,
+      timedOut: false,
+      attempt,
+    };
+    expect(resolveEmptyResponseRetryInstruction(state)).toBeNull();
+    expect(resolveIncompleteTurnPayloadText({ ...state, externalAbort: false })).toBeNull();
+  });
+
+  it("still surfaces a visible error for a truly empty assistant turn", () => {
+    const assistant = emptyAssistant({
+      provider: "anthropic",
+      model: "claude-opus-4.7",
+      content: [{ type: "text", text: "" }],
+      stopReason: "stop",
+    });
+    const attempt = emptyAttempt(assistant);
+    expect(
+      resolveIncompleteTurnPayloadText({
+        provider: "anthropic",
+        payloadCount: 0,
+        aborted: false,
+        externalAbort: false,
+        timedOut: false,
+        attempt,
+      }),
+    ).toContain("couldn't generate a response");
+  });
+
   it.each([
     { name: "visible terminal stop", text: "The final answer.", stopReason: "stop" },
     { name: "failed terminal sentinel", text: "NO_REPLY", stopReason: "error" },

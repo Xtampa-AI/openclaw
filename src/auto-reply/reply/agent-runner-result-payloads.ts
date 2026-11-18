@@ -1,4 +1,5 @@
 import { hasCompletionMessageSessionSpawn } from "../../agents/accepted-session-spawn.js";
+import { isExplicitSilentTerminalRun } from "../../agents/agent-run-terminal-reply.js";
 import { resolveDiagnosticModelResponse } from "../../agents/diagnostic-model-response.js";
 import {
   hasCommittedSourceReplyDeliveryEvidence,
@@ -183,8 +184,16 @@ export async function prepareReplyAgentPayloads(state: {
       sourceReplyDeliveryState: runResult.sourceReplyDeliveryState,
     }),
   );
+  // (kairos fork) An explicit silent token fulfills the reply obligation: the
+  // model deliberately answered NO_REPLY, so a "required" expectation resolves
+  // to intentional silence instead of a missing-reply error. Output that is
+  // empty without the token still resolves "missing" and errors as before.
+  const explicitSilentFinal = isExplicitSilentTerminalRun({
+    meta: runResult.meta,
+    payloads: payloadArray,
+  });
   let completion = resolveReplyCompletion(
-    terminalReplyExpectation,
+    explicitSilentFinal ? "optional" : terminalReplyExpectation,
     blocked
       ? "blocked"
       : sourceReplyDelivery !== "missing"

@@ -51,7 +51,7 @@ export function registerRequiredReplyCompletionCases({
   });
 
   it.each(["required", "optional"] as const)(
-    "honors %s completion despite silentExpected and bare NO_REPLY payloads",
+    "treats bare NO_REPLY payloads as intentional silence under %s completion",
     async (terminalReplyExpectation) => {
       const onPartialReply = vi.fn();
       const onBlockReply = vi.fn();
@@ -74,12 +74,9 @@ export function registerRequiredReplyCompletionCases({
       expect(onReasoningStream).not.toHaveBeenCalled();
       expect(onPartialReply).not.toHaveBeenCalled();
       expect(onBlockReply).not.toHaveBeenCalled();
-      if (terminalReplyExpectation === "required") {
-        const payloads = Array.isArray(res) ? res : [res];
-        expect(payloads).toContainEqual(expect.objectContaining({ isError: true }));
-      } else {
-        expect(res).toBeUndefined();
-      }
+      // (kairos fork) An explicit NO_REPLY is deliberate silence under any
+      // expectation, not a missing reply.
+      expect(res).toBeUndefined();
     },
   );
 
@@ -162,7 +159,9 @@ export function registerRequiredReplyCompletionCases({
         payloads: [{ text: "NO_REPLY" }],
         meta: { finalAssistantVisibleText: "NO_REPLY" },
       },
-      missing: true,
+      // (kairos fork) An explicit silent token is an authored answer, not a
+      // missing reply.
+      missing: false,
     },
     {
       label: "optional NO_REPLY",

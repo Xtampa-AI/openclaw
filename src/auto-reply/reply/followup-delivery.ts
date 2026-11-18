@@ -1,4 +1,5 @@
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
+import { isExplicitSilentTerminalRun } from "../../agents/agent-run-terminal-reply.js";
 import {
   hasCommittedSourceReplyDeliveryEvidence,
   hasCompletedSourceReplyDeliveryEvidence,
@@ -209,8 +210,12 @@ export async function resolveFollowupDeliveryDecision(params: {
       sourceReplyDeliveryState: result.sourceReplyDeliveryState,
     }),
   );
+  // (kairos fork) An explicit silent token fulfills the reply obligation in
+  // follow-up delivery too — same rule as the primary finalization path.
   let completion = resolveReplyCompletion(
-    terminalReplyExpectation,
+    isExplicitSilentTerminalRun({ meta: result.meta, payloads: accounting.payloadArray })
+      ? "optional"
+      : terminalReplyExpectation,
     result.meta?.error?.kind === "hook_block" || result.didSendDeterministicApprovalPrompt === true
       ? "blocked"
       : sourceReplyDelivery !== "missing"

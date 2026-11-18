@@ -161,6 +161,12 @@ export function resolveIncompleteTurnPayloadText(params: {
     : undefined;
 
   const stopReason = assistant?.stopReason;
+  // (kairos fork) An explicit silent token is a deliberate terminal answer, not
+  // an incomplete turn: honor NO_REPLY even under a "required" reply expectation
+  // instead of surfacing a spurious user-visible error.
+  if (assistantState.silent && !textToolCallAttempt && stopReason !== "error") {
+    return null;
+  }
   if (
     !textToolCallAttempt &&
     !incompleteTerminalAssistant &&
