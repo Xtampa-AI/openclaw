@@ -55,6 +55,7 @@ export function resetAuthProfileFailureState(
           cooldownModel: existing.cooldownModel,
           errorCount: existing.errorCount,
           failureCounts: existing.failureCounts,
+          lastRateLimitAt: existing.lastRateLimitAt,
         }
       : {}),
     ...overrides,

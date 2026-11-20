@@ -9,6 +9,7 @@ import {
 } from "../messages.js";
 import type { SessionContext, SessionTreeEntry } from "../types.js";
 import { selectResetKeptEntries } from "./tool-result-pairing.js";
+import { isTranscriptArtifactProvider } from "./transcript-model.js";
 
 const SESSION_HISTORY_PRELUDE = Symbol.for("openclaw.sessionHistoryPrelude");
 
@@ -122,35 +123,46 @@ export function* iterateSessionContextMessages<T extends SessionTreeEntry>(
   pathEntries: readonly T[],
   readEntry: (entry: T) => SessionTreeEntry = (entry) => entry,
 ): Generator<AgentMessage> {
-  for (const { entry, context } of iterateSessionContextEntries(pathEntries)) {
-    if (entry.type === "reset") {
-      continue;
+  for (const selected of iterateSessionContextEntries(pathEntries)) {
+    const message = projectSessionContextMessage(selected, readEntry);
+    if (message) {
+      yield message;
     }
-    const hydrated = readEntry(entry);
-    if (hydrated.type === "branch_summary" && !hydrated.summary) {
-      continue;
-    }
-    // Explicit reset retention can include otherwise excluded user/assistant messages.
-    let message =
-      context === "reset-retained" && hydrated.type === "message"
-        ? hydrated.message
-        : projectSessionEntryMessage(hydrated);
-    if (!message) {
-      continue;
-    }
-    if (context !== "current" && message.role === "assistant") {
-      message = stripCompactionReplayCheckpoint(message);
-    }
-    if (context === "reset-retained" && (message.role === "user" || message.role === "assistant")) {
-      message = { ...message };
-      Object.defineProperty(message, SESSION_HISTORY_PRELUDE, {
-        configurable: true,
-        enumerable: false,
-        value: true,
-      });
-    }
-    yield message;
   }
+}
+
+/** Project one selected entry without changing its canonical position or retained context. */
+export function projectSessionContextMessage<T extends SessionTreeEntry>(
+  { entry, context }: { entry: T; context: "current" | "retained" | "reset-retained" },
+  readEntry: (entry: T) => SessionTreeEntry = (selected) => selected,
+): AgentMessage | undefined {
+  if (entry.type === "reset") {
+    return undefined;
+  }
+  const hydrated = readEntry(entry);
+  if (hydrated.type === "branch_summary" && !hydrated.summary) {
+    return undefined;
+  }
+  // Explicit reset retention can include otherwise excluded user/assistant messages.
+  let message =
+    context === "reset-retained" && hydrated.type === "message"
+      ? hydrated.message
+      : projectSessionEntryMessage(hydrated);
+  if (!message) {
+    return undefined;
+  }
+  if (context !== "current" && message.role === "assistant") {
+    message = stripCompactionReplayCheckpoint(message);
+  }
+  if (context === "reset-retained" && (message.role === "user" || message.role === "assistant")) {
+    message = { ...message };
+    Object.defineProperty(message, SESSION_HISTORY_PRELUDE, {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+  }
+  return message;
 }
 
 /** Build model context from an ordered session branch and its latest state markers. */
@@ -160,9 +172,13 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
   for (const entry of pathEntries) {
     if (entry.type === "thinking_level_change") {
       thinkingLevel = entry.thinkingLevel;
-    } else if (entry.type === "model_change") {
+    } else if (entry.type === "model_change" && !isTranscriptArtifactProvider(entry.provider)) {
       model = { provider: entry.provider, modelId: entry.modelId };
-    } else if (entry.type === "message" && entry.message.role === "assistant") {
+    } else if (
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      !isTranscriptArtifactProvider(entry.message.provider)
+    ) {
       model = { provider: entry.message.provider, modelId: entry.message.model };
     }
   }

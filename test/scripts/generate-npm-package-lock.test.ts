@@ -215,6 +215,51 @@ describe("generate-npm-package-lock", () => {
     },
   );
 
+  it("reads pnpm policy once per generation and refreshes it on the next call", () => {
+    const root = tempDirs.make("openclaw-npm-policy-lifetime-");
+    writeFileSync(path.join(root, "pnpm-workspace.yaml"), "{}\n");
+    writeFileSync(path.join(root, "pnpm-lock.yaml"), JSON.stringify({ packages: {} }));
+    writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({ name: "policy-fixture", version: "1.0.0" }),
+    );
+    const script = `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const lockPath = ${JSON.stringify(path.join(root, "pnpm-lock.yaml"))};
+const read = fs.readFileSync;
+let reads = 0;
+fs.readFileSync = function(file, ...args) {
+  if (String(file) === lockPath) reads++;
+  return read.call(this, file, ...args);
+};
+syncBuiltinESMExports();
+const { generateNpmPackageLock } = await import(${JSON.stringify(new URL("../../scripts/generate-npm-package-lock.mts", import.meta.url).href)});
+const first = JSON.parse(generateNpmPackageLock(${JSON.stringify(root)}));
+const firstReads = reads;
+fs.writeFileSync(lockPath, "invalid: [");
+let error;
+try { generateNpmPackageLock(${JSON.stringify(root)}); } catch (caught) { error = caught.message; }
+console.log(JSON.stringify({ first, firstReads, nextReads: reads - firstReads, error }));`;
+    const result = spawnSync(
+      process.execPath,
+      ["--import", import.meta.resolve("tsx"), "--input-type=module", "-e", script],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_NPM_PACKAGE_LOCK_REPO_ROOT: root,
+          npm_config_offline: "true",
+        },
+      },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    const observed = JSON.parse(result.stdout);
+    expect(observed.first).toMatchObject({ name: "policy-fixture", lockfileVersion: 3 });
+    expect(observed.firstReads).toBe(1);
+    expect(observed.nextReads).toBe(1);
+    expect(observed.error).toContain("Flow sequence");
+  });
+
   it("accepts strict npm-lock command timeout and buffer overrides", () => {
     expect(
       createNpmLockExecOptions({ command: "npm", args: ["install"] }, "/tmp/package", {
@@ -1027,6 +1072,13 @@ describe("generate-npm-package-lock", () => {
         tarball,
       };
     };
+    const registryVersions = (entries: Array<[string, ReturnType<typeof packPackage>]>) =>
+      Object.fromEntries(
+        entries.map(([version, { artifact, manifest, tarball }]) => [
+          version,
+          { integrity: artifact.integrity, manifest, tarball },
+        ]),
+      );
     const writeParent = (
       name: string,
       dependencies: Record<string, string>,
@@ -1122,71 +1174,17 @@ describe("generate-npm-package-lock", () => {
     writeFileSync(
       registryConfig,
       JSON.stringify({
-        parent: {
-          "1.0.0": {
-            integrity: parent.artifact.integrity,
-            manifest: parent.manifest,
-            tarball: parent.tarball,
-          },
-        },
-        overlap: {
-          "1.0.0": {
-            integrity: overlap.artifact.integrity,
-            manifest: overlap.manifest,
-            tarball: overlap.tarball,
-          },
-        },
-        modern: {
-          "1.0.0": {
-            integrity: modern.artifact.integrity,
-            manifest: modern.manifest,
-            tarball: modern.tarball,
-          },
-        },
-        broad: {
-          "1.0.0": {
-            integrity: broad.artifact.integrity,
-            manifest: broad.manifest,
-            tarball: broad.tarball,
-          },
-        },
-        unrelated: {
-          "1.0.0": {
-            integrity: unrelated.artifact.integrity,
-            manifest: unrelated.manifest,
-            tarball: unrelated.tarball,
-          },
-        },
-        violator: {
-          "1.0.0": {
-            integrity: violator.artifact.integrity,
-            manifest: violator.manifest,
-            tarball: violator.tarball,
-          },
-        },
-        forked: Object.fromEntries(
-          forkedPackages.map(({ artifact, manifest, tarball }) => [
-            artifact.version,
-            { integrity: artifact.integrity, manifest, tarball },
-          ]),
-        ),
-        leaf: Object.fromEntries(
-          leafPackages.map(({ artifact, manifest, tarball }) => [
-            artifact.version,
-            { integrity: artifact.integrity, manifest, tarball },
-          ]),
-        ),
-        blocked: Object.fromEntries(
-          blockedPackages.map(({ artifact, manifest, tarball }) => [
-            artifact.version,
-            { integrity: artifact.integrity, manifest, tarball },
-          ]),
-        ),
-        replacement: Object.fromEntries(
-          replacementPackages.map(({ artifact, manifest, tarball }) => [
-            artifact.version,
-            { integrity: artifact.integrity, manifest, tarball },
-          ]),
+        parent: registryVersions([["1.0.0", parent]]),
+        overlap: registryVersions([["1.0.0", overlap]]),
+        modern: registryVersions([["1.0.0", modern]]),
+        broad: registryVersions([["1.0.0", broad]]),
+        unrelated: registryVersions([["1.0.0", unrelated]]),
+        violator: registryVersions([["1.0.0", violator]]),
+        forked: registryVersions(forkedPackages.map((entry) => [entry.artifact.version, entry])),
+        leaf: registryVersions(leafPackages.map((entry) => [entry.artifact.version, entry])),
+        blocked: registryVersions(blockedPackages.map((entry) => [entry.artifact.version, entry])),
+        replacement: registryVersions(
+          replacementPackages.map((entry) => [entry.artifact.version, entry]),
         ),
       }),
     );
@@ -1765,8 +1763,16 @@ process.on("SIGTERM", () => server.close(() => process.exit(0)));
     ).toEqual([]);
   });
 
-  it("falls back to every npm lock when lockfile ownership is ambiguous", () => {
-    const packageDirs = npmLockPackageDirsForChangedPaths(["pnpm-lock.yaml"]).map(repoRelativePath);
+  it.each([
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "scripts/generate-npm-package-lock.mts",
+    "scripts/lib/npm-lock-package-selection.mjs",
+    "scripts/lib/npm-lock-package-selection.d.mts",
+    "scripts/lib/record-shared.mjs",
+    "scripts/lib/record-shared.d.mts",
+  ])("falls back to every npm lock when policy ownership changes: %s", (file) => {
+    const packageDirs = npmLockPackageDirsForChangedPaths([file]).map(repoRelativePath);
 
     expect(packageDirs).toContain("");
     expect(packageDirs).toContain("packages/gateway-client");

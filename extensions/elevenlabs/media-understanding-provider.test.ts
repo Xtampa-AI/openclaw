@@ -1,10 +1,19 @@
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
+import {
+  capturePluginRegistration,
+  requireRegisteredProvider,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { installPinnedHostnameTestHooks } from "openclaw/plugin-sdk/test-media-understanding";
 import { describe, expect, it, vi } from "vitest";
-import { elevenLabsMediaUnderstandingProvider } from "./media-understanding-provider.js";
+import plugin from "./index.js";
 
 describe("elevenLabsMediaUnderstandingProvider", () => {
   installPinnedHostnameTestHooks();
+  const { mediaUnderstandingProviders } = capturePluginRegistration({
+    id: "elevenlabs",
+    register: plugin.register,
+  });
+  const provider = requireRegisteredProvider(mediaUnderstandingProviders, "elevenlabs");
   const request = {
     buffer: Buffer.from("audio"),
     fileName: "voice.mp3",
@@ -16,7 +25,7 @@ describe("elevenLabsMediaUnderstandingProvider", () => {
   it("posts multipart audio to ElevenLabs speech-to-text", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ text: "hello" }));
 
-    const result = await elevenLabsMediaUnderstandingProvider.transcribeAudio!({
+    const result = await provider.transcribeAudio!({
       ...request,
       language: "en",
       fetchFn: fetchMock,
@@ -39,7 +48,7 @@ describe("elevenLabsMediaUnderstandingProvider", () => {
   it("forwards supported provider query options to speech-to-text", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ text: "hello" }));
 
-    await elevenLabsMediaUnderstandingProvider.transcribeAudio!({
+    await provider.transcribeAudio!({
       ...request,
       query: { no_verbatim: true, tag_audio_events: false, diarize: true },
       fetchFn: fetchMock,
@@ -55,18 +64,15 @@ describe("elevenLabsMediaUnderstandingProvider", () => {
   it("ignores unsupported query keys and does not let them override dedicated fields", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ text: "hello" }));
 
-    const query = {
-      webhook: "https://example.com/hook",
-      model_id: "other_model",
-      language_code: "fr",
-    };
-    // Model malformed JavaScript input without weakening the typed request contract.
-    Object.defineProperty(query, "no_verbatim", { value: ["true"], enumerable: true });
-
-    await elevenLabsMediaUnderstandingProvider.transcribeAudio!({
+    await provider.transcribeAudio!({
       ...request,
       language: "en",
-      query,
+      query: {
+        webhook: "https://example.com/hook",
+        model_id: "other_model",
+        language_code: "fr",
+        no_verbatim: ["true"],
+      },
       fetchFn: fetchMock,
     });
 
@@ -82,7 +88,7 @@ describe("elevenLabsMediaUnderstandingProvider", () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify([])));
 
     await expect(
-      elevenLabsMediaUnderstandingProvider.transcribeAudio!({
+      provider.transcribeAudio!({
         ...request,
         model: "scribe_v2",
         fetchFn: fetchMock,

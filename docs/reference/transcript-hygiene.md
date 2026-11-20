@@ -76,6 +76,11 @@ thinking, omits unfinished calls and partial text, and uses a replayable stop re
 The stored failure and billing facts remain unchanged. This uses existing
 assistant-row shapes and requires no database migration.
 
+Responses item-conflict recovery receipts survive discarded failed or silent
+assistant content as empty replay rows. The transport consumes their metadata
+without sending an empty assistant message, preserving the repaired identity
+boundary after a failed retry or session reopen.
+
 Direct Anthropic Messages append-only replay also keeps failed and recovered
 assistant frames separate, along with consecutive user turns. Strict routes
 retain their role-merging behavior.
@@ -134,6 +139,11 @@ image stays omitted on every replay. Successful outcomes (verified as-is, or the
 downscaled replacement) are cached in process by content digest and limits,
 bounded to 16 MiB, so later turns reuse them instead of decoding the same bytes
 again.
+Image-free content from immutable transcript publications reuses its cleanup
+result for the same replay policy. New or mutable content is still inspected;
+image-bearing content always goes through the image sanitizer, so unavailable
+backends and failed checks remain retryable. These weakly keyed results expire
+with their source content and do not change stored transcript bytes.
 This also helps
 control image-driven token pressure for vision-capable models: lower max
 dimensions reduce token usage, higher dimensions preserve detail.
@@ -275,8 +285,9 @@ inter-session user turns that only have provenance metadata.
   Encrypted reasoning bytes, executable tool arguments, and previously approved
   history remain unchanged.
 - Successful SDK Responses completions omit absent error fields. The session
-  owner attaches run metadata to fresh assistant history before persistence, so
-  the next tool step and transcript reload retain the same run envelope.
+  owner attaches run metadata to fresh assistant and tool-result history before
+  persistence, so the next tool step and transcript reload retain the same run
+  envelope. This internal metadata is not sent in Responses tool outputs.
 - Native ChatGPT Codex Responses follows Codex wire parity by replaying
   prior Responses reasoning/message/function payloads without prior item
   IDs while preserving session `prompt_cache_key`.
@@ -292,6 +303,11 @@ inter-session user turns that only have provenance metadata.
 
 **OpenAI-compatible Chat Completions**
 
+- Historical calls to tools absent from the outgoing catalog, including tools whose
+  schemas were rejected, replay as assistant text together with their results.
+  The model still sees errors such as `Tool session_status not found`. Declared
+  calls retain native tool protocol, with their results kept together in mixed
+  batches. This deterministic request projection leaves stored history unchanged.
 - Historical assistant thinking/reasoning blocks are stripped before replay
   so local and proxy-style OpenAI-compatible servers do not receive
   prior-turn reasoning fields such as `reasoning` or `reasoning_content`.

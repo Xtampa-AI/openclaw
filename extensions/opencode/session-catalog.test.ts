@@ -5,28 +5,46 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import type { SessionTranscriptWriteContext } from "openclaw/plugin-sdk/session-transcript-runtime";
 import { withEnvAsync } from "openclaw/plugin-sdk/test-env";
+import { withinTest } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  bindTestCatalogOwner,
-  type RegisteredSessionCatalogProvider,
-  type SessionCatalogProvider,
-} from "./session-catalog-owner.test-support.js";
+import { createSessionCatalogContinuationStore } from "../test-support/session-catalog-continuation.test-support.js";
 
 type ResolveAcpSessionAvailability =
   (typeof import("openclaw/plugin-sdk/acp-runtime"))["resolveAcpSessionAvailability"];
 type RunCommandBuffered =
   (typeof import("openclaw/plugin-sdk/process-runtime"))["runCommandBuffered"];
+type RegisteredSessionCatalogProvider = Parameters<OpenClawPluginApi["registerSessionCatalog"]>[0];
+type SessionCatalogProvider = RegisteredSessionCatalogProvider;
 type NodeHostCommand = Parameters<OpenClawPluginApi["registerNodeHostCommand"]>[0];
 type NodeInvokePolicy = Parameters<OpenClawPluginApi["registerNodeInvokePolicy"]>[0];
 type CatalogListParams = Parameters<SessionCatalogProvider["list"]>[0];
 type CatalogReadParams = Parameters<SessionCatalogProvider["read"]>[0];
-type CreateSessionEntryParams = Parameters<
-  OpenClawPluginApi["runtime"]["agent"]["session"]["createSessionEntry"]
->[0];
 
-const nodeHostMocks = vi.hoisted(() => ({
-  runNodePtyCommand: vi.fn(async () => ({ exitCode: 0 })),
-}));
+function bindTestCatalogOwner(provider: RegisteredSessionCatalogProvider): SessionCatalogProvider {
+  return {
+    ...provider,
+    list: (params) => provider.list({ agentId: "main", ...params }),
+    read: (params) => provider.read({ agentId: "main", ...params }),
+    ...(provider.continueSession
+      ? {
+          continueSession: (params) => provider.continueSession!({ agentId: "main", ...params }),
+        }
+      : {}),
+    ...(provider.archive
+      ? { archive: (params) => provider.archive!({ agentId: "main", ...params }) }
+      : {}),
+    ...(provider.openTerminal
+      ? {
+          openTerminal: (params) => provider.openTerminal!({ agentId: "main", ...params }),
+        }
+      : {}),
+  } as SessionCatalogProvider;
+}
+
+const nodeHostMocks = await vi.hoisted(async () => {
+  const { createNodeHostMocks } = await import("../test-support/node-host.test-support.js");
+  return createNodeHostMocks();
+});
 const acpRuntimeMocks = vi.hoisted(() => ({
   resolveAcpSessionAvailability: vi.fn<ResolveAcpSessionAvailability>(() => ({ available: true })),
 }));
@@ -75,29 +93,8 @@ vi.mock("openclaw/plugin-sdk/session-transcript-runtime", async (importOriginal)
   };
 });
 
-vi.mock("openclaw/plugin-sdk/node-host", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/node-host")>();
-  return {
-    ...actual,
-    runNodePtyCommand: nodeHostMocks.runNodePtyCommand,
-    resolveNodeHostExecutable: (
-      command: string,
-      options: {
-        env?: NodeJS.ProcessEnv;
-        pathEnv?: string;
-        includeExtensionless?: boolean;
-      },
-    ) => {
-      const env = options.env ?? process.env;
-      return actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv: options.pathEnv ?? env.PATH ?? env.Path ?? "",
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-    },
-  };
-});
+// mock-isolation: Shared owner preserves real exports with fresh command-resolution mocks.
+vi.mock("openclaw/plugin-sdk/node-host", nodeHostMocks.mockRuntime);
 
 import { registerOpenCodeSessionCatalog } from "./session-catalog-plugin.js";
 import {
@@ -129,6 +126,7 @@ function captureOpenCodeSessionRegistrations(
       id: "opencode",
       pluginConfig,
       runtime: {
+        config: { current: () => ({}) },
         nodes: { list: vi.fn().mockResolvedValue({ nodes: [] }) },
       } as unknown as OpenClawPluginApi["runtime"],
       ...(overrides as Partial<OpenClawPluginApi>),
@@ -170,7 +168,7 @@ function capturePairedNodeCatalog(nodes: Array<Record<string, unknown>>, invoke:
   const { provider } = captureOpenCodeSessionRegistrations(
     {},
     {
-      runtime: { nodes: { list: listNodes, invoke } },
+      runtime: { config: { current: () => ({}) }, nodes: { list: listNodes, invoke } },
     },
   );
   return { listNodes, provider };
@@ -186,9 +184,8 @@ const readPairedNode = (
   params: Omit<CatalogReadParams, "hostId" | "threadId"> = {},
 ) => provider.read({ ...pairedNodeLocator, ...params });
 
-const readTestTranscript = (
-  params: Omit<Parameters<typeof readLocalOpenCodeTranscriptPage>[0], "threadId"> = {},
-) => readLocalOpenCodeTranscriptPage({ threadId: "ses_test", ...params });
+const readTestTranscript = (params: Record<string, unknown> = {}) =>
+  readLocalOpenCodeTranscriptPage({ threadId: "ses_test", ...params });
 
 async function expectRejects(promise: Promise<unknown>, message: string) {
   await expect(promise).rejects.toThrow(message);
@@ -214,39 +211,10 @@ async function expectPairedNodeListError(
 }
 
 function captureOpenCodeContinuationCatalog() {
-  const entries: Array<{ sessionKey: string; entry: Record<string, unknown> }> = [];
-  const createSessionEntry = vi.fn(async (params: CreateSessionEntryParams) => {
-    const sessionKey = `agent:${params.agentId ?? "main"}:${params.key}`;
-    const entry = {
-      sessionId: "adopted-opencode-session",
-      updatedAt: Date.now(),
-      pluginOwnerId: "opencode",
-      initializationPending: true as const,
-      ...(params.label ? { label: params.label } : {}),
-      ...(params.displayName ? { displayName: params.displayName } : {}),
-      ...(params.spawnedCwd ? { spawnedCwd: params.spawnedCwd } : {}),
-      pluginExtensions: params.initialEntry.pluginExtensions,
-    };
-    entries.push({ sessionKey, entry });
-    const created = {
-      key: sessionKey,
-      agentId: params.agentId ?? "main",
-      sessionId: entry.sessionId,
-      entry,
-    };
-    try {
-      const finalPatch = await params.afterCreate?.(created);
-      entry.pluginExtensions = finalPatch?.pluginExtensions ?? entry.pluginExtensions;
-      delete (entry as { initializationPending?: true }).initializationPending;
-      return created;
-    } catch (error) {
-      entries.splice(
-        entries.findIndex((candidate) => candidate.entry === entry),
-        1,
-      );
-      throw error;
-    }
-  });
+  const { entries, createSessionEntry } = createSessionCatalogContinuationStore(
+    "opencode",
+    "adopted-opencode-session",
+  );
   const session = { createSessionEntry, listSessionEntries: vi.fn(() => entries) };
   const runtime = {
     config: { current: () => ({}) },
@@ -405,7 +373,11 @@ function restoreEnv(name: string, value: string | undefined) {
   }
 }
 
+let cleanupHeldListing: (() => Promise<void>) | undefined;
 afterEach(async () => {
+  // Timeout teardown must join the fixture before resetting its mocks and environment.
+  await cleanupHeldListing?.();
+  cleanupHeldListing = undefined;
   acpRuntimeMocks.resolveAcpSessionAvailability.mockReset().mockReturnValue({ available: true });
   nodeHostMocks.runNodePtyCommand.mockClear();
   processRuntimeMocks.runCommandBuffered.mockClear();
@@ -466,13 +438,13 @@ describe("OpenCode session catalog", () => {
   );
 
   itWithCli.each([1, 2])(
-    "lists and reads sessions through the v%s CLI JSON surfaces",
+    "searches and reads canonical titles through the v%s CLI JSON surfaces",
     async (version) => {
-      await installFakeOpenCode("hi", "Catalog session", { command: "pwd" }, version);
-      const listed = await listLocalOpenCodeSessionPage({ limit: 20 });
+      await installFakeOpenCode("hi", "Cafe\u0301 catalog", { command: "pwd" }, version);
+      const listed = await listLocalOpenCodeSessionPage({ limit: 20, searchTerm: "CAFÉ" });
       const expectedSession = {
         threadId: "ses_test",
-        name: "Catalog session",
+        name: "Cafe\u0301 catalog",
         cwd: "/workspace",
         source: "opencode-cli",
         canContinue: true,
@@ -717,6 +689,7 @@ describe("OpenCode session catalog", () => {
     ]);
     expect(transcriptMocks.messages[0]?.["__openclaw"]).toEqual({
       mirrorOrigin: "opencode-catalog-import",
+      catalogDisplay: { type: "userMessage" },
     });
   });
 
@@ -1009,11 +982,8 @@ describe("OpenCode session catalog", () => {
     );
   });
 
-  it("fans out paired-node listing instead of blocking later hosts", async () => {
-    let releaseSlow: ((value: unknown) => void) | undefined;
-    const slow = new Promise<unknown>((resolve) => {
-      releaseSlow = resolve;
-    });
+  it("fans out paired-node listing instead of blocking later hosts", async (context) => {
+    const { promise: slow, resolve: releaseSlow } = Promise.withResolvers<unknown>();
     const page = (threadId: string) => pairedNodeSessionPage(pairedNodeSession({ threadId }));
     const invoke = vi.fn(({ nodeId }: { nodeId: string }) =>
       nodeId === "node-a" ? slow : Promise.resolve(page("session-b")),
@@ -1026,8 +996,21 @@ describe("OpenCode session catalog", () => {
     );
 
     const listing = provider!.list({ hostIds: ["node:node-a", "node:node-b"] });
-    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
-    releaseSlow?.(page("session-a"));
+    const fanOut = vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+    const settledWork = Promise.allSettled([listing, fanOut]);
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanup = () =>
+      (cleanupPromise ??= (async () => {
+        // The held mock ignores cancellation; join both node tasks and the polling assertion.
+        releaseSlow(page("session-a"));
+        await settledWork;
+      })());
+    cleanupHeldListing = cleanup;
+    try {
+      await withinTest(fanOut, context.signal);
+    } finally {
+      await cleanup();
+    }
     await expect(listing).resolves.toEqual([
       expect.objectContaining({ nodeId: "node-a", sessions: [expect.any(Object)] }),
       expect.objectContaining({ nodeId: "node-b", sessions: [expect.any(Object)] }),

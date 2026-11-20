@@ -4,14 +4,12 @@ import { execFileSync, spawnSync } from "node:child_process";
 import process from "node:process";
 import { booleanFlag, parseFlagArgs, stringFlag } from "./lib/arg-utils.mts";
 import { runManagedCommand } from "./lib/managed-child-process.mts";
-import { parseReleaseVersion } from "./lib/release-version.mjs";
 
 type ReleasePrepushCommand = {
   name: string;
   bin: "git" | "node";
   args: string[];
   cwd: string;
-  env?: NodeJS.ProcessEnv;
 };
 
 type ReleasePrepushDependencies = {
@@ -22,7 +20,6 @@ type ReleasePrepushDependencies = {
   refreshMain: () => void;
   refreshReleaseBranch: (branch: string) => string | undefined;
   resolveCommit: (ref: string) => string;
-  resolveInitialReleaseBase: (headSha: string, auditMergeBase: string) => string | undefined;
   runCommand: (command: ReleasePrepushCommand) => Promise<number>;
 };
 
@@ -76,37 +73,6 @@ export function selectChangedGateBase(
   return canonicalReleaseSha;
 }
 
-function resolveInitialReleaseBase(headSha: string, auditMergeBase: string): string | undefined {
-  // A new release can descend from shipped bytes no longer on main's ancestry.
-  // Only remote-published stable tags can exempt shipped bytes from this check.
-  const publishedTags = new Map(
-    git(["ls-remote", "--tags", "--refs", "origin", "refs/tags/v*"])
-      .split("\n")
-      .map((line) => {
-        const [sha, ref] = line.split("\t");
-        return [ref, sha];
-      }),
-  );
-  const tag = git([
-    "for-each-ref",
-    "--merged=" + headSha,
-    "--contains=" + auditMergeBase,
-    "--sort=-version:refname",
-    "--format=%(objectname) %(refname)",
-    "refs/tags/v*",
-  ])
-    .split("\n")
-    .map((line) => line.split(" "))
-    .find(
-      ([sha, ref]) =>
-        ref &&
-        publishedTags.get(ref) === sha &&
-        parseReleaseVersion(ref.slice("refs/tags/v".length))?.channel === "stable",
-    );
-  const ref = tag?.[1];
-  return ref ? resolveCommit(ref) : undefined;
-}
-
 export function currentBranch(): string {
   const branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
   return canonicalReleaseBranch(branch);
@@ -120,9 +86,11 @@ export function canonicalReleaseBranch(branch: string): string {
 }
 
 export function refreshMain(): void {
-  execFileSync("git", ["fetch", "--tags", "origin", "refs/heads/main:refs/remotes/origin/main"], {
-    stdio: "inherit",
-  });
+  execFileSync(
+    "git",
+    ["fetch", "--no-tags", "origin", "refs/heads/main:refs/remotes/origin/main"],
+    { stdio: "inherit" },
+  );
 }
 
 export function refreshReleaseBranch(branch: string): string | undefined {
@@ -154,7 +122,6 @@ export function buildReleasePrepushPlan(
   baseSha: string,
   headSha: string,
   cwd: string,
-  env: NodeJS.ProcessEnv = process.env,
 ): ReleasePrepushCommand[] {
   return [
     {
@@ -162,14 +129,12 @@ export function buildReleasePrepushPlan(
       bin: "git",
       args: ["diff", "--check", baseSha, headSha],
       cwd,
-      env,
     },
     {
       name: "release changelog layout",
       bin: "node",
       args: ["scripts/release-changelog.mjs", "check", "--ref", headSha],
       cwd,
-      env,
     },
   ];
 }
@@ -180,7 +145,6 @@ async function defaultRunCommand(command: ReleasePrepushCommand): Promise<number
     bin: command.bin,
     args: command.args,
     cwd: command.cwd,
-    env: command.env,
   });
 }
 
@@ -192,7 +156,6 @@ const defaultDependencies: ReleasePrepushDependencies = {
   refreshMain,
   refreshReleaseBranch,
   resolveCommit,
-  resolveInitialReleaseBase,
   runCommand: defaultRunCommand,
 };
 
@@ -219,16 +182,12 @@ export async function runReleasePrepush(
   const baseSha = dependencies.resolveCommit(options.base);
   const headSha = dependencies.resolveCommit(headRef);
   const canonicalReleaseSha = branch ? dependencies.refreshReleaseBranch(branch) : undefined;
-  let comparisonBaseSha = selectChangedGateBase(
+  const comparisonBaseSha = selectChangedGateBase(
     baseSha,
     headSha,
     canonicalReleaseSha,
     dependencies.assertAuditBounds,
   );
-  if (branch && canonicalReleaseSha === undefined) {
-    comparisonBaseSha =
-      dependencies.resolveInitialReleaseBase(headSha, comparisonBaseSha) ?? comparisonBaseSha;
-  }
 
   if (comparisonBaseSha !== baseSha) {
     console.error(
@@ -243,10 +202,7 @@ export async function runReleasePrepush(
     return 0;
   }
 
-  for (const command of buildReleasePrepushPlan(comparisonBaseSha, headSha, process.cwd(), {
-    ...process.env,
-    OPENCLAW_RELEASE_CONTEXT_REF: branch,
-  })) {
+  for (const command of buildReleasePrepushPlan(comparisonBaseSha, headSha, process.cwd())) {
     const status = await dependencies.runCommand(command);
     if (status !== 0) {
       console.error(`[release:prepush] failed: ${command.name}`);

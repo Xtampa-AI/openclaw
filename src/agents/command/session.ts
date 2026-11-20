@@ -58,7 +58,6 @@ import {
   listAgentIds,
   resolveDefaultAgentId,
 } from "../agent-scope.js";
-import { clearBootstrapSnapshotOnSessionRollover } from "../bootstrap-cache.js";
 import { clearRotatedSessionMetadata } from "../session-reset-metadata.js";
 
 type SessionResolution = {
@@ -69,7 +68,10 @@ type SessionResolution = {
   storePath: string;
   isNewSession: boolean;
   previousSessionId?: string;
-  automaticReset?: { reason: "idle" | "daily"; expectedLifecycleRevision?: string };
+  automaticReset?: {
+    reason: "idle" | "daily" | "reset";
+    expectedLifecycleRevision?: string;
+  };
   persistedThinking?: ThinkLevel;
   persistedVerbose?: VerboseLevel;
 };
@@ -162,7 +164,9 @@ export function buildExplicitSessionIdSessionKey(params: {
   sessionId: string;
   agentId?: string;
 }): string {
-  return `agent:${normalizeAgentId(params.agentId)}:explicit:${params.sessionId.trim()}`;
+  return normalizeStoreSessionKey(
+    `agent:${normalizeAgentId(params.agentId)}:explicit:${params.sessionId.trim()}`,
+  );
 }
 
 async function collectSessionIdMatchesForRequest(opts: {
@@ -437,12 +441,10 @@ async function resolveSessionKeyForRequestInternal(
     ? normalizeAgentId(knownAgentId)
     : requestedSessionId
       ? undefined
-      : normalizeAgentId(
-          resolveDefaultAgentId(opts.cfg, {
-            surface: "agent command session routing",
-            hint: "Pass --agent <id> or an agent-prefixed --session-key.",
-          }),
-        );
+      : resolveDefaultAgentId(opts.cfg, {
+          surface: "agent command session routing",
+          hint: "Pass --agent <id> or an agent-prefixed --session-key.",
+        });
   const storeAgentId = explicitSessionKey
     ? unownedBareSessionKey
       ? sessionIdScanAnchor
@@ -671,12 +673,9 @@ export async function resolveSession(
   opts.assertCurrent?.();
   const isNewSession = !fresh && !requestedSessionId;
   const automaticReset: SessionResolution["automaticReset"] =
-    isNewSession &&
-    sessionEntry &&
-    freshness?.staleReason &&
-    !terminalMainTranscriptNewerThanRegistry
+    isNewSession && sessionEntry && !terminalMainTranscriptNewerThanRegistry
       ? {
-          reason: freshness.staleReason,
+          reason: freshness?.staleReason ?? "reset",
           expectedLifecycleRevision: sessionEntry.lifecycleRevision,
         }
       : undefined;
@@ -686,13 +685,6 @@ export async function resolveSession(
     crypto.randomUUID();
   const resolvedSessionEntry =
     isNewSession && sessionEntry ? clearRotatedSessionMetadata(sessionEntry) : sessionEntry;
-
-  if (!automaticReset) {
-    clearBootstrapSnapshotOnSessionRollover({
-      sessionKey,
-      previousSessionId: isNewSession ? sessionEntry?.sessionId : undefined,
-    });
-  }
 
   // Behavior overrides belong to the logical session, not one transcript id.
   // Carry them across every rollover; explicit `default` directives clear them.

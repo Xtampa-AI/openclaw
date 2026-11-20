@@ -1,6 +1,3 @@
-// Load the Gateway's deferred runtime during collection, outside the beforeAll deadline.
-import "../agents/prepared-model-runtime.js";
-import "../gateway/server-start.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -13,33 +10,13 @@ import {
   peekGatewayRestartReason,
   resetGatewayRestartStateForInProcessRestart,
 } from "../infra/restart.js";
-import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { captureEnv } from "../test-utils/env.js";
 import { acquireTestPortBlock, type TestPortClaim } from "../test-utils/port-claims.js";
 import { prepareUserProfileCatalogForTest } from "../test-utils/user-profile-catalog.js";
-import { localStateOwnerFixtureEntrypoint } from "./cli-entrypoint.test-support.js";
-import { runCliProcessChild } from "./cli-process-child.test-helpers.js";
-
-const entrypoint = resolveRuntimeWorkerArgv(
-  resolveRuntimeWorkerUrl(localStateOwnerFixtureEntrypoint),
-);
-const stateOwnerEnv = (root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
-  PATH: process.env.PATH,
-  SystemRoot: process.env.SystemRoot,
-  HOME: root,
-  USERPROFILE: root,
-  OPENCLAW_HOME: root,
-  OPENCLAW_STATE_DIR: path.join(root, "state"),
-  OPENCLAW_CONFIG_PATH: path.join(root, "openclaw.json"),
-  OPENCLAW_NO_RESPAWN: "1",
-  OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
-  NODE_DISABLE_COMPILE_CACHE: "1",
-  ...overrides,
-});
-const run = (env: NodeJS.ProcessEnv, args: string[], input?: string) =>
-  runCliProcessChild({ nodeArgs: [...entrypoint, ...args], env, input });
+import { writeFixtureJson } from "./cli-fixtures.test-support.js";
+import { runStateOwnerCli as run, stateOwnerEnv } from "./cli-process-fixture.test-support.js";
 
 // One real Gateway owns the state root; CLI children are the shapes the Windows companion
 // app runs against its own running Gateway (setup wizard, gateway setup, local AI tray).
@@ -82,25 +59,18 @@ describe("config mutations against a running Gateway", () => {
   beforeAll(async () => {
     // Canonical paths: the Gateway keys resident state by the identity path the CLI resolves.
     const root = await fs.realpath(roots.make("openclaw-config-owner-route-"));
-    claim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+    claim = await acquireTestPortBlock({ offsets: [0] });
     env = stateOwnerEnv(root, { OPENCLAW_GATEWAY_TOKEN: token, ...prefixEnv });
     await fs.mkdir(env.OPENCLAW_STATE_DIR!, { recursive: true });
-    await fs.writeFile(
-      env.OPENCLAW_CONFIG_PATH!,
-      JSON.stringify({
-        gateway: {
-          mode: "local",
-          port: claim.port,
-          auth: { mode: "token", token },
-          reload: { mode: "hybrid" },
-        },
-        agents: {
-          defaults: { skipBootstrap: true, heartbeat: { every: "0m" } },
-          entries: { main: {} },
-        },
-        plugins: { slots: { memory: "none" } },
-      }),
-    );
+    await writeFixtureJson(env.OPENCLAW_CONFIG_PATH!, {
+      gateway: {
+        mode: "local",
+        port: claim.port,
+        auth: { mode: "token", token },
+        reload: { mode: "hybrid" },
+      },
+      agents: { entries: { main: {} } },
+    });
     // Plain assignment: suite-wide stubs would be reset before each test while this Gateway runs.
     Object.assign(process.env, {
       HOME: env.HOME,
@@ -120,8 +90,6 @@ describe("config mutations against a running Gateway", () => {
     });
     lock = await acquireGatewayLock({ port: claim.port, allowInTests: true, timeoutMs: 0 });
     expect(lock).not.toBeNull();
-    // Mirrors Gateway boot admission, which the CLI run loop performs before this server starts.
-    releaseProfiles = (await prepareUserProfileCatalogForTest()).release;
     server = await startGatewayServer(claim.port, {
       auth: { mode: "token", token },
       controlUiEnabled: false,
@@ -129,6 +97,8 @@ describe("config mutations against a running Gateway", () => {
       hotReloadRecovery,
     });
     await server.startupSettled;
+    // Mirrors Gateway boot admission, which the CLI run loop performs around this server.
+    releaseProfiles = (await prepareUserProfileCatalogForTest()).release;
     // Stands in for the companion app's wizard connection, which must survive every write.
     const connected = createDeferredCore();
     observer = new GatewayClient({
@@ -230,25 +200,22 @@ describe("config mutations against a running Gateway", () => {
     const object = await run(env, [
       "config",
       "set",
-      "gateway.nodes.pairing.sshVerify",
-      JSON.stringify({ cidrs: ["10.0.0.0/8"] }),
+      "tools.toolSearch",
+      JSON.stringify({ include: [{ source: "mcp" }] }),
       "--strict-json",
     ]);
     expect(object.code, object.stderr).toBe(0);
-    const scalar = await run(env, ["config", "set", "gateway.nodes.pairing.sshVerify", "false"]);
+    const scalar = await run(env, ["config", "set", "tools.toolSearch", "false"]);
     expect(scalar.code, scalar.stderr).toBe(0);
-    expect((await gatewayConfig()).gateway.nodes.pairing.sshVerify).toBe(false);
+    expect((await gatewayConfig()).tools.toolSearch).toBe(false);
   });
 
   it("previews then applies a batch file, and unsets the written paths", async () => {
     const batchFile = path.join(env.HOME!, "local-ai.batch.json");
-    await fs.writeFile(
-      batchFile,
-      JSON.stringify([
-        { path: "models.providers.llamacpp", value: provider },
-        { path: "agents.defaults.model.primary", value: "llamacpp/local" },
-      ]),
-    );
+    await writeFixtureJson(batchFile, [
+      { path: "models.providers.llamacpp", value: provider },
+      { path: "agents.defaults.model.primary", value: "llamacpp/local" },
+    ]);
     const preview = await run(env, ["config", "set", "--batch-file", batchFile, "--dry-run"]);
     expect(preview.code, preview.stderr).toBe(0);
     expect((await readConfig()).models).toBeUndefined();
@@ -383,10 +350,9 @@ describe("config mutations against a running Gateway", () => {
     expect(JSON.parse(rerun.stdout)).toMatchObject({ ok: true, configStatus: "unchanged" });
     expect(await fs.readFile(env.OPENCLAW_CONFIG_PATH!, "utf8")).toBe(written);
 
-    // This fixture already seeds skipBootstrap, so the flag needs no write.
     const skip = await setup(env, "--skip-bootstrap", "--json");
     expect(skip.code, skip.stderr).toBe(0);
-    expect(JSON.parse(skip.stdout)).toMatchObject({ ok: true, configStatus: "unchanged" });
+    expect(JSON.parse(skip.stdout)).toMatchObject({ ok: true, configStatus: "updated" });
     expect((await gatewayConfig()).agents.defaults.skipBootstrap).toBe(true);
     expectGatewayKeptRunning();
   });

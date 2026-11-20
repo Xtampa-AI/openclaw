@@ -1,25 +1,13 @@
-import type { AssistantMessage, Context } from "@openclaw/llm-core";
+import type { Context } from "@openclaw/llm-core";
 import { describe, expect, it } from "vitest";
 import { makeTextToolResult } from "../../../../test/helpers/text-tool-result.js";
 import { convertResponsesMessages as convertProviderResponsesMessages } from "../providers/openai-responses-shared.js";
-import { createZeroUsage } from "../usage.test-support.js";
 import { buildOpenAIResponsesReasoningReplayMetadata } from "./openai-responses-compaction-replay.js";
 import * as fixtures from "./openai-responses-prompt-observer.test-support.js";
 import { convertResponsesMessages } from "./openai-responses-replay-internal.js";
-function createAssistant(content: AssistantMessage["content"]): AssistantMessage {
-  return {
-    role: "assistant",
-    content,
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: createZeroUsage(),
-    stopReason: "toolUse",
-    timestamp: 1,
-  };
-}
-const model = fixtures.createModel();
-const identity = { sessionId: "session-current", authProfileId: "profile-current" };
+
+const model = fixtures.createReplayModel();
+const identity = { sessionId: "session-current" };
 const item = {
   type: "reasoning",
   id: "rs_synthetic",
@@ -38,7 +26,7 @@ function history(sessionId: string): Context {
   };
   return {
     messages: [
-      createAssistant([
+      fixtures.createAssistant(model, [
         reasoning,
         { type: "text", text: "The earlier answer." },
         { type: "toolCall", id: "call_echo|fc_echo", name: "echo", arguments: { value: 42 } },

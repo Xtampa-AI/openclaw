@@ -33,32 +33,53 @@ function materialize(
     ?.models[0];
 }
 
-it.each<[string, string, string, number, Partial<ModelDefinitionConfig>?, number?]>([
-  ["ollama-cloud", "minimax-m3", cloud, 131_072],
-  ["ollama-cloud", "kimi-k3", cloud, 1_048_576, { contextWindow: 1_048_576 }],
-  ["ollama-cloud", "glm-5.2", cloud, 131_072],
-  ["ollama", "custom", cloud, 262_144],
-  ["ollama", "custom:cloud", local, 262_144],
-  ["ollama", "custom", local, 32_768],
-  ["ollama", "custom", local, 16_384, { contextWindow: 32_768 }],
-  ["ollama", "custom", local, 4096, { contextWindow: 4096 }],
-  ["ollama", "minimax-m3", local, 32_768],
-  ["ollama", "minimax-m3", local, 32_768, { baseUrl: cloud }],
-  ["ollama", "minimax-m3", cloud, 131_072, { baseUrl: local }],
-  ["ollama", "custom", cloud, 1024, { maxTokens: 1024 }],
-  ["ollama", "custom", cloud, 2048, {}, 2048],
-  ["ollama", "custom", local, 2048, {}, 2048],
-])(
-  "materializes %s/%s at %s with cap %i",
-  (provider, id, baseUrl, expected, model, providerCap) => {
-    expect(
-      materialize(
-        provider,
-        id,
-        baseUrl,
-        { contextWindow: 262_144, params: { num_predict: -1 }, ...model },
-        providerCap,
-      ),
-    ).toMatchObject({ maxTokens: expected, params: { num_predict: -1 } });
-  },
-);
+it.each([
+  ["kimi-k2.6", 262_144],
+  ["kimi-k2.7-code", 262_144],
+  ["kimi-k3", 1_048_576],
+  ["deepseek-v4-pro", 1_048_576],
+  ["deepseek-v4-pro:0813", 1_048_576],
+  ["gemma4", 262_144],
+  ["gemma4:31b", 262_144],
+  ["glm-5.2", 131_072],
+  ["gpt-oss:120b", 131_072],
+  ["gpt-oss:20b", 131_072],
+  ["minimax-m2.7", 196_608],
+  ["minimax-m3", 524_288],
+  ["mistral-large-3:675b", 262_144],
+  ["nemotron-3-nano:30b", 262_144],
+  ["nemotron-3-super", 262_144],
+  ["nemotron-3-ultra", 262_144],
+])("materializes %s from the authored cloud catalog", (id, expected) => {
+  expect(materialize("ollama-cloud", id, cloud)?.maxTokens).toBe(expected);
+});
+
+it.each<[string, string, number, Partial<ModelDefinitionConfig>?, number?]>([
+  ["custom", cloud, 262_144],
+  ["custom:cloud", local, 262_144],
+  ["custom", local, 32_768],
+  ["custom", local, 16_384, { contextWindow: 32_768 }],
+  ["custom", local, 4096, { contextWindow: 4096 }],
+  ["minimax-m3", local, 32_768],
+  ["kimi-k3", local, 32_768],
+  ["minimax-m3", local, 32_768, { baseUrl: cloud }],
+  ["minimax-m3", cloud, 262_144, { baseUrl: local }],
+  ["minimax-m3", cloud, 262_144],
+  ["kimi-k3:cloud", local, 262_144],
+  ["minimax-m3", local, 1024, { maxTokens: 1024 }],
+  ["custom", cloud, 1024, { maxTokens: 1024 }],
+  ["custom", cloud, 2048, {}, 2048],
+])("materializes %s at %s with cap %i", (id, baseUrl, expected, model, providerCap) => {
+  const actual = materialize(
+    "ollama",
+    id,
+    baseUrl,
+    {
+      contextWindow: 262_144,
+      params: { num_predict: -1 },
+      ...model,
+    },
+    providerCap,
+  );
+  expect(actual).toMatchObject({ maxTokens: expected, params: { num_predict: -1 } });
+});

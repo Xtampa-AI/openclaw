@@ -33,6 +33,7 @@ import {
   readProviderReviewAcknowledgment,
   type ProviderReviewAcknowledgment,
 } from "../../sessions/provider-review.js";
+import { REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME } from "../../talk/agent-consult-tool.js";
 import {
   isBrowserCopilotClient,
   isBrowserOperatorUiClient,
@@ -41,6 +42,7 @@ import {
 import type { ChatAttachment } from "../chat-attachments.js";
 import { sanitizeChatSendMessageInput } from "../chat-input-sanitize.js";
 import { hasGatewayAdminScope } from "../operator-scopes.js";
+import { readQueuedChatInputAdmission } from "../queued-chat-input-admission.js";
 import { normalizeRpcAttachmentsToChatAttachments } from "./attachment-normalize.js";
 import { normalizeChatHumanMentions } from "./chat-human-mentions.js";
 import {
@@ -62,6 +64,7 @@ type ChatSendRequestParams = Omit<
 };
 
 export type NormalizedChatSendRequest = {
+  normalizeThinkingLevelOverride?: boolean;
   providerReviewAcknowledgment?: ProviderReviewAcknowledgment;
   goalOperation?: SessionGoalOperation & { action: "start" | "resume" };
   chatSendReceivedAtMs: number;
@@ -85,6 +88,17 @@ export type NormalizedChatSendRequest = {
   reconnectResumeRequested: boolean;
 };
 
+/** Talk settings are machine preferences, not user commands for a particular model. */
+function shouldNormalizeTalkThinking(
+  request: Pick<NormalizedChatSendRequest, "p" | "systemInputProvenance">,
+): boolean {
+  return (
+    request.p.thinking !== undefined &&
+    request.systemInputProvenance?.kind === "internal_system" &&
+    request.systemInputProvenance.sourceTool === REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME
+  );
+}
+
 type NormalizeChatSendRequestResult =
   | { ok: true; value: NormalizedChatSendRequest }
   | { ok: false; error: string; reason?: string };
@@ -100,6 +114,10 @@ export function normalizeChatSendRequest(params: {
   const chatSendReceivedAtMs = performance.now();
   const reject = (error: string) => ({ ok: false as const, error });
   const client = params.client;
+  const recoveredInput =
+    typeof params.params.idempotencyKey === "string"
+      ? readQueuedChatInputAdmission(params.params.idempotencyKey)
+      : undefined;
   const clientInfo = client?.connect?.client;
   const supportsTaskSuggestions =
     isOperatorUiClient(clientInfo) &&
@@ -303,6 +321,7 @@ export function normalizeChatSendRequest(params: {
     inboundMessage: modelMessage,
     ...(workContext ? { workContext } : {}),
     systemInputProvenance,
+    normalizeThinkingLevelOverride: shouldNormalizeTalkThinking({ p, systemInputProvenance }),
     systemProvenanceReceipt,
     suppressCommandInterpretation: commandInterpretationSuppressed,
     toolBindings: p.toolBindings,
@@ -315,6 +334,14 @@ export function normalizeChatSendRequest(params: {
   };
   if (stopCommand) {
     return { ok: true, value };
+  }
+  if (recoveredInput) {
+    // Approved text may differ from the submitted bytes; retries keep their original identity.
+    const requestIdentity = recoveredInput.target.message["__openclaw"]?.chatRequestIdentity;
+    return {
+      ok: true,
+      value: { ...value, ...(typeof requestIdentity === "string" ? { requestIdentity } : {}) },
+    };
   }
   return loadChatRequestIdentityKeyAsync().then((key) => {
     // A keyed verifier survives redaction without storing an offline prompt digest.

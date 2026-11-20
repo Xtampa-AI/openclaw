@@ -2,6 +2,8 @@
 import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { isMainThread } from "node:worker_threads";
 import { sameFileIdentity } from "@openclaw/fs-safe/advanced";
 import { isPathInside } from "@openclaw/fs-safe/path";
 import { walkDirectory } from "@openclaw/fs-safe/walk";
@@ -19,9 +21,11 @@ import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapsh
 import { normalizeAgentId } from "../routing/session-key.js";
 import { capturePostgresBackup, readBackupEngineImage } from "../snapshot/database-backup.js";
 import { listDefaultAgentDatabasePaths } from "../state/agent-database-path-discovery.js";
+import type { OpenClawRegisteredAgentDatabase } from "../state/openclaw-agent-db-contract.js";
 import { assertOpenClawAgentDatabaseOwner } from "../state/openclaw-agent-db-maintenance.js";
 import { readOpenClawAgentDatabaseRegistryRows } from "../state/openclaw-agent-db-registry.read.js";
 import { assertOpenClawStateDatabaseOwner } from "../state/openclaw-state-db-maintenance.js";
+import { tableExists } from "../state/openclaw-state-db-schema-helpers.js";
 import {
   resolveOpenClawRegisteredAgentDatabasePath,
   resolveOpenClawStateSqlitePath,
@@ -38,9 +42,16 @@ import {
   type BackupSqliteSourceGroup,
 } from "./backup-sqlite-source-groups.js";
 import { isTransientSqliteBackupPath } from "./backup-volatile-filter.js";
-import { listDatabaseEngineStores } from "./database-engine/registry.js";
-import { hasErrnoCode } from "./errno.js";
+import { resolveClientCredentialStorePath } from "./client-credential-paths.js";
+import type { ClientCredentialDatabase } from "./client-credential-schema.js";
+import { resolveAgentPortRoots } from "./database-engine/agent-port.js";
+import { readEngineAnchor } from "./database-engine/open.js";
+import { listDatabaseEngineStores, selectDatabaseEngine } from "./database-engine/registry.js";
+import { sha256File } from "./directory-durability.js";
+import { hasErrnoCode, ignoreMissingPath as ignoreMissingSource } from "./errno.js";
 import { collectErrorGraphCandidates, formatErrorMessage } from "./errors.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
+import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import {
   isAppleDoubleMetadataFile,
   resolveSqliteDatabaseFilePaths,
@@ -63,12 +74,6 @@ type SqliteBackupAsset = {
   skippedSourcePaths: Set<string>;
 };
 
-function ignoreMissingSource(error: unknown): undefined {
-  if (!hasErrnoCode(error, "ENOENT")) {
-    throw error;
-  }
-}
-
 function findLegacyAuditBackupStateChange(
   error: unknown,
 ): LegacyAuditBackupStateChangedError | undefined {
@@ -84,7 +89,7 @@ type CanonicalSqliteSource = {
   archiveSourcePath: string;
   identity: BigIntStats;
   sourcePath: string;
-} & ({ role: "global" | "quarantine" } | { role: "agent"; agentId: string });
+} & ({ role: "global" | "quarantine" | "client" } | { role: "agent"; agentId: string });
 
 // The sealed inventory also bounds header answers to one backup capture.
 const sqliteHeaderAnswers = new WeakMap<BackupResourceInventory, Map<string, boolean>>();
@@ -152,6 +157,7 @@ export function classifyBackupSqliteSource(
 
 async function discoverBackupSqliteSources(params: {
   inventory: BackupResourceInventory;
+  resourceRoots?: readonly string[];
 }): Promise<{ snapshotPaths: string[]; discoveredSourcePaths: Set<string> }> {
   const snapshotPaths = new Set<string>();
   const discoveredSourcePaths = new Set<string>();
@@ -161,6 +167,11 @@ async function discoverBackupSqliteSources(params: {
 
   const isRetainedPath = (pathname: string) =>
     !isPathInside(gatewayLockDir, pathname) && !params.inventory.isVolatile(pathname);
+  const isSelectedPath = (pathname: string) =>
+    !params.resourceRoots ||
+    params.resourceRoots.some(
+      (root) => isPathInside(root, pathname) || isPathInside(pathname, root),
+    );
   for (const directory of [
     params.inventory.stateDir,
     ...params.inventory.agentRoots.map(({ sourcePath }) => sourcePath),
@@ -174,11 +185,13 @@ async function discoverBackupSqliteSources(params: {
       symlinks: "include",
       include: (entry) =>
         (entry.kind === "file" || entry.kind === "symlink") &&
+        isSelectedPath(entry.path) &&
         isRetainedPath(entry.path) &&
         params.inventory.isIncludedByOwner(entry.path),
       descend: (entry) => {
         if (
           visitedDirectories.has(entry.path) ||
+          !isSelectedPath(entry.path) ||
           !isRetainedPath(entry.path) ||
           !params.inventory.isTraversable(entry.path) ||
           params.inventory.isPackageContent(entry.path)
@@ -234,22 +247,34 @@ export async function discoverBackupDatabasePaths(params: {
   stateDir: string;
   config: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
+  agentRegistry?: readonly OpenClawRegisteredAgentDatabase[];
 }): Promise<string[]> {
+  if (
+    isMainThread &&
+    selectDatabaseEngine({ id: "state", postgres: true }, params.config) === "postgres"
+  ) {
+    const { preparePostgresBackupDiscovery } = await import("./backup-database-discovery.js");
+    return (await preparePostgresBackupDiscovery(params)).paths;
+  }
   const discovered = await collectStateDatabasePaths(params);
   const paths = [...discovered.values()].flatMap((database) => database.spellings);
+  paths.push(
+    ...(await resolveAgentPortRoots(
+      { ...params, env: params.env ?? process.env },
+      params.agentRegistry,
+    )),
+  );
   const plugins = resolvePluginMetadataSnapshot(params);
-  const capable = new Set(
+  const capable = new Set<string>(
     listDatabaseEngineStores()
       .filter((store) => store.postgres)
       .map((store) => store.id),
   );
   // Retained engine stores remain downgrade-sensitive when their plugin is disabled.
   const retained = plugins.plugins.flatMap((plugin) =>
-    capable.has(plugin.id)
-      ? (plugin.backupResources ?? []).map((resource) =>
-          Object.assign({}, resource, { pluginId: plugin.id }),
-        )
-      : [],
+    (plugin.backupResources ?? [])
+      .filter((resource) => capable.has(resource.databaseFamily ?? plugin.id))
+      .map((resource) => Object.assign({}, resource, { pluginId: plugin.id })),
   );
   const resources = await createBackupResourcePlan({
     stateDir: params.stateDir,
@@ -262,7 +287,15 @@ export async function discoverBackupDatabasePaths(params: {
     pluginRoots: plugins.plugins.map((plugin) => plugin.rootDir),
   });
   const inventory = sealBackupResourceInventory(resources, []);
-  paths.push(...(await discoverBackupSqliteSources({ inventory })).snapshotPaths);
+  // Core paths are already known; unrelated state cannot contribute plugin stores.
+  paths.push(
+    ...(
+      await discoverBackupSqliteSources({
+        inventory,
+        resourceRoots: resources.pluginResourceRoots,
+      })
+    ).snapshotPaths,
+  );
   const existing: string[] = [];
   for (const file of new Set(paths)) {
     const info = await fs.stat(file).catch(ignoreMissingSource);
@@ -320,11 +353,24 @@ export async function createBackupSqliteSnapshotPlan(params: {
 }): Promise<{
   inventory: BackupResourceInventory;
   snapshots: SqliteBackupAsset[];
+  postgresSnapshots: Array<{ sourcePath: string; manifestSha256: string }>;
   discoveredSourcePaths: Set<string>;
+  sharedDatabaseSourcePath?: string;
 }> {
   const capturedSnapshots = new Map<BackupSqliteSourceGroup, string>();
   const snapshots: SqliteBackupAsset[] = [];
+  const postgresSnapshots: Array<{ sourcePath: string; manifestSha256: string }> = [];
+  let sharedDatabaseSourcePath: string | undefined;
   let capturedAgents: Array<{ role: "agent"; agentId: string; sourcePath: string }> = [];
+  function captureAgentRegistry(database: DatabaseSync, archiveSourcePath: string) {
+    capturedAgents = readOpenClawAgentDatabaseRegistryRows(database, archiveSourcePath).map(
+      (row) => ({
+        role: "agent" as const,
+        agentId: normalizeAgentId(row.agent_id),
+        sourcePath: resolveOpenClawRegisteredAgentDatabasePath(archiveSourcePath, row.path),
+      }),
+    );
+  }
   async function captureSource(
     archiveSourcePath: string,
     sourceGroup: BackupSqliteSourceGroup | undefined,
@@ -346,35 +392,37 @@ export async function createBackupSqliteSnapshotPlan(params: {
     assertNotUpdateCapturePath(archiveSourcePath, params.resources.stateDir);
     assertNotUpdateCapturePath(sourceDatabasePath, params.resources.stateDir);
     const sourcePath = path.join(params.tempDir, `openclaw-state-db-${snapshots.length}.sqlite`);
+    let hasPostgresAnchor: boolean | undefined;
     try {
       const capture = () =>
         createVerifiedSqliteSnapshot({
           sourcePath: sourceDatabasePath,
           targetPath: sourcePath,
           requireNonEmptySource: Boolean(canonicalSource),
-          validate:
-            canonicalSource?.role === "global"
-              ? (database, pathname) => assertOpenClawStateDatabaseOwner(database, { pathname })
-              : canonicalSource?.role === "agent"
-                ? (database, pathname) =>
-                    assertOpenClawAgentDatabaseOwner(database, {
-                      agentId: canonicalSource.agentId,
-                      pathname,
-                    })
-                : undefined,
+          validate: canonicalSource
+            ? (database, pathname) => {
+                hasPostgresAnchor ??= readEngineAnchor(database) !== undefined;
+                if (hasPostgresAnchor) {
+                  return;
+                }
+                if (canonicalSource.role === "global") {
+                  assertOpenClawStateDatabaseOwner(database, { pathname });
+                } else if (canonicalSource.role === "agent") {
+                  assertOpenClawAgentDatabaseOwner(database, {
+                    agentId: canonicalSource.agentId,
+                    pathname,
+                  });
+                }
+              }
+            : undefined,
           transform: async (database) => {
+            hasPostgresAnchor ??= readEngineAnchor(database) !== undefined;
+            // Anchors are verified and captured with their PostgreSQL data below.
+            if (hasPostgresAnchor) {
+              return;
+            }
             if (canonicalSource?.role === "global") {
-              capturedAgents = readOpenClawAgentDatabaseRegistryRows(
-                database,
-                canonicalSource.archiveSourcePath,
-              ).map((row) => ({
-                role: "agent" as const,
-                agentId: normalizeAgentId(row.agent_id),
-                sourcePath: resolveOpenClawRegisteredAgentDatabasePath(
-                  canonicalSource.archiveSourcePath,
-                  row.path,
-                ),
-              }));
+              captureAgentRegistry(database, canonicalSource.archiveSourcePath);
               if (
                 params.legacyAuditDatabaseWitness !== undefined &&
                 createLegacyAuditDatabaseWitness(database) !== params.legacyAuditDatabaseWitness
@@ -387,6 +435,17 @@ export async function createBackupSqliteSnapshotPlan(params: {
               rewriteLegacyAuditBackupCheckpoints(database, params.legacyAuditSnapshots);
             } else if (canonicalSource?.role === "agent") {
               sanitizeOpenClawStateLeaseRows(database);
+            } else if (
+              canonicalSource?.role === "client" &&
+              tableExists(database, "native_exec_socket_credentials")
+            ) {
+              // Socket authentication is installation-local and must regenerate on restore.
+              executeSqliteQuerySync(
+                database,
+                getNodeSqliteKysely<ClientCredentialDatabase>(database)
+                  .updateTable("native_exec_socket_credentials")
+                  .set({ socket_token: null }),
+              );
             }
             await embedSessionColdArchivesInSnapshot({
               database,
@@ -419,6 +478,12 @@ export async function createBackupSqliteSnapshotPlan(params: {
       );
       await fs.mkdir(path.dirname(directory), { mode: 0o700 });
       await capturePostgresBackup({ sourcePath: sourceDatabasePath, directory });
+      if (canonicalSource?.role === "global") {
+        using database = openNodeSqliteDatabase(path.join(directory, "database.sqlite"), {
+          readOnly: true,
+        });
+        captureAgentRegistry(database, canonicalSource.archiveSourcePath);
+      }
       for (const name of ["anchor.sqlite", "database.sqlite", "manifest.json"]) {
         snapshots.push({
           sourcePath: path.join(directory, name),
@@ -436,6 +501,10 @@ export async function createBackupSqliteSnapshotPlan(params: {
         sourcePath: anchorPath,
         archiveSourcePath,
         skippedSourcePaths: new Set(resolveSqliteDatabaseFilePaths(sourceDatabasePath)),
+      });
+      postgresSnapshots.push({
+        sourcePath: archiveSourcePath,
+        manifestSha256: (await sha256File(path.join(directory, "manifest.json"))).digest,
       });
       return;
     }
@@ -484,6 +553,7 @@ export async function createBackupSqliteSnapshotPlan(params: {
     );
     globalGroup = groups.get(globalSource.sourcePath);
     await captureSource(globalPath, globalGroup, globalSource);
+    sharedDatabaseSourcePath = globalSource.sourcePath;
   } else {
     for (const sidecar of resolveSqliteDatabaseFilePaths(globalPath).slice(1)) {
       const exists = await fs.lstat(sidecar).catch(ignoreMissingSource);
@@ -500,6 +570,12 @@ export async function createBackupSqliteSnapshotPlan(params: {
   const defaultDatabases = await listDefaultAgentDatabasePaths(params.resources.stateDir);
   const discoveredDatabasePaths: string[] = [];
   const candidates: Array<BackupCoreDatabase & { discoveredPath?: string }> = [
+    {
+      role: "client",
+      sourcePath: resolveClientCredentialStorePath({
+        OPENCLAW_STATE_DIR: params.resources.stateDir,
+      }),
+    },
     {
       role: "quarantine" as const,
       sourcePath: resolveQuarantineStorePath({
@@ -569,5 +645,11 @@ export async function createBackupSqliteSnapshotPlan(params: {
       throw new Error(`Canonical SQLite path changed after discovery: ${source.sourcePath}`);
     }
   }
-  return { inventory, snapshots, discoveredSourcePaths: discovery.discoveredSourcePaths };
+  return {
+    inventory,
+    snapshots,
+    postgresSnapshots,
+    discoveredSourcePaths: discovery.discoveredSourcePaths,
+    sharedDatabaseSourcePath,
+  };
 }

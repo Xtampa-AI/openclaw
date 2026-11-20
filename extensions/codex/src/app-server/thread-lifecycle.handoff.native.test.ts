@@ -1,11 +1,10 @@
 import fs from "node:fs/promises";
-import http from "node:http";
 import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { racePromiseWithAbortSignal } from "openclaw/plugin-sdk/time-runtime";
-import { afterEach, expect, it, vi, type TestContext } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { ensureCodexAppServerClientRuntime } from "./client-runtime.js";
 import { wasCodexAppServerThreadClosed } from "./client-thread-closure.js";
 import { CodexAppServerClient } from "./client.js";
@@ -24,117 +23,18 @@ import { startOrResumeThread } from "./thread-lifecycle-run.js";
 import { createCodexThreadLifecycleTimingTracker } from "./thread-lifecycle-timing.js";
 import { releaseCodexBoundLiveThread } from "./thread-lifecycle-warm.js";
 import {
-  createAppServerOptions,
   createParams,
   resetThreadLifecycleTestFixtures,
 } from "./thread-lifecycle.test-fixtures.js";
+import {
+  listenForNativeResponses,
+  nativeAppServerOptions,
+  nativeProviderConfig,
+  runNativeTurn,
+  sendNativeResponse,
+} from "./thread-native.test-support.js";
 import { retainCodexAppServerBindingSubscription } from "./thread-ownership.js";
 import { CODEX_APP_SERVER_VERSION } from "./version.js";
-
-// Keep the native proof on the baseline fixture contracts; no newer shared harness.
-async function listenForNativeResponses(context: TestContext, listener: http.RequestListener) {
-  const server = http.createServer(listener);
-  context.onTestFinished(async () => {
-    server.closeAllConnections();
-    if (server.listening) {
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    }
-  });
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Missing loopback provider address");
-  }
-  return address.port;
-}
-function sendNativeResponse(response: http.ServerResponse, id: string, item: unknown) {
-  const events = [
-    { type: "response.created", response: { id } },
-    { type: "response.output_item.done", item },
-    {
-      type: "response.completed",
-      response: { id, usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
-    },
-  ];
-  response.writeHead(200, { "Content-Type": "text/event-stream" });
-  response.end(
-    events
-      .map(
-        (event) => `event: ${event.type}
-data: ${JSON.stringify(event)}
-
-`,
-      )
-      .join(""),
-  );
-}
-function nativeProviderConfig(name: string, port: number, options: string[], features: string[]) {
-  return [
-    'model="gpt-5.6-luna"',
-    `model_provider="${name}"`,
-    'cli_auth_credentials_store="ephemeral"',
-    'web_search="disabled"',
-    'approval_policy="never"',
-    ...options,
-    "[features]",
-    ...features,
-    "[analytics]",
-    "enabled=false",
-    "[feedback]",
-    "enabled=false",
-    `[model_providers.${name}]`,
-    'name="Synthetic handoff provider"',
-    `base_url="http://127.0.0.1:${port}/v1"`,
-    'wire_api="responses"',
-    "requires_openai_auth=false",
-    "supports_websockets=false",
-    "request_max_retries=0",
-    "stream_max_retries=0",
-  ].join(String.fromCharCode(10));
-}
-function nativeAppServerOptions(native: Awaited<ReturnType<typeof createCodexNativeTestState>>) {
-  const env = Object.fromEntries(
-    Object.entries(native.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
-  return {
-    ...createAppServerOptions(),
-    start: {
-      transport: "stdio" as const,
-      command: native.command,
-      commandSource: "config" as const,
-      args: ["app-server"],
-      cwd: native.cwd,
-      headers: {},
-      env,
-      clearEnv: Object.keys(process.env).filter((key) => !(key in env)),
-    },
-  };
-}
-async function runNativeTurn(client: CodexAppServerClient, threadId: string, text: string) {
-  const completed = createDeferred<unknown>();
-  const stop = client.addNotificationHandler((notification) => {
-    if (
-      notification.method === "turn/completed" &&
-      isJsonObject(notification.params) &&
-      notification.params.threadId === threadId
-    ) {
-      completed.resolve(notification.params.turn);
-    }
-  });
-  try {
-    await client.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text, text_elements: [] }],
-    });
-    return await racePromiseWithAbortSignal(completed.promise, AbortSignal.timeout(20_000));
-  } finally {
-    stop();
-  }
-}
 
 vi.unmock("node:child_process");
 afterEach(() => {
@@ -279,7 +179,7 @@ it(
         clientId: successor.getInstanceId(),
         ownerClientId: old.getInstanceId(),
         threadId: sibling.thread.id,
-        lifecycleTiming: createCodexThreadLifecycleTimingTracker({ enabled: false }),
+        lifecycleTiming: createCodexThreadLifecycleTimingTracker(false),
         signal: stop.signal,
       }).finally(() => {
         settled = true;

@@ -1,5 +1,5 @@
 // Live end-to-end checks for AgentSession turns, compaction, and follow-up delivery.
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "openclaw/plugin-sdk/llm";
@@ -7,16 +7,15 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { isLiveTestEnabled } from "../live-test-helpers.js";
 import type { AgentMessage } from "../runtime/index.js";
+import { cleanupLiveSessions } from "./agent-session-live-cleanup.test-support.js";
+import { createResourceLoader } from "./agent-session-loop-resource-loader.test-support.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
-import { createExtensionRuntime } from "./extensions/loader.js";
-import type { LoadExtensionsResult, ToolDefinition } from "./extensions/types.js";
+import type { ExtensionFactory, ToolDefinition } from "./extensions/types.js";
 import { ModelRegistry } from "./model-registry.js";
-import type { ResourceLoader } from "./resource-loader.js";
 import { createAgentSession } from "./sdk.js";
 import { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
-import { createSyntheticSourceInfo } from "./source-info.js";
 
 const API_KEY = process.env.ANTHROPIC_API_KEY?.trim() ?? "";
 const LIVE = isLiveTestEnabled() && API_KEY.length > 0;
@@ -27,41 +26,6 @@ const DEFAULT_MODEL_ID = "claude-haiku-4-5";
 
 const sessions: AgentSession[] = [];
 const tempRoots: string[] = [];
-
-type ExtensionHandlers = Map<string, Array<(...args: unknown[]) => Promise<unknown>>>;
-
-function createResourceLoader(handlers: ExtensionHandlers = new Map()): ResourceLoader {
-  const extensionsResult: LoadExtensionsResult = {
-    extensions:
-      handlers.size > 0
-        ? [
-            {
-              path: "<live-test-extension>",
-              resolvedPath: "<live-test-extension>",
-              sourceInfo: createSyntheticSourceInfo("<live-test-extension>", {
-                source: "temporary",
-              }),
-              handlers,
-              tools: new Map(),
-              messageRenderers: new Map(),
-              commands: new Map(),
-              flags: new Map(),
-              shortcuts: new Map(),
-            },
-          ]
-        : [],
-    errors: [],
-    runtime: createExtensionRuntime(),
-  };
-  return {
-    getExtensions: () => extensionsResult,
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    extendResources: () => {},
-    reload: async () => {},
-  };
-}
 
 async function resolveLiveModel(
   modelsPath: string,
@@ -103,7 +67,7 @@ async function resolveLiveModel(
     throw new Error(`No Anthropic Haiku model found for ${requestedModelId}`);
   }
   return {
-    model: { ...model, maxTokens: Math.min(model.maxTokens, 128) },
+    model,
     modelRegistry,
   };
 }
@@ -111,7 +75,7 @@ async function resolveLiveModel(
 async function createLiveSession(
   options: {
     customTools?: (cwd: string) => ToolDefinition[];
-    handlers?: ExtensionHandlers;
+    handlers?: ExtensionFactory;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "openclaw-agent-session-live-"));
@@ -125,7 +89,8 @@ async function createLiveSession(
   const sessionManager = SessionManager.inMemory();
   const settingsManager = SettingsManager.inMemory({
     defaultThinkingLevel: "off",
-    compaction: { enabled: true, reserveTokens: 128, keepRecentTokens: 0 },
+    // Exercise the normal summary budget; a 128-token reserve caps turn-prefix summaries at 64.
+    compaction: { enabled: true, keepRecentTokens: 0 },
     retry: {
       enabled: false,
       provider: { timeoutMs: PROVIDER_TIMEOUT_MS, maxRetryDelayMs: 0 },
@@ -139,7 +104,10 @@ async function createLiveSession(
     thinkingLevel: "off",
     tools: customTools.map((tool) => tool.name),
     customTools,
-    resourceLoader: createResourceLoader(options.handlers),
+    resourceLoader: await createResourceLoader(options.handlers, {
+      cwd,
+      agentDir: join(root, "agent"),
+    }),
     modelRegistry,
     sessionManager,
     settingsManager,
@@ -160,14 +128,7 @@ function assistantText(message: AgentMessage): string {
 }
 
 afterEach(async () => {
-  for (const session of sessions.splice(0)) {
-    session.dispose();
-  }
-  await Promise.all(
-    tempRoots.splice(0).map(async (root) => {
-      await rm(root, { recursive: true, force: true });
-    }),
-  );
+  await cleanupLiveSessions(sessions, tempRoots);
 });
 
 describeLive("AgentSession live", () => {
@@ -239,20 +200,15 @@ describeLive("AgentSession live", () => {
     async () => {
       const sessionRef: { current?: AgentSession } = {};
       let queued = false;
-      const handlers: ExtensionHandlers = new Map([
-        [
-          "agent_end",
-          [
-            async () => {
-              if (!queued) {
-                queued = true;
-                await sessionRef.current?.followUp("Reply with exactly SECOND.");
-              }
-              return undefined;
-            },
-          ],
-        ],
-      ]);
+      const handlers: ExtensionFactory = (api) => {
+        api.on("agent_end", async () => {
+          if (!queued) {
+            queued = true;
+            await sessionRef.current?.followUp("Reply with exactly SECOND.");
+          }
+          return undefined;
+        });
+      };
       const { session } = await createLiveSession({ handlers });
       sessionRef.current = session;
 

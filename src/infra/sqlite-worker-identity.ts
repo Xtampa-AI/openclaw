@@ -161,6 +161,16 @@ export function findChangedDatabasePaths(
 export async function readDatabasePathIdentity(
   databasePath: string,
 ): Promise<DatabasePathIdentity> {
+  const identity = await inspectDatabasePathIdentity(databasePath);
+  if (!identity) {
+    throw new Error("SQLite worker database path must identify a regular file");
+  }
+  return identity;
+}
+
+export async function inspectDatabasePathIdentity(
+  databasePath: string,
+): Promise<DatabasePathIdentity | undefined> {
   const file = await stat(databasePath, { bigint: true }).catch((error: unknown) => {
     if (hasErrnoCode(error, "ENOENT")) {
       return undefined;
@@ -168,6 +178,9 @@ export async function readDatabasePathIdentity(
     throw error;
   });
   if (file) {
+    if (!file.isFile()) {
+      return undefined;
+    }
     try {
       const canonicalPath = await realpath(databasePath);
       const canonicalFile = await stat(canonicalPath, { bigint: true });
@@ -180,12 +193,16 @@ export async function readDatabasePathIdentity(
     }
   }
   // Resolve the existing ancestor before a first open so directory aliases share admission.
+  const canonicalPath = await resolveDatabasePathKeyAsync(databasePath);
+  return { key: `path:${canonicalPath}`, canonicalPath };
+}
+
+export async function resolveDatabasePathKeyAsync(databasePath: string): Promise<string> {
   const missing: string[] = [];
-  let ancestor = databasePath;
+  let ancestor = path.resolve(databasePath);
   while (true) {
     try {
-      const canonicalPath = normalizeDatabasePath(path.join(await realpath(ancestor), ...missing));
-      return { key: `path:${canonicalPath}`, canonicalPath };
+      return normalizeDatabasePath(path.join(await realpath(ancestor), ...missing));
     } catch (error) {
       ancestor = missingAncestorParent(ancestor, missing, error);
     }
@@ -204,6 +221,18 @@ export function assertDatabasePathIdentity(
   }
 }
 
+/** Async admission preserves the same existing-file and observed-absence checks. */
+export async function assertDatabasePathIdentityAsync(
+  databasePath: string,
+  expected: DatabasePathIdentity,
+): Promise<void> {
+  if (expected.key.startsWith("file:")) {
+    assertDatabaseFileIdentity(await stat(databasePath, { bigint: true }), expected);
+  } else if ((await readDatabasePathIdentity(databasePath)).key !== expected.key) {
+    throw new Error(`SQLite database path identity changed: ${databasePath}`);
+  }
+}
+
 export function assertExistingDatabaseIdentity(
   databasePath: string,
   expected: string,
@@ -215,13 +244,21 @@ export function assertExistingDatabaseIdentity(
   });
 }
 
-export function isSoleDatabaseFileDescriptor(descriptor: number, file: BigIntStats): boolean {
+export function isSoleDatabaseFileDescriptor(
+  descriptor: number,
+  file: BigIntStats,
+  additionalOwnedDescriptors?: ReadonlySet<number>,
+): boolean {
   if (process.platform !== "linux") {
     return false;
   }
   try {
     for (const name of readdirSync("/proc/self/fd")) {
-      if (!/^\d+$/u.test(name) || Number(name) === descriptor) {
+      if (
+        !/^\d+$/u.test(name) ||
+        Number(name) === descriptor ||
+        additionalOwnedDescriptors?.has(Number(name))
+      ) {
         continue;
       }
       try {

@@ -198,6 +198,7 @@ export function openSqliteWorkerStore<Operations extends SqliteWorkerOperations>
 export function openAgentDatabaseSqliteWorkerStore<Operations extends SqliteWorkerOperations>(
   options: SqliteWorkerStoreOptions,
   custody: {
+    startupPreparation?: boolean;
     stateContext?: SqliteWorkerStateContext;
     stateDatabasePath?: string;
     onNativeLost?: SqliteWorkerOpenCustody["onNativeLost"];
@@ -219,6 +220,7 @@ export function openAgentDatabaseSqliteWorkerStore<Operations extends SqliteWork
       custody.stateContext,
       () => custody.assertCurrent(),
       {
+        carrierClass: custody.startupPreparation ? "agent" : undefined,
         createAdmission: custody.createAdmission,
         stateDatabasePath: custody.stateDatabasePath,
         onNativeLost: custody.onNativeLost,
@@ -246,7 +248,7 @@ export function openSharedStateSqliteWorkerStore<Operations extends SqliteWorker
       { ...options, input: undefined },
       stateContext,
       assertCurrent,
-      lifecycle,
+      { ...lifecycle, carrierClass: "shared-state" },
     ),
   ).then((store) => {
     if (store) {

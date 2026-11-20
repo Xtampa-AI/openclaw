@@ -5,6 +5,7 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import { decodeWindowsOutputBuffer } from "../infra/windows-encoding.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { copyOwnedBuffer } from "../shared/owned-buffer.js";
 import { hasChildProcessExited, releaseChildProcessOutputAfterExit } from "./child-process.js";
 import { resolveMaxOutputBytes, type CommandOutputStream } from "./exec-output.js";
 import {
@@ -256,6 +257,7 @@ export async function runExec(
 
 export type BufferedCommandOptions = {
   timeoutMs?: number;
+  noOutputTimeoutMs?: number;
   cwd?: string;
   input?: string | Uint8Array;
   baseEnv?: NodeJS.ProcessEnv;
@@ -276,7 +278,7 @@ export type BufferedCommandResult = {
   code: number | null;
   signal: NodeJS.Signals | null;
   killed: boolean;
-  termination: "exit" | "timeout" | "signal" | "output-limit" | "error";
+  termination: "exit" | "timeout" | "no-output-timeout" | "signal" | "output-limit" | "error";
   outputLimitStream?: CommandOutputStream;
   errorStream?: CommandOutputStream;
   error?: Error;
@@ -318,7 +320,9 @@ export async function runCommandBuffered(
         : Math.max(0, maxCombinedOutputBytes - combinedBytes);
     const remaining = Math.max(0, Math.min(maxBytes - capturedBytes[stream], combinedRemaining));
     if (remaining > 0) {
-      const captured = Buffer.from(chunk.subarray(0, remaining));
+      // Pipe chunks stay immutable until concatenation; only clipped views need owned storage.
+      const captured =
+        chunk.byteLength > remaining ? copyOwnedBuffer(chunk.subarray(0, remaining)) : chunk;
       chunks[stream].push(captured);
       capturedBytes[stream] += captured.byteLength;
     }
@@ -343,6 +347,7 @@ export async function runCommandBuffered(
       outputCapture: "discard",
       signal: options.signal,
       timeoutMs: options.timeoutMs,
+      noOutputTimeoutMs: options.noOutputTimeoutMs,
       tolerateOutputError: {
         stdout: options.discardOutput?.stdout || options.tolerateOutputError?.stdout,
         stderr: options.discardOutput?.stderr || options.tolerateOutputError?.stderr,
@@ -351,9 +356,7 @@ export async function runCommandBuffered(
     });
     const termination: BufferedCommandResult["termination"] = result.outputLimitExceeded
       ? "output-limit"
-      : result.termination === "no-output-timeout"
-        ? "timeout"
-        : result.termination;
+      : result.termination;
     return {
       stdout: capturedOutput("stdout"),
       stderr: capturedOutput("stderr"),

@@ -9,7 +9,10 @@ import {
   settleCliSessionResult,
 } from "../../agents/cli-session-store.js";
 import { shouldClearFailedCliSessionBinding } from "../../agents/cli-session.js";
-import { resolveDelegationCapability } from "../../agents/delegation-capability.js";
+import {
+  isFallbackAttempt,
+  resolveDelegationCapability,
+} from "../../agents/delegation-capability.js";
 import { withAdmittedCliCandidate } from "../../agents/embedded-agent-runner/run-entry-cli.js";
 import type { CompactionAccountingTarget } from "../../agents/embedded-agent-runner/run/internal-params.js";
 import {
@@ -17,8 +20,9 @@ import {
   hasNewGeneratedMediaTaskForSessionKey,
 } from "../../agents/media-generation-activity.js";
 import { findModelInCatalog } from "../../agents/model-catalog-lookup.js";
-import { recordModelFallbackStop } from "../../agents/model-fallback-stop.js";
+import { createUnrecordedScheduledAccountRefusal } from "../../agents/scheduled-unrecorded-account.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
+import { resolveCollapsedSessionAuthPinSource } from "../../config/sessions/auth-profile-override-provenance.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import { createAgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
 import { resolveRunAuthProfile } from "./agent-runner-auth-profile.js";
@@ -52,6 +56,14 @@ export async function runCliFallbackCandidate(
     onSessionWriter: (writer: CompactionAccountingTarget) => void;
   },
 ): ReturnType<typeof runCliAgentWithLifecycle> {
+  if (
+    params.candidateRun.cyberAccessProgram !== undefined &&
+    params.candidateRun.cyberAccessProgram !== "standard"
+  ) {
+    throw new Error(
+      "Daybreak access is unsupported by this CLI runtime. Select Standard or use the OpenClaw or native Codex runtime.",
+    );
+  }
   const turn = params.turn;
   params.scheduledInference?.assertCandidate(params.provider, true);
   const onPreparedBlockReply = turn.opts?.onPreparedBlockReply;
@@ -85,6 +97,7 @@ export async function runCliFallbackCandidate(
   const lifecycleBackstop = createAgentLifecycleTerminalBackstop({
     runId: params.runId,
     sessionKey: turn.sessionKey,
+    onTerminalEvent: turn.followupRun.run.internalEventExecution?.onTerminalEvent,
     startedAt: cliLifecycleStartedAt,
     getLifecycleGeneration: () => params.lifecycleGeneration,
     resolveTerminationFields: (error) =>
@@ -201,6 +214,10 @@ export async function runCliFallbackCandidate(
             activeSessionEntry: sessionEntry,
           });
         const scheduledInference = params.scheduledInference;
+        // Only session pins follow cross-provider fallback; configured accounts stay provider-scoped.
+        const sessionPinned =
+          params.candidateRun.authProfileId?.trim() === sessionEntry?.authProfileOverride?.trim() &&
+          resolveCollapsedSessionAuthPinSource(sessionEntry) === "user";
         // The CLI owner must see explicit pins before provider scoping can discard them.
         // A recorded account runs only when this backend forwards exactly that account.
         const authProfileId = scheduledInference
@@ -222,18 +239,22 @@ export async function runCliFallbackCandidate(
                 authProfileProvider: params.provider,
                 config: params.runtimeConfig,
                 agentDir: params.candidateRun.agentDir,
-                selected: params.candidateRun,
+                selected: sessionPinned
+                  ? params.candidateRun
+                  : resolveRunAuthProfile(params.candidateRun, params.provider, {
+                      config: params.runtimeConfig,
+                    }),
                 sessionBinding: cliSessionBinding,
               })
             : resolveRunAuthProfile(params.candidateRun, params.cliExecutionProvider, {
                 config: params.runtimeConfig,
               }).authProfileId;
         if (turn.followupRun.run.scheduledAutomation && !scheduledInference && authProfileId) {
-          const refusal = new Error(
-            "Automation has no recorded inference account. Explicitly select its account with a model@profile update before running it.",
-          );
-          recordModelFallbackStop(refusal);
-          throw refusal;
+          throw createUnrecordedScheduledAccountRefusal({
+            runtime: params.cliExecutionProvider,
+            modelRef: `${params.provider}/${params.model}`,
+            profileId: authProfileId,
+          });
         }
         const diagnosticOwner = params.deferredLifecycle.handoffToCli();
         // A forked child carries the parent's binding with a one-shot fork marker;
@@ -433,12 +454,11 @@ export async function runCliFallbackCandidate(
               turn.followupRun.currentInboundEventKind !== "room_event" &&
               turn.followupRun.run.suppressTranscriptOnlyAssistantPersistence !== true,
             storePath: turn.storePath,
-            // Candidate zero is the primary attempt; later candidates are
-            // fallbacks. Carry the runner-owned fact instead of inferring from
-            // this shared dispatch path, or primary CLI runs lose delegation.
+            // Carry the runner-owned facts instead of inferring from this shared
+            // dispatch path, or primary CLI runs lose delegation.
             ...buildCliMcpDelegationCapabilityBinding(
               resolveDelegationCapability({
-                fallbackActive: params.isFallbackRetry,
+                fallbackActive: isFallbackAttempt(params),
                 inputProvenance: turn.followupRun.run.inputProvenance,
                 disableTools: turn.opts?.disableTools,
                 toolsAllow: turn.opts?.toolsAllow,
@@ -481,7 +501,7 @@ export async function runCliFallbackCandidate(
                     }),
                 }),
             authProfileId,
-            // Retain both settlement and credential authority through asynchronous CLI preparation.
+            // The CLI owner rechecks this after awaits and before credential/transport effects.
             assertCurrent: scheduledInference
               ? () => {
                   assertSettlementCurrent();
@@ -489,9 +509,11 @@ export async function runCliFallbackCandidate(
                 }
               : undefined,
             nativeAuthOnly:
-              turn.followupRun.run.scheduledAutomation && !scheduledInference ? true : undefined,
+              turn.followupRun.run.scheduledAutomation && !params.scheduledInference
+                ? true
+                : undefined,
             mediaImageLayout: params.currentTurnImages.mediaImageLayout,
-            messageChannel: turn.followupRun.originatingChannel ?? undefined,
+            messageChannel: turn.followupRun.originatingChannel,
             messageProvider: hookMessageProvider,
             currentChannelId:
               turn.followupRun.originatingTo ?? turn.sessionCtx.OriginatingTo ?? turn.sessionCtx.To,

@@ -1,10 +1,11 @@
 import type { SessionTranscriptBoundedActiveContext } from "../../config/sessions/session-accessor.sqlite-contract.js";
 import type { SessionEntryCohortRequest } from "../../config/sessions/session-entry-read.types.js";
+import type { SessionTranscriptContextSelection } from "../../config/sessions/session-history-read.types.js";
 import type { PreparedSessionTranscriptHydration } from "../../config/sessions/session-transcript-worker.types.js";
 import type { SessionTranscriptTargetBinding } from "../../config/sessions/transcript-target-binding.js";
 
 export type SessionManagerPersistenceTarget = SessionTranscriptTargetBinding;
-export type SessionManagerBoundedContextLimits = { maxBytes: number; maxEvents: number };
+export type SessionManagerBoundedContextLimits = SessionTranscriptContextSelection;
 export type PreparedSessionTranscriptReload = PreparedSessionTranscriptHydration;
 export type SessionManagerTranscriptCohort = {
   selection: NonNullable<SessionEntryCohortRequest["transcript"]>;
@@ -24,3 +25,20 @@ export type SessionManagerBoundedContext = SessionManagerBoundedView &
     SessionTranscriptBoundedActiveContext,
     "persistedSuffixStartSeq" | "boundaryCount" | "transcriptMutationAt"
   > & { limits: SessionManagerBoundedContextLimits };
+
+/** Public read-only methods; the facade supplies their exact signatures. */
+export type SessionManagerReadMethod =
+  | "getCwd"
+  | "getSessionId"
+  | "getSessionTarget"
+  | "getLeafId"
+  | "getAppendParentId"
+  | "getAppendMode"
+  | "getLeafEntry"
+  | "getEntry"
+  | "getLabel"
+  | "getBranch"
+  | "getHeader"
+  | "getEntries"
+  | "getTree"
+  | "getSessionName";

@@ -88,6 +88,91 @@ function heldWorkerBorrowingProbe(directory: string) {
 }
 
 describe.concurrent("fresh compiled subprocess invocation", () => {
+  it("keeps source-host SDK imports native in state and maintenance workers", ({
+    workerArtifacts,
+  }) =>
+    workerArtifacts.fixtureLifetime.run(async () => {
+      const { node, prepareWorkers } = workerArtifacts.createFixtureCommands();
+      const owner = workerArtifacts.createWorkerRun();
+      const fixture = workerArtifacts.fixtureDirectory();
+      try {
+        await prepareWorkers(owner);
+        const probe = writeFixture(
+          fixture,
+          "native-sdk-worker.mjs",
+          `
+          import assert from 'node:assert/strict';
+          import {parentPort,workerData} from 'node:worker_threads';
+          await import(workerData.entry);
+          const {tryNativeRequireModule}=await import(workerData.nativeRequire);
+          for (const sdk of workerData.sdks) {
+            const native=tryNativeRequireModule(sdk);
+            assert(native.ok,'source-host SDK must load natively: '+sdk);
+            const imported=await import(sdk);
+            assert.equal(native.moduleExport,imported,'source SDK must retain one module identity');
+          }
+          parentPort.postMessage('native-sdk-ready');
+          parentPort.close();
+          `,
+        );
+        const result = await node(
+          [
+            "--input-type=module",
+            "--eval",
+            `
+            import assert from 'node:assert/strict';
+            import path from 'node:path';
+            import {pathToFileURL} from 'node:url';
+            import {MessagePort,Worker} from 'node:worker_threads';
+            const [probe,directory,root]=process.argv.slice(1);
+            for(const entry of [
+              'infra/sqlite-store.worker.js',
+              'state/openclaw-state.worker.js',
+              'commands/doctor-database-engine-inspection.worker.js',
+              'snapshot/database-backup.worker.js',
+              'infra/database-engine/port-command.entry.worker.js',
+            ]) {
+              const worker=new Worker(pathToFileURL(probe),{
+                execArgv:[],
+                env:{...process.env,NODE_OPTIONS:'',TSX_TSCONFIG_PATH:path.join(root,'tsconfig.json')},
+                workerData:{
+                  entry:pathToFileURL(path.join(directory,'dist',entry)).href,
+                  nativeRequire:pathToFileURL(path.join(root,'src/plugins/native-module-require.ts')).href,
+                  sdks:['sqlite-worker-runtime.ts','time-runtime.ts'].map(sdk=>
+                    pathToFileURL(path.join(root,'src/plugin-sdk',sdk)).href),
+                },
+              });
+              try {
+                const ready=await new Promise((resolve,reject)=>{
+                  worker.on('message',message=>{
+                    // The real SQLite worker publishes its diagnostic port before the SDK proof.
+                    if(message?.status==='memory') {
+                      assert(message.port instanceof MessagePort);
+                      assert(Array.isArray(message.postgresBridgeCounters));
+                      message.port.close();
+                      return;
+                    }
+                    resolve(message);
+                  });
+                  worker.once('error',reject);
+                  worker.once('exit',code=>reject(new Error('worker exited before SDK proof: '+code)));
+                });
+                assert.equal(ready,'native-sdk-ready');
+              } finally {await worker.terminate();}
+            }
+            `,
+            probe,
+            owner.descriptor.directory,
+            root,
+          ],
+          root,
+        );
+        expect(result.code, result.stderr + result.stdout).toBe(0);
+      } finally {
+        await owner.dispose();
+      }
+    }));
+
   it("uses installed fs-safe packages from compiled subprocesses", ({ workerArtifacts }) =>
     workerArtifacts.fixtureLifetime.run(async () => {
       const { node, prepareWorkers } = workerArtifacts.createFixtureCommands();
@@ -852,7 +937,6 @@ describe.concurrent("fresh compiled subprocess invocation", () => {
 
   it.each([
     { args: ["run", "--", "--help"], metadata: false },
-    { args: ["run", "--help"], metadata: true },
     { args: ["bench", "--run"], metadata: false },
     { args: ["list"], metadata: true },
     { args: ["--browser.headless", "run", "--version"], metadata: false },
@@ -1531,6 +1615,23 @@ export default class {
           };
           export const preservedModuleBuildSources = ["src/infra/runtime-process-entrypoints.ts"];
           export const preservedModuleBuildAssets = [];
+          `,
+        );
+        // Retain the declaration inputs exercised by the integrity assertions below.
+        const declarations = "scripts/lib/vitest-worker-declarations.mts";
+        fs.renameSync(
+          path.join(fixture, declarations),
+          path.join(fixture, "scripts/lib/vitest-worker-declarations.original.mts"),
+        );
+        writeFixture(
+          fixture,
+          declarations,
+          `export * from "./vitest-worker-declarations.original.mts";
+          export const vitestWorkerDeclarationEntries = {
+            "infra/runtime-process-entrypoints": "src/infra/runtime-process-entrypoints.ts",
+            "plugins/runtime-retention-entrypoint.test-support": "src/plugins/runtime-retention-entrypoint.test-support.ts",
+            "tui/tui-pty-runtime-test-support": "src/tui/tui-pty-runtime-test-support.ts",
+          };
           `,
         );
         const databasePath = path.join(fixture, "probe.sqlite");

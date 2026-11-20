@@ -25,26 +25,23 @@ function stripErrorPrefix(raw: string): string {
   return raw.replace(/^error:\s*/i, "").trim();
 }
 export function inferSignalStatus(signal: FailoverSignal): number | undefined {
-  if (typeof signal.status === "number" && Number.isFinite(signal.status)) {
+  if (Number.isFinite(signal.status)) {
     return signal.status;
   }
   const message = stripErrorPrefix(signal.message?.trim() ?? "");
   return extractLeadingHttpStatus(message)?.code ?? extractProviderWrappedHttpStatus(message)?.code;
 }
-function isExplicitNoBodyHttpMessage(raw: string | undefined, status?: number): boolean {
+function isExplicitNoBodyHttpMessage(raw: string | undefined, status: number): boolean {
   const trimmed = raw?.trim();
   if (!trimmed) {
     return false;
   }
   const candidate = stripErrorPrefix(trimmed);
   const leadingStatus = extractLeadingHttpStatus(candidate);
-  if (leadingStatus) {
-    if (typeof status === "number" && leadingStatus.code !== status) {
-      return false;
-    }
-    return NO_BODY_HTTP_WRAPPER_RE.test(leadingStatus.rest);
-  }
-  return NO_BODY_HTTP_WRAPPER_RE.test(candidate);
+  return (
+    (!leadingStatus || leadingStatus.code === status) &&
+    NO_BODY_HTTP_WRAPPER_RE.test(leadingStatus?.rest ?? candidate)
+  );
 }
 export function isUnclassifiedNoBodyHttpSignal(signal: FailoverSignal): boolean {
   const status = inferSignalStatus(signal);
@@ -192,7 +189,7 @@ export function classifyFailoverClassificationFromHttpStatus(
   opts?: { preserveProviderSignalClassification?: boolean },
 ): FailoverClassification | null {
   const messageReason = failoverReasonFromClassification(messageClassification);
-  if (typeof status !== "number" || !Number.isFinite(status)) {
+  if (status === undefined || !Number.isFinite(status)) {
     return null;
   }
   if (status === 402) {

@@ -1,6 +1,7 @@
-import type { Context, Model } from "@openclaw/llm-core";
+import type { Model } from "@openclaw/llm-core";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions.js";
 import { isGoogleGemini3ThinkingLevelModel } from "../internal/google-model-family.js";
+import type { ProviderContext } from "../provider-types.js";
 import { detectOpenAICompletionsCompat } from "./openai-completions-compat.js";
 import { requiresReasoningContentReplay } from "./openai-completions-reasoning-replay.js";
 import {
@@ -30,7 +31,7 @@ function hasGoogleCompatThoughtSignatureTruncationFootprint(value: string): bool
 
 function injectToolCallThoughtSignatures(
   outgoingMessages: ChatCompletionMessageParam[],
-  context: Context,
+  context: ProviderContext,
   model: OpenAIModeModel,
 ): void {
   if (!isGoogleOpenAICompatModel(model)) {
@@ -128,21 +129,6 @@ function sanitizeOpenRouterReasoningReplayFields(record: ReasoningReplayMessage)
   delete record.reasoning_text;
 }
 
-function shouldPreserveReasoningContentReplay(
-  model: OpenAIModeModel,
-  compat: { requiresReasoningContentOnAssistantMessages: boolean; thinkingFormat: string },
-): boolean {
-  if (
-    compat.requiresReasoningContentOnAssistantMessages ||
-    compat.thinkingFormat === "deepseek" ||
-    compat.thinkingFormat === "zai" ||
-    shouldTrustReasoningContentReplayMetadata(model)
-  ) {
-    return true;
-  }
-  return requiresReasoningContentReplay(model.id);
-}
-
 function shouldPreserveOpenRouterReasoningReplay(model: OpenAIModeModel): boolean {
   if (model.provider !== "openrouter") {
     return true;
@@ -151,24 +137,13 @@ function shouldPreserveOpenRouterReasoningReplay(model: OpenAIModeModel): boolea
   return !(normalizedModelId.startsWith("anthropic/") || normalizedModelId.startsWith("x-ai/"));
 }
 
-function shouldTrustReasoningContentReplayMetadata(model: OpenAIModeModel): boolean {
-  if (!model.reasoning) {
-    return false;
-  }
-  const provider = model.provider.trim().toLowerCase();
-  if (provider === "openai") {
-    return false;
-  }
-  return shouldPreserveOpenRouterReasoningReplay(model);
-}
-
 // OpenAI Chat Completions assistant-message input does not define reasoning
 // replay fields, while OpenRouter and DeepSeek-style providers document
 // compatible pass-back contracts. Keep valid provider-owned replay fields, but
 // strip them for stock OpenAI before a follow-up request hits the wire.
 export function applyCompletionsReplay(
   outgoingMessages: ChatCompletionMessageParam[],
-  context: Context,
+  context: ProviderContext,
   model: OpenAIModeModel,
   compat: {
     requiresReasoningContentOnAssistantMessages: boolean;
@@ -178,7 +153,14 @@ export function applyCompletionsReplay(
   injectToolCallThoughtSignatures(outgoingMessages, context, model);
   const preserveOpenRouterReasoning =
     compat.thinkingFormat === "openrouter" && shouldPreserveOpenRouterReasoningReplay(model);
-  const preserveReasoningContent = shouldPreserveReasoningContentReplay(model, compat);
+  const preserveReasoningContent =
+    compat.requiresReasoningContentOnAssistantMessages ||
+    compat.thinkingFormat === "deepseek" ||
+    compat.thinkingFormat === "zai" ||
+    (model.reasoning &&
+      model.provider.trim().toLowerCase() !== "openai" &&
+      shouldPreserveOpenRouterReasoningReplay(model)) ||
+    requiresReasoningContentReplay(model.id);
   for (const message of outgoingMessages) {
     if (message.role !== "assistant") {
       continue;
@@ -187,10 +169,22 @@ export function applyCompletionsReplay(
       sanitizeOpenRouterReasoningReplayFields(message);
     } else {
       const record: ReasoningReplayMessage = message;
+      const requiresReasoningContent =
+        model.compat?.requiresReasoningContentOnAssistantMessages === true;
+      if (preserveReasoningContent && requiresReasoningContent) {
+        // Only an explicit endpoint contract overrides the server's emitted field name.
+        for (const field of ["reasoning_content", "reasoning", "reasoning_text"] as const) {
+          if (typeof record[field] === "string" && record[field].length > 0) {
+            record.reasoning_content = record[field];
+            break;
+          }
+        }
+      }
       for (const field of COMPLETIONS_REASONING_REPLAY_FIELDS) {
         if (
           preserveReasoningContent &&
-          field === "reasoning_content" &&
+          field !== "reasoning_details" &&
+          (!requiresReasoningContent || field === "reasoning_content") &&
           typeof record[field] === "string"
         ) {
           continue;

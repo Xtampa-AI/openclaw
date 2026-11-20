@@ -62,6 +62,8 @@ separate recovery mechanisms: cleanup does not manage package or Git runtime
 backups, and retained migration originals are not a full pre-update backup.
 Preserve every recovery location named in the update report until you have
 verified the installation.
+If a launcher backup cannot be restored, the update error names the affected
+launcher and the retained backup path.
 
 Launcher backups compare the link type and target, plus ownership when it can
 be preserved. Symlink permission bits do not block an update; macOS link modes
@@ -189,6 +191,10 @@ already-running older updater.
 While those fingerprints are tracked, the new version's Doctor also reads databases
 through private copies for its schema checks. A Doctor that fails before writing
 therefore leaves the snapshots restorable, and the package rolls back.
+A short-lived OpenClaw command holding state when Doctor starts maintenance does
+not cause that rollback: Doctor first waits for it to finish, while keeping time for
+its own work inside the update step (see
+[how updates run](/cli/update/how-updates-run#when-restart-is-skipped-or-fails)).
 On Windows, an eligible capture first runs the same native SQLite exclusion check
 used by rollback. This settles any retained WAL before recording write fingerprints,
 so later check cleanup is not mistaken for another writer. If another connection
@@ -265,12 +271,17 @@ verification failure. The command still exits nonzero; recovery does not turn a
 rejected version into a successful update.
 
 Recovery reports distinguish restored package files from a healthy Gateway.
-Once the updater verifies that the target Gateway is serving, later optional
-recognized maintenance failures, such as a late restart-health report or removing
-an old CLI wrapper, remain warnings and do not trigger rollback or turn the update
-into a failure. Authority refusals, data-at-risk failures, and unclassified errors
-still block successful completion. This does not rewrite an earlier failed
-attempt when a later status check finds the Gateway healthy.
+Once the updater verifies that the target Gateway is serving, a late
+restart-health report remains a warning and does not trigger rollback or turn the
+update into a failure. An old CLI wrapper that cannot be removed after a switch
+from a Git checkout to a package install is also a warning, whether or not the
+Gateway restarted: the package install is kept, and the wrapper keeps starting
+the old checkout wherever it comes first on `PATH` until you remove it. The
+warning names the path it could not remove or inspect. A wrapper that a system
+package owns still fails the update and rolls the package install back. Authority
+refusals, data-at-risk failures, and unclassified errors still block successful
+completion. This does not rewrite an earlier failed attempt when a later status
+check finds the Gateway healthy.
 
 A verified rollback names the version serving after recovery, including when
 an additional repair was needed. If the restored service fails its health check,
@@ -428,7 +439,7 @@ The failed update retains its nonzero exit code even if the agent repairs it.
 
 - For `openclaw update --channel dev` on source checkouts, the updater auto-bootstraps `pnpm` when needed. If you see a pnpm/corepack bootstrap error, install `pnpm` manually (or re-enable `corepack`) and rerun the update.
 - Check: [Troubleshooting](/gateway/troubleshooting)
-- Ask in Discord: [https://discord.gg/clawd](https://discord.gg/clawd)
+- For official OpenClaw support, visit [community.openclaw.ai](https://community.openclaw.ai/).
 
 ### Unattended repair on your own inference
 

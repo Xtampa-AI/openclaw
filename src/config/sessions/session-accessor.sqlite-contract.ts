@@ -21,6 +21,11 @@ export type {
   SessionLifecycleArtifactCleanupResult,
 } from "./session-accessor.lifecycle-types.js";
 
+export type SqliteTranscriptSnapshotRow = {
+  eventJson: string;
+  seq: number;
+};
+
 export type TranscriptWriteSnapshot<T> = {
   result: T;
   lifecycleRevision?: string;
@@ -37,6 +42,13 @@ export type TranscriptMessageWriteSnapshot<TMessage> = TranscriptWriteSnapshot<
 export type TranscriptEventAppendResult =
   | { appended: false }
   | { appended: true; effectiveParentId?: string | null };
+
+export type TranscriptEventReadOptions = {
+  beforeEventSeq?: number;
+  afterEventSeq?: number;
+  projection?: "reset-boundary";
+  maxEventBytes?: number;
+};
 
 export type CacheTtlProjectionPrefix = {
   anchorIds: string[];
@@ -93,7 +105,7 @@ export type SqliteSessionReclamationDiagnostics = {
 /** One validated request owns this record until its observed release event. */
 export type SqliteSessionReclamationAdmissionDiagnostics = {
   admissionId: number;
-  releaseCause?: "worker-release" | "worker-exit";
+  releaseCause?: "preliminary-release" | "worker-release" | "worker-exit";
 };
 
 export type SqliteSessionDatabaseAdmissionDiagnostics = {

@@ -135,7 +135,11 @@ export async function anthropicAnalyzePdf(
   const request = params.requestConfig?.request;
   const headers = new Headers(params.requestConfig?.headers);
   for (const [name, value] of Object.entries(request?.headers ?? {})) {
-    headers.set(name, value);
+    if (value === null) {
+      headers.delete(name);
+    } else {
+      headers.set(name, value);
+    }
   }
   const hasExplicitAuthOverride =
     (request?.auth?.mode !== undefined && request.auth.mode !== "provider-default") ||
@@ -188,7 +192,7 @@ export async function anthropicAnalyzePdf(
         },
       ],
     },
-    request,
+    request: request ? { ...request, headers: requestHeaders } : undefined,
     defaultAuthHeader: usesOAuthApiKey ? "authorization" : "x-api-key",
     signal: params.signal,
   });

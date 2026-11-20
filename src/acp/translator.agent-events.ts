@@ -94,7 +94,7 @@ export class AcpTranslatorAgentEvents {
         preambles.set(previous.itemId, previous.text);
         pending.preamblePreview = undefined;
       }
-      if (isNewPreamble && typeof projection.retainedText === "string") {
+      if (isNewPreamble && projection.retainedText !== undefined) {
         sent = "";
         const retained = projection.retainedText.trimEnd();
         const answer = pending.sentText ?? "";
@@ -273,12 +273,14 @@ export class AcpTranslatorAgentEvents {
     if (params.runId) {
       return this.findPendingBySessionKey(params.sessionKey, params.runId);
     }
-    const toolCallId = params.approvalEvent.toolCallId;
+    const { runId, toolCallId } = params.approvalEvent;
     let match: AcpPendingPrompt | undefined;
     for (const pending of this.pendingPrompts.values()) {
       if (
         pending.sessionKey !== params.sessionKey ||
-        (toolCallId && pending.toolCalls?.get(toolCallId)?.kind !== "execute")
+        (runId
+          ? pending.idempotencyKey !== runId
+          : toolCallId && pending.toolCalls?.get(toolCallId)?.kind !== "execute")
       ) {
         continue;
       }

@@ -1,5 +1,4 @@
 import { createLazyRuntimeSurface } from "openclaw/plugin-sdk/lazy-runtime";
-import type { ProviderReasoningOutputModeContext } from "openclaw/plugin-sdk/plugin-entry";
 import { runLiveProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import { resolveMergedModelProviderConfig } from "openclaw/plugin-sdk/provider-catalog-shared";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-entry";
@@ -22,26 +21,6 @@ import {
   resolveGoogleGenerativeAiTransport,
 } from "./provider-policy.js";
 
-function resolveGoogleReasoningOutputMode(
-  ctx: ProviderReasoningOutputModeContext,
-): "native" | "tagged" {
-  if (
-    ctx.provider === "google" ||
-    ctx.provider === "google-vertex" ||
-    ctx.provider === "google-interactions"
-  ) {
-    const api = ctx.model?.api ?? ctx.modelApi;
-    if (
-      !api ||
-      api === "google-generative-ai" ||
-      api === "google-vertex" ||
-      api === "google-interactions"
-    ) {
-      return "native";
-    }
-  }
-  return "tagged";
-}
 const loadGenerativeAiStream = createLazyRuntimeSurface(
   () => import("./transport-stream.js"),
   (runtime) => runtime.createGoogleGenerativeAiTransportStreamFn(),
@@ -157,7 +136,24 @@ export function buildGoogleProvider(): ProviderPlugin {
     // Tagged mode simultaneously injects <think>/<final> which the model opens before a tool
     // call, never closes, leaving the post-tool turn empty (payloads=0). The CLI backend keeps
     // tagged mode because it emits JSON text, not native thought parts.
-    resolveReasoningOutputMode: resolveGoogleReasoningOutputMode,
+    resolveReasoningOutputMode: (ctx): "native" | "tagged" => {
+      if (
+        ctx.provider === "google" ||
+        ctx.provider === "google-vertex" ||
+        ctx.provider === "google-interactions"
+      ) {
+        const api = ctx.model?.api ?? ctx.modelApi;
+        if (
+          !api ||
+          api === "google-generative-ai" ||
+          api === "google-vertex" ||
+          api === "google-interactions"
+        ) {
+          return "native";
+        }
+      }
+      return "tagged";
+    },
     isModernModelRef: ({ modelId }) => isModernGoogleModel(modelId),
   };
 }

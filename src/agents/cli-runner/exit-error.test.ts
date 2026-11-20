@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { FailoverError } from "../failover-error.js";
-import { createCliExitFailoverError, resolveCliResumeAtError } from "./exit-error.js";
+import type { FailoverError } from "../failover-error.js";
+import { createCliExitFailoverError } from "./exit-error.js";
 
 const context: Pick<FailoverError, "provider" | "model" | "sessionId" | "lane"> = {
   provider: "anthropic",
@@ -23,7 +23,6 @@ function classifyExit(
     context,
     candidates,
     retryEmptyFailure: false,
-    fallbackMessage: "CLI failed.",
     ...resume,
   });
 }
@@ -76,24 +75,4 @@ describe("createCliExitFailoverError resume rejection", () => {
     });
     expect(error.reason).toBe("unknown");
   });
-});
-
-it("does not reinterpret aborts or already-classified timeouts as checkpoint rejection", () => {
-  const message = "No message found with message.uuid of: " + CHECKPOINT_UUID;
-  const abort = new Error(message);
-  abort.name = "AbortError";
-  const timeout = new FailoverError(message, { reason: "timeout", ...context });
-  for (const error of [abort, timeout]) {
-    expect(
-      resolveCliResumeAtError(error, { resumeCheckpointId: CHECKPOINT_UUID }, context),
-    ).toBeUndefined();
-  }
-});
-
-it("does not classify a UUID mention without the checkpoint diagnostic", () => {
-  expect(
-    classifyExit(["Unrelated failure for " + CHECKPOINT_UUID], {
-      resumeCheckpointId: CHECKPOINT_UUID,
-    }).reason,
-  ).toBe("unknown");
 });

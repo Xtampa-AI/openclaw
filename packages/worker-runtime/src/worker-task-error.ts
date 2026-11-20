@@ -1,13 +1,15 @@
 import type { Slot } from "./worker-task-pool.types.js";
 
 export class WorkerTaskError extends Error {
+  readonly capacityAvailable?: Promise<void>;
   constructor(
     message: string,
     readonly code: "unavailable" | "timeout" | "failed" | "overloaded",
-    options?: ErrorOptions,
+    options?: ErrorOptions & { capacityAvailable?: Promise<void> },
   ) {
     super(message, options);
     this.name = "WorkerTaskError";
+    this.capacityAvailable = options?.capacityAvailable;
   }
 }
 

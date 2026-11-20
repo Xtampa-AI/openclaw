@@ -35,8 +35,6 @@ const suite = createControlUiE2eSuite({
 
 suite.define(() => {
   it("loads entry, CSS and lazy Workboard chunks from the UI origin with an authenticated remote Gateway", async () => {
-    // The mock Gateway must report the served artifact's identity: a mismatch makes
-    // stale-build recovery reload the page and discard the pending gateway handoff.
     const buildInfo = normalizeControlUiBuildInfo(
       JSON.parse(await fs.readFile(path.join(repoRoot, "dist/build-info.json"), "utf8")),
     );
@@ -93,36 +91,30 @@ suite.define(() => {
       const url = new URL("workboard/ops", suite.server.baseUrl);
       url.hostname = "ui.example";
       url.hash = new URLSearchParams({ gatewayUrl }).toString();
-      await page.goto(url.href);
-      const confirmation = await waitForConfirmModal(page);
-      const switchGateway = confirmation.getByRole("button", {
-        name: "Switch to gateway.example",
-        exact: true,
-      });
-      // Connection-state renders can replace the modal button while Playwright is
-      // waiting for pointer stability. Invoke the currently resolved control
-      // atomically; the socket, route, and asset assertions below own the effect.
-      await switchGateway.evaluate((button: HTMLButtonElement) => button.click());
+      const response = await page.goto(url.href);
+      expect(response?.status()).toBe(200);
+      expect(errors).toEqual([]);
+      const confirmation = await waitForConfirmModal(
+        page,
+        page.locator("openclaw-modal-dialog").filter({ has: page.locator(".gateway-switch") }),
+      );
+      await confirmation
+        .getByRole("button", { name: "Switch to gateway.example", exact: true })
+        .click();
       await page.locator(".workboard-page-title").filter({ hasText: "Operations" }).waitFor();
       expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
       expect((await gateway.getSocketUrls()).at(-1)).toBe(gatewayUrl);
       expect((await gateway.waitForRequest("plugins.controlUi.report")).params).toMatchObject({
-        pluginId: "workboard",
-        revision,
-        status: "activated",
+        reports: [{ pluginId: "workboard", revision, status: "activated" }],
       });
       // Deep links retain the shipped relative base; the Gateway resolves any /assets/ segment.
       const prefix = `/assets/plugins/workboard/${revision}/`;
       const assets = requests
         .map((request) => new URL(request))
         .filter((asset) => asset.pathname.includes(prefix));
-      expect(assets.length).toBeGreaterThan(0);
       expect(assets.every((asset) => asset.origin === url.origin)).toBe(true);
-      expect(assets.some((asset) => asset.pathname.endsWith(`${prefix}${build.entryName}`))).toBe(
-        true,
-      );
-      for (const style of build.styles) {
-        expect(assets.some((asset) => asset.pathname.endsWith(`${prefix}${style}`))).toBe(true);
+      for (const filename of [build.entryName, ...build.styles]) {
+        expect(assets.some((asset) => asset.pathname.endsWith(`${prefix}${filename}`))).toBe(true);
       }
       expect(
         assets.some(

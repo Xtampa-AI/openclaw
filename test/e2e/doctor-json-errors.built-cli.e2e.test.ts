@@ -51,6 +51,7 @@ describe("Doctor JSON runtime failures", () => {
       schemaVersion: 1,
       status: "blocked",
       ok: false,
+      status: "blocked",
       checksRun: 0,
       checksSkipped: 0,
       findings: [

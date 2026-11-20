@@ -1,5 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
+import { getDatabaseEngineInput } from "../infra/database-engine/context.js";
+import { isConstrainedProcessLowOnMemory } from "../infra/host-memory.js";
 import type { PageCacheProgress } from "../infra/sqlite-page-cache.worker.js";
 import {
   runSqliteReadOnlyOperation,
@@ -21,28 +23,37 @@ export async function warmGatewayDatabasePageCache(params: {
   startupTrace?: GatewayStartupTrace;
   log: { info: (message: string) => void; warn: (message: string) => void };
 }): Promise<void> {
-  if (process.platform !== "linux") {
+  if (process.platform !== "linux" || isConstrainedProcessLowOnMemory()) {
     return;
   }
   const statePath = resolveOpenClawStateSqlitePath();
-  const state = captureOpenClawStateReadContext(statePath);
+  // PostgreSQL paths are identity anchors, not local application data.
+  const state = getDatabaseEngineInput("state")
+    ? undefined
+    : captureOpenClawStateReadContext(statePath);
   const targets = [
-    {
-      path: statePath,
-      kind: "state" as const,
-      assertCurrent: () => state.admission.assertCurrent(),
-      env: process.env,
-    },
-    ...params.databases.map(({ database, assertCurrent }) => ({
-      path: database.path,
-      kind: "agent" as const,
-      assertCurrent,
-      env: database.env ?? process.env,
-    })),
+    ...(state
+      ? [
+          {
+            path: statePath,
+            kind: "state" as const,
+            assertCurrent: () => state.admission.assertCurrent(),
+            env: process.env,
+          },
+        ]
+      : []),
+    ...(getDatabaseEngineInput("agent")
+      ? []
+      : params.databases.map(({ database, assertCurrent }) => ({
+          path: database.path,
+          kind: "agent" as const,
+          assertCurrent,
+          env: database.env ?? process.env,
+        }))),
   ];
   let remaining = MAX_PASS_BYTES;
   for (const target of targets) {
-    if (params.signal.aborted || remaining <= 0) {
+    if (params.signal.aborted || remaining <= 0 || isConstrainedProcessLowOnMemory()) {
       return;
     }
     // Best-effort maintenance never retains a worker beyond its bounded warm window.
@@ -51,6 +62,9 @@ export async function warmGatewayDatabasePageCache(params: {
       target.assertCurrent();
       const identity = await readDatabasePathIdentity(target.path);
       target.assertCurrent();
+      if (isConstrainedProcessLowOnMemory()) {
+        return;
+      }
       const options = {
         source: "canonical" as const,
         expectedIdentity: identity.key,
@@ -90,6 +104,10 @@ export async function warmGatewayDatabasePageCache(params: {
           let previousBytes = 0;
           let chunkStarted = performance.now();
           while (!progress.complete) {
+            // Optional warming releases its reader when requests need the memory.
+            if (isConstrainedProcessLowOnMemory()) {
+              return;
+            }
             // Idle/startup time must not accumulate credit for an unpaced burst of disk reads.
             await delay(
               Math.max(
@@ -103,6 +121,9 @@ export async function warmGatewayDatabasePageCache(params: {
               { signal },
             );
             target.assertCurrent();
+            if (isConstrainedProcessLowOnMemory()) {
+              return;
+            }
             previousBytes = Math.max(progress.readBytes, progress.diskBytes);
             chunkStarted = performance.now();
             progress = await runSqliteReadOnlyOperation(

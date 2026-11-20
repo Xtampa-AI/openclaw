@@ -8,11 +8,18 @@ import { safeParseJson } from "@openclaw/normalization-core";
 import { cloneEnvWithPlatformSemantics } from "../../config/config-env-vars.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { sha256HexPrefixCore } from "../../infra/crypto-digest.js";
+import { assertEngineStoreExecutionAllowed } from "../../infra/database-engine/admission-scope.js";
+import { getDatabaseEngineInput } from "../../infra/database-engine/context.js";
+import { openNodeSqliteDatabase, resolveExistingSqliteFileUri } from "../../infra/node-sqlite.js";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import { resolveSqliteDatabaseFilePaths } from "../../infra/sqlite-files.js";
 import { stageSqliteTransactionState } from "../../infra/sqlite-post-commit.js";
+import { openSqliteReadOnlyDatabase } from "../../infra/sqlite-snapshot-source.js";
 import type { DatabaseFileIdentity } from "../../infra/sqlite-worker-identity.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
 import { agentDatabaseLifecycle } from "../../state/openclaw-agent-db-lifecycle.js";
+import { openOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
   assertExistingAgentSchemaOwner,
   readExistingAgentSchemaMeta,
@@ -30,7 +37,10 @@ import {
 } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { resolveUserPath } from "../../utils.js";
-import { resolveRegisteredAgentIdForDir } from "../agent-dir-registry.js";
+import {
+  resolveRegisteredAgentIdForDir,
+  resolveRegisteredAgentIdForDirAsync,
+} from "../agent-dir-registry.js";
 import {
   prepareAuthProfileAuthorizationWrite,
   readAuthProfileAuthorizationLifetimes,
@@ -58,6 +68,8 @@ import {
   inspectAuthProfileJsonCell,
   inspectAgentAuthProfileJsonCellReadOnly,
   readAuthProfileJsonCellText,
+  readAuthProfileRows,
+  readAuthProfileRowsReadOnly,
 } from "./sqlite-json.js";
 import {
   acquireAuthProfileReadDatabase,
@@ -65,6 +77,7 @@ import {
   isMissingDatabasePath,
 } from "./sqlite-read-pool.js";
 import type {
+  AuthProfileRowRead,
   AuthProfileStoreOwner,
   PersistedAuthProfileStoreInspection,
   PreparedAuthProfileStoreOwner,
@@ -161,6 +174,11 @@ export function resolveAuthProfileDatabaseOwnerId(agentDir: string): string {
   return target.agentId;
 }
 
+export async function resolveAuthProfileDatabaseOwnerIdAsync(agentDir: string): Promise<string> {
+  const directory = path.dirname(resolveAuthProfileDatabasePath(agentDir));
+  return (await resolveRegisteredAgentIdForDirAsync(directory)) ?? inferAgentIdFromDir(directory);
+}
+
 /** Resolves the SQLite database and sidecar paths used by auth profiles. */
 export function resolveAuthProfileDatabaseFilePaths(agentDir: string): string[] {
   return resolveSqliteDatabaseFilePaths(resolveAuthProfileDatabasePath(agentDir));
@@ -191,7 +209,14 @@ function resolveAuthProfileDatabaseKind(
 /** Validate selected-agent ownership without requiring a current session schema. */
 export function assertAuthProfileStoreAgentOwner(agentDir: string, agentId: string): void {
   const pathname = resolveAuthProfileDatabasePath(agentDir);
-  const acquired = acquireAuthProfileReadDatabase(pathname);
+  if (getDatabaseEngineInput("agent")) {
+    const opened = openOpenClawAgentDatabaseReadOnly({ agentId, path: pathname });
+    if (opened.found) {
+      opened.database.close();
+    }
+    return;
+  }
+  const acquired = acquireAuthProfileReadDatabase(pathname, openSqliteReadOnlyDatabase);
   if (acquired.status === "missing") {
     return;
   }
@@ -205,25 +230,93 @@ export function assertAuthProfileStoreAgentOwner(agentDir: string, agentId: stri
   );
 }
 
+function readSelectedAgentAuthDatabase<T>(
+  target: { path: string; env?: NodeJS.ProcessEnv },
+  read: (db: EngineConnection) => T,
+): { value: T } | undefined {
+  assertEngineStoreExecutionAllowed();
+  if (isMissingDatabasePath(target.path)) {
+    return undefined;
+  }
+  const anchor = openNodeSqliteDatabase(resolveExistingSqliteFileUri(target.path));
+  let database: EngineConnection = anchor;
+  try {
+    database = openAgentEngineStore(anchor, undefined, target.path, true, (connection, error) => {
+      database = connection;
+      throw error;
+    });
+    return { value: read(database) };
+  } finally {
+    try {
+      database.close();
+    } finally {
+      if (database !== anchor && anchor.isOpen) {
+        anchor.close();
+      }
+    }
+  }
+}
+
+function readAuthProfileDatabaseReadOnly<T>(
+  databaseTarget: Pick<AuthProfileDatabaseTarget, "kind" | "path"> & { env?: NodeJS.ProcessEnv },
+  reader: {
+    read: (db: EngineConnection, kind: AuthProfileDatabaseTarget["kind"]) => T;
+    readNativeAgent: (databasePath: string) => T;
+    unavailable: (inspection: PersistedAuthProfileStoreInspection) => T;
+  },
+): T {
+  if (databaseTarget.kind === "shared-state") {
+    try {
+      return (
+        withExistingOpenClawStateDatabaseReadOnly(({ db }) => reader.read(db, "shared-state"), {
+          path: databaseTarget.path,
+          ...(databaseTarget.env ? { env: databaseTarget.env } : {}),
+        }) ?? reader.unavailable({ status: "missing", reason: "database" })
+      );
+    } catch {
+      return reader.unavailable(
+        isMissingDatabasePath(databaseTarget.path)
+          ? { status: "missing", reason: "database" }
+          : { status: "unreadable" },
+      );
+    }
+  }
+  if (getDatabaseEngineInput("agent")) {
+    try {
+      return (
+        readSelectedAgentAuthDatabase(databaseTarget, (db) => reader.read(db, "agent"))?.value ??
+        reader.unavailable({ status: "missing", reason: "database" })
+      );
+    } catch {
+      return reader.unavailable({ status: "unreadable" });
+    }
+  }
+  return reader.readNativeAgent(databaseTarget.path);
+}
+
 export function inspectAuthProfileJsonCellReadOnly(
   databaseTarget: Pick<AuthProfileDatabaseTarget, "kind" | "path"> & { env?: NodeJS.ProcessEnv },
   target: "store" | "state",
 ): PersistedAuthProfileStoreInspection {
-  if (databaseTarget.kind === "shared-state") {
-    try {
-      return (
-        withExistingOpenClawStateDatabaseReadOnly(
-          ({ db }) => inspectAuthProfileJsonCell(db, target, "shared-state"),
-          { path: databaseTarget.path, ...(databaseTarget.env ? { env: databaseTarget.env } : {}) },
-        ) ?? { status: "missing", reason: "database" }
-      );
-    } catch {
-      return isMissingDatabasePath(databaseTarget.path)
-        ? { status: "missing", reason: "database" }
-        : { status: "unreadable" };
-    }
-  }
-  return inspectAgentAuthProfileJsonCellReadOnly(databaseTarget.path, target);
+  return readAuthProfileDatabaseReadOnly(databaseTarget, {
+    read: (db, kind) => inspectAuthProfileJsonCell(db, target, kind),
+    readNativeAgent: (databasePath) =>
+      inspectAgentAuthProfileJsonCellReadOnly(databasePath, target, openSqliteReadOnlyDatabase),
+    unavailable: (inspection) => inspection,
+  });
+}
+
+export function readPersistedAuthProfileRows(
+  agentDir?: string,
+  env?: NodeJS.ProcessEnv,
+): AuthProfileRowRead {
+  const target = resolveAuthProfileDatabaseOptions(agentDir, env);
+  return readAuthProfileDatabaseReadOnly(target, {
+    read: (db, kind) => readAuthProfileRows(db, target.path, kind),
+    readNativeAgent: (databasePath) =>
+      readAuthProfileRowsReadOnly(databasePath, openSqliteReadOnlyDatabase),
+    unavailable: (inspection) => ({ store: inspection, state: inspection, cacheable: false }),
+  });
 }
 
 /** Doctor retains opaque rotation-state bytes while repairing independently readable credentials. */
@@ -236,7 +329,16 @@ export function readAuthProfileStateJsonTextReadOnly(
       { path: target.path, ...(target.env ? { env: target.env } : {}) },
     );
   }
-  const acquired = acquireAuthProfileReadDatabase(target.path);
+  if (getDatabaseEngineInput("agent")) {
+    const result = readSelectedAgentAuthDatabase(target, (db) =>
+      readAuthProfileJsonCellText(db, "state", "agent"),
+    );
+    if (!result) {
+      throw new Error("Auth profile rotation-state source is unavailable; retry Doctor.");
+    }
+    return result.value;
+  }
+  const acquired = acquireAuthProfileReadDatabase(target.path, openSqliteReadOnlyDatabase);
   if (acquired.status !== "readable") {
     throw new Error("Auth profile rotation-state source is unavailable; retry Doctor.");
   }
@@ -491,6 +593,7 @@ export async function prepareAuthProfileWriteTransactionAsync(
   agentDir: string | undefined,
   options: AuthProfileWriteOptions,
   assertCurrent?: () => void,
+  existingDatabaseTarget?: AuthProfileDatabaseTarget,
 ) {
   const env = prepareAuthProfileWriteEnvironment(options);
   const capturedAgentDir = agentDir ? resolveUserPath(agentDir, env) : undefined;
@@ -502,10 +605,9 @@ export async function prepareAuthProfileWriteTransactionAsync(
   });
   options.assertEnvironment?.(env);
   assertCurrent?.();
-  const databaseTarget = resolveAuthProfileDatabaseOptions(
-    sharedStoreWrite ? undefined : capturedAgentDir,
-    env,
-  );
+  const databaseTarget =
+    existingDatabaseTarget ??
+    resolveAuthProfileDatabaseOptions(sharedStoreWrite ? undefined : capturedAgentDir, env);
   return { databaseTarget, sharedOwner: prepareAuthProfileSharedOwner(env) };
 }
 
@@ -577,6 +679,7 @@ export function runAuthProfileWriteTransaction<T>(
           ...(existing
             ? {
                 repairAdmission: {
+                  integrityTables: ["auth_profile_store", "auth_profile_state"],
                   expectedIdentity: existing.identity,
                   assertCurrent: existing.assertCurrent,
                 },

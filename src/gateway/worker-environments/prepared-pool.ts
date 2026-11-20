@@ -101,8 +101,10 @@ export function createPreparedWorkerPool(options: pool.PoolOptions) {
       { preparationKey: preparation.key, demandAtMs },
     );
   };
-  const candidates = (intent: WorkerProviderPreparedIntent) =>
-    intent.preparationKey
+  const candidates = (intent: WorkerProviderPreparedIntent) => {
+    const preparation =
+      intent.profileSnapshot.runtimePreparation ?? intent.profileSnapshot.project?.preparation;
+    return preparation
       ? store.list().filter((record) => {
           const limits = pool.poolPolicy(options, record.profileId, record.providerId);
           const presenceDemand = presence.current();
@@ -112,7 +114,7 @@ export function createPreparedWorkerPool(options: pool.PoolOptions) {
             record.state === "ready" &&
             record.providerId === intent.providerId &&
             record.preparation !== null &&
-            record.preparation.key === intent.preparationKey &&
+            record.preparation.key === preparation.key &&
             record.preparation.consumedAtMs === null &&
             ((presenceDemand &&
               presenceDemand.project.key ===
@@ -126,6 +128,7 @@ export function createPreparedWorkerPool(options: pool.PoolOptions) {
           );
         })
       : [];
+  };
   const maintain = async (environmentId?: string) => {
     if (signal.aborted) {
       return;
@@ -168,11 +171,14 @@ export function createPreparedWorkerPool(options: pool.PoolOptions) {
       return false;
     }
   };
-  const cancelPreparation = async (environmentId: string) => {
+  const cancelPreparation = async (environmentId: string, authorize?: () => void) => {
     await store.ready();
     const record = store.get(environmentId);
     const controller = preparations.get(environmentId);
-    if (record?.preparation && (await pool.retirePoolRecord(options, record, "invalidated"))) {
+    if (
+      record?.preparation &&
+      (await pool.retirePoolRecord(options, record, "invalidated", authorize))
+    ) {
       // The durable cancellation fences readiness; the lifecycle retains provider
       // custody until its aborted operation and physical cleanup actually settle.
       controller?.abort();

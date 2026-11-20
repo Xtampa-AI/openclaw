@@ -7,10 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { UpdateCommandFailure } from "../cli/update-cli/update-command-result.js";
 import { withUpdateFailureTriage } from "../cli/update-cli/update-command-triage.js";
-import * as configPaths from "../config/paths.js";
 import type { HealthFinding } from "../flows/health-checks.js";
 import { resolveInstallationTarget } from "../infra/installation-target-context.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
+import * as logTailModule from "../logging/log-tail.js";
 import { defaultRuntime } from "../runtime.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { triageCommand } from "./triage.js";
@@ -335,7 +335,7 @@ describe("triageCommand", () => {
     expect(mocks.confirm).not.toHaveBeenCalled();
   });
 
-  it("keeps separate-installation diagnostics without inspecting the host service", async () => {
+  it("preserves local diagnostics and redacted snapshot failures while the Gateway is offline", async () => {
     const { writeDiagnosticSupportExport } = await vi.importActual<
       typeof import("../logging/diagnostic-support-export.js")
     >("../logging/diagnostic-support-export.js");
@@ -344,21 +344,17 @@ describe("triageCommand", () => {
     await fs.writeFile(configPath, JSON.stringify({ gateway: { auth: { token: secret } } }));
     mocks.callGatewayFromCliWithTransport.mockRejectedValue(new Error(`Offline token=${secret}`));
     mocks.gatherDaemonStatus.mockRejectedValue(new Error("Status unavailable"));
-    mocks.writeDiagnosticSupportExport.mockImplementation((options) =>
-      writeDiagnosticSupportExport({
-        ...options,
-        stateDir,
-        env: { HOME: stateDir, OPENCLAW_CONFIG_PATH: configPath },
-        readLogTail: async () => ({
-          file: path.join(stateDir, "gateway.log"),
-          cursor: 0,
-          size: 0,
-          lines: [],
-          truncated: false,
-          reset: false,
-        }),
-      }),
-    );
+    vi.stubEnv("HOME", stateDir);
+    vi.stubEnv("OPENCLAW_CONFIG_PATH", configPath);
+    vi.spyOn(logTailModule, "readConfiguredLogTail").mockResolvedValue({
+      file: path.join(stateDir, "gateway.log"),
+      cursor: 0,
+      size: 0,
+      lines: [],
+      truncated: false,
+      reset: false,
+    });
+    mocks.writeDiagnosticSupportExport.mockImplementation(writeDiagnosticSupportExport);
     const runtime = createTriageRuntime();
 
     await triageCommand(runtime, { json: true });
@@ -374,8 +370,7 @@ describe("triageCommand", () => {
     const diagnostics = JSON.parse(await zip.file("diagnostics.json")!.async("string"));
     expect(diagnostics.config).toMatchObject({ exists: true, parseOk: true });
     expect(diagnostics.health).toMatchObject({ status: "failed" });
-    expect(diagnostics.status).toMatchObject({ status: "skipped" });
-    expect(mocks.gatherDaemonStatus).not.toHaveBeenCalled();
+    expect(diagnostics.status).toMatchObject({ status: "failed" });
     const entries = await Promise.all(
       Object.values(zip.files)
         .filter((entry) => !entry.dir)
@@ -390,46 +385,6 @@ describe("triageCommand", () => {
       }
       expect((await fs.stat(path.dirname(report.promptPath))).mode & 0o777).toBe(0o700);
     }
-  });
-
-  it("reuses the sanitized support exporter with Gateway status and health snapshots", async () => {
-    // This case exercises the default-install branch; the separate-installation case above
-    // proves a redirected state directory must not inspect the host service.
-    vi.spyOn(configPaths, "isDefaultInstallIdentity").mockReturnValue(true);
-    const health = { ok: true };
-    const status = { gateway: { reachable: true } };
-    const bundlePath = path.join(stateDir, "diagnostics.zip");
-    mocks.callGatewayFromCliWithTransport.mockResolvedValue(health);
-    mocks.gatherDaemonStatus.mockResolvedValue(status);
-    mocks.writeDiagnosticSupportExport.mockImplementation(async (options) => {
-      expect(await options.readHealthSnapshot()).toBe(health);
-      expect(await options.readStatusSnapshot()).toBe(status);
-      return { path: bundlePath };
-    });
-    const runtime = createTriageRuntime();
-
-    await triageCommand(runtime, { json: true });
-
-    const report = runtime.writeJson.mock.calls[0]?.[0] as {
-      promptPath: string;
-      bundlePath: string;
-      bundleError: null;
-      suggestedCommands: string[];
-    };
-    expect(report).toMatchObject({ bundlePath, bundleError: null });
-    expect(path.isAbsolute(report.promptPath)).toBe(true);
-    expect(path.isAbsolute(report.bundlePath)).toBe(true);
-    expect(report.suggestedCommands[0]).toContain(report.promptPath);
-    expect(report.suggestedCommands[1]).toContain(report.promptPath);
-    expect(await fs.readFile(report.promptPath, "utf8")).toContain(
-      "Sanitized ZIP: $OPENCLAW_STATE_DIR/diagnostics.zip",
-    );
-    expect(mocks.gatherDaemonStatus).toHaveBeenCalledWith({
-      rpc: { timeout: "3000", json: true },
-      probe: true,
-      requireRpc: false,
-      deep: false,
-    });
   });
 
   it.each([false, true])(

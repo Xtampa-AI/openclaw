@@ -1,5 +1,7 @@
 import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { filterStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { resolveOpenClawCliInvocation } from "../../../cli-invocation.mjs";
 import { resolveGatewayInstallEntrypoint } from "../../daemon/gateway-entrypoint.js";
 import { withGatewayServiceOperationLock } from "../../daemon/service-operation-lock.js";
 import { GatewayServiceDefinitionBackupReceiptSchema } from "../../daemon/service-stage.js";
@@ -87,15 +89,13 @@ export async function isUpdatedInstallGatewayExecutorSupported(params: {
   if (!entrypoint) {
     return false;
   }
-  const argv = [
-    params.nodeRunner ?? resolveNodeRunner(),
-    entrypoint,
-    "gateway",
-    "install",
-    "--update-executor",
-    "check",
-    "--json",
-  ];
+  const invocation = resolveOpenClawCliInvocation({
+    execPath: params.nodeRunner ?? resolveNodeRunner(),
+    entryPath: entrypoint,
+    execArgv: [],
+    args: ["gateway", "install", "--update-executor", "check", "--json"],
+  });
+  const argv = [invocation.command, ...invocation.args];
   const check = await withUpdateCommandExecutorChild(
     params.executor,
     params.root,
@@ -260,7 +260,13 @@ export async function runUpdatedInstallGatewayCommand(
     grant?: UpdateCommandChildGrant,
     bindChild?: (pid: number, argv?: readonly string[]) => void,
   ) => {
-    const argv = [nodeRunner, entrypoint, ...args, ...(grant ? ["--update-executor", "run"] : [])];
+    const invocation = resolveOpenClawCliInvocation({
+      execPath: nodeRunner,
+      entryPath: entrypoint,
+      execArgv: [],
+      args: [...args, ...(grant ? ["--update-executor", "run"] : [])],
+    });
+    const argv = [invocation.command, ...invocation.args];
     params.onGatewayStartAttempted?.(action);
     return await runSettledGatewayCommand(argv, {
       ...(grant
@@ -272,7 +278,7 @@ export async function runUpdatedInstallGatewayCommand(
                 ? {
                     originalDefinition: params.originalManagedServiceRuntime.definition.fingerprint,
                     originalRuntimePin:
-                      params.originalManagedServiceRuntime.definition.runtimePin.revision,
+                      params.originalManagedServiceRuntime.definition.runtimePin?.revision,
                   }
                 : {}),
               targetRoot: resolveUpdateInstallRoot(params.result.root!),
@@ -304,9 +310,7 @@ export async function runUpdatedInstallGatewayCommand(
   }
   const response = complete ? safeParseJsonRecord(res.stdout) : undefined;
   if (installing && response) {
-    const warnings = Array.isArray(response.warnings)
-      ? response.warnings.filter((message): message is string => typeof message === "string")
-      : [];
+    const warnings = filterStringEntries(response.warnings);
     if (warnings.length) {
       params.onWarnings?.(warnings);
     }
@@ -337,7 +341,7 @@ export async function runUpdatedInstallGatewayCommand(
       receipt?.before === original.definition.fingerprint &&
       typeof receipt.after === "string" &&
       /^[a-f0-9]{64}$/.test(receipt.after) &&
-      receipt.runtimePinBefore === original.definition.runtimePin.revision &&
+      receipt.runtimePinBefore === original.definition.runtimePin?.revision &&
       typeof receipt.runtimePinAfter === "string" &&
       /^[a-f0-9]{64}$/.test(receipt.runtimePinAfter)
     ) {

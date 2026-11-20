@@ -16,13 +16,17 @@ describe("queue configuration", () => {
     expect(validateConfigObject({ messages: { queue } }).ok).toBe(false);
   });
 
+  it.each([false, true])("preserves explicit collaborative steering %s", (value) => {
+    const queue = { allowCollaborativeSteering: value };
+    const result = validateConfigObject({ messages: { queue } });
+    expect(result).toMatchObject({ ok: true, config: { messages: { queue } } });
+  });
+
   it.each(["queue", "reject"] as const)("preserves collaborative fallback %s", (value) => {
     const queue = { collaborativeSteeringFallback: value };
     expect(validateConfigObject({ messages: { queue } })).toMatchObject({
       ok: true,
-      config: {
-        messages: { queue: { ...queue, allowCollaborativeSteering: true } },
-      },
+      config: { messages: { queue } },
     });
   });
 
@@ -57,10 +61,7 @@ describe("queue configuration", () => {
     if (!result.ok) {
       return;
     }
-    expect(result.config.messages?.queue).toEqual({
-      ...queue,
-      allowCollaborativeSteering: true,
-    });
+    expect(result.config.messages?.queue).toEqual({ ...queue, allowCollaborativeSteering: true });
     expect(result.warnings.filter(({ path }) => path.startsWith("messages.queue."))).toEqual([
       {
         path: "messages.queue.byChannel.telegarm",
@@ -89,5 +90,7 @@ describe("queue configuration", () => {
     });
     const debounce = lookupConfigSchema(schema, "messages.queue.debounceMsByChannel.x");
     expect(debounce?.schema).toMatchObject({ type: "integer", minimum: 0 });
+    const steering = lookupConfigSchema(schema, "messages.queue.allowCollaborativeSteering");
+    expect(steering?.schema).toMatchObject({ type: "boolean" });
   });
 });

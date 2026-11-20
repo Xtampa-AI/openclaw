@@ -2,10 +2,8 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, it } from "vitest";
 import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
-import {
-  defaultControlUiFeatureMethods,
-  installMockGateway,
-} from "../test-helpers/control-ui-e2e.ts";
+import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
+import { waitForChatScrollIdle } from "./chat-flow.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "Composer reverse Tab" });
@@ -14,7 +12,6 @@ suite.define(() => {
   it("leaves mention suggestions without choosing a recipient on Shift+Tab", async () => {
     await suite.withPage({ viewport: { width: 1280, height: 900 } }, async ({ page }) => {
       const gateway = await installMockGateway(page, {
-        featureMethods: [...defaultControlUiFeatureMethods, "users.mentionable"],
         presenceUsers: [
           {
             self: true,
@@ -37,14 +34,15 @@ suite.define(() => {
         },
       });
       await page.goto(`${suite.server.baseUrl}chat`);
-      await gateway.waitForRequest("chat.startup");
+      await gateway.waitForRequest("sessions.messages.subscribe");
       const textarea = page.locator(".agent-chat__composer-combobox > textarea");
       await textarea.waitFor();
+      await waitForChatScrollIdle(page);
       await textarea.focus();
       await page.keyboard.press("Shift+Tab");
       const previous = await page.evaluateHandle(() => document.activeElement);
       expect(await page.evaluate((element) => element !== document.body, previous)).toBe(true);
-      await textarea.fill("@Casey");
+      await textarea.pressSequentially("@Casey");
       const menu = page.getByRole("listbox", { name: "Mention a person" });
       await menu.getByRole("option", { name: "Casey Vale Online" }).waitFor();
       await page.keyboard.press("Shift+Tab");

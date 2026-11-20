@@ -1,16 +1,18 @@
 /** Shared fresh-request estimates for admission and compaction replacement. */
 import { estimateStringChars } from "@openclaw/normalization-core/cjk-chars";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { SAFETY_MARGIN } from "../compaction-planning.js";
-import type { AgentMessage, BashExecutionMessage } from "../runtime/index.js";
+import { IMAGE_BLOCK_TOKENS } from "../../../packages/agent-core/src/harness/compaction/compaction-cut-point.js";
 import {
   BRANCH_SUMMARY_PREFIX,
   BRANCH_SUMMARY_SUFFIX,
   bashExecutionToText,
   COMPACTION_SUMMARY_PREFIX,
   COMPACTION_SUMMARY_SUFFIX,
-  IMAGE_BLOCK_TOKENS,
-} from "../runtime/index.js";
+} from "../../../packages/agent-core/src/harness/messages.js";
+import type { AgentMessage, BashExecutionMessage } from "../../../packages/agent-core/src/types.js";
+
+/** Buffer for token-estimation inaccuracy, shared by admission and compaction. */
+export const SAFETY_MARGIN = 1.2;
 
 export const ESTIMATED_CHARS_PER_TOKEN = 4;
 const TOOL_RESULT_CHARS_PER_TOKEN = 2;
@@ -194,10 +196,9 @@ export function estimateRenderedPromptTokens(params: {
   systemPrompt?: string;
   prompt: string;
 }): number {
-  const systemTokens =
-    typeof params.systemPrompt === "string" && params.systemPrompt.trim().length > 0
-      ? MESSAGE_BOUNDARY_OVERHEAD_TOKENS + estimateStringTokenPressure(params.systemPrompt)
-      : 0;
+  const systemTokens = params.systemPrompt?.trim()
+    ? MESSAGE_BOUNDARY_OVERHEAD_TOKENS + estimateStringTokenPressure(params.systemPrompt)
+    : 0;
   return (
     systemTokens + MESSAGE_BOUNDARY_OVERHEAD_TOKENS + estimateStringTokenPressure(params.prompt)
   );
@@ -207,6 +208,7 @@ export function estimateRenderedPromptTokens(params: {
 export function createFreshLlmBoundaryTokenEstimator(params: {
   systemPrompt?: string;
   tools?: readonly { name: string; description: string; parameters: unknown }[];
+  retainCompletionUsage?: boolean;
 }) {
   const toolTokens = estimateToolSchemaTokens(params.tools);
   const fixedPromptTokens = estimateRenderedPromptTokens({
@@ -214,16 +216,75 @@ export function createFreshLlmBoundaryTokenEstimator(params: {
     prompt: "",
   });
   // Apply the safety margin once to the complete request before provider tokenization.
-  return (request: { messages: AgentMessage[]; prompt: string; imageCount?: number }): number =>
-    Math.ceil(
+  return (request: { messages: AgentMessage[]; prompt: string; imageCount?: number }): number => {
+    let messageTokens = 0;
+    const completions = new Map<string, { estimated: number; measured: number }>();
+    for (const message of request.messages) {
+      const estimated = estimateMessageTokenPressure(message);
+      messageTokens += estimated;
+      if (!params.retainCompletionUsage || message.role !== "assistant" || estimated === 0) {
+        continue;
+      }
+      const usage = message.usage?.contextUsage;
+      const completion = usage?.state === "available" ? usage.totalTokens - usage.promptTokens : 0;
+      const measured = Number.isFinite(completion) ? Math.max(0, completion) / SAFETY_MARGIN : 0;
+      // Async prefixes share the local turn identity even when the provider ID arrives late.
+      // Their visible content and terminal usage describe one completion, not extra occupancy.
+      const identity = message.turnId?.trim() || message.responseId?.trim();
+      if (identity) {
+        const previous = completions.get(identity);
+        completions.set(identity, {
+          estimated: (previous?.estimated ?? 0) + estimated,
+          measured: Math.max(previous?.measured ?? 0, measured),
+        });
+      } else {
+        messageTokens += Math.max(0, measured - estimated);
+      }
+    }
+    // Preserve opaque completion occupancy without charging visible output twice.
+    for (const { estimated, measured } of completions.values()) {
+      messageTokens += Math.max(0, measured - estimated);
+    }
+    return Math.ceil(
       (fixedPromptTokens +
         estimateStringTokenPressure(request.prompt) +
         toolTokens +
         (request.imageCount ?? 0) * IMAGE_BLOCK_TOKENS +
-        request.messages.reduce(
-          (total, message) => total + estimateMessageTokenPressure(message),
-          0,
-        )) *
+        messageTokens) *
         SAFETY_MARGIN,
     );
+  };
+}
+
+export function estimateVariableRequestTokens(messages: AgentMessage[], prompt: string): number {
+  const estimateTokens = createFreshLlmBoundaryTokenEstimator({});
+  return estimateTokens({ messages, prompt }) - estimateTokens({ messages: [], prompt: "" });
+}
+
+export function estimateCompactionHistoryTokens(
+  messages: AgentMessage[],
+  budget?: {
+    pendingTokens: number;
+    pendingUserTokens?: number;
+    pendingUserIdempotencyKey?: string;
+  },
+): number {
+  // A key identifies overlapping input, not proof that its content is replaced.
+  // A retained carrier can reuse a larger canonical user, so charge the larger representation.
+  const pending =
+    budget?.pendingTokens && budget.pendingUserIdempotencyKey
+      ? messages.findLast(
+          (message) =>
+            message.role === "user" &&
+            "idempotencyKey" in message &&
+            message.idempotencyKey === budget.pendingUserIdempotencyKey,
+        )
+      : undefined;
+  const overlap = pending
+    ? Math.min(
+        estimateCompactionHistoryTokens([pending]),
+        budget?.pendingUserTokens ?? budget?.pendingTokens ?? 0,
+      )
+    : 0;
+  return estimateVariableRequestTokens(messages, "") - overlap;
 }

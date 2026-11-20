@@ -1,12 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, readFileSync, realpathSync, rmSync } from "node:fs";
 import { posix, win32 } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   isNodeVersionAtLeast,
   MINIMUM_BUN_VERSION,
   parseNodeReleaseVersion,
 } from "../node-version.mjs";
+import { createRuntimeProcessScriptFile } from "../runtime-process-scripts.generated.mjs";
 import { LEGACY_PACKAGE_INSTALL_GUARD_RELATIVE_PATH } from "./lib/package-lifecycle-marker.mjs";
 
 const allowedLifecyclePackageManagers = new Set(["pnpm", "npm", "yarn", "bun"]);
@@ -15,8 +16,6 @@ const lifecyclePackageManagerLauncherAliases = new Map([
   ["yarn-berry", "yarn"],
 ]);
 const NODE_ENGINE_CLAUSE_RE = /^\s*>=\s*v?(\d+\.\d+\.\d+)(?:\s+<\s*v?(\d+(?:\.\d+\.\d+)?))?\s*$/iu;
-const NODE_RUNTIME_PROBE_SOURCE =
-  "process.stdout.write(JSON.stringify({version:process.versions.node??null,bunVersion:process.versions.bun??null,execPath:process.execPath??null}))";
 const PACKAGE_CLI_NODE_PROBE_TIMEOUT_MS = 10_000;
 /**
  * @typedef {{
@@ -174,47 +173,6 @@ function stripBunLifecyclePaths(pathEntries, cwd, pathApi, platform, dependencyL
   return null;
 }
 
-function stripBunPostinstallPathLayout(pathEntries, cwd, pathApi, platform) {
-  const resolvedCwd = pathApi.resolve(cwd);
-  const firstExpected = pathApi.join(resolvedCwd, "node_modules", ".bin");
-  if (
-    normalizePathForComparison(pathEntries[0] ?? "", pathApi, platform) !==
-    normalizePathForComparison(firstExpected, pathApi, platform)
-  ) {
-    return null;
-  }
-
-  const expectedSuffix = [];
-  for (let directory = pathApi.dirname(resolvedCwd); ; directory = pathApi.dirname(directory)) {
-    expectedSuffix.push(pathApi.join(directory, "node_modules", ".bin"));
-    if (pathApi.dirname(directory) === directory) {
-      break;
-    }
-  }
-  const bunShimIndex = pathEntries.length - expectedSuffix.length - 1;
-  const nodeGypIndex = bunShimIndex - 1;
-  if (nodeGypIndex <= 0) {
-    return null;
-  }
-  for (const [index, expected] of expectedSuffix.entries()) {
-    if (
-      normalizePathForComparison(pathEntries[bunShimIndex + 1 + index] ?? "", pathApi, platform) !==
-      normalizePathForComparison(expected, pathApi, platform)
-    ) {
-      return null;
-    }
-  }
-  if (
-    !/^bun-node-(?:[0-9a-f]+|[0-9]+-(?:[0-9a-f]+|debug)(?:-[0-9a-f]{16})?)$/u.test(
-      pathApi.basename(pathEntries[bunShimIndex] ?? ""),
-    ) ||
-    !/^\.[0-9a-f]+-[0-9]+\.node-gyp$/u.test(pathApi.basename(pathEntries[nodeGypIndex] ?? ""))
-  ) {
-    return null;
-  }
-  return pathEntries.slice(1, nodeGypIndex);
-}
-
 /**
  * Finds persistent Node, or an explicit Bun launcher after exhausting the lifecycle PATH.
  *
@@ -228,7 +186,6 @@ function stripBunPostinstallPathLayout(pathEntries, cwd, pathApi, platform) {
  *   access?: (path: string, mode: number) => void;
  *   realpath?: (path: string) => string;
  *   run?: PackageCliNodeProbeRun;
- *   allowUnavailableNodeFallback?: boolean;
  * }} [options]
  * @returns {PackageCliNodeRuntime | null}
  */
@@ -243,7 +200,6 @@ export function probePackageCliNodeRuntime(options = {}) {
     access = accessSync,
     realpath = realpathSync,
     run = spawnSync,
-    allowUnavailableNodeFallback = false,
   } = options;
   const pathApi = platform === "win32" ? win32 : posix;
   const delimiter = platform === "win32" ? ";" : ":";
@@ -258,21 +214,20 @@ export function probePackageCliNodeRuntime(options = {}) {
     patch: 4,
   });
   const localPrefix = normalizeEnvValue(env.npm_config_local_prefix);
-  const validLocalPrefix = isStableAbsolutePath(localPrefix, pathApi, platform);
-  if (reorderedLifecycle && !validLocalPrefix && !allowUnavailableNodeFallback) {
+  if (reorderedLifecycle && !isStableAbsolutePath(localPrefix, pathApi, platform)) {
     return null;
   }
   const dependencyLifecycle =
     reorderedLifecycle &&
-    validLocalPrefix &&
     normalizePathForComparison(localPrefix, pathApi, platform) !==
       normalizePathForComparison(pathApi.resolve(cwd), pathApi, platform);
-  const rawPathEntries = pathEnv.split(delimiter);
-  const pathEntries =
-    stripBunLifecyclePaths(rawPathEntries, cwd, pathApi, platform, dependencyLifecycle) ??
-    (allowUnavailableNodeFallback
-      ? stripBunPostinstallPathLayout(rawPathEntries, cwd, pathApi, platform)
-      : null);
+  const pathEntries = stripBunLifecyclePaths(
+    pathEnv.split(delimiter),
+    cwd,
+    pathApi,
+    platform,
+    dependencyLifecycle,
+  );
   if (!pathEntries) {
     return null;
   }
@@ -283,13 +238,18 @@ export function probePackageCliNodeRuntime(options = {}) {
         delete childEnv[key];
       }
     }
-    return run(candidate, ["-e", NODE_RUNTIME_PROBE_SOURCE], {
-      cwd,
-      encoding: "utf8",
-      env: childEnv,
-      timeout: PACKAGE_CLI_NODE_PROBE_TIMEOUT_MS,
-      windowsHide: true,
-    });
+    const script = createRuntimeProcessScriptFile("packageCliNodeProbe");
+    try {
+      return run(candidate, [fileURLToPath(script.url)], {
+        cwd,
+        encoding: "utf8",
+        env: childEnv,
+        timeout: PACKAGE_CLI_NODE_PROBE_TIMEOUT_MS,
+        windowsHide: true,
+      });
+    } finally {
+      script.dispose();
+    }
   };
 
   for (const entry of pathEntries) {
@@ -335,9 +295,6 @@ export function probePackageCliNodeRuntime(options = {}) {
       continue;
     }
     if (result?.status !== 0) {
-      if (allowUnavailableNodeFallback) {
-        continue;
-      }
       return null;
     }
 
@@ -366,7 +323,6 @@ export function probePackageCliNodeRuntime(options = {}) {
  *   bunVersion?: string | null;
  *   engine?: string | null;
  *   execPath?: string | null;
- *   bunLauncher?: string | null;
  *   probeNodeRuntime?: () => PackageCliNodeRuntime | null;
  * }} [options]
  * @param {(...data: unknown[]) => void} [reportError]
@@ -378,18 +334,12 @@ export function enforceSupportedNodeRuntime(
     bunVersion = process.versions.bun ?? null,
     engine = readPackageNodeEngine(),
     execPath = process.execPath,
-    bunLauncher = process.env.OPENCLAW_PACKAGE_BUN_LAUNCHER ?? null,
     probeNodeRuntime = probePackageCliNodeRuntime,
   } = {},
   reportError = console.error,
 ) {
-  const activeBunVersion = normalizeEnvValue(bunVersion);
-  const normalizedExecPath = normalizeEnvValue(execPath);
-  const canonicalBunLauncher = normalizeEnvValue(bunLauncher);
-  const detectedRuntime = activeBunVersion
-    ? canonicalBunLauncher && canonicalBunLauncher === normalizedExecPath
-      ? { version: null, bunVersion: activeBunVersion, execPath: normalizedExecPath }
-      : probeNodeRuntime()
+  const detectedRuntime = normalizeEnvValue(bunVersion)
+    ? probeNodeRuntime()
     : { version, execPath };
   if (detectedRuntime?.bunVersion) {
     if (

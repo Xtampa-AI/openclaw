@@ -5,7 +5,6 @@ import {
   createStructuredOutboundPayloadPlan,
   createMessageReceiptFromOutboundResults,
   projectOutboundPayloadPlanForDelivery,
-  type MessageReceipt,
 } from "openclaw/plugin-sdk/channel-outbound";
 import type { MarkdownTableMode, ReplyToMode } from "openclaw/plugin-sdk/config-contracts";
 import type { ReplyPayloadDelivery } from "openclaw/plugin-sdk/interactive-runtime";
@@ -55,7 +54,7 @@ import { buildInlineKeyboard, reactMessageTelegram } from "../send.js";
 import { recordSentMessage } from "../sent-message-cache.js";
 import { resolveTelegramTargetChatType } from "../targets.js";
 import { planTelegramTextDeliveryPages } from "../telegram-text-delivery.js";
-import { emitTelegramMessageSentHooks } from "./delivery.hooks.js";
+import { emitTelegramMessageSentHooks, runTelegramMessageSendingHook } from "./delivery.hooks.js";
 import { resolveTelegramReplyId, type TelegramThreadSpec } from "./helpers.js";
 import {
   resolveReplyQuoteForSend,
@@ -205,9 +204,6 @@ function createReplyDeliverer(
         if (config.thread?.id !== undefined) {
           await reportAcceptedPart(part);
         }
-        config.runtime.log?.(
-          `telegram text delivery ok chat=${config.chatId} message=${messageId}`,
-        );
         await recordMessageId(messageId);
         await replyProgress.promptContext?.accept({ messageId, text: plainText });
       },
@@ -547,9 +543,7 @@ type DeliverRepliesParams = {
   onMediaAccepted?: (mediaUrls: readonly string[]) => void;
 };
 
-export async function deliverReplies(
-  params: DeliverRepliesParams,
-): Promise<{ delivered: boolean; receipt?: MessageReceipt }> {
+export async function deliverReplies(params: DeliverRepliesParams) {
   return deliverReplyPlan(params, (replies) =>
     createOutboundPayloadPlan(replies, {
       cfg: params.cfg,
@@ -559,16 +553,14 @@ export async function deliverReplies(
   );
 }
 
-export async function deliverStructuredReplies(
-  params: DeliverRepliesParams,
-): Promise<{ delivered: boolean; receipt?: MessageReceipt }> {
+export async function deliverStructuredReplies(params: DeliverRepliesParams) {
   return deliverReplyPlan(params, createStructuredOutboundPayloadPlan);
 }
 
 async function deliverReplyPlan(
   params: DeliverRepliesParams,
   createPlan: (replies: ReplyPayload[]) => ReturnType<typeof createOutboundPayloadPlan>,
-): Promise<{ delivered: boolean; receipt?: MessageReceipt }> {
+) {
   const progress: DeliveryProgress = {
     hasReplied: false,
     ...(params.promptContextSequence ? { promptContext: params.promptContextSequence } : {}),
@@ -615,12 +607,13 @@ async function deliverReplyPlan(
     return receipt;
   };
 
+  // HTML-mode text bypasses the markdown -> rich-block converter, so native
+  // table rendering only applies to the rich markdown funnel.
+  const richMessages = params.richMessages === true && params.textMode !== "html";
   for (const originalReply of normalizedReplies) {
     let reply = canonicalizeTelegramPresentationPayload(originalReply, {
       allowWebAppButtons: resolveTelegramTargetChatType(params.chatId) === "direct",
-      // HTML-mode text bypasses the markdown -> rich-block converter, so native
-      // table rendering only applies to the rich markdown funnel.
-      richTables: params.richMessages === true && params.textMode !== "html",
+      richTables: richMessages,
     });
     const mediaList = reply.mediaUrls?.length
       ? reply.mediaUrls
@@ -678,24 +671,15 @@ async function deliverReplyPlan(
       replyQuoteEntities: params.replyQuoteEntities,
     });
     if (hasMessageSendingHooks) {
-      const hookResult = await hookRunner?.runMessageSending(
-        {
-          to: params.chatId,
-          content: hookContent,
-          replyToId,
-          threadId: params.thread?.id,
-          metadata: {
-            channel: "telegram",
-            mediaUrls: mediaList,
-            threadId: params.thread?.id,
-          },
-        },
-        {
-          channelId: "telegram",
-          accountId: params.accountId,
-          conversationId: params.chatId,
-        },
-      );
+      const hookResult = await runTelegramMessageSendingHook(hookRunner, {
+        chatId: params.chatId,
+        accountId: params.accountId,
+        sessionKey: params.sessionKeyForInternalHooks,
+        content: hookContent,
+        replyToId,
+        threadId: params.thread?.id,
+        mediaUrls: mediaList,
+      });
       if (hookResult?.cancel) {
         continue;
       }
@@ -722,11 +706,10 @@ async function deliverReplyPlan(
     try {
       const deliveredCountBeforeReply = deliveredCount();
       const replyMarkup = buildInlineKeyboard(
-        resolveTelegramInlineButtons({
-          buttons: telegramData?.buttons,
-          presentation,
-          interactive,
-        }),
+        resolveTelegramInlineButtons(
+          { buttons: telegramData?.buttons, presentation, interactive },
+          { supportsDisabled: richMessages },
+        ),
       );
       let firstDeliveredMessageId: number | undefined;
       let deliveredMediaUrls: string[] = [];

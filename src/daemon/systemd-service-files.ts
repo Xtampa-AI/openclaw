@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isStringArray } from "@openclaw/normalization-core/record-coerce";
 import { hasErrnoCode } from "../infra/errno.js";
+import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import {
   resolveGatewaySystemdServiceName,
   resolveGatewaySystemdServiceNameCandidates,
@@ -28,6 +30,9 @@ import { systemdUnitCallArgs } from "./systemd-bus-query.js";
 import { createSystemdCommandQuery } from "./systemd-command-query.js";
 import { buildSystemdCommandSnapshot } from "./systemd-command-snapshot.js";
 import {
+  buildSystemdCommandSnapshot,
+  expandSystemdSpecifier,
+  parseSystemdEnvironmentFileSpec,
   resolveSystemdEnvironmentFiles,
   type SystemdEnvironmentFileSpec,
 } from "./systemd-environment-files.js";
@@ -99,6 +104,7 @@ async function readSystemdManagerCommand(
     opts,
     unavailable,
   );
+  let effectiveExecutable: string | undefined;
   try {
     const assertAbsentWithoutLoading = async (): Promise<null> => {
       // Missing loaded objects do not prove an authored/native unit definition is absent.
@@ -143,8 +149,6 @@ async function readSystemdManagerCommand(
     }
     const readProperties = (scope: "Unit" | "Service", names: string[], signatures: string[]) =>
       query(["get-property", destination, unitPath, `${manager}.${scope}`, ...names], signatures);
-    const isStringArray = (value: unknown): value is string[] =>
-      Array.isArray(value) && value.every((entry) => typeof entry === "string");
     const unitProperties = await readProperties(
       "Unit",
       [
@@ -314,6 +318,7 @@ async function readSystemdManagerCommand(
     ) {
       snapshot.environment = { ...snapshot.environment, HOME: account.homedir };
     }
+    effectiveExecutable = execution[0];
     return {
       ...snapshot,
       ...(managedDefinition && managedOverrides ? { managedDefinition, managedOverrides } : {}),
@@ -323,6 +328,9 @@ async function readSystemdManagerCommand(
     };
   } finally {
     await close();
+    if (effectiveExecutable) {
+      opts?.onEffectiveExecutable?.(effectiveExecutable);
+    }
   }
 }
 
@@ -643,7 +651,11 @@ async function readSystemdServiceCommand(
         return command;
       })
       .catch((error: unknown) => {
-        if (opts?.requireEffective || findServiceOwnershipRefusal(error)) {
+        if (
+          opts?.requireEffective ||
+          findServiceOwnershipRefusal(error) ||
+          hasCommandProcessCleanupError(error)
+        ) {
           throw error;
         }
         opts?.onCommandInspection?.({ kind: "unavailable", error });
@@ -660,7 +672,11 @@ async function readSystemdServiceCommand(
     };
   } catch (error) {
     options?.onCommandInspection?.({ kind: "unavailable", error });
-    if (options?.requireEffective || findServiceOwnershipRefusal(error)) {
+    if (
+      options?.requireEffective ||
+      findServiceOwnershipRefusal(error) ||
+      hasCommandProcessCleanupError(error)
+    ) {
       throw error;
     }
     return null;
@@ -689,20 +705,4 @@ export function resolveLegacyNodeSystemdEnvironmentFilePath(params: {
 
 export function isNodeSystemdEnvironment(env: GatewayServiceEnv): boolean {
   return env.OPENCLAW_SERVICE_KIND?.trim() === "node";
-}
-
-function expandSystemdSpecifier(input: string, env: GatewayServiceEnv): string {
-  return input.replace(/%%|%h/gu, (specifier) =>
-    specifier === "%%" ? "%" : normalizeWindowsPathSeparators(resolveDaemonHomeDir(env)),
-  );
-}
-
-function parseSystemdEnvironmentFileSpec(
-  value: string,
-  env: GatewayServiceEnv,
-): SystemdEnvironmentFileSpec | undefined {
-  const optional = value.startsWith("-");
-  const pathname = expandSystemdSpecifier(optional ? value.slice(1) : value, env);
-  // Native systemd ignores relative declarations rather than resolving them beside the unit.
-  return path.posix.isAbsolute(pathname) ? [pathname, optional] : undefined;
 }

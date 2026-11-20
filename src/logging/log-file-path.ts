@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { resolveStateDir } from "../config/state-dir.js";
 import type { OpenClawConfig } from "../config/types.js";
 import {
   DEFAULT_POSIX_TMP_ROOT,
   resolvePreferredOpenClawTmpDir,
 } from "../infra/tmp-openclaw-dir.js";
+import { ensureLogDirectorySync } from "./log-directory.js";
 import { canUseNodeFs, formatLocalDate, LOG_PREFIX, LOG_SUFFIX } from "./log-file-shared.js";
 
 const ROLLING_LOG_FILE_RE = /^(openclaw(?:-[a-z0-9-]+)?)-(\d{4}-\d{2}-\d{2})\.log$/u;
@@ -28,8 +30,8 @@ function encodeLogProfileSegment(profile: string): string {
   return encoded;
 }
 
-function resolveLogProfileSegment(env: NodeJS.ProcessEnv): string | null {
-  const profile = env.OPENCLAW_PROFILE?.trim();
+function resolveLogProfileSegment(): string | null {
+  const profile = process.env.OPENCLAW_PROFILE?.trim();
   if (!profile || profile.toLowerCase() === "default") {
     return null;
   }
@@ -41,26 +43,30 @@ function resolveLogProfileSegment(env: NodeJS.ProcessEnv): string | null {
 }
 
 /** Resolves today's default rolling log path for the active CLI profile. */
-export function resolveDefaultRollingLogFile(options?: {
-  date?: Date;
-  env?: NodeJS.ProcessEnv;
-  logDir?: string;
-}): string {
-  const date = options?.date ?? new Date();
-  const env = options?.env ?? process.env;
-  const logDir =
-    options?.logDir ?? (canUseNodeFs() ? resolvePreferredOpenClawTmpDir() : DEFAULT_POSIX_TMP_ROOT);
-  const profileSegment = resolveLogProfileSegment(env);
+export function resolveDefaultRollingLogFile(options?: { prepare?: false }): string {
+  const date = new Date();
+  let logDir = DEFAULT_POSIX_TMP_ROOT;
+  if (canUseNodeFs()) {
+    const stateDir = resolveStateDir();
+    logDir = path.join(stateDir, "logs");
+    // Disabled sinks need a descriptive target, not filesystem admission. Only
+    // active file logging and explicit log discovery prepare the safe directory.
+    if (options?.prepare !== false) {
+      ensureLogDirectorySync(stateDir, true, 0o700);
+      logDir = resolvePreferredOpenClawTmpDir({
+        preferredDir: logDir,
+        tmpdir: () => path.join(stateDir, "tmp"),
+      });
+    }
+  }
+  const profileSegment = resolveLogProfileSegment();
   const profileSuffix = profileSegment ? `-${profileSegment}` : "";
   return path.join(logDir, `${LOG_PREFIX}${profileSuffix}-${formatLocalDate(date)}${LOG_SUFFIX}`);
 }
 
 /** Resolves the configured log file or today's rolling default log path. */
-export function resolveConfiguredLogFilePath(
-  config?: OpenClawConfig | null,
-  options?: { date?: Date; env?: NodeJS.ProcessEnv; logDir?: string },
-): string {
-  return config?.logging?.file ?? resolveDefaultRollingLogFile(options);
+export function resolveConfiguredLogFilePath(config?: OpenClawConfig | null): string {
+  return config?.logging?.file ?? resolveDefaultRollingLogFile();
 }
 
 /** Returns whether a configured path had the legacy default rolling filename shape. */

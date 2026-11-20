@@ -23,7 +23,7 @@ import { GatewayRestartHealthError } from "./update-command-service-command.js";
 import { withOwnedManagedUpdateEnv } from "./update-command-service-env.js";
 import type { UpdateCommandTerminalRecord } from "./update-command-terminal-record.js";
 import {
-  publishUpdateCommandTerminalResult,
+  prepareUpdateCommandTerminalResult,
   resolveSettledUpdateCommandResult,
 } from "./update-command-terminal.js";
 
@@ -169,7 +169,7 @@ export function completeUpdateCommandResult(
   });
 }
 
-export async function publishSettledUpdateCommandResult(
+export async function prepareSettledUpdateCommandResult(
   params: Pick<
     FinishUpdateParams,
     | "opts"
@@ -190,23 +190,26 @@ export async function publishSettledUpdateCommandResult(
       completedDowntimeMs?: number;
     };
   },
-  onTerminalRecord?: (record: UpdateCommandTerminalRecord["record"]) => void,
-): Promise<UpdateRunResult> {
+  assertCurrent?: () => void,
+) {
+  assertCurrent?.();
   const settled = await resolveSettledUpdateCommandResult(
     params,
     state.pendingResult,
     state.failure,
     state.terminalRecord,
   );
+  assertCurrent?.();
   const result = completeUpdateCommandResult(params, settled.result);
   const reporting = state.readReportingState();
   const reportDowntime = !settled.settlementFailed && reporting.pendingRestartAtMs === undefined;
   if (reporting.notify) {
     await reporting.notify(result);
   }
+  assertCurrent?.();
   // Notification can yield. Preserve the finalizer's original observation points.
   const { rolledBack, completedDowntimeMs } = state.readReportingState();
-  return publishUpdateCommandTerminalResult(
+  return prepareUpdateCommandTerminalResult(
     params,
     result,
     {
@@ -214,19 +217,17 @@ export async function publishSettledUpdateCommandResult(
       downtimeMs: reportDowntime ? completedDowntimeMs : undefined,
       captured: settled.captured,
     },
-    onTerminalRecord,
+    assertCurrent,
   );
 }
 
-export function shouldPropagatePostUpdateException(
-  error: unknown,
-  activationVerified: boolean,
-): boolean {
-  return (
-    (error instanceof UpdateCommandFailure &&
-      (!activationVerified || error.result.reason !== "wrapper-retirement-failed")) ||
-    hasCommandProcessCleanupError(error)
-  );
+export async function publishSettledUpdateCommandResult(
+  params: Parameters<typeof prepareSettledUpdateCommandResult>[0],
+  state: Parameters<typeof prepareSettledUpdateCommandResult>[1],
+  onTerminalRecord?: (record: UpdateCommandTerminalRecord["record"]) => void,
+): Promise<UpdateRunResult> {
+  const prepared = await prepareSettledUpdateCommandResult(params, state);
+  return prepared(onTerminalRecord);
 }
 
 export function createPostUpdateExceptionResult(
@@ -240,14 +241,10 @@ export function createPostUpdateExceptionResult(
   if (
     activationVerified &&
     collectNestedErrorCandidates(error).every(
-      (cause) =>
-        cause instanceof GatewayRestartHealthError ||
-        (cause instanceof UpdateCommandFailure &&
-          cause.result.reason === "wrapper-retirement-failed" &&
-          cause.result.recovery?.serviceRestartSafe !== false),
+      (cause) => cause instanceof GatewayRestartHealthError,
     ) &&
     error instanceof Error &&
-    params.result.recovery?.serviceRestartSafe !== false
+    !(params.result.recovery?.serviceRestartSafe === false && params.result.recovery.dataAtRisk)
   ) {
     // Only known maintenance failures qualify; health does not grant authority.
     const warning = `Gateway activation verified; post-update maintenance needs attention: ${message}`;

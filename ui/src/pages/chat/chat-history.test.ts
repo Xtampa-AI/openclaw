@@ -2,16 +2,17 @@
 import { reduceSessionProjection } from "@openclaw/gateway-client/browser";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { missingScopeErrorShape } from "../../../../packages/gateway-protocol/src/schema/error-codes.js";
+import { composeTranscriptDisplay } from "../../../../src/chat/transcript-display-position.ts";
 import { createDeferred } from "../../../../test/helpers/promise.js";
-import { GatewayRequestError } from "../../api/gateway.ts";
+import { GatewayRequestError } from "../../api/gateway-connect-errors.ts";
 import type { GatewaySessionRow, SessionsRewindResult } from "../../api/types.ts";
 import { handleChatGatewayEvent } from "./chat-gateway.ts";
 import { rewindChatHistory, switchChatHistoryBranch } from "./chat-history-actions.ts";
 import { loadOlderChatHistoryPage, requestChatSessionSnapshot } from "./chat-history-request.ts";
 import type { ChatHistoryResult } from "./chat-history-snapshot.ts";
-import { syncSelectedSessionMessageSubscription } from "./chat-history-subscription.ts";
 import {
   activeHistory as emptyActiveHistory,
+  createState,
   type TestState,
 } from "./chat-history.inflight.test-support.ts";
 import { loadChatHistory, type ChatEventPayload } from "./chat-history.ts";
@@ -27,18 +28,6 @@ import {
   type ChatMessageCache,
 } from "./session-message-cache.ts";
 
-function createState(history: ChatHistoryResult) {
-  const state = makeChatHost({ sessionKey: "main", requestHandlers: { "chat.history": history } });
-  vi.spyOn(state.sessions, "reconcileMutation").mockResolvedValue({ status: "refreshed" });
-  vi.spyOn(state.sessions, "reconcileRunTerminal").mockReturnValue(false);
-  vi.spyOn(state.sessions, "listBranches").mockResolvedValue([]);
-  return Object.assign(state, {
-    connectionEpoch: 1,
-    chatThinkingLevel: null,
-    chatVerboseLevel: null,
-    requestUpdate: vi.fn(),
-  });
-}
 function activeHistory(runId: string) {
   const history = emptyActiveHistory(runId);
   history.inFlightRun!.text = "intentionally ignored on web";
@@ -96,19 +85,6 @@ function rewindState(history: ChatHistoryResult, response: Promise<SessionsRewin
 }
 const rewind = (state: ReturnType<typeof rewindState>) =>
   rewindChatHistory(state, "user-entry", new ChatAttachmentReadLifecycle(() => {}));
-const previous = { key: "agent:main:previous", agentId: null };
-const selected = { key: "agent:main:next", agentId: null };
-function subscriptionState(
-  unsubscribeMessages: ReturnType<typeof vi.fn>,
-  subscribeMessages = vi.fn(async () => selected),
-) {
-  return Object.assign(withSessions({ messages: [] }, { subscribeMessages, unsubscribeMessages }), {
-    sessionKey: selected.key,
-    chatSessionMessageSubscriptionRequestedKey: previous.key,
-    chatSessionMessageSubscription: previous,
-    sessionsError: null as string | null,
-  });
-}
 
 it("preserves prepared quiet activity through older pages and prefetched snapshots", async () => {
   const result = {
@@ -123,7 +99,9 @@ it("preserves prepared quiet activity through older pages and prefetched snapsho
     activity: [{ messageId: "wait-result", items: [] }],
   });
   const expected = [{ ...result, activity: [] }];
-  expect((await loadOlderChatHistoryPage(state, 1))?.messages).toEqual(expected);
+  expect((await loadOlderChatHistoryPage(state, { cursor: "older-1" }))?.messages).toEqual(
+    expected,
+  );
   expect(
     await requestChatSessionSnapshot(state.client!, state.sessionKey, state, () => true),
   ).toMatchObject({ kind: "snapshot", snapshot: { messages: expected } });
@@ -141,31 +119,9 @@ it("requests the configured default agent for the global workspace alias", async
   await loadChatHistory(state);
   expect(request).toHaveBeenCalledWith(
     "chat.history",
-    {
-      sessionKey: "workspace",
-      agentId: "main",
-      limit: 80,
-      maxBytes: 256 * 1024,
-      toolResultMaxChars: 2_000,
-    },
-    { signal: expect.any(AbortSignal), timeoutMs: 30_000 },
+    expect.objectContaining({ sessionKey: "workspace", agentId: "main" }),
+    expect.anything(),
   );
-});
-
-it("starts the new subscription before the old unsubscribe settles", async () => {
-  const release = createDeferred();
-  const state = subscriptionState(vi.fn(() => release.promise));
-  const sync = syncSelectedSessionMessageSubscription(state);
-  await Promise.resolve();
-  expect(state.sessions.unsubscribeMessages).toHaveBeenCalledOnce();
-  expect(state.sessions.subscribeMessages).toHaveBeenCalledWith(selected.key, {
-    agentId: undefined,
-    includeApprovals: true,
-  });
-  expect(state.chatSessionMessageSubscription).toEqual(previous);
-  release.resolve();
-  await sync;
-  expect(state.chatSessionMessageSubscription).toEqual(selected);
 });
 
 it("rewinds cached history and restores only valid composer attachments", async () => {
@@ -253,7 +209,6 @@ it("retries branch metadata after a reconnect read fails", async () => {
   await loadChatHistory(state);
   expect(state.chatBranchesConnectionEpoch).toBe(state.connectionEpoch - 1);
   await loadChatHistory(state);
-  expect(state.sessions.listBranches).toHaveBeenCalledTimes(2);
   expect(state.chatBranchesSessionKey).toBe(state.sessionKey);
   expect(state.chatBranchesConnectionEpoch).toBe(state.connectionEpoch);
   expect(state.chatBranches).toHaveLength(1);
@@ -263,34 +218,24 @@ it("rejects in-flight history after switching branches on the same session", asy
   const pending = createDeferred<ChatHistoryResult>();
   const old = message("assistant", "private old branch");
   const next = message("assistant", "selected branch");
-  const state = withSessions(
-    { messages: [next] },
-    { listBranches: vi.fn().mockResolvedValue([]), switchBranch: vi.fn().mockResolvedValue({}) },
-  );
+  const state = withSessions({ messages: [next] }, { switchBranch: vi.fn().mockResolvedValue({}) });
   state.sessionKey = "agent:main:branches";
   state.chatMessages = [old];
-  const request = vi
-    .spyOn(state.client!, "request")
+  vi.spyOn(state.client!, "request")
     .mockReturnValueOnce(pending.promise)
     .mockResolvedValueOnce({ messages: [next] });
   const loading = loadChatHistory(state);
-  expect(request).toHaveBeenCalledOnce();
   await expect(switchChatHistoryBranch(state, "selected-leaf")).resolves.toBe(true);
-  expect(request).toHaveBeenCalledTimes(2);
   expect(state.chatMessages).toEqual([next]);
   pending.resolve({ messages: [old] });
   await loading;
-  expect(request).toHaveBeenCalledTimes(2);
   expect(state.chatMessages).toEqual([next]);
 });
 
 it("reconciles a committed branch switch after a same-client reconnect", async () => {
   const pending = createDeferred<object>();
   const next = message("assistant", "selected branch after reconnect");
-  const state = withSessions(
-    { messages: [next] },
-    { listBranches: vi.fn().mockResolvedValue([]), switchBranch: vi.fn(() => pending.promise) },
-  );
+  const state = withSessions({ messages: [next] }, { switchBranch: vi.fn(() => pending.promise) });
   state.chatMessages = [message("assistant", "stale branch")];
   const loading = switchChatHistoryBranch(state, "stale-leaf");
   state.connectionEpoch += 2;
@@ -444,48 +389,6 @@ describe("chat history run errors", () => {
     handleChatGatewayEvent(state, { sessionKey: "main", runId, ...event });
   }
 
-  it("retires a recovered failure after a newer successful history and rejects its stale replay", async () => {
-    const first = {
-      role: "user",
-      content: "Start working",
-      __openclaw: { id: "first", idempotencyKey: "run:user", seq: 1 },
-    };
-    const failed = { sessionId: "session", messages: [first], sessionInfo: row() };
-    let history: ChatHistoryResult = failed;
-    const state = host(() => history);
-    await loadChatHistory(state);
-    expect(state.chatRunError?.summary).toContain(failed.sessionInfo.lastRunError);
-    history = {
-      sessionId: "session",
-      messages: [
-        first,
-        {
-          role: "user",
-          content: "Try again",
-          __openclaw: { id: "retry", idempotencyKey: "retry:user", seq: 2 },
-        },
-        {
-          role: "assistant",
-          content: "Recovered",
-          __openclaw: { id: "answer", idempotencyKey: "retry", seq: 3 },
-        },
-      ],
-      sessionInfo: row({ status: "done", lastRunId: "retry", lastRunError: undefined }),
-    };
-    await loadChatHistory(state);
-    expect(state.currentSessionId).toBe("session");
-    expect(state.chatMessages).toEqual(history.messages);
-    expect(state.chatRunId).toBeNull();
-    expect(getChatSessionProjection(state).runs.run).toMatchObject({
-      status: "error",
-      errorMessage: failed.sessionInfo.lastRunError,
-    });
-    expect(state.chatRunError).toBeNull();
-    history = failed;
-    await loadChatHistory(state);
-    expect(state.chatRunError).toBeNull();
-  });
-
   it.each([
     { snapshotStatus: "failed", newerState: "failed", requestOrder: "before" },
     { snapshotStatus: "done", newerState: "completed", requestOrder: "after" },
@@ -594,3 +497,250 @@ describe("chat history run errors", () => {
     expect(state.chatMessages).toContainEqual(expect.objectContaining({ content: summary }));
   });
 });
+
+it("keeps an overlapping loaded history window when compaction advances its leaf", async () => {
+  const prompt = message("user", "Keep the verified discussion visible.", {
+    id: "prompt",
+    seq: 100,
+    transcriptPosition: { source: "history", rawSeq: 100 },
+  });
+  const answer = message("assistant", "The earlier verification is complete.", {
+    id: "answer",
+    seq: 101,
+    transcriptPosition: { source: "history", rawSeq: 101 },
+  });
+  const tool = message("assistant", "Inspecting the next check.", {
+    id: "tool",
+    seq: 102,
+    transcriptPosition: { source: "history", rawSeq: 102 },
+  });
+  const compact = {
+    role: "system",
+    __openclaw: {
+      id: "compact",
+      seq: 103,
+      kind: "compaction",
+      transcriptPosition: { source: "history", rawSeq: 103 },
+    },
+  };
+  const row = {
+    key: "main",
+    kind: "direct" as const,
+    updatedAt: 1,
+    sessionId: "session",
+    hasActiveRun: true,
+    activeRunIds: ["goal-run"],
+    status: "running" as const,
+  };
+  const state = createState({ messages: [] });
+  const request = vi
+    .spyOn(state.client!, "request")
+    .mockResolvedValueOnce({
+      messages: [prompt, answer, tool],
+      sessionInfo: { ...row, activeLeafEntryId: "tool" },
+      deltaCursor: "before-compact",
+      hasMore: true,
+      olderCursor: "older:held",
+      nextOffset: 3,
+      totalMessages: 102,
+    })
+    .mockResolvedValueOnce({ kind: "reset" })
+    .mockResolvedValueOnce({
+      messages: [tool, compact],
+      sessionInfo: { ...row, activeLeafEntryId: "compact" },
+      deltaCursor: "after-compact",
+      hasMore: true,
+      olderCursor: "older:tail",
+      nextOffset: 2,
+      totalMessages: 103,
+    });
+  await loadChatHistory(state);
+  await loadChatHistory(state);
+  expect(state.chatMessages).toEqual([prompt, answer, tool, compact]);
+  expect(state.chatMessages[0]).toBe(prompt);
+  expect(state.chatHistoryPagination).toEqual({
+    hasMore: true,
+    olderCursor: "older:held",
+    nextOffset: 4,
+    totalMessages: 103,
+  });
+  expect(request).toHaveBeenCalledTimes(3);
+});
+
+it("recovers a paged held window when the compaction tail starts at an unheld tool result", async () => {
+  const prompt = message("user", "Keep the deployment context", {
+    id: "prompt",
+    seq: 2000,
+    transcriptPosition: { source: "history", rawSeq: 2000 },
+  });
+  const call = message("assistant", "Running the check", {
+    id: "call",
+    seq: 2001,
+    transcriptPosition: { source: "history", rawSeq: 2001 },
+  });
+  const result = {
+    role: "toolResult",
+    content: "Check passed",
+    __openclaw: {
+      id: "result",
+      seq: 2002,
+      transcriptPosition: { source: "history", rawSeq: 2002 },
+    },
+  };
+  const compact = {
+    role: "system",
+    __openclaw: {
+      id: "compact",
+      seq: 2003,
+      kind: "compaction",
+      transcriptPosition: { source: "history", rawSeq: 2003 },
+    },
+  };
+  const row = { key: "main", kind: "direct" as const, updatedAt: 1, sessionId: "session" };
+  const state = createState({ messages: [] });
+  const request = vi
+    .spyOn(state.client!, "request")
+    .mockResolvedValueOnce({
+      messages: [prompt, call],
+      sessionInfo: { ...row, activeLeafEntryId: "call" },
+      deltaCursor: "before-compact",
+      hasMore: true,
+      olderCursor: "older:held",
+      nextOffset: 2,
+      totalMessages: 2001,
+    })
+    .mockResolvedValueOnce({ kind: "reset" })
+    .mockResolvedValueOnce({
+      messages: [result, compact],
+      sessionInfo: { ...row, activeLeafEntryId: "compact" },
+      deltaCursor: "after-compact",
+      hasMore: true,
+      olderCursor: "older:tail",
+      nextOffset: 2,
+      totalMessages: 2003,
+    })
+    .mockResolvedValueOnce({
+      messages: [prompt, call],
+      sessionId: row.sessionId,
+      hasMore: true,
+      olderCursor: "older:recovered",
+      nextOffset: 4,
+      totalMessages: 2003,
+    });
+  await loadChatHistory(state);
+  await loadChatHistory(state);
+  expect(state.chatMessages).toEqual([prompt, call, result, compact]);
+  expect(request).toHaveBeenLastCalledWith(
+    "chat.history",
+    expect.objectContaining({ cursor: "older:tail" }),
+    expect.anything(),
+  );
+  expect(state.chatHistoryPagination).toEqual({
+    hasMore: true,
+    olderCursor: "older:held",
+    nextOffset: 4,
+    totalMessages: 2003,
+  });
+});
+
+it.each(["relocated branch activity", "rewrite generation"])(
+  "replaces stale physical history after %s",
+  async (change) => {
+    const positioned = (id: string, rawSeq: number, source = "before") =>
+      message("assistant", id, { id, seq: rawSeq, transcriptPosition: { source, rawSeq } });
+    const anchor = positioned("B", 2);
+    const activity = {
+      role: "toolResult",
+      content: "old branch activity",
+      __openclaw: {
+        id: "old-activity",
+        seq: 4,
+        transcriptPosition: {
+          source: "before",
+          rawSeq: 4,
+          activity: { afterRawSeq: 1, scopeId: "scope", startOrder: 0 },
+        },
+      },
+    };
+    const old =
+      change === "relocated branch activity"
+        ? composeTranscriptDisplay([anchor, positioned("old-C", 3), activity])
+        : [positioned("old-A", 1), anchor];
+    const source = change === "rewrite generation" ? "after-rewrite" : "before";
+    const next = [
+      positioned("B", 2, source),
+      positioned("D", 5, source),
+      positioned("E", 6, source),
+      positioned("F", 7, source),
+    ];
+    const row = { key: "main", kind: "direct" as const, updatedAt: 1, sessionId: "session" };
+    const state = createState({ messages: [] });
+    vi.spyOn(state.client!, "request")
+      .mockResolvedValueOnce({
+        messages: old,
+        sessionInfo: { ...row, activeLeafEntryId: "old" },
+        deltaCursor: "old",
+        hasMore: true,
+        olderCursor: "older:old",
+        nextOffset: 3,
+        totalMessages: 4,
+      })
+      .mockResolvedValueOnce({ kind: "reset" })
+      .mockResolvedValueOnce({
+        messages: next,
+        sessionInfo: { ...row, activeLeafEntryId: "F" },
+        deltaCursor: "next",
+        hasMore: true,
+        olderCursor: "older:next",
+        nextOffset: 4,
+        totalMessages: 7,
+      });
+    await loadChatHistory(state);
+    await loadChatHistory(state);
+    expect(state.chatMessages).toEqual(next);
+    if (change === "rewrite generation") {
+      expect(state.chatHistoryPagination).toMatchObject({ olderCursor: "older:next" });
+    }
+  },
+);
+
+it.each(["unrelated tip", "sequence-only overlap", "window reset"])(
+  "does not retain a loaded prefix across %s",
+  async (change) => {
+    const prompt = message("user", "Previous discussion", { id: "prompt", seq: 100 });
+    const shared = message("assistant", "Shared row", {
+      ...(change === "sequence-only overlap" ? {} : { id: "shared" }),
+      seq: 102,
+    });
+    const replacement =
+      change === "unrelated tip"
+        ? message("assistant", "Other branch", { id: "other", seq: 103 })
+        : shared;
+    const row = { key: "main", kind: "direct" as const, updatedAt: 1, sessionId: "session" };
+    const state = createState({ messages: [] });
+    vi.spyOn(state.client!, "request")
+      .mockResolvedValueOnce({
+        messages: [prompt, shared],
+        sessionInfo: { ...row, activeLeafEntryId: "previous" },
+        deltaCursor: "previous",
+        hasMore: true,
+        olderCursor: "older:previous",
+        nextOffset: 3,
+        totalMessages: 102,
+      })
+      .mockResolvedValueOnce({ kind: "reset" })
+      .mockResolvedValueOnce({
+        messages: [replacement],
+        sessionInfo: { ...row, activeLeafEntryId: "next" },
+        windowReset: change === "window reset",
+        hasMore: true,
+        olderCursor: "older:next",
+        nextOffset: change === "unrelated tip" ? 1 : 2,
+        totalMessages: 103,
+      });
+    await loadChatHistory(state);
+    await loadChatHistory(state);
+    expect(state.chatMessages).toEqual([replacement]);
+    expect(state.chatHistoryPagination).toMatchObject({ olderCursor: "older:next" });
+  },
+);

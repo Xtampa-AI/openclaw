@@ -1,3 +1,4 @@
+import type { PairedDeviceTokenIdentity } from "../infra/device-pairing-core.types.js";
 import { notifyListeners, registerListener } from "../shared/listeners.js";
 
 type CurrentCaller = () => boolean;
@@ -9,6 +10,22 @@ type SourceDependencies = Readonly<{
   sharedGenerationOwner?: object;
   sharedGeneration?: string;
   authorityOwner?: object;
+  /** Supplied only by authenticated WS dispatch after device-token admission. */
+  reconnect?: Readonly<{
+    device: Readonly<PairedDeviceTokenIdentity>;
+    profileId: string;
+    role: string;
+    scopes: string;
+    clientId: string;
+    clientMode: string;
+    pairedClientId?: string;
+    transportPolicyGeneration?: string;
+    verifiedIdentity?: string;
+    origin?: string;
+    requestHost?: string;
+    isLocalClient?: boolean;
+    accessOwner?: object | null;
+  }>;
 }>;
 
 type SourceIdentity = {
@@ -29,6 +46,7 @@ type RevocationState = {
 type RevocationOwner = {
   closed: boolean;
   devices: Map<string, Set<RevocationState>>;
+  reconnectSources?: Set<SourceIdentity>;
 };
 
 type CapturedRevocation = {
@@ -39,16 +57,44 @@ type CapturedRevocation = {
   hasSourceAuthority: boolean;
   isRevocationCurrent: CurrentCaller;
   sourceIdentity: object;
+  reconnectSourceClient?: object;
   releaseSourceIdentity?: () => void;
   releaseClientRevocation?: () => void;
 };
 
 const owners = new WeakMap<object, RevocationOwner>();
-const captures = new WeakMap<() => unknown, CapturedRevocation>();
+const captures = new WeakMap<object, CapturedRevocation>();
 const sourceIdentities = new WeakMap<object, Set<SourceIdentity>>();
 
-function retainSourceIdentity({ client, ...dependencies }: SourceDependencies) {
-  let identities = sourceIdentities.get(client);
+function sameReconnectSource(
+  left: SourceDependencies["reconnect"],
+  right: SourceDependencies["reconnect"],
+): boolean {
+  return left && right
+    ? left.device.deviceId === right.device.deviceId &&
+        left.device.key === right.device.key &&
+        left.profileId === right.profileId &&
+        left.role === right.role &&
+        left.scopes === right.scopes &&
+        left.clientId === right.clientId &&
+        left.clientMode === right.clientMode &&
+        left.pairedClientId === right.pairedClientId &&
+        left.transportPolicyGeneration === right.transportPolicyGeneration &&
+        left.verifiedIdentity === right.verifiedIdentity &&
+        left.origin === right.origin &&
+        left.requestHost === right.requestHost &&
+        left.isLocalClient === right.isLocalClient &&
+        left.accessOwner === right.accessOwner
+    : left === right;
+}
+
+function retainSourceIdentity(
+  owner: RevocationOwner,
+  { client, ...dependencies }: SourceDependencies,
+) {
+  let identities = dependencies.reconnect
+    ? (owner.reconnectSources ??= new Set())
+    : sourceIdentities.get(client);
   if (!identities) {
     identities = new Set();
     sourceIdentities.set(client, identities);
@@ -59,7 +105,8 @@ function retainSourceIdentity({ client, ...dependencies }: SourceDependencies) {
       entry.dependencies.authPolicyGeneration === dependencies.authPolicyGeneration &&
       entry.dependencies.sharedGenerationOwner === dependencies.sharedGenerationOwner &&
       entry.dependencies.authorityOwner === dependencies.authorityOwner &&
-      entry.dependencies.sharedGeneration === dependencies.sharedGeneration,
+      entry.dependencies.sharedGeneration === dependencies.sharedGeneration &&
+      sameReconnectSource(entry.dependencies.reconnect, dependencies.reconnect),
   );
   if (!source) {
     source = { dependencies, token: Object.freeze({}), references: 0 };
@@ -180,7 +227,10 @@ export function captureGatewayDeviceRevocation(
   captures.set(isCurrent, capture);
   capture.releaseClientRevocation = sourceAuthority?.subscribe(() => revoke(state));
   if (sourceAuthority?.dependencies) {
-    const source = retainSourceIdentity(sourceAuthority.dependencies);
+    const source = retainSourceIdentity(owner, sourceAuthority.dependencies);
+    capture.reconnectSourceClient = sourceAuthority.dependencies.reconnect
+      ? sourceAuthority.dependencies.client
+      : undefined;
     capture.sourceIdentity = source.token;
     capture.releaseSourceIdentity = source.release;
   }
@@ -188,7 +238,7 @@ export function captureGatewayDeviceRevocation(
 }
 
 /** Carry the original capture through a composed commit guard without changing its contract. */
-export function bindGatewayDeviceRevocation<T extends () => unknown>(
+export function bindGatewayDeviceRevocation<T extends object>(
   guard: T,
   isCurrent: (() => unknown) | undefined,
 ): T {
@@ -197,6 +247,24 @@ export function bindGatewayDeviceRevocation<T extends () => unknown>(
     captures.set(guard, capture);
   }
   return guard;
+}
+
+/** Retain only device revocation for detached work, not its completed request or transport. */
+export function retainGatewayDeviceSourceRevocation(source: object | undefined) {
+  const capture = source ? captures.get(source) : undefined;
+  if (!capture) {
+    return undefined;
+  }
+  if (!capture.isRevocationCurrent() || capture.state.references === 0) {
+    throw new Error("Gateway device source is no longer active.");
+  }
+  capture.state.references += 1;
+  return {
+    isCurrent: capture.isRevocationCurrent,
+    subscribe: (listener: () => void) =>
+      registerListener((capture.state.listeners ??= new Set()), listener),
+    release: releaseHold(capture),
+  };
 }
 
 /** Read only owner-held revocation/lifetime facts, without invoking the caller authority callback. */
@@ -251,6 +319,15 @@ export function readGatewayDeviceSourceIdentity(
   guard: (() => unknown) | undefined,
 ): object | undefined {
   return guard ? captures.get(guard)?.sourceIdentity : undefined;
+}
+
+/** Only the exact authenticated client or a host-transferred principal can use this cohort. */
+export function readGatewayDeviceReconnectSourceIdentity(
+  guard: (() => unknown) | undefined,
+  sourceClient: object,
+): object | undefined {
+  const capture = guard ? captures.get(guard) : undefined;
+  return capture?.reconnectSourceClient === sourceClient ? capture.sourceIdentity : undefined;
 }
 
 /** Notify retained work of access revocation, independently of transport or Gateway shutdown. */

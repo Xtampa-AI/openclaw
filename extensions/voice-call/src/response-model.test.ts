@@ -1,7 +1,7 @@
 // Voice Call tests cover response model plugin behavior.
 import { describe, expect, it } from "vitest";
 import type { OpenClawPluginApi } from "../api.js";
-import { VoiceCallConfigSchema } from "./config.js";
+import { normalizeVoiceCallConfig } from "./config.js";
 import { resolveVoiceResponseModel } from "./response-model.js";
 
 const agentRuntime = {
@@ -17,13 +17,12 @@ describe("resolveVoiceResponseModel", () => {
       resolveVoiceResponseModel({
         cfg: {},
         agentId: "main",
-        voiceConfig: VoiceCallConfigSchema.parse({
+        voiceConfig: normalizeVoiceCallConfig({
           responseModel: "gpt-5.4-mini",
         }),
         agentRuntime,
       }),
     ).toEqual({
-      modelRef: "gpt-5.4-mini",
       provider: "together",
       model: "gpt-5.4-mini",
     });
@@ -34,13 +33,12 @@ describe("resolveVoiceResponseModel", () => {
       resolveVoiceResponseModel({
         cfg: { agents: { entries: { main: { model: "anthropic/claude-opus-5-5" } } } },
         agentId: "main",
-        voiceConfig: VoiceCallConfigSchema.parse({
+        voiceConfig: normalizeVoiceCallConfig({
           responseModel: "openai/gpt-5.4-mini",
         }),
         agentRuntime,
       }),
     ).toEqual({
-      modelRef: "openai/gpt-5.4-mini",
       provider: "openai",
       model: "gpt-5.4-mini",
     });
@@ -57,11 +55,10 @@ describe("resolveVoiceResponseModel", () => {
           },
         },
         agentId: "support",
-        voiceConfig: VoiceCallConfigSchema.parse({}),
+        voiceConfig: normalizeVoiceCallConfig({}),
         agentRuntime,
       }),
     ).toEqual({
-      modelRef: "anthropic/claude-opus-5-5",
       provider: "anthropic",
       model: "claude-opus-5-5",
     });
@@ -77,11 +74,10 @@ describe("resolveVoiceResponseModel", () => {
           },
         },
         agentId: "support",
-        voiceConfig: VoiceCallConfigSchema.parse({}),
+        voiceConfig: normalizeVoiceCallConfig({}),
         agentRuntime,
       }),
     ).toEqual({
-      modelRef: "anthropic/claude-opus-5-5",
       provider: "anthropic",
       model: "claude-opus-5-5",
     });
@@ -92,11 +88,10 @@ describe("resolveVoiceResponseModel", () => {
       resolveVoiceResponseModel({
         cfg: {},
         agentId: "main",
-        voiceConfig: VoiceCallConfigSchema.parse({}),
+        voiceConfig: normalizeVoiceCallConfig({}),
         agentRuntime,
       }),
     ).toEqual({
-      modelRef: "openai/gpt-6-astra",
       provider: "openai",
       model: "gpt-6-astra",
     });

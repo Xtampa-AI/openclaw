@@ -3,7 +3,7 @@ import { sanitizeUntrustedFileName } from "@openclaw/fs-safe/advanced";
 import { mediaKindFromMime } from "@openclaw/media-core/constants";
 import { basenameFromAnyPath } from "@openclaw/media-core/file-name";
 import { isPassThroughRemoteMediaSource } from "@openclaw/media-core/media-source-url";
-import { mimeTypeFromFilePath } from "@openclaw/media-core/mime";
+import { detectMime, mimeTypeFromFilePath } from "@openclaw/media-core/mime";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
@@ -18,7 +18,6 @@ import {
   resolveAllowedManagedMediaPath,
   resolveSandboxedMediaSource,
 } from "../../agents/sandbox-paths.js";
-import { ensureSandboxWorkspaceForSession, resolveSandboxContext } from "../../agents/sandbox.js";
 import { resolveSandboxConfigForAgent } from "../../agents/sandbox/config.js";
 import { withSandboxRuntimeStatusInWorker } from "../../agents/sandbox/runtime-status.js";
 import type { SandboxContext, SandboxWorkspaceAccess } from "../../agents/sandbox/types.js";
@@ -30,11 +29,12 @@ import { collectReplyMediaEntries } from "../../infra/outbound/reply-media-entri
 import { resolveOutboundMediaMaxBytes } from "../../media/configured-max-bytes.js";
 import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { HostReadMediaTypeError, LocalMediaAccessError } from "../../media/local-media-access.js";
+import { resolveLocalMediaPath } from "../../media/local-media-path.js";
 import { normalizeMediaReferenceForComparison } from "../../media/media-reference-comparison.js";
 import { resolveInboundMediaReference } from "../../media/media-reference.js";
 import { resolveOutboundAttachmentFromUrl } from "../../media/outbound-attachment.js";
 import { resolveAgentScopedHostOutboundMediaAccess } from "../../media/read-capability.js";
-import { resolveWebchatAttachmentFromUrl } from "../../media/webchat-attachment.js";
+import { saveMediaFile } from "../../media/store.js";
 import { captureChannelReadAuthority } from "../../shared/channel-read-authority.js";
 import {
   appendReplyMediaFailures,
@@ -145,6 +145,8 @@ type ReplyMediaSourcePreparationParams = {
   sandboxContainerWorkdir?: string;
   mediaAccess?: OutboundMediaAccess;
   workspaceMediaAccess?: OutboundMediaAccess;
+  /** Supplied only by the explicit current-source send owner, never by reply text. */
+  htmlPublication?: "explicit";
   /** Physical remote alias of the captured logical workspace. */
   workspaceMediaRoot?: string;
   /** Streams local audio/video up to this size instead of the channel cap. */
@@ -189,23 +191,26 @@ export function createReplyMediaSourcePreparer(
   const persistedMediaBySource = new Map<string, Promise<{ path: string; contentType?: string }>>();
 
   const resolveSandboxWorkspace = async () => {
-    sandboxWorkspacePromise ??= ensureSandboxWorkspaceForSession(
-      {
-        config: params.cfg,
-        agentId,
-        sessionKey: params.sessionKey,
-        workspaceDir: params.workspaceDir,
+    sandboxWorkspacePromise ??= import("../../agents/sandbox/context.js").then(
+      async ({ ensureSandboxWorkspaceForSession }) => {
+        const sandbox = await ensureSandboxWorkspaceForSession(
+          {
+            config: params.cfg,
+            agentId,
+            sessionKey: params.sessionKey,
+            workspaceDir: params.workspaceDir,
+          },
+          readSource,
+        );
+        return sandbox
+          ? {
+              root: sandbox.workspaceDir,
+              containerWorkdir: sandbox.containerWorkdir,
+              // Fail closed when access metadata is absent: treat as unmounted.
+              workspaceAccess: sandbox.workspaceAccess ?? "none",
+            }
+          : undefined;
       },
-      readSource,
-    ).then((sandbox) =>
-      sandbox
-        ? {
-            root: sandbox.workspaceDir,
-            containerWorkdir: sandbox.containerWorkdir,
-            // Fail closed when access metadata is absent: treat as unmounted.
-            workspaceAccess: sandbox.workspaceAccess ?? "none",
-          }
-        : undefined,
     );
     return await sandboxWorkspacePromise;
   };
@@ -254,14 +259,45 @@ export function createReplyMediaSourcePreparer(
       groupChannel: params.groupChannel,
       groupSpace: params.groupSpace,
     });
-    const persistPromise = (
-      params.localMediaMaxBytes
-        ? resolveWebchatAttachmentFromUrl(media, maxBytes, {
-            mediaAccess,
-            localMediaMaxBytes: params.localMediaMaxBytes,
-          })
-        : resolveOutboundAttachmentFromUrl(media, maxBytes, { mediaAccess })
-    )
+    const localMediaMaxBytes = params.localMediaMaxBytes;
+    const persistPromise = (async () => {
+      const localPath = localMediaMaxBytes ? resolveLocalMediaPath(media) : undefined;
+      const localKind = localPath ? mediaKindFromMime(mimeTypeFromFilePath(localPath)) : undefined;
+      if (
+        localPath &&
+        (localKind === "audio" || localKind === "video") &&
+        localMediaMaxBytes &&
+        mediaAccess.openFile
+      ) {
+        await using opened = await mediaAccess.openFile(localPath, {
+          maxBytes: localMediaMaxBytes,
+        });
+        if (opened) {
+          // Native host media keeps the same magic-byte requirement as buffered host reads.
+          const header = Buffer.alloc(8192);
+          const { bytesRead } = await opened.handle.read(header, 0, header.length, 0);
+          const prefix = header.subarray(0, bytesRead);
+          const kind = mediaKindFromMime(await detectMime({ buffer: prefix }));
+          if (kind !== "audio" && kind !== "video") {
+            throw new HostReadMediaTypeError(
+              "Host-local audio/video sends require a buffer-verified media type.",
+            );
+          }
+          const saved = await saveMediaFile(
+            opened,
+            "outbound",
+            localMediaMaxBytes,
+            path.basename(localPath),
+            prefix,
+          );
+          return { path: saved.path, contentType: saved.contentType };
+        }
+      }
+      return await resolveOutboundAttachmentFromUrl(media, maxBytes, {
+        mediaAccess,
+        htmlPublication: params.htmlPublication,
+      });
+    })()
       .then((saved) => ({
         ...saved,
         contentType: saved.contentType ?? mimeTypeFromFilePath(media) ?? "application/octet-stream",
@@ -400,7 +436,7 @@ export function createReplyMediaSourcePreparer(
           );
         }
         prepared.push({ source, outcome: { failure } });
-        logVerbose(`dropping blocked reply media ${source}: ${String(error)}`);
+        logVerbose(`dropping blocked reply media: reason=${failure.code}`);
       }
     }
     return prepared;
@@ -425,14 +461,18 @@ export function createReplyMediaSourcePreparer(
       async (preparedRuntimeStatus) => {
         let sandbox: SandboxContext | null = null;
         try {
-          sandbox = await resolveSandboxContext({
-            config: params.cfg,
-            agentId,
-            sessionKey: params.sessionKey,
-            workspaceDir: params.workspaceDir,
-            preparedRuntimeStatus,
-            assertCurrent,
-          });
+          if (preparedRuntimeStatus.sandboxed) {
+            const { resolveSandboxContext } = await import("../../agents/sandbox/context.js");
+            assertCurrent();
+            sandbox = await resolveSandboxContext({
+              config: params.cfg,
+              agentId,
+              sessionKey: params.sessionKey,
+              workspaceDir: params.workspaceDir,
+              preparedRuntimeStatus,
+              assertCurrent,
+            });
+          }
           if (sandbox && !sandbox.fsBridge) {
             throw new Error("SSH sandbox has no filesystem bridge for reply media");
           }

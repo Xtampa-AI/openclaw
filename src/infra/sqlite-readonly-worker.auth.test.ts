@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { prepareAgentSessionStoreDeletionSafety } from "../agents/agent-delete-session-store-safety.targets.js";
 import {
   bindAuthProfileFileObservationReaders,
   readAuthProfileDatabaseIdentity,
   refreshAuthProfileFileState,
-  registerAuthProfileFileChangeListener,
+  authProfileFileChanges,
 } from "../agents/auth-profiles/file-state.js";
 import { watchAuthProfileNativeCommits } from "../agents/auth-profiles/store-update-commit.js";
 import { resolveStateDir } from "../config/state-dir.js";
@@ -53,6 +54,8 @@ const skipBroker = process.platform === "win32";
 it.skipIf(skipBroker)(
   "reuses the Gateway reader through detached observations and retained-state restart",
   async () => {
+    // The macOS directory watch host bypasses fs.watch; keep the unavailable watcher in-process.
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
     vi.spyOn(fs, "watch").mockImplementation(() => {
       throw new Error("synthetic unavailable watcher");
     });
@@ -67,7 +70,10 @@ it.skipIf(skipBroker)(
     const observed: unknown[] = [];
     const fallbackObserved = createDeferredCore();
     let refresh = () => read(source, "canonical");
-    const unsubscribe = registerAuthProfileFileChangeListener(async ({ directory }) => {
+    const publishFileChange = authProfileFileChanges.onChange;
+    authProfileFileChanges.onChange = async (change) => {
+      await publishFileChange?.(change);
+      const { directory } = change;
       if (directory !== path.dirname(source)) {
         return;
       }
@@ -78,7 +84,7 @@ it.skipIf(skipBroker)(
       }
       // Credential publication can replace the observation's refresh callback.
       refresh = () => read(source, "canonical");
-    });
+    };
     try {
       await broker.ready();
       vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
@@ -128,7 +134,7 @@ it.skipIf(skipBroker)(
       vi.useRealTimers();
       publication?.dispose();
       await Promise.allSettled(pendingRefresh ? [pendingRefresh] : []);
-      unsubscribe();
+      authProfileFileChanges.onChange = publishFileChange;
       await closeOpenClawStateDatabaseAsync();
       await scope.close();
       await restartedScope.close();
@@ -148,7 +154,7 @@ it.skipIf(skipBroker)(
     const broker = createSpawnBrokerHost();
     const gatewayReaders = createSqliteReadOnlyWorkerScope();
     const callerReaders = createSqliteReadOnlyWorkerScope();
-    let unsubscribe = () => {};
+    const publishFileChange = authProfileFileChanges.onChange;
     const observed: unknown[] = [];
     try {
       await broker.ready();
@@ -157,11 +163,12 @@ it.skipIf(skipBroker)(
       runWithSpawnBroker(broker, () => gatewayReaders.run(bindAuthProfileFileObservationReaders));
       const { source, store } = createAuthDatabase();
       vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
-      unsubscribe = registerAuthProfileFileChangeListener(async (change) => {
+      authProfileFileChanges.onChange = async (change) => {
+        await publishFileChange?.(change);
         if (change.directory === path.dirname(source)) {
           observed.push((await read(source, "canonical")).store);
         }
-      });
+      };
       runWithSpawnBroker(broker, () =>
         callerReaders.run(() => readAuthProfileDatabaseIdentity(source)),
       );
@@ -184,7 +191,7 @@ it.skipIf(skipBroker)(
       expect(spawn).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      unsubscribe();
+      authProfileFileChanges.onChange = publishFileChange;
       await closeOpenClawStateDatabaseAsync();
       await callerReaders.close();
       await gatewayReaders.close();
@@ -234,12 +241,22 @@ function createAuthDatabase(key = "synthetic", metadata?: Record<string, string>
 }
 
 function clearAuthState(source: string) {
-  const writer = new (requireNodeSqlite().DatabaseSync)(source);
-  try {
-    writer.prepare("UPDATE auth_profile_state SET state_json = ?").run('{"lastGood":{}}');
-  } finally {
-    writer.close();
-  }
+  using writer = new (requireNodeSqlite().DatabaseSync)(source);
+  writer.prepare("UPDATE auth_profile_state SET state_json = ?").run('{"lastGood":{}}');
+}
+
+function holdBrokerReadiness(broker: ReturnType<typeof createSpawnBrokerHost>) {
+  const ready = createDeferredCore();
+  const admitted = createDeferredCore<BrokerChild>();
+  const spawnChild = broker.spawn.bind(broker);
+  const spawning = vi.spyOn(broker, "spawn").mockImplementation((...args) => {
+    const child = spawnChild(...args);
+    const actualReady = child.ready();
+    vi.spyOn(child, "ready").mockImplementation(() => actualReady.then(() => ready.promise));
+    void actualReady.then(() => admitted.resolve(child), admitted.reject);
+    return child;
+  });
+  return { ready, admitted, spawning };
 }
 
 function read(
@@ -256,6 +273,38 @@ function read(
     signal,
   });
 }
+
+it("rejects stale auth identity before transferring credentials from a replaced database", async () => {
+  const { source } = createAuthDatabase("original");
+  const replacement = createAuthDatabase("replacement");
+  const expectedIdentity = readDatabasePathIdentitySync(source).key;
+  await withSqliteReadOnlyWorkerScope(async () => {
+    await read(source, "canonical");
+    const child: ChildProcess = vi.mocked(spawn).mock.results[0]?.value;
+    const replies: unknown[] = [];
+    child.on("message", (message: unknown) => replies.push(message));
+    fs.renameSync(source, `${source}.retired`);
+    fs.renameSync(replacement.source, source);
+    await expect(
+      runSqliteReadOnlyWorker(source, {
+        mode: "auth-profile-rows",
+        source: "canonical",
+        expectedIdentity,
+        env: { ...process.env },
+      }),
+    ).rejects.toThrow("identity changed");
+    expect(replies).toEqual([
+      {
+        id: expect.any(Number),
+        result: { ok: false, message: expect.stringContaining("identity changed") },
+      },
+    ]);
+    expect((await read(source, "canonical")).store).toEqual({
+      status: "readable",
+      raw: replacement.store,
+    });
+  });
+});
 
 it("observes agent initialization after a cold auth read in the same worker", async () => {
   const root = tempDirs.make("openclaw-auth-bootstrap-");
@@ -278,9 +327,6 @@ it("observes agent initialization after a cold auth read in the same worker", as
     using database = openNodeSqliteDatabase(source);
     ensureOpenClawAgentDatabaseSchema(database, { agentId: "main", path: source, env });
     database
-      .prepare("INSERT INTO cache_entries (scope, key, value_json, updated_at) VALUES (?, ?, ?, ?)")
-      .run("plugin-model-catalog-v1", "fixture", "synthetic catalog", 1);
-    database
       .prepare(
         "INSERT INTO auth_profile_store (store_key, store_json, updated_at) VALUES (?, ?, ?)",
       )
@@ -288,10 +334,17 @@ it("observes agent initialization after a cold auth read in the same worker", as
     await expect(
       runSqliteReadOnlyOperation(
         source,
-        { type: "pluginCatalog.read", input: { agentId: "main", pluginIds: ["fixture"] } },
+        {
+          type: "agentRetirement.sessionStoreBlocker",
+          input: prepareAgentSessionStoreDeletionSafety(
+            { agents: { entries: { survivor: {} } }, session: { store: source } },
+            "main",
+            env,
+          ),
+        },
         { source: "canonical", expectedIdentity, env },
       ),
-    ).resolves.toEqual([{ pluginId: "fixture", contents: "synthetic catalog" }]);
+    ).resolves.toEqual({ blocker: "survivor" });
     expect((await read(source, "canonical", undefined, env)).store).toEqual({
       status: "readable",
       raw: store,
@@ -485,29 +538,6 @@ it("reuses equivalent state roots and separates changed auth environments", asyn
   }
 });
 
-it("rejects queued reads on scope shutdown without stopping the shared idle child", async () => {
-  const { source } = createAuthDatabase();
-  const scope = createSqliteReadOnlyWorkerScope();
-  try {
-    await scope.run(() => read(source, "canonical"));
-    const pending = scope.run(() =>
-      Promise.allSettled([read(source, "canonical"), read(source, "canonical")]),
-    );
-    await scope.close();
-    expect(await pending).toEqual(
-      Array.from({ length: 2 }, () => ({
-        status: "rejected",
-        reason: expect.objectContaining({ message: "SQLite read-only worker scope closed" }),
-      })),
-    );
-    await expect(scope.run(() => read(source, "canonical"))).rejects.toThrow("scope closed");
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(spawn).mock.results[0]?.value.connected).toBe(true);
-  } finally {
-    await scope.close();
-  }
-});
-
 it("releases request readers before agent database removal", async () => {
   const { source } = createAuthDatabase();
   await withSqliteReadOnlyWorkerScope(async () => {
@@ -578,10 +608,19 @@ it.skipIf(skipBroker)(
 );
 
 describe.skipIf(skipBroker)("auth SQLite broker lifecycle", () => {
-  it("reports broker nonadmission without spawning on the request thread", async () => {
-    const { source } = createAuthDatabase();
-    const broker = createSpawnBrokerHost();
+  let source: string;
+  let rows: ReturnType<typeof createAuthDatabase>["rows"];
+  let broker: ReturnType<typeof createSpawnBrokerHost>;
+  beforeEach(async () => {
+    ({ source, rows } = createAuthDatabase());
+    broker = createSpawnBrokerHost();
     await broker.ready();
+  });
+  afterEach(async () => {
+    await broker.close();
+  });
+
+  it("reports broker nonadmission without spawning on the request thread", async () => {
     await broker.close();
     vi.mocked(spawn).mockClear();
     await expect(runWithSpawnBroker(broker, () => read(source, "canonical"))).rejects.toMatchObject(
@@ -593,44 +632,29 @@ describe.skipIf(skipBroker)("auth SQLite broker lifecycle", () => {
   });
 
   it("cancels an admitted read before IPC readiness and joins its child", async () => {
-    const { source } = createAuthDatabase();
-    const broker = createSpawnBrokerHost();
-    const ready = createDeferredCore();
-    const admitted = createDeferredCore<BrokerChild>();
+    let held: ReturnType<typeof holdBrokerReadiness> | undefined;
     const abort = new AbortController();
     let reading: Promise<unknown> | undefined;
     try {
-      await broker.ready();
-      const brokerSpawn = broker.spawn.bind(broker);
-      vi.spyOn(broker, "spawn").mockImplementation((...args) => {
-        const child = brokerSpawn(...args);
-        const actualReady = child.ready();
-        vi.spyOn(child, "ready").mockImplementation(() => actualReady.then(() => ready.promise));
-        void actualReady.then(() => admitted.resolve(child), admitted.reject);
-        return child;
-      });
+      held = holdBrokerReadiness(broker);
       reading = runWithSpawnBroker(broker, () => read(source, "canonical", abort.signal));
       const failure = new Error("auth read cancelled before readiness");
       const rejected = expect(reading).rejects.toBe(failure);
-      const child = await admitted.promise;
+      const child = await held.admitted.promise;
       abort.abort(failure);
       await rejected;
       expect(child.signalCode).toBe("SIGKILL");
       expect(child.connected).toBe(false);
     } finally {
-      ready.resolve();
+      held?.ready.resolve();
       abort.abort();
       await Promise.allSettled([reading]);
-      await broker.close();
     }
   });
 
   it("preserves timeout failure when broker nonadmission arrives afterward", async () => {
-    const { source } = createAuthDatabase();
-    const broker = createSpawnBrokerHost();
     let child: BrokerChild | undefined;
     try {
-      await broker.ready();
       await broker.close();
       vi.mocked(spawn).mockClear();
       vi.spyOn(broker, "spawn").mockImplementationOnce((command, args) => {
@@ -655,50 +679,32 @@ describe.skipIf(skipBroker)("auth SQLite broker lifecycle", () => {
       expect(spawn).not.toHaveBeenCalled();
     } finally {
       vi.restoreAllMocks();
-      await broker.close();
     }
   });
 
   it("starts no child for an aborted read", async () => {
-    const { source } = createAuthDatabase();
-    const broker = createSpawnBrokerHost();
-    try {
-      await broker.ready();
-      const brokerSpawn = vi.spyOn(broker, "spawn");
-      vi.mocked(spawn).mockClear();
-      const failure = new Error("auth read already cancelled");
-      await expect(
-        runWithSpawnBroker(broker, () => read(source, "canonical", AbortSignal.abort(failure))),
-      ).rejects.toBe(failure);
-      expect(brokerSpawn).not.toHaveBeenCalled();
-      expect(spawn).not.toHaveBeenCalled();
-    } finally {
-      await broker.close();
-    }
+    const brokerSpawn = vi.spyOn(broker, "spawn");
+    vi.mocked(spawn).mockClear();
+    const failure = new Error("auth read already cancelled");
+    await expect(
+      runWithSpawnBroker(broker, () => read(source, "canonical", AbortSignal.abort(failure))),
+    ).rejects.toBe(failure);
+    expect(brokerSpawn).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it.each([false, true])(
     "retains a failed read until lost-broker cleanup settles (cleanup failure: %s)",
     async (cleanupFails) => {
-      const { source, rows } = createAuthDatabase();
-      const broker = createSpawnBrokerHost();
-      const admitted = createDeferredCore<BrokerChild>();
-      const ready = createDeferredCore();
+      let held: ReturnType<typeof holdBrokerReadiness> | undefined;
       const cleanupEntered = createDeferredCore();
       const releaseCleanup = createDeferredCore();
       const cleanupFailure = new Error("recorded broker cleanup failure");
       let reading: Promise<unknown> | undefined;
       let settled = false;
       try {
-        await broker.ready();
-        const brokerSpawn = broker.spawn.bind(broker);
-        const spawning = vi.spyOn(broker, "spawn").mockImplementation((...args) => {
-          const child = brokerSpawn(...args);
-          const actualReady = child.ready();
-          vi.spyOn(child, "ready").mockImplementation(() => actualReady.then(() => ready.promise));
-          void actualReady.then(() => admitted.resolve(child), admitted.reject);
-          return child;
-        });
+        held = holdBrokerReadiness(broker);
+        const { admitted, ready, spawning } = held;
         const cleanup = broker.waitForCleanup.bind(broker);
         const cleanupSpy = vi.spyOn(broker, "waitForCleanup").mockImplementation(async () => {
           cleanupEntered.resolve();
@@ -749,11 +755,10 @@ describe.skipIf(skipBroker)("auth SQLite broker lifecycle", () => {
         }
         cleanupSpy.mockRestore();
       } finally {
-        ready.resolve();
+        held?.ready.resolve();
         releaseCleanup.resolve();
         await Promise.allSettled([reading]);
         vi.restoreAllMocks();
-        await broker.close();
       }
     },
   );

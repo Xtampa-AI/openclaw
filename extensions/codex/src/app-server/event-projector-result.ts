@@ -1,12 +1,13 @@
 import { AgentHarnessProjectionSettlement } from "openclaw/plugin-sdk/agent-harness-attempt-runtime";
 import {
   classifyAgentHarnessTerminalOutcome,
+  prepareAgentRunTerminalReply,
   type AgentMessage,
   type EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { AgentHarnessToolResultTelemetry } from "openclaw/plugin-sdk/agent-harness-tool-runtime";
 import { resolveCodexTtsProvenanceTransfer } from "openclaw/plugin-sdk/codex-mcp-projection";
-import { isSilentReplyText } from "openclaw/plugin-sdk/reply-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
   attemptTerminal,
   type AttemptFailureSource,
@@ -30,6 +31,8 @@ import type { CodexTurn, JsonValue } from "./protocol.js";
 import { CodexTranscriptCheckpoint } from "./transcript-checkpoint.js";
 import { attachCodexAssistantItemIds } from "./upstream-prompt-provenance.js";
 import { resolveCodexPromptError } from "./usage-limit-error.js";
+
+const TERMINAL_REPLY_SNAPSHOT_MAX_CHARS = 4_096;
 
 export type CodexAppServerToolTelemetry = Partial<
   Omit<AgentHarnessToolResultTelemetry, "confirmedMediaDeliveries">
@@ -65,7 +68,6 @@ class CodexProjectionSettlement extends AgentHarnessProjectionSettlement<Embedde
         item.type === "agentMessage" &&
         item.phase !== "commentary" &&
         item.delivery !== "async" &&
-        typeof item.text === "string" &&
         item.text.trim().length > 0,
     );
     return turn?.status === "completed" && answer ? { turn, answer } : undefined;
@@ -129,7 +131,10 @@ export abstract class CodexTurnProjection {
       : this.assistantProjection.collectAssistantTexts();
     const hasDeliverableAssistantOnCompletedTurn =
       this.completedTurn?.status === "completed" &&
-      rawAssistantTexts.some((text) => text.trim().length > 0 && !isSilentReplyText(text));
+      rawAssistantTexts.some(
+        (text) =>
+          prepareAgentRunTerminalReply({ rawText: text }).terminalReply.disposition === "visible",
+      );
     const synthesized = this.toolTranscriptProjection.synthesizeMissingToolResults({
       synthesize:
         !this.completedTurn ||
@@ -164,10 +169,7 @@ export abstract class CodexTurnProjection {
     );
     this.contextTokens = options.initialContextTokens;
     this.contextTokensSource = options.initialContextTokens === undefined ? undefined : "resolved";
-    // Terminal diagnostics remain observable after ordinary projection is retired.
-    this.diagnostics = new CodexProjectionDiagnostics(threadId, turnId, (data) =>
-      emitCodexAgentEvent(this.params, { stream: "codex_app_server.diagnostic", data }),
-    );
+    this.diagnostics = new CodexProjectionDiagnostics(threadId, turnId);
     this.nativeToolLifecycleProjector = new CodexNativeToolLifecycleProjector(
       params,
       threadId,
@@ -265,9 +267,42 @@ export abstract class CodexTurnProjection {
     const completedItemCount = this.completedItemIds.size;
     const guardianReviewCount = this.eventProjection.guardianReviewCount;
     const yieldDetected = options?.yieldDetected;
-    const assistantTexts = toolTelemetry.finalSourceReplyDelivered
+    const rawAssistantTexts = toolTelemetry.finalSourceReplyDelivered
       ? []
       : this.assistantProjection.collectAssistantTexts();
+    const preparedReplies = rawAssistantTexts.map((rawText) =>
+      prepareAgentRunTerminalReply({ rawText }),
+    );
+    const visibleReplies = preparedReplies.filter(
+      (reply) => reply.terminalReply.disposition === "visible",
+    );
+    const assistantTexts = visibleReplies.map((reply) => reply.text);
+    const terminalText = assistantTexts.join("\n\n");
+    const terminalSnapshotText = preparedReplies
+      .flatMap(({ terminalReply }) =>
+        terminalReply.disposition === "visible" ? terminalReply.text : [],
+      )
+      .join("\n\n");
+    const aggregateTruncated = terminalSnapshotText.length > TERMINAL_REPLY_SNAPSHOT_MAX_CHARS;
+    const preparedTerminalReply = visibleReplies.length
+      ? {
+          text: terminalText,
+          terminalReply: {
+            disposition: "visible" as const,
+            text: aggregateTruncated
+              ? `${truncateUtf16Safe(
+                  terminalSnapshotText,
+                  TERMINAL_REPLY_SNAPSHOT_MAX_CHARS - 1,
+                ).trimEnd()}…`
+              : terminalSnapshotText,
+          },
+        }
+      : (preparedReplies.at(-1) ?? prepareAgentRunTerminalReply({}));
+    const rawTranscriptTexts = visibleReplies.length
+      ? rawAssistantTexts.filter(
+          (_, index) => preparedReplies[index]?.terminalReply.disposition === "visible",
+        )
+      : rawAssistantTexts;
     const asyncMessages = this.assistantProjection.collectAsyncMessages();
     const commentaryMessages = this.assistantProjection.collectCommentaryMessages();
     const reasoningText = this.reasoningProjection.reasoningText();
@@ -287,9 +322,9 @@ export abstract class CodexTurnProjection {
     };
     const lastAssistant = providerRefusal
       ? this.assistantProjection.createAssistantMessage("", assistantMessageOptions)
-      : assistantTexts.length
+      : rawTranscriptTexts.length
         ? this.assistantProjection.createAssistantMessage(
-            assistantTexts.join("\n\n"),
+            rawTranscriptTexts.join("\n\n"),
             assistantMessageOptions,
           )
         : undefined;
@@ -378,6 +413,7 @@ export abstract class CodexTurnProjection {
         : {}),
       messagesSnapshot,
       assistantTexts,
+      preparedTerminalReply,
       toolMetas,
       lastAssistant,
       currentAttemptAssistant,
@@ -391,7 +427,6 @@ export abstract class CodexTurnProjection {
       messagingToolSentTexts: toolTelemetry.messagingToolSentTexts,
       ...mediaDelivery,
       messagingToolSourceReplyPayloads: toolTelemetry.messagingToolSourceReplyPayloads ?? [],
-      heartbeatToolResponse: toolTelemetry.heartbeatToolResponse,
       toolAudioAsVoice: toolTelemetry.toolAudioAsVoice,
       successfulCronAdds: toolTelemetry.successfulCronAdds,
       acceptedSessionSpawns: toolTelemetry.acceptedSessionSpawns,
@@ -416,12 +451,6 @@ export abstract class CodexTurnProjection {
     for (const toolResult of toolTelemetry.coreTtsToolResults ?? []) {
       transferTtsProvenance?.(toolResult, result, toolAutoDeliveryMediaUrls ?? []);
     }
-    this.diagnostics.recordNoAnswer(
-      runParams.runId,
-      result,
-      completedTurn,
-      toolTelemetry.finalSourceReplyDelivered === true,
-    );
     return result;
   }
 

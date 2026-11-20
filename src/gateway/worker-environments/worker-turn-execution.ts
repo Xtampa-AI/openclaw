@@ -1,24 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { SKILL_RESOURCE_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/skill-resources.js";
 import { WORKER_LOCAL_INFERENCE_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
-import { WORKER_GATEWAY_TOOLS_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-gateway-tool.js";
+import { WORKER_TURN_ADMISSION_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-turn-admission.js";
 import { resolveAgentDir } from "../../agents/agent-scope.js";
 import {
   copyAgentToolMetadata,
   getAgentToolExecutionLocation,
 } from "../../agents/agent-tool-metadata.js";
-import { createOpenClawCodingToolsInternalAsync } from "../../agents/agent-tools.js";
-import type { EmbeddedAttemptSteeringLease } from "../../agents/embedded-agent-runner/run/attempt-prompt-build.js";
+import { createOpenClawCodingToolsInternalAsync } from "../../agents/agent-tools.async.js";
 import { applyEmbeddedAttemptToolsAllow } from "../../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import { admitEmbeddedContextEngine } from "../../agents/embedded-agent-runner/run/context-engine-admission.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import { createModelVisibilityPolicy } from "../../agents/model-visibility-policy.js";
 import { acquireAgentRunPreparedModelRuntime } from "../../agents/prepared-model-runtime.js";
-import {
-  ackPendingAgentSteeringItems,
-  releasePendingAgentSteeringItems,
-} from "../../agents/subagents/registry/subagent-registry.js";
-import type { AnyAgentTool } from "../../agents/tools/common.js";
 import { createLibrarySkillWorkshopTool } from "../../agents/tools/skill-workshop-tool-library.js";
 import { registerAgentRunDelegatedAuthorityClosedHandler } from "../../infra/agent-run-registry.js";
 import { logInfo } from "../../logger.js";
@@ -34,11 +28,14 @@ import { sameWorkerSessionTurnClaim } from "./placement-record.js";
 import { isWorkerEnvironmentAttachedTo } from "./placement-target.js";
 import {
   bindWorkerTurnCapabilities,
+  assertWorkerTurnInputAdmitted,
   getWorkerTurnToolSurface,
 } from "./placement-turn-claim-events.js";
 import { prepareWorkerDesktopLaunchPlan } from "./worker-desktop-launch-plan.js";
+import { prepareWorkerExecApproval } from "./worker-exec-approval.js";
 import type { WorkerGatewayToolRuntime } from "./worker-gateway-tool-contract.js";
 import { createWorkerGatewayToolRuntime } from "./worker-gateway-tool-runtime.js";
+import { bindWorkerGitHubTurn } from "./worker-github-binding.js";
 import { createWorkerReplyMedia } from "./worker-reply-media.js";
 import { resolveWorkerToolAuthority } from "./worker-tool-authority.js";
 import { releaseClaimIfOwned, waitForTurnOperation } from "./worker-turn-admission.js";
@@ -60,8 +57,9 @@ import {
 import { prepareWorkerTurnPrompt, WORKER_CONTEXT_ENGINE_HOST } from "./worker-turn-prompt.js";
 import { resolveWorkerTurnTranscriptTarget } from "./worker-turn-transcript-target.js";
 import {
+  createWorkerTurnInputAdmission,
   gateWorkerTurnInput,
-  persistWorkerTurnUserMessage,
+  persistWorkerTurnInput,
   readWorkerTurnInputContext,
 } from "./worker-turn-user-message.js";
 import {
@@ -125,10 +123,10 @@ export async function executeWorkerTurn(
       );
     }
   }
-  await recoverWorkspaceBeforeTurn({ ...params, signal: turn.abortSignal });
   params.assertRunCurrent();
   turn.abortSignal?.throwIfAborted();
-  const { available: githubPublicationAvailable } = readGitHubPublicationFact(placement);
+  // Keep credential discovery independent of the brokered publication request tool.
+  readGitHubPublicationFact(placement);
 
   const startedAt = Date.now();
   await turn.onExecutionStarted?.({ lifecycleGeneration: turn.lifecycleGeneration, backend });
@@ -153,22 +151,21 @@ export async function executeWorkerTurn(
   }
   const inputContext = {
     turn,
+    cwd: params.workspace.kind === "local" ? params.workspace.path : placement.remoteWorkspaceDir,
     transcriptTarget,
     identity: placement,
     modelRef,
     startedAt,
     assertCurrent: assertContextCurrent,
+    assertSourceCurrent,
     onBlocked: () => {
       blocked = true;
     },
   };
-  const blockedResult = await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
-    gateWorkerTurnInput(inputContext),
-  );
-  if (blockedResult) {
-    await releaseClaimIfOwned(params.placements, params.turnClaim);
-    return blockedResult;
-  }
+  // Project the wire handshake; the receipt also carries storage-only provenance.
+  const { bundleHash, openclawVersion, protocolFeatures } = bootstrapReceipt;
+  const workerAdmission = protocolFeatures.includes(WORKER_TURN_ADMISSION_PROTOCOL_FEATURE);
+  let blockedResult: Awaited<ReturnType<typeof gateWorkerTurnInput>>;
   await using contextEngineAdmission = await withPluginRuntimeGenerationScope(
     preparedRuntime.snapshot,
     () =>
@@ -185,16 +182,6 @@ export async function executeWorkerTurn(
       ),
   );
   assertContextCurrent();
-  if (recorder && turn.suppressNextUserMessagePersistence !== true && !recorder.hasPersisted()) {
-    const persisted = await recorder.persistApproved({
-      storageTarget: transcriptTarget,
-      cwd: params.workspace.kind === "local" ? params.workspace.path : placement.remoteWorkspaceDir,
-    });
-    if (persisted) {
-      turn.onUserMessagePersisted?.(persisted.message);
-    }
-    assertContextCurrent();
-  }
   const context = await readWorkerTurnInputContext(inputContext);
   const { manager, history, userMessageAlreadyPersisted } = context;
   let baseLeafId = context.baseLeafId;
@@ -226,6 +213,9 @@ export async function executeWorkerTurn(
   if (!tunnel.launchTurn) {
     throw new Error("Worker tunnel does not support worker turns");
   }
+  assertContextCurrent();
+  await recoverWorkspaceBeforeTurn({ ...params, turn, tunnel, signal: turn.abortSignal });
+  assertContextCurrent();
   const portalAvailable =
     Boolean(environment.nodeDeviceId) &&
     environment.sshEndpoint === null &&
@@ -299,13 +289,6 @@ export async function executeWorkerTurn(
     }
   });
   let toolRuntime: WorkerGatewayToolRuntime | undefined;
-  await using steering: AsyncDisposable & { lease?: EmbeddedAttemptSteeringLease } = {
-    async [Symbol.asyncDispose]() {
-      if (this.lease) {
-        await releasePendingAgentSteeringItems(this.lease);
-      }
-    },
-  };
   const toolIdentity = {
     sessionId: placement.sessionId,
     runId: turn.runId,
@@ -318,6 +301,7 @@ export async function executeWorkerTurn(
       throw new Error("Worker tool surface owner changed");
     }
   };
+  let githubGrant: Awaited<ReturnType<typeof bindWorkerGitHubTurn>>;
   try {
     const isAuthorized = () => {
       try {
@@ -329,9 +313,6 @@ export async function executeWorkerTurn(
         return false;
       }
     };
-    if (!bootstrapReceipt.protocolFeatures.includes(WORKER_GATEWAY_TOOLS_PROTOCOL_FEATURE)) {
-      throw new StaleWorkerBuildError();
-    }
     const skillWorkshop = turn.skillLibraryAuthoring
       ? createLibrarySkillWorkshopTool({ ...turn.skillLibraryAuthoring, defaultTarget: "personal" })
       : undefined;
@@ -339,7 +320,7 @@ export async function executeWorkerTurn(
       assertCurrent: assertToolSurfaceCurrent,
       signal,
       prepare: async (identity) => {
-        const inheritedPublicationToolRef: { current?: AnyAgentTool } = {};
+        const additionalInheritedToolNamesRef: string[] = [];
         const placementTools = createWorkerPlacementTools({
           ...turn,
           ...placement,
@@ -368,8 +349,8 @@ export async function executeWorkerTurn(
                   conversationCapabilityProfile: capabilityProfile,
                   preparedModelRuntime: preparedRuntime.snapshot,
                   installedSkills,
-                  githubPublicationAvailable,
-                  inheritedPublicationToolRef,
+                  githubPublicationAvailable: true,
+                  additionalInheritedToolNamesRef,
                   cronCreatorAuthorityUnavailableReason: undefined,
                   runSessionKey: placement.sessionKey,
                   sessionKey: turn.sandboxSessionKey ?? placement.sessionKey,
@@ -391,14 +372,8 @@ export async function executeWorkerTurn(
                 { assertCurrent: assertToolSurfaceCurrent, signal },
               );
               if (turn.disableTools || turn.modelRun || turn.promptMode === "none") {
-                inheritedPublicationToolRef.current = undefined;
+                additionalInheritedToolNamesRef.length = 0;
                 return [];
-              }
-              if (inheritedPublicationToolRef.current) {
-                inheritedPublicationToolRef.current = applyEmbeddedAttemptToolsAllow(
-                  [inheritedPublicationToolRef.current],
-                  turn.toolsAllow,
-                )[0];
               }
               return applyEmbeddedAttemptToolsAllow(prepared, turn.toolsAllow).filter((tool) => {
                 const location = getAgentToolExecutionLocation(tool);
@@ -424,7 +399,10 @@ export async function executeWorkerTurn(
         return {
           policy: toolPolicy,
           presentation,
-          inheritedPublicationTool: inheritedPublicationToolRef.current,
+          additionalInheritedToolNames: applyEmbeddedAttemptToolsAllow(
+            additionalInheritedToolNamesRef.map((name) => ({ name })),
+            turn.toolsAllow,
+          ).map((tool) => tool.name),
           tools: tools.map((tool) =>
             copyAgentToolMetadata(tool, {
               ...tool,
@@ -444,10 +422,15 @@ export async function executeWorkerTurn(
       assertCurrent: assertActive,
       signal,
     });
-    bindWorkerTurnCapabilities(params.placements, params.turnClaim, {
+    const assertInputAdmitted = bindWorkerTurnCapabilities(params.placements, params.turnClaim, {
+      execApproval: prepareWorkerExecApproval({ exec, turn, manager, signal, placement }),
       toolSurface: toolRuntime,
       prepareReplyMedia,
       inference,
+      admitTurn: workerAdmission
+        ? (request, assertCurrent, recordApproval) =>
+            admitTurn(request, assertCurrent, recordApproval)
+        : undefined,
     });
     const connectionIdentity = {
       ...toolIdentity,
@@ -473,9 +456,6 @@ export async function executeWorkerTurn(
       contextEngine: contextEngineAdmission.contextEngine,
       contextEnginePluginId:
         contextEngineAdmission.contextEngineLogicalTurnLease.effectiveEnginePluginId,
-      setLeasedSteering: (lease: EmbeddedAttemptSteeringLease) => {
-        steering.lease = lease;
-      },
       assertCurrent: assertActive,
     };
     const promptContext = await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
@@ -502,6 +482,16 @@ export async function executeWorkerTurn(
       isAuthorized,
       signal,
     });
+    assertActive();
+    blockedResult = workerAdmission
+      ? undefined
+      : await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
+          gateWorkerTurnInput(inputContext, { ...media, prompt: turn.prompt, history }),
+        );
+    if (blockedResult) {
+      await releaseClaimIfOwned(params.placements, params.turnClaim);
+      return blockedResult;
+    }
     const skillResources = await prepareSkillResourceDelivery(
       turn.skillsSnapshot,
       () => {
@@ -518,15 +508,31 @@ export async function executeWorkerTurn(
     ) {
       throw new StaleWorkerBuildError();
     }
-    if (!userMessageAlreadyPersisted && !recorder) {
-      baseLeafId = await persistWorkerTurnUserMessage({
-        turn,
+    const persistInput = async () => {
+      assertWorkerTurnInputAdmitted(connectionIdentity);
+      baseLeafId = await persistWorkerTurnInput({
+        ...inputContext,
         manager,
-        transcriptTarget,
         media,
-        assertRunCurrent: params.assertRunCurrent,
+        assertRunCurrent: assertActive,
         isAuthorized,
+        userMessageAlreadyPersisted,
+        baseLeafId,
       });
+      return baseLeafId;
+    };
+    const admitTurn = createWorkerTurnInputAdmission({
+      ...inputContext,
+      assertCurrent: assertActive,
+      runtime: preparedRuntime.snapshot,
+      preparedInput: media,
+      persist: persistInput,
+      onBlockedResult: (result) => {
+        blockedResult = result;
+      },
+    });
+    if (!workerAdmission) {
+      await persistInput();
     }
     const promptMessages = promptContext.runtimeContext ? 2 : 1;
     const initialMessagePlan = windowInitialMessages(media.history, promptMessages);
@@ -538,9 +544,16 @@ export async function executeWorkerTurn(
       );
       throw new WorkerTurnExecutionError(WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE);
     }
-    // Project the wire handshake; the receipt also carries storage-only provenance.
-    const { bundleHash, openclawVersion, protocolFeatures } = bootstrapReceipt;
-    const { github } = readGitHubPublicationFact(placement);
+    githubGrant = await bindWorkerGitHubTurn({
+      session: placement,
+      fact: readGitHubPublicationFact(placement),
+      sessionTarget: transcriptTarget,
+      store: params.placements,
+      claim: params.turnClaim,
+      protocolFeatures: bootstrapReceipt.protocolFeatures,
+      signal,
+      assertCurrent: assertActive,
+    });
     const launchPlan = await fitLaunchDescriptorWithRuntimeIdentity({
       runtimeIdentity,
       measure: (plan) => tunnel.measureLaunchTurn(plan, params.turnClaim),
@@ -565,7 +578,7 @@ export async function executeWorkerTurn(
             prompt: media.prompt,
             suppressPromptTranscript: true,
             workspaceDir: placement.remoteWorkspaceDir,
-            ...(github ? { github } : {}),
+            ...(githubGrant ? { github: githubGrant.binding } : {}),
             ...(skillResources ? { skillResources } : {}),
             ...(turn.permissionMode
               ? {
@@ -615,13 +628,11 @@ export async function executeWorkerTurn(
     if (!isAuthorized()) {
       throw new Error("Worker turn authority changed while preparing its launch");
     }
-    if (steering.lease && !steering.lease.isCurrent()) {
-      throw new Error("Queued child results lost authority before worker prompt injection");
+    if (!workerAdmission) {
+      recorder?.markSentToProvider?.();
     }
-    recorder?.markSentToProvider?.();
     turn.onExecutionPhase?.({ phase: "attempt_dispatch", backend });
     const handoffAbort = new AbortController();
-    let handoffError: Error | undefined;
     let handoffPending: Promise<void> | undefined;
     let dispatchReady = false;
     const onDispatchReady = () => {
@@ -638,30 +649,24 @@ export async function executeWorkerTurn(
       handoffPending = (async () => {
         try {
           if (!(await params.environments.acknowledgeCredentialDelivery(credential))) {
-            handoffError = new Error(
-              "Cloud worker credential owner changed during process handoff",
+            handoffAbort.abort(
+              new Error("Cloud worker credential owner changed during process handoff"),
             );
           }
         } catch (error) {
-          handoffError = new Error("Cloud worker credential handoff failed", { cause: error });
-        }
-        if (handoffError) {
-          handoffAbort.abort(handoffError);
+          handoffAbort.abort(new Error("Cloud worker credential handoff failed", { cause: error }));
         }
       })();
     };
-    if (github && readGitHubPublicationFact(placement).github?.token !== github.token) {
-      throw new Error("GitHub identity changed before worker launch; retry the turn.");
-    }
     let processResult: Awaited<ReturnType<NonNullable<typeof tunnel.launchTurn>>>;
     try {
       processResult = await tunnel.launchTurn({
-        assertCurrent: assertActive,
+        assertCurrent: githubGrant?.assertCurrent ?? assertActive,
         plan: launchPlan.plan,
         turnClaim: params.turnClaim,
         timeoutMs: turn.timeoutMs,
         credentialExpiresAtMs: credential.expiresAtMs,
-        signal: AbortSignal.any([signal, handoffAbort.signal]),
+        signal: AbortSignal.any([githubGrant?.signal ?? signal, handoffAbort.signal]),
         onDispatchReady,
       });
     } finally {
@@ -672,11 +677,13 @@ export async function executeWorkerTurn(
     if (environment.nodeDeviceId && environment.sshEndpoint === null) {
       params.onTerminal();
     }
-    if (handoffError) {
-      throw handoffError;
-    }
+    handoffAbort.signal.throwIfAborted();
     if (!dispatchReady) {
       throw new Error("Cloud worker launch completed before transport dispatch");
+    }
+    if (blockedResult) {
+      await releaseClaimIfOwned(params.placements, params.turnClaim);
+      return blockedResult;
     }
     return await finalizeWorkerTurnResult({
       ...params,
@@ -684,21 +691,17 @@ export async function executeWorkerTurn(
       transcriptTarget,
       tunnel,
       processResult,
+      assertInputAdmitted,
       modelRef,
       baseLeafId,
       promptContext,
       prepareReplyMedia,
       takeFinishingOutcome: () => takeFinishingOutcome(credential.deliveryId),
-      settleSteering: async () => {
-        if (steering.lease) {
-          await ackPendingAgentSteeringItems(steering.lease);
-          steering.lease = undefined;
-        }
-      },
       signal,
       startedAt,
     });
   } finally {
+    await githubGrant?.revoke();
     await toolRuntime?.close();
     stopWatchingClaim();
     stopWatchingRun();

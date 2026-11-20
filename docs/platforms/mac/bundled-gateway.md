@@ -31,8 +31,11 @@ their always-on service.
 For local connections, the app prefers the configured `gateway.auth.token` or
 `gateway.auth.password` over `OPENCLAW_GATEWAY_TOKEN` or
 `OPENCLAW_GATEWAY_PASSWORD` inherited by the app, matching Gateway startup.
-Environment credentials remain fallbacks when no configured credential resolves.
-Remote connections retain their environment overrides.
+Typed env SecretRefs use the selected provider and its allowlist. The app reads
+the referenced value from the Gateway service environment first, then the app
+environment. An invalid, denied, or missing active typed reference does not fall
+back to an unrelated credential. Only the selected authentication surface is sent
+to the Gateway. Remote connections retain their environment overrides.
 
 Before launching an app-hosted Gateway, the app saves a local authentication
 token when neither configuration nor the child environment supplies credentials
@@ -79,16 +82,39 @@ ends unexpectedly.
 The private worker validates core and node configuration through a read-only
 bootstrap, without Gateway-wide Doctor preflight or channel-schema validation.
 Node plugins still validate their own settings before publishing commands, and
-the node runtime owns its MCP clients. Node startup retains the Doctor-owned
-device-auth, device-identity, and exec-approval migrations; this is not a promise
-that all worker startup is read-only. Public `node run`, Gateway, and Doctor
-retain their existing startup policies.
+the node runtime owns its MCP clients. Node startup prepares client credentials
+through their migration owner before using them, and retains exec-approval
+migrations; this is not a promise that all worker startup is read-only.
 
-When the native app creates identity, device-auth, or approval tables before
-the worker starts, node startup completes that recognized version-zero database
-through the shared initializer before plugins read their state. Existing
-native rows are preserved. This does not migrate an already-versioned shared
-Gateway database or adopt unknown or occupied bootstrap state.
+The native app loads private identities and cached device tokens from its local
+`client/credentials.sqlite` before connecting, without opening the selected
+Gateway database. The active app serves bounded same-user credential operations,
+holding exclusive SQLite custody only for each operation. A fresh client can create an identity while
+PostgreSQL or the Gateway is unavailable; shared approval policy still requires
+its existing state owner.
+
+The packaged app runs the matching bundled CLI's narrow, noninteractive
+credential preparation before native admission. That native handoff also settles
+pending local runtime-pin migration before the app chooses its Gateway runtime.
+It preserves explicit pin data rather than forcing a new seed; a migration
+conflict prevents startup and retains recovery guidance. Gateway and node
+startup use the same credential migration owner. When an in-place app update
+leaves the previous build's app-managed Gateway service running, that Gateway
+still owns the state, so the app stops it, prepares credentials, and then
+installs the service on its own runtime. Ordinary pending migrations
+and validated remounts
+complete automatically without a manual Doctor command or a recovery prompt.
+A recognized credential-only native version-zero database can be
+extracted under exclusive custody before PostgreSQL bootstrap. Unknown data or
+other application tables require the supported Doctor/port route. Existing
+private keys are preserved; migration failure never silently creates replacement
+keys. Update older apps after shared credential retirement. Doctor remains the
+recovery path for unsupported or inconsistent source state.
+
+Independent native credential sources remain untouched after their read-only
+import. The previous app can still read them after rollback. The local copy keeps
+source identity and content hash, preserving refreshed tokens for an unchanged
+source and rebuilding after a source change. Consumed JSON imports remain consumed.
 
 ## Automatic setup
 
@@ -134,6 +160,12 @@ retries setup when needed. See
 [Chrome extension](/tools/chrome-extension).
 
 ## Manual recovery
+
+If the bundled runtime exits with an illegal instruction (`SIGILL`), the app stops
+automatic restarts immediately and preserves the crash output in the Gateway log.
+Update or reinstall OpenClaw.app and include that log if the failure persists.
+An independently managed [Node Gateway](/install/node) is an alternative; connect
+the app to it. The app does not automatically switch its bundled runtime to Node.
 
 Read the version to install from the app: choose **About OpenClaw** in the
 menu bar, or run `openclaw-mac status --json`, which reports the app version
@@ -197,11 +229,22 @@ If the pin is invalid, enabling fails with the CLI error; reinstall explicitly w
 `--runtime` or `--runtime-path` to replace the saved pin.
 Disabling it uninstalls the LaunchAgent, which removes the pin.
 
+Runtime intent lives in the daemon-owned local SQLite store
+`<state>/control/services.sqlite`, independently of the selected shared-state
+engine. The app reads typed intent through its bundled CLI; it does not open the
+shared database. Unknown, malformed, or stale intent preserves the service and
+requires an explicit runtime selection before replacement. A pending migration is
+reported as `migrationPending`; update and resume preserve the current runtime
+until Doctor or a CLI start/repair completes it. An app-hosted resume that runs
+neither Doctor nor the CLI start fence may keep the receipt pending; the next
+CLI start/repair or `openclaw doctor` completes it.
+
 A newly installed app-managed Bun service is pinned to
-`<state>/runtime/<runtimeBuildId>/bin/bun`, with the matching package and
-`OPENCLAW_SQLITE_LIBRARY` environment. After an app update, the app reinstalls
-only services it owns whose executable is inside `<state>/runtime/` onto the new
-concrete build. A service using an executable outside that directory stays
+`<state>/runtime/service/bun`, with its matching package and
+`OPENCLAW_SQLITE_LIBRARY` loaded from `<state>/runtime/<runtimeBuildId>/`. After
+an app update, the app reinstalls only services it owns whose executable is
+inside `<state>/runtime/`, keeping the stable Bun path while selecting the new
+concrete build’s package and SQLite library. A service using an executable outside that directory stays
 unchanged, including an unpinned executable. The update window reports
 "Gateway service uses an operator-pinned runtime; update it yourself."
 
@@ -383,7 +426,8 @@ Node resume path; it does not skip the version update or enable the hosting
 toggle early.
 
 Before an app-owned install through the bundled CLI, the app reads runtime intent
-with that same CLI, runtime, and environment using `gateway status --deep --json`.
+with that same CLI, runtime, and environment using `gateway status --runtime-intent-only --json`.
+This local inspection remains available when the Gateway or PostgreSQL is stopped.
 It passes the observed revision and service definition to the installer after its
 final local custody checks. Failed or unknown inspection stops the install. If an
 operator changes the service or runtime pin before installation begins, the CLI

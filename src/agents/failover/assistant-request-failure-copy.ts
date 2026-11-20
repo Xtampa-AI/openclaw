@@ -3,6 +3,7 @@ import { asPositiveSafeInteger } from "@openclaw/normalization-core/number-coerc
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { GatewayStorageFailure } from "../../infra/sqlite-error-diagnostics.js";
+import { classifyGatewayStorageFailure } from "../../infra/sqlite-error-diagnostics.js";
 import { redactSensitiveText } from "../../logging/redact.js";
 import {
   CONTEXT_OVERFLOW_ERROR_MESSAGE,
@@ -44,6 +45,8 @@ export const ERROR_DETAILS_HINT =
   "For details, open Settings → Logs in the Control UI or run `openclaw logs --follow` in your terminal.";
 
 const STORAGE_FAILURE_COPY: Record<GatewayStorageFailure, string> = {
+  unavailable:
+    "The database connection was lost. This operation was rolled back; nothing from it was saved. Please retry.",
   SQLITE_BUSY:
     "OpenClaw is busy saving your conversation. Wait a moment, then check the conversation before trying again.",
   SQLITE_LOCKED:
@@ -56,6 +59,10 @@ const STORAGE_FAILURE_COPY: Record<GatewayStorageFailure, string> = {
     "OpenClaw couldn't save your conversation. Check the storage on the computer running OpenClaw before continuing.",
   transcript_writer_fenced:
     "This conversation changed while OpenClaw was working. Check its latest messages before continuing.",
+  session_actor_reconciliation:
+    "OpenClaw couldn't confirm the last update to this conversation. Some work may have been saved. Wait for current work to finish, then reopen the conversation and check its history before trying again. If it still fails, restart OpenClaw.",
+  "57014":
+    "PostgreSQL canceled a database operation or its statement timed out. Check the conversation for completed work before trying again. If it happens again, ask the operator to check PostgreSQL timeouts and server activity.",
 };
 
 const RUNTIME_COORDINATION_FAILURE_CODE_COPY: Readonly<Record<string, string>> = {
@@ -65,6 +72,9 @@ const RUNTIME_COORDINATION_FAILURE_CODE_COPY: Readonly<Record<string, string>> =
   "runner-offline":
     "The device runner is offline. Reconnect it, retry later, or bring the session back to this gateway.",
 };
+
+const ITEM_CONFLICT_USER_TEXT =
+  "⚠️ The AI service could not recover saved conversation state (item_conflict). Retry this turn. If it still fails, run /compact or choose another model, and share the Gateway logs with the operator.";
 
 const ASSISTANT_REQUEST_FAILURE_COPY = {
   auth: "Couldn't sign in to the AI service. Sign in again under Models in the Control UI or run `openclaw configure`.",
@@ -104,6 +114,9 @@ export function renderAssistantRequestFailureCopy(
   if (facts.storageFailure) {
     return `⚠️ ${STORAGE_FAILURE_COPY[facts.storageFailure]} ${ERROR_DETAILS_HINT}`;
   }
+  if (facts.code === "item_conflict") {
+    return ITEM_CONFLICT_USER_TEXT;
+  }
   if (facts.code === "incomplete_tool_call") {
     return "⚠️ The task couldn't finish. Some actions may have completed; check their results before continuing.";
   }
@@ -116,7 +129,7 @@ export function renderAssistantRequestFailureCopy(
     return `⚠️ ${copy}`;
   }
   const hasStatus =
-    typeof facts.status === "number" &&
+    facts.status !== undefined &&
     Number.isInteger(facts.status) &&
     facts.status >= 100 &&
     facts.status <= 599;
@@ -195,9 +208,17 @@ export function renderFormatErrorCopy(raw: string): string {
 
 /** Share bounded request-limit facts between live failures and persisted chat history. */
 export function renderAssistantFormatFailureCopy(
-  message: { errorMessage?: unknown; errorBody?: unknown; errorType?: unknown },
+  message: {
+    errorMessage?: unknown;
+    errorBody?: unknown;
+    errorType?: unknown;
+    errorCode?: unknown;
+  },
   reason?: FailoverReason | null,
 ): string | undefined {
+  if (message.errorCode === "item_conflict" || message.errorMessage === ITEM_CONFLICT_USER_TEXT) {
+    return ITEM_CONFLICT_USER_TEXT;
+  }
   for (const [isBody, raw] of [
     [true, message.errorBody],
     [false, message.errorMessage],
@@ -206,6 +227,14 @@ export function renderAssistantFormatFailureCopy(
       continue;
     }
     const info = parseApiErrorInfo(raw);
+    if (
+      info?.code === "item_conflict" ||
+      /^(?:LLM request rejected: )?An input item conflicts with an existing record\.$/u.test(
+        info?.message ?? raw.trim(),
+      )
+    ) {
+      return ITEM_CONFLICT_USER_TEXT;
+    }
     if (isBody && !info?.message) {
       continue;
     }
@@ -313,6 +342,7 @@ export function renderRecordedAssistantFailureCopy(message: {
     return formatCopy;
   }
   const classifiedCopy = renderAssistantRequestFailureCopy({
+    storageFailure: classifyGatewayStorageFailure(message),
     code,
     status,
     // The legacy timeout retry bucket also includes explicit server failures.

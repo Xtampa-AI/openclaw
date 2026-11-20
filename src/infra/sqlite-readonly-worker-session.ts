@@ -8,11 +8,16 @@ import { recordChildProcessSpawn } from "../process/spawn-diagnostics.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { registerOpenClawAgentDatabaseReadCandidateResource } from "../state/openclaw-agent-db-resources.js";
+import {
+  assertChildRuntimeAvailable,
+  classifyChildRuntimeFailure,
+} from "./child-runtime-viability.js";
 import { tryProcessCwd } from "./safe-cwd.js";
 import { captureSqliteAuthSchema } from "./sqlite-readonly-auth-schema.js";
 import {
   createSqliteAuthTransferReceiver,
   createSqliteOperationTransferReceiver,
+  type SqliteReadOnlyTransferReply,
 } from "./sqlite-readonly-auth-transfer.js";
 import { retainSnapshotWork } from "./sqlite-readonly-location-cleanup.js";
 import {
@@ -24,6 +29,7 @@ import {
   SQLITE_READONLY_WORKER_MAX_BUFFER,
   type SqliteReadOnlyWorkerMode,
   type SqliteReadOnlyWorkerOptions,
+  type SqliteReadOnlyWorkerResult,
   type SqliteReadOnlyWorkerValue,
 } from "./sqlite-readonly-worker-protocol.js";
 import type {
@@ -55,12 +61,13 @@ export function createSqliteReadOnlyWorkerSession(
     pooledRead?: boolean;
     argv: string[];
     requestArgs: (pathname: string, options: SqliteReadOnlyWorkerOptions) => string[];
-    readBudget: (pathname: string) => { timeoutMs: number; size: string };
+    readBudget: (pathname: string) => Promise<{ timeoutMs: number; size: string }>;
     deadlineOwnedByCaller: () => boolean;
     timeoutError: (pathname: string, timeoutMs: number, size: string) => Error;
     closeTimeoutMs: number;
   },
 ): SqliteReadOnlyWorkerSession {
+  assertChildRuntimeAvailable();
   const env = { ...host.env };
   const cwd = host.cwd;
   const executable = process.execPath;
@@ -164,6 +171,7 @@ export function createSqliteReadOnlyWorkerSession(
   if (host.retainLifetime !== false) {
     void retainSnapshotWork(closed, () => retire(new Error("SQLite snapshot owner stopped")));
   }
+  let receivedMessage = false;
   let spawned = false;
   let nativeClosed = false;
   child.once("spawn", () => {
@@ -183,22 +191,29 @@ export function createSqliteReadOnlyWorkerSession(
               ].join(": "),
               { cause: error },
             ),
-            { code: error.code },
+            { code: error.code, path: error.path },
           ),
     ),
   );
   child.once("close", (code, signal) => {
     nativeClosed = true;
     retired = true;
+    const failure =
+      pending?.failure ??
+      createSqliteReadOnlyWorkerError(
+        `exited with ${signal ? `signal ${signal}` : `code ${code}`}`,
+        stderr,
+      );
+    const runtimeFailure = classifyChildRuntimeFailure({
+      execPath: executable,
+      error: failure,
+      stderr,
+      signal,
+      started: receivedMessage,
+    });
     if (pending) {
       const request = releasePending(pending);
-      request.reject(
-        request.failure ??
-          createSqliteReadOnlyWorkerError(
-            `exited with ${signal ? `signal ${signal}` : `code ${code}`}`,
-            stderr,
-          ),
-      );
+      request.reject(runtimeFailure ?? failure);
     }
     resolveClosed();
   });
@@ -221,62 +236,58 @@ export function createSqliteReadOnlyWorkerSession(
   if (!ready) {
     attachOutput();
   }
-  child.on("message", (message: unknown) => {
-    if (retired) {
-      return;
-    }
-    if (
-      !pending ||
-      !message ||
-      typeof message !== "object" ||
-      Object.keys(message).length !== 2 ||
-      !("id" in message) ||
-      message.id !== pending.id ||
-      !("result" in message)
-    ) {
-      retire(createSqliteReadOnlyWorkerError("returned an unexpected response", stderr));
-      return;
-    }
-    try {
-      let value: SqliteReadOnlyWorkerValue;
-      if (
-        pending.transfer &&
-        !(
-          typeof message.result === "object" &&
-          message.result !== null &&
-          "ok" in message.result &&
-          message.result.ok === false
-        )
-      ) {
-        const reply = pending.transfer.accept(message.result);
-        if ("request" in reply) {
-          sendMessage({ id: pending.id, transfer: reply.request });
-          return;
-        }
-        value = reply.value;
-      } else {
-        value = readSqliteReadOnlyWorkerValue(
-          { kind: "launched", stdout: JSON.stringify(message.result), stderr, status: 0 },
-          pending.mode,
-        );
-      }
-      releasePending(pending).resolve(value);
-    } catch (error) {
-      if (
-        pending &&
-        host.retainOnOperationError &&
-        isSqliteSnapshotStagingMode(pending.mode) &&
-        isSqliteReadOnlyWorkerResult(message.result) &&
-        !message.result.ok
-      ) {
-        releasePending(pending).reject(error);
+  child.on(
+    "message",
+    (message: { id: number; result: SqliteReadOnlyTransferReply | SqliteReadOnlyWorkerResult }) => {
+      receivedMessage = true;
+      if (retired) {
         return;
       }
-      // A failed native close can retain a source lease. Do not reject the
-      // request (and let its staging directory disappear) until process close.
-      retire(error);
-    }
-  });
+      if (
+        !pending ||
+        !message ||
+        typeof message !== "object" ||
+        Object.keys(message).length !== 2 ||
+        !("id" in message) ||
+        message.id !== pending.id ||
+        !("result" in message)
+      ) {
+        retire(createSqliteReadOnlyWorkerError("returned an unexpected response", stderr));
+        return;
+      }
+      try {
+        let value: SqliteReadOnlyWorkerValue;
+        if (pending.transfer && "type" in message.result) {
+          const reply = pending.transfer.accept(message.result);
+          if ("request" in reply) {
+            sendMessage({ id: pending.id, transfer: reply.request });
+            return;
+          }
+          value = reply.value;
+        } else {
+          value = readSqliteReadOnlyWorkerValue(
+            { kind: "launched", stdout: JSON.stringify(message.result), stderr, status: 0 },
+            pending.mode,
+          );
+        }
+        releasePending(pending).resolve(value);
+      } catch (error) {
+        if (
+          pending &&
+          host.retainOnOperationError &&
+          isSqliteSnapshotStagingMode(pending.mode) &&
+          isSqliteReadOnlyWorkerResult(message.result) &&
+          !message.result.ok
+        ) {
+          releasePending(pending).reject(error);
+          return;
+        }
+        // A failed native close can retain a source lease. Do not reject the
+        // request (and let its staging directory disappear) until process close.
+        retire(error);
+      }
+    },
+  );
   const session: SqliteReadOnlyWorkerSession = {
     closed,
     isRetired() {
@@ -321,13 +332,10 @@ export function createSqliteReadOnlyWorkerSession(
         }
       }
       return (pendingOperation = new Promise<SqliteReadOnlyWorkerValue>((resolve, reject) => {
-        const { timeoutMs, size } = host.readBudget(pathname);
         stderr = "";
         outputBytes = 0;
         const abort = () => retire(options.signal?.reason);
-        const timer = host.deadlineOwnedByCaller()
-          ? undefined
-          : setTimeout(() => retire(host.timeoutError(pathname, timeoutMs, size)), timeoutMs);
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const id = ++sequence;
         pending = {
           id,
@@ -349,11 +357,24 @@ export function createSqliteReadOnlyWorkerSession(
           abort();
           return;
         }
-        const send = () => {
-          if (retired) {
-            return;
-          }
+        const send = async () => {
           try {
+            if (!host.deadlineOwnedByCaller()) {
+              const { timeoutMs, size } = await host.readBudget(pathname);
+              if (retired) {
+                return;
+              }
+              timer = setTimeout(
+                () => retire(host.timeoutError(pathname, timeoutMs, size)),
+                timeoutMs,
+              );
+            }
+            if (ready) {
+              await ready;
+              if (retired) {
+                return;
+              }
+            }
             const request = {
               id,
               args: host.requestArgs(pathname, options),
@@ -361,6 +382,7 @@ export function createSqliteReadOnlyWorkerSession(
                 ? {
                     [options.mode === "operation" ? "operation" : "auth"]: {
                       expectedIdentity: options.expectedIdentity,
+                      expectedBirthtime: options.expectedBirthtime,
                       artifactPreserving: options.artifactPreserving,
                       ...(options.mode === "operation"
                         ? { command: serialize(options.command).toString("base64") }
@@ -389,11 +411,7 @@ export function createSqliteReadOnlyWorkerSession(
             retire(error);
           }
         };
-        if (ready) {
-          void ready.then(send);
-        } else {
-          send();
-        }
+        void send();
       }));
     },
     setIdle,

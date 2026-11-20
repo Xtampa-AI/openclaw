@@ -938,11 +938,11 @@ extension DashboardWindowController {
     }
 
     func navigateBack() {
-        self.activeNavigationWebView.goBack()
+        self.nativeBrowser.goBack(in: self.activeNavigationWebView)
     }
 
     func navigateForward() {
-        self.activeNavigationWebView.goForward()
+        self.nativeBrowser.goForward(in: self.activeNavigationWebView)
     }
 
     fileprivate func closeFocusedPanelOrWindow() {
@@ -1388,6 +1388,10 @@ extension DashboardWindowController {
     /// Clearing here covers page/WebKit-initiated main-frame navigations that
     /// never pass through `load(_:)`, so commands queue for the new document.
     func webView(_ webView: WKWebView, didCommit _: WKNavigation!) {
+        if self.nativeBrowser.owns(webView) {
+            self.nativeBrowser.navigationDidCommit(in: webView)
+            return
+        }
         guard webView === self.webView else { return }
         self.documentHost.committed()
         self.invalidateGatewayHealth()
@@ -1460,9 +1464,9 @@ extension DashboardWindowController {
         self.webView(webView, didFail: navigation, withError: error)
     }
 
-    func webView(_ webView: WKWebView, didFail _: WKNavigation!, withError error: Error) {
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         if self.nativeBrowser.owns(webView) {
-            self.nativeBrowser.navigationDidFail(for: webView, error: error)
+            self.nativeBrowser.navigationDidFail(navigation, for: webView, error: error)
             return
         }
         guard webView === self.webView else { return }
@@ -1470,13 +1474,24 @@ extension DashboardWindowController {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        if webView === self.webView {
-            self.finishDocumentLoad(.failure(URLError(.networkConnectionLost)))
-            self.documentHost.hasLiveContent = false
-            self.nativeCommandsReady = false
-            self.invalidateGatewayHealth()
-        } else if self.nativeBrowser.owns(webView) {
-            webView.reload()
+        if webView === self.webView, let page = self.signedOut {
+            // The signed-out page rejects the generic Reload, so redraw it with its own sign-in actions.
+            let progress = self.reconnectTask == nil ? nil : self.signInProgress
+            self.showFailureHTML(
+                DashboardFailurePage.html(
+                    signedOut: page,
+                    signingIn: progress != nil,
+                    browserAttempt: progress?.canOpenBrowser == true ? self.reconnectTask?.id : nil,
+                    error: progress?.error),
+                present: false)
+        } else if webView === self.webView {
+            // A failure page instead of reload: a crash that recurs on load would loop.
+            self.showDashboardFailure(
+                URLError(.networkConnectionLost),
+                message: String(localized: "The dashboard page stopped unexpectedly."),
+                detail: String(localized: "Choose Reload to try loading the dashboard again."))
+        } else if let browser = self.nativeBrowser.browserTab(for: webView) {
+            browser.trackNavigation(webView.reload())
         }
     }
 

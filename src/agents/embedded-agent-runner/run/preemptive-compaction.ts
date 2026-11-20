@@ -2,10 +2,10 @@ import { resolveCompactionReplayPressure } from "@openclaw/ai/transports";
 import type { Model } from "@openclaw/llm-core";
 import type { SessionContextBudgetStatus } from "../../../config/sessions.js";
 import { resolveEffectiveCompactionReserveTokens } from "../../agent-compaction-constants.js";
-import { SAFETY_MARGIN } from "../../compaction-planning.js";
 import type { AgentMessage, StreamFn } from "../../runtime/index.js";
 import { calculateContextTokens, IMAGE_BLOCK_TOKENS } from "../../runtime/index.js";
 import {
+  SAFETY_MARGIN,
   createFreshLlmBoundaryTokenEstimator,
   ESTIMATED_CHARS_PER_TOKEN,
   estimateStringTokenPressure,
@@ -14,7 +14,6 @@ import {
   estimateRenderedPromptTokens,
   estimateToolSchemaTokens,
 } from "../../sessions/context-token-pressure.js";
-import { log } from "../logger.js";
 import type { MeasuredRequestContext } from "../prompt-cache-request-observer.js";
 import { estimateToolResultReductionPotential } from "../tool-result-truncation.js";
 import { MidTurnPrecheckSignal, type MidTurnPrecheckRequest } from "./midturn-precheck.js";
@@ -44,7 +43,6 @@ export type PreemptiveCompactionDecision = CompactionPressureDecision & {
 export type CompactionReplayPressureContext = {
   model: Model;
   sessionId?: string;
-  authProfileId?: string;
   enabled?: boolean;
 };
 
@@ -193,6 +191,7 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
   contextTokenBudget: number;
   reserveTokens: number;
   toolResultMaxChars?: number;
+  estimateRecoverableToolResultChars?: () => number;
   toolSchemaTokens?: number;
   llmBoundaryTokenPressure?: LlmBoundaryTokenPressure;
   replay?: CompactionReplayPressureContext;
@@ -254,22 +253,13 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
   };
 }
 
-/** Price the projected foreground request; persisted usage alone cannot bind its prefix. */
-export function resolveProjectedRequestPressure(params: {
+/** Price a request only after its caller has matched the measured predecessor. */
+export function estimateProjectedRequestTokenPressure(params: {
   context: Parameters<StreamFn>[1];
   previousRequest?: MeasuredRequestContext;
-  contextTokenBudget: number;
-  reserveTokens: number;
-  toolResultMaxChars?: number;
-  replay?: CompactionReplayPressureContext;
-}) {
+}): LlmBoundaryTokenPressure {
   const { context, previousRequest } = params;
-  const anchor =
-    previousRequest &&
-    Number.isFinite(previousRequest.contextTokens) &&
-    previousRequest.contextTokens > 0
-      ? previousRequest
-      : undefined;
+  const anchor = previousRequest && previousRequest.contextTokens > 0 ? previousRequest : undefined;
   const messages = context.messages;
   // Measured completion occupancy includes opaque reasoning. Its async fragments
   // share either identity; unrelated synthetic assistants remain fresh content.
@@ -285,45 +275,39 @@ export function resolveProjectedRequestPressure(params: {
             ),
         )
     : messages;
-  const estimate = createFreshLlmBoundaryTokenEstimator(anchor ? {} : context);
-  // Without a matching prefix, estimate current text but retain measured output:
-  // opaque reasoning can survive a system/tool change without visible token text.
-  const unanchoredCompletionTokens = anchor
-    ? 0
-    : messages.reduce((total, message) => {
-        const usage = message.role === "assistant" ? message.usage?.contextUsage : undefined;
-        const completion =
-          usage?.state === "available" ? usage.totalTokens - usage.promptTokens : 0;
-        return total + (Number.isFinite(completion) ? Math.max(0, completion) : 0);
-      }, 0);
+  const estimate = createFreshLlmBoundaryTokenEstimator(
+    anchor ? {} : { ...context, retainCompletionUsage: true },
+  );
+  return {
+    estimatedPromptTokens:
+      (anchor?.contextTokens ?? 0) + estimate({ messages: appended, prompt: "" }),
+    source: anchor ? "provider_context_usage" : "transcript_estimate",
+  };
+}
+
+/** Price the projected foreground request; persisted usage alone cannot bind its prefix. */
+export function resolveProjectedRequestPressure(params: {
+  context: Parameters<StreamFn>[1];
+  previousRequest?: MeasuredRequestContext;
+  contextTokenBudget: number;
+  reserveTokens: number;
+  toolResultMaxChars?: number;
+  estimateRecoverableToolResultChars?: () => number;
+  replay?: CompactionReplayPressureContext;
+}) {
+  const { context, previousRequest } = params;
+  const anchor = previousRequest && previousRequest.contextTokens > 0 ? previousRequest : undefined;
   const precheck = shouldPreemptivelyCompactBeforePrompt({
     ...params,
-    messages,
+    messages: context.messages,
     systemPrompt: context.systemPrompt,
     toolSchemaTokens: estimateToolSchemaTokenPressure(context.tools),
     prompt: "",
     // A current-run anchor already includes any provider-owned compaction prefix.
     replay: anchor ? undefined : params.replay,
-    llmBoundaryTokenPressure: {
-      estimatedPromptTokens:
-        (anchor?.contextTokens ?? 0) +
-        unanchoredCompletionTokens +
-        estimate({
-          messages: appended,
-          prompt: "",
-        }),
-      source: anchor ? "provider_context_usage" : "transcript_estimate",
-    },
+    llmBoundaryTokenPressure: estimateProjectedRequestTokenPressure(params),
   });
-  const decision = precheck.compactionReplay ?? precheck;
-  log.debug(
-    `[context-overflow-midturn-precheck] provider-bound check route=${decision.route} ` +
-      `messages=${messages.length} pressureSource=${decision.pressureSource} ` +
-      `estimatedPromptTokens=${decision.estimatedPromptTokens} ` +
-      `promptBudgetBeforeReserve=${decision.promptBudgetBeforeReserve} ` +
-      `overflowTokens=${decision.overflowTokens}`,
-  );
-  return decision;
+  return precheck.compactionReplay ?? precheck;
 }
 
 /** Stop before a projected foreground request that no longer fits its budget. */
@@ -344,7 +328,12 @@ function resolveCompactionPressureDecision(
   pressure: Pick<TranscriptBoundaryTokenPressure, "messages" | "estimatedPromptTokens"> & {
     source: string;
   },
-  params: { contextTokenBudget: number; reserveTokens: number; toolResultMaxChars?: number },
+  params: {
+    contextTokenBudget: number;
+    reserveTokens: number;
+    toolResultMaxChars?: number;
+    estimateRecoverableToolResultChars?: () => number;
+  },
 ): CompactionPressureDecision {
   const { estimatedPromptTokens } = pressure;
   const contextTokenBudget = Math.max(1, Math.floor(params.contextTokenBudget));
@@ -354,18 +343,21 @@ function resolveCompactionPressureDecision(
   });
   const promptBudgetBeforeReserve = Math.max(1, contextTokenBudget - effectiveReserveTokens);
   const overflowTokens = Math.max(0, estimatedPromptTokens - promptBudgetBeforeReserve);
-  const toolResultPotential = estimateToolResultReductionPotential({
-    messages: pressure.messages,
-    contextWindowTokens: params.contextTokenBudget,
-    maxCharsOverride: params.toolResultMaxChars,
-  });
+  const toolResultReducibleChars =
+    overflowTokens > 0
+      ? (params.estimateRecoverableToolResultChars?.() ??
+        estimateToolResultReductionPotential({
+          messages: pressure.messages,
+          contextWindowTokens: params.contextTokenBudget,
+          maxCharsOverride: params.toolResultMaxChars,
+        }).maxReducibleChars)
+      : 0;
   const overflowChars = overflowTokens * ESTIMATED_CHARS_PER_TOKEN;
   const truncationBufferChars = TRUNCATION_ROUTE_BUFFER_TOKENS * ESTIMATED_CHARS_PER_TOKEN;
   const truncateOnlyThresholdChars = Math.max(
     overflowChars + truncationBufferChars,
     Math.ceil(overflowChars * 1.5),
   );
-  const toolResultReducibleChars = toolResultPotential.maxReducibleChars;
 
   // Choose truncate-only only when available reduction comfortably exceeds the overflow.
   const route: PreemptiveCompactionRoute =

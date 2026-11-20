@@ -1,16 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { expect, it, vi } from "vitest";
 import type { OpenClawPluginServiceContext } from "../runtime-api.js";
 import { createEmptyAcpxKeyedStore } from "./empty-keyed-store.test-support.js";
+import { fixtureSession, ownerAgentScript } from "./runtime-process.test-support.js";
 import type { CompleteAcpRuntime } from "./runtime-proxy.js";
 import { createAcpxRuntimeService } from "./service.js";
-
-const ownerAgentScript = fileURLToPath(
-  new URL("../../../test/fixtures/acp/owner-agent.mjs", import.meta.url),
-);
 
 it("probes without a default workspace and launches sessions in their requested cwd", async () => {
   await withOpenClawTestState(
@@ -65,9 +62,7 @@ await import(${JSON.stringify(pathToFileURL(ownerAgentScript).href)});
           throw new Error("ACPX backend was not published");
         }
         const handle = await backend.runtime.ensureSession({
-          sessionKey: "agent:main:acp:cwd",
-          agent: "fixture",
-          mode: "persistent",
+          ...fixtureSession("agent:main:acp:cwd"),
           cwd: workspace,
         });
         try {

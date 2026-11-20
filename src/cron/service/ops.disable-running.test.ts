@@ -1,14 +1,13 @@
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import {
-  createCronRegressionState,
   createDueIsolatedJob,
   setupCronRegressionFixtures,
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
-import { createDeferred } from "../../../test/helpers/promise.js";
-import { saveCronStore } from "../store.js";
+import { retireActiveCronTaskRunTracking } from "./active-run-cancellation.js";
 import { stop } from "./ops-lifecycle.js";
 import { update } from "./ops-mutations.js";
 import { run } from "./ops-run.js";
+import { createCronRunFixture, createHeldCronRunner } from "./ops.test-support.js";
 
 const fixtures = setupCronRegressionFixtures({ prefix: "cron-disable-running-" });
 
@@ -20,33 +19,29 @@ it("cancels a forced paused job on explicit disable, but not a display edit", as
     nextRunAtMs: nowMs + 3_600_000,
   });
   job.enabled = false;
-  const started = createDeferred();
-  type Runner = Parameters<typeof createCronRegressionState>[0]["runIsolatedAgentJob"];
-  const release = createDeferred<Awaited<ReturnType<Runner>>>();
-  const runner = vi.fn<Runner>(async () => {
-    started.resolve();
-    return await release.promise;
-  });
-  const { storePath } = fixtures.makeStorePath();
-  await saveCronStore(storePath, { version: 1, jobs: [job] });
-  const state = createCronRegressionState({
-    storePath,
-    nowMs: () => nowMs,
-    runIsolatedAgentJob: runner,
+  const held = createHeldCronRunner();
+  const { state, readJob } = await createCronRunFixture(fixtures.makeStorePath().storePath, job, {
+    runIsolatedAgentJob: held.runner,
   });
   const running = run(state, job.id, "force");
   try {
-    await started.promise;
-    const signal = runner.mock.calls[0]?.[0].abortSignal;
+    await held.started;
+    const signal = held.runner.mock.calls[0]?.[0].abortSignal;
     expect(signal).toBeDefined();
     await update(state, job.id, { description: "Still paused, manually running" });
     expect(signal?.aborted).toBe(false);
 
+    // Teardown can retire the registry while this occurrence still owns its marker.
+    retireActiveCronTaskRunTracking();
     await update(state, job.id, { enabled: false });
     expect(signal?.aborted).toBe(true);
     expect(signal?.reason).toBe("Cron job disabled by operator.");
+    await running;
+    expect((await readJob())?.state.runningAtMs).toBeUndefined();
+    held.release.resolve({ status: "ok" });
+    await expect(run(state, job.id, "force")).resolves.toMatchObject({ ran: true });
   } finally {
-    release.resolve({ status: "ok" });
+    held.release.resolve({ status: "ok" });
     await running;
     stop(state);
   }

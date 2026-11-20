@@ -9,6 +9,7 @@ import type {
 } from "openclaw/plugin-sdk/channel-outbound";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { normalizeMessagePresentation } from "openclaw/plugin-sdk/interactive-runtime";
+import type { dispatchReplyWithBufferedBlockDispatcher } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import {
   isFastModeAutoProgressPayload,
   isReplyPayloadNonTerminalToolErrorWarning,
@@ -19,7 +20,6 @@ import {
   type ReplyPayload,
 } from "openclaw/plugin-sdk/reply-payload";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
-import type { TelegramBotDeps } from "./bot-deps.js";
 import {
   deliverFinalAnswerText,
   handlePreviewFinalizedResult,
@@ -65,9 +65,7 @@ import { applyTextToPayload, markTelegramDroppedControlFallback } from "./intera
 import { createTelegramReasoningStepState } from "./reasoning-lane-coordinator.js";
 import { resolveTelegramTargetChatType } from "./targets.js";
 
-type BufferedDispatchParams = Parameters<
-  TelegramBotDeps["dispatchReplyWithBufferedBlockDispatcher"]
->[0];
+type BufferedDispatchParams = Parameters<typeof dispatchReplyWithBufferedBlockDispatcher>[0];
 type DispatcherOptions = BufferedDispatchParams["dispatcherOptions"];
 type Deliver = DispatcherOptions["deliver"];
 type Skip = NonNullable<DispatcherOptions["onSkip"]>;
@@ -114,6 +112,7 @@ function resolvePayloadTelegramControls(
     },
     {
       allowWebAppButtons: resolveTelegramTargetChatType(String(turn.context.chatId)) === "direct",
+      supportsDisabled: turn.richMessages,
       onDroppedControl: (control) => droppedControls.push(control),
       questionOptionIndices: resolveAskUserQuestionOptionIndices(payload),
     },
@@ -479,7 +478,7 @@ async function deliverReplyWithNormalization(
       if (!suppressProgressAnswerBlock) {
         turn.progressCompositor.resetActivity();
       }
-      return toTelegramReplyDeliveryResult(turn, true);
+      return toTelegramReplyDeliveryResult(turn, !suppressProgressAnswerBlock);
     }
 
     if (segment.lane === "answer" && info.kind === "block") {

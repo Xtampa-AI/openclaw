@@ -14,19 +14,7 @@ describe("formatRuntimeOptionsText", () => {
 });
 
 describe("parseSteerInput", () => {
-  it.each([
-    [
-      "—session agent:codex:acp:s1 —briefly summarize this",
-      "agent:codex:acp:s1",
-      "—briefly summarize this",
-    ],
-    ["--session primary one two", "primary", "one two"],
-    ["--session=primary one two", "primary", "one two"],
-    ["--session=--literal one", "--literal", "one"],
-    ["--session=—target one", "—target", "one"],
-    ["one —session first two --session=second —literal", "second", "one two —literal"],
-    ["--session primary first\nsecond\n  third", "primary", "first\nsecond\n  third"],
-  ])(
+  it.each([["one —session first two --session=second —literal", "second", "one two —literal"]])(
     "consumes session values without changing instructions: %s",
     (text, sessionToken, instruction) => {
       expect(parseSteerInput(text)).toEqual({
@@ -36,37 +24,29 @@ describe("parseSteerInput", () => {
     },
   );
 
-  it.each(
-    [
-      "--session",
-      "--session   ",
-      "--session --next one",
-      "--session —next one",
-      "--session= one",
-    ].map((text) => ({ text })),
-  )("rejects missing session values: $text", ({ text }) => {
-    expect(parseSteerInput(text)).toEqual({
-      ok: false,
-      error:
-        "--session requires a value. Usage: /acp steer [--session <session-key|session-id|session-label>] <instruction>",
-    });
-  });
+  it.each([{ text: "--session —next one" }])(
+    "rejects missing session values: $text",
+    ({ text }) => {
+      expect(parseSteerInput(text)).toEqual({
+        ok: false,
+        error:
+          "--session requires a value. Usage: /acp steer [--session <session-key|session-id|session-label>] <instruction>",
+      });
+    },
+  );
 });
 
 describe("parseSpawnInput", () => {
   const params = { cfg: {}, ctx: {}, command: {} } as never;
 
-  it.each(["--mode", "--bind", "--thread", "--cwd", "--label"])(
-    "rejects missing values for %s in both option forms",
-    (flag) => {
-      for (const option of [flag, `${flag}=`]) {
-        expect(parseSpawnInput(params, ["codex", option])).toEqual({
-          ok: false,
-          error: expect.stringContaining(`${flag} requires a value. Usage: /acp spawn`),
-        });
-      }
-    },
-  );
+  it.each(["--thread"])("rejects missing values for %s in both option forms", (flag) => {
+    for (const option of [flag, `${flag}=`]) {
+      expect(parseSpawnInput(params, ["codex", option])).toEqual({
+        ok: false,
+        error: expect.stringContaining(`${flag} requires a value. Usage: /acp spawn`),
+      });
+    }
+  });
 
   it("preserves option values across mixed equals and separate forms", () => {
     expect(

@@ -43,6 +43,7 @@ import {
 import type { authorizePluginGatewayHttpRequestOrReply } from "./http-auth-utils.js";
 import {
   finishFailedGatewayHttpResponse,
+  finishGatewayHttpDatabaseAdmissionError,
   sendGatewayAuthFailure,
   setDefaultSecurityHeaders,
   isWebSocketUpgradeRequest,
@@ -140,9 +141,7 @@ export function createGatewayHttpRequestHandler(
       ),
     ).catch((error: unknown) => {
       console.error("[gateway-http] failed to finalize request:", error);
-      if (!res.destroyed) {
-        res.destroy(error instanceof Error ? error : undefined);
-      }
+      res.destroy(error instanceof Error ? error : undefined);
     });
   };
 
@@ -161,7 +160,10 @@ export function createGatewayHttpRequestHandler(
           res.end();
         }
       } catch (error) {
-        if (finishGatewayHttpAuthorityError(res, error)) {
+        if (
+          finishGatewayHttpAuthorityError(res, error) ||
+          finishGatewayHttpDatabaseAdmissionError(res, error)
+        ) {
           return undefined;
         }
         console.error("[gateway-http] legacy plugin request failed:", error);
@@ -201,6 +203,11 @@ export function createGatewayHttpRequestHandler(
       if (requestPath === undefined) {
         sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
         return undefined;
+      }
+      // Share documents and images stay fetchable for previews, but never invite
+      // indexing, including static, unavailable, and rejected responses.
+      if (isControlUiSharePath(requestPath, controlUiRouteBasePath)) {
+        res.setHeader("X-Robots-Tag", "noindex, nofollow");
       }
       const remoteRoute = remoteIngress
         ? resolveRemoteControlUiHttpRoute(
@@ -648,7 +655,7 @@ export function createGatewayHttpRequestHandler(
           (await getManagedMediaAttachmentsModule()).handleManagedOutgoingMediaHttpRequest(
             req,
             res,
-            { ...routeAuth, basePath: controlUiRouteBasePath },
+            { ...routeAuth, basePath: controlUiRouteBasePath, clients },
           ),
         false,
         "outgoing-media",
@@ -713,7 +720,10 @@ export function createGatewayHttpRequestHandler(
       respondNotFound(res);
       return undefined;
     } catch (err) {
-      if (finishGatewayHttpAuthorityError(res, err)) {
+      if (
+        finishGatewayHttpAuthorityError(res, err) ||
+        finishGatewayHttpDatabaseAdmissionError(res, err)
+      ) {
         return undefined;
       }
       console.error("[gateway-http] unhandled error in request handler:", err);

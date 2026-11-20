@@ -15,6 +15,7 @@ import {
   formatExternalSupervisorUpdateRequired,
   isGatewayExternallySupervised,
 } from "../../infra/gateway-supervision.js";
+import { readInstallOwner } from "../../infra/install-owner.js";
 import { resolveOpenClawPackageRootSync } from "../../infra/openclaw-root.js";
 import { settlePendingPackageActivation } from "../../infra/package-update-activation.js";
 import { resolveUpdateInstallKind } from "../../infra/update-check.js";
@@ -26,7 +27,6 @@ import { readDevUpdateTarget } from "../../infra/update-dev-target.js";
 import { createUpdatePreflightDiagnostics } from "../../infra/update-failure-facts.js";
 import { normalizeUpdateFailureResult } from "../../infra/update-failure-result.js";
 import { resolveUpdateInstallRoot } from "../../infra/update-install-root.js";
-import { cleanupStaleManagedServiceUpdateHandoffs } from "../../infra/update-managed-service-handoff-cleanup.js";
 import {
   POST_CORE_UPDATE_CHANNEL_ENV,
   POST_CORE_UPDATE_ENV,
@@ -36,6 +36,10 @@ import {
   resolveManagedUpdateRequester,
 } from "../../infra/update-requester-authority.js";
 import { normalizeControlPlaneUpdateResult } from "../../infra/update-restart-sentinel-payload.js";
+import {
+  readUpdateResultPolicy,
+  sendUpdateResultTelemetry,
+} from "../../infra/update-result-telemetry.js";
 import { readUpdateRunDriver } from "../../infra/update-run-driver.js";
 import {
   adoptUpdateRun,
@@ -43,6 +47,7 @@ import {
   finishUpdateRun,
   getUpdateRun,
   heartbeatUpdateRun,
+  reconcileAbandonedUpdateRunsAsync,
   recordUpdateRunPhase,
   recordUpdateRunDiagnostics,
   recordUpdateRunStep,
@@ -70,9 +75,10 @@ import {
 import { loadInstalledPluginIndexInstallRecords } from "../../plugins/installed-plugin-index-records.js";
 import { defaultRuntime } from "../../runtime.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
-import { assertOpenClawStateWriteAllowedAtPath } from "../../state/openclaw-state-ownership.js";
+import { assertOpenClawStateWriteAllowedAtPath } from "../../state/openclaw-state-ownership-preflight.js";
 import { VERSION } from "../../version.js";
 import { exitCliAfterOutput } from "../one-shot-exit.js";
+import { reportHostOwnedUpdate } from "./host-owned.js";
 import type { UpdateDisplayProgress } from "./progress.js";
 import {
   parseUpdateChannel,
@@ -83,7 +89,6 @@ import {
 import { suppressDeprecations } from "./suppress-deprecations.js";
 import { resolveForegroundUpdateAdmission } from "./update-command-handoff.js";
 import type { UpdateInitializationAdmission } from "./update-command-initialization-types.js";
-import { resolveMutableUpdateInstallKind } from "./update-command-install-kind.js";
 import {
   admitMutableUpdateSignalRun,
   retireMutableUpdateSignalLedgerRecording,
@@ -184,6 +189,7 @@ export async function admitUpdateCommandRun(params: {
   expectedForeground?: true;
   initialization?: UpdateInitializationAdmission;
   assertCurrent?: () => void;
+  onAdmitted?: (run: NonNullable<UpdateCommandOptions["run"]>) => void | Promise<void>;
 }): Promise<NonNullable<UpdateCommandOptions["run"]>> {
   assertUpdatePackageActivationAdmission(params.root, {
     serviceRoot: params.serviceRoot,
@@ -213,6 +219,8 @@ export async function admitUpdateCommandRun(params: {
       params.opts.run?.completionOwner === "gateway-restart" ||
       undefined,
   });
+  // Read reporting policy first: nothing may yield between activation admission and creation.
+  const reportResult = params.opts.dryRun !== true && (await readUpdateResultPolicy(env));
   assertUpdatePackageActivationAdmission(params.root, {
     serviceRoot: params.serviceRoot,
     dryRun: params.opts.dryRun,
@@ -228,6 +236,7 @@ export async function admitUpdateCommandRun(params: {
       runId: env[UPDATE_RUN_ID_ENV]?.trim() || params.initialization?.runId,
       trigger: "cli",
       preview: params.opts.dryRun === true,
+      reportResult,
       origin: { driver, admission: { owner: "installed" } },
       supersedeStaleIdentityless:
         !env[UPDATE_RUN_ID_ENV]?.trim() && env[POST_CORE_UPDATE_ENV] !== "1",
@@ -244,29 +253,17 @@ export async function admitUpdateCommandRun(params: {
     ledgerOptions,
   );
   const record = adoptUpdateRun(created.runId, ledgerOptions);
-  const requester = resolveManagedUpdateRequester(record.origin.requester);
-  const requesterAuthority = requester?.authorizationSource?.startsWith("profile:")
-    ? Object.freeze({
-        requester: Object.freeze({ ...requester }),
-        isCurrent: () => {
-          throw new Error("Profile update continuation has not acquired its native owner.");
-        },
-      })
-    : requester
-      ? await createManagedUpdateRequesterAuthority(requester, env)
-      : undefined;
-  const run = {
+  const run: NonNullable<UpdateCommandOptions["run"]> = {
     runId: record.runId,
     originalRecoveryCapture:
       params.initialization?.originalRecoveryCapture ?? params.opts.run?.originalRecoveryCapture,
     defaultStepTimeoutMs: record.trigger === "campaign" ? AUTO_UPDATE_STEP_TIMEOUT_MS : undefined,
-    env,
+    ...ledgerOptions,
     ...(record.trigger !== "cli" &&
     meta?.runId === record.runId &&
     meta.completionOwner === "gateway-restart"
       ? { completionOwner: "gateway-restart" as const }
       : {}),
-    ...(requesterAuthority ? { requesterAuthority } : {}),
   };
   if (
     !env[UPDATE_RUN_ID_ENV] &&
@@ -279,6 +276,29 @@ export async function admitUpdateCommandRun(params: {
       admitMutableUpdateSignalRun(run, record);
     }
   }
+  // Adoption grants this invocation the run; register its terminal owner before
+  // any fallible enrichment can strand the committed row without a result.
+  await params.onAdmitted?.(run);
+  params.assertCurrent?.();
+  if (!params.opts.dryRun && !env[UPDATE_RUN_ID_ENV]?.trim()) {
+    // Create the ledger before opening its reader; later update work may relocate it.
+    await reconcileAbandonedUpdateRunsAsync(
+      { excludeRunId: record.runId },
+      { ...ledgerOptions, snapshot: true },
+    );
+    params.assertCurrent?.();
+  }
+  const requester = resolveManagedUpdateRequester(record.origin.requester);
+  run.requesterAuthority = requester?.authorizationSource?.startsWith("profile:")
+    ? Object.freeze({
+        requester: Object.freeze({ ...requester }),
+        isCurrent: () => {
+          throw new Error("Profile update continuation has not acquired its native owner.");
+        },
+      })
+    : requester
+      ? await createManagedUpdateRequesterAuthority(requester, env)
+      : undefined;
   return run;
 }
 
@@ -319,12 +339,12 @@ export function createUpdateRunProgress(
     pendingSteps,
     onRollbackOutcome: (rollbackOutcome) => {
       if (!deferred) {
-        recordUpdateRunVerification(run.runId, { rollbackOutcome }, { env: run.env });
+        recordUpdateRunVerification(run.runId, { rollbackOutcome }, run);
       }
     },
     onHeartbeat() {
       if (!deferred) {
-        heartbeatUpdateRun(run.runId, driver, { env: run.env });
+        heartbeatUpdateRun(run.runId, driver, run);
       }
     },
     deferLedgerWrites() {
@@ -414,7 +434,7 @@ export function completeUpdateCommandRun(
   if (recoveries.some(({ record }) => isUpdateRecoveryPending(record))) {
     return { ...result, status: "error", reason: "update-recovery-pending", runId: run.runId };
   }
-  const recordOptions = { env: run.env, redactPaths: result.root ? [result.root] : [] };
+  const recordOptions = { ...run, redactPaths: result.root ? [result.root] : [] };
   // Both finalization and outer CLI unwind come here. A verified restored generation
   // stays with its helper until native recovery finishes; neither caller may close it early.
   const helperRecoveryPending =
@@ -445,6 +465,7 @@ export function completeUpdateCommandRun(
         downtimeMs: completion.downtimeMs,
       },
       recordOptions,
+      (payload) => void sendUpdateResultTelemetry(payload, { env: run.env }),
     );
     if (result.verification) {
       result.recovery = finished.verification.recovery ?? undefined;
@@ -516,7 +537,18 @@ export async function prepareUpdateCommand(opts: UpdateCommandOptions) {
   // The shim can move during preparation; the loaded module owns the executing generation.
   const executingRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });
   const discoveredRoot = opts.sourceUpdate?.root ?? (await resolveUpdateRoot());
-  const installKind = await resolveMutableUpdateInstallKind(discoveredRoot, opts, timeoutMs);
+  const installKind = await resolveUpdateInstallKind(discoveredRoot, { timeoutMs });
+  if (installKind === "host") {
+    reportHostOwnedUpdate(await readInstallOwner(discoveredRoot), opts);
+  }
+  if (installKind === "immutable") {
+    throw new Error(
+      "Immutable installations require the native immutable openclaw update entry point.",
+    );
+  }
+  if (opts.sha !== undefined) {
+    throw new Error("--sha requires an adopted immutable installation.");
+  }
   if (!postCoreUpdateResume && opts.dryRun !== true && isGatewayExternallySupervised()) {
     throw new Error(formatExternalSupervisorUpdateRequired());
   }
@@ -640,8 +672,6 @@ export async function prepareMutableUpdateRuntime(
   fence: UpdateRecoveryFence,
 ) {
   return await withOwnedManagedUpdateEnv(env, async () => {
-    fence.assertCurrent();
-    await cleanupStaleManagedServiceUpdateHandoffs().catch(() => undefined);
     fence.assertCurrent();
     await assertOpenClawStateWriteAllowedAtPath({
       databasePath: resolveOpenClawStateSqlitePath(process.env),

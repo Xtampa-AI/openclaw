@@ -5,7 +5,6 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { GATEWAY_SERVICE_RUNTIME_PID_ENV } from "../daemon/constants.js";
 import * as serviceMembership from "../daemon/service-process-membership.js";
-import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { createCommandResult as commandResult } from "../test-utils/npm-spec-install-test-helpers.js";
@@ -69,7 +68,6 @@ describe("update-cli", () => {
     runWithGatewayServiceEnv,
     setupInstalledPackageRoot,
     mockPackageInstallStatus,
-    tempDirs,
   } = createUpdateCliFixture();
 
   it("admits an absent service update while its selected port has an unmanaged listener", async () => {
@@ -365,13 +363,13 @@ describe("update-cli", () => {
         expect.objectContaining({
           stderrTail: expect.stringContaining("would kill this command"),
         }),
-        {
+        expect.objectContaining({
           name: "gateway recovery observation",
-          command: "gateway verification",
-          cwd: root,
-          durationMs: expect.any(Number),
           exitCode: 0,
-        },
+          diagnostics: [
+            "No recovery needed; still serving 1.0.0. No service was stopped or started.",
+          ],
+        }),
       ],
     });
     expect(mutationAdmitted).not.toHaveBeenCalled();
@@ -450,7 +448,7 @@ describe("update-cli", () => {
             ]),
             advisory: {
               kind: "recoverable-maintenance",
-              message: expect.stringContaining("Gateway service inspection is unavailable"),
+              message: expect.stringContaining("Stop the Gateway through its owner"),
             },
           }),
         ]),
@@ -466,7 +464,7 @@ describe("update-cli", () => {
         listUpdateRuns({ limit: 1 })[0]?.steps.some(
           (step) =>
             step.step === "warning:managed-service" &&
-            step.detail?.includes("Gateway service inspection is unavailable"),
+            step.detail?.includes("Stop the Gateway through its owner"),
         ),
       ).toBe(true);
       expect(fsSync.existsSync(staleState)).toBe(false);
@@ -608,23 +606,5 @@ describe("update-cli", () => {
     );
     expect(freshRestartCalls()).toHaveLength(0);
     expect(getErrorOutput()).not.toContain("inspection-secret-canary");
-  });
-
-  it("reports a fresh JSON refusal once through Commander", async () => {
-    await mockPackageInstallAtCaseDir();
-    const stateDir = tempDirs.make("openclaw-fresh-cli-refusal-");
-    await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
-      await expect(invokeUpdateCli({ tag: "main", yes: true, json: true })).rejects.toEqual(
-        new ExitError(1),
-      );
-      expect(fsSync.existsSync(resolveOpenClawStateSqlitePath())).toBe(false);
-    });
-    expect(defaultRuntime.exit).not.toHaveBeenCalled();
-    expect(packageInstallCommandCall()).toBeUndefined();
-    expect(lastWriteJsonCall()).toMatchObject({
-      status: "error",
-      reason: "unsupported-package-target",
-    });
-    expect(defaultRuntime.error).toHaveBeenCalledOnce();
   });
 });

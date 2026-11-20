@@ -1,5 +1,6 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { validateConfigObjectRaw } from "../config/validation-core.js";
 import {
   createDoctorHealthFlowContext,
   resolveDoctorHealthContributions,
@@ -24,7 +25,7 @@ function legacyOutputCapContribution() {
 }
 
 function customProvider(maxTokens: number): OpenClawConfig {
-  return {
+  const parsed = validateConfigObjectRaw({
     models: {
       providers: {
         custom: {
@@ -33,7 +34,11 @@ function customProvider(maxTokens: number): OpenClawConfig {
         },
       },
     },
-  } as unknown as OpenClawConfig;
+  });
+  if (!parsed.ok) {
+    throw new Error(JSON.stringify(parsed.issues));
+  }
+  return parsed.config;
 }
 
 it("prints saved legacy output caps as a doctor note without failing health", async () => {
@@ -45,13 +50,16 @@ it("prints saved legacy output caps as a doctor note without failing health", as
 
   expect(note).toHaveBeenCalledTimes(1);
   const [text, title] = note.mock.calls[0] as [string, string];
-  expect(title).toBe("Doctor information");
-  expect(text).toContain('Provider "custom" pins maxTokens');
+  expect(title).toBe("Model output caps");
+  expect(text).toContain('Provider "custom" has saved maxTokens values');
+  expect(text).toContain("may leave the output cap unchanged or lower it");
   expect(text).toContain("big-model (4096)");
   expect(text).toContain("remove maxTokens");
   expect(ctx.healthOk).not.toBe(false);
   expect(ctx.cfg).toEqual(before);
-  expect(ctx.updateWarnings ?? []).toEqual([]);
+  expect(ctx.healthFindings?.map((finding) => finding.checkId)).toEqual([
+    "core/doctor/legacy-output-cap",
+  ]);
 });
 
 it("stays quiet when no saved output cap matches a former default", async () => {
@@ -60,5 +68,5 @@ it("stays quiet when no saved output cap matches a former default", async () => 
   await legacyOutputCapContribution().run(ctx);
 
   expect(note).not.toHaveBeenCalled();
-  expect(ctx.updateWarnings ?? []).toEqual([]);
+  expect(ctx.healthFindings ?? []).toEqual([]);
 });

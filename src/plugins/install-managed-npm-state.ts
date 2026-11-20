@@ -2,8 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { NpmSpecResolution } from "../infra/install-source-utils.js";
-import { parseRegistryNpmSpec } from "../infra/npm-registry-spec.js";
+import { parseRegistryNpmSpec, type NpmSpecResolution } from "../infra/npm-registry-spec.js";
 import { isNotFoundPathError } from "../infra/path-guards.js";
 import {
   resolvePluginNpmGenerationProjectDir,
@@ -60,42 +59,6 @@ export type ManagedNpmProjectQuarantine = {
   quarantineDir: string;
   movedArtifactNames: string[];
 };
-
-type ManagedNpmRootPrepareDependencyResult =
-  | { ok: true; dependencySpec: string }
-  | {
-      ok: false;
-      error: string;
-    };
-
-export type ManagedNpmRootDependencySpecPreparation = (params: {
-  npmRoot: string;
-}) => Promise<ManagedNpmRootPrepareDependencyResult>;
-
-export async function resolveManagedNpmRootDependencySpecForInstall(params: {
-  npmRoot: string;
-  packageName: string;
-  dependencySpec?: string;
-  prepareDependencySpec?: ManagedNpmRootDependencySpecPreparation;
-}): Promise<ManagedNpmRootPrepareDependencyResult> {
-  if (params.prepareDependencySpec) {
-    try {
-      return await params.prepareDependencySpec({ npmRoot: params.npmRoot });
-    } catch (error) {
-      return {
-        ok: false,
-        error: `Failed to prepare managed npm dependency for ${params.packageName}: ${String(error)}`,
-      };
-    }
-  }
-  if (params.dependencySpec === undefined) {
-    return {
-      ok: false,
-      error: `missing managed npm dependency spec for ${params.packageName}`,
-    };
-  }
-  return { ok: true, dependencySpec: params.dependencySpec };
-}
 
 export function isManagedNpmProjectCorruptionInstallFailure(result: {
   stdout: string;

@@ -1,175 +1,140 @@
-import { logWarn } from "../../../logger.js";
+import { finishGoalContinuationSettlement } from "../../../auto-reply/reply/goal-continuation-return.js";
 import type { DeliveryContext } from "../../../utils/delivery-context.shared.js";
 import type {
   RequesterSettleWakeState,
   SubagentRunRecord,
 } from "../registry/subagent-registry.types.js";
+import { isSubagentObligationRetired } from "../registry/subagent-requester-settle-identity.js";
 import { isSameSubagentRun, isSameSubagentRunOwner } from "../registry/subagent-run-generation.js";
+import { hasSubagentRunEnded } from "../registry/subagent-run-liveness.js";
+import { finalizeRequesterFinalAttachment } from "../requester-final-attachment.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
-
-/** Delivered findings stay consumed unless restart reconciliation still owns them. */
-export function needsRequesterSettleFindings(entry: SubagentRunRecord): boolean {
-  return (
-    entry.delivery?.status !== "delivered" ||
-    entry.execution.interruptionReason === "gateway-restart"
-  );
-}
 
 export type RequesterSettleWakeBatchState = Omit<RequesterSettleWakeState, "retireAfterSettle">;
 
+const REQUESTER_SETTLE_WAKE_MAX_ATTEMPTS = 3;
+const REQUESTER_SETTLE_WAKE_RETRY_DELAYS_MS = [30_000, 120_000] as const;
+
+export function isRequesterSettleMemberReady(entry: SubagentRunRecord): boolean {
+  return (
+    entry.execution.status !== "running" &&
+    entry.pauseReason !== "sessions_yield" &&
+    hasSubagentRunEnded(entry)
+  );
+}
+
+export function needsRequesterSettleFindings(entry: SubagentRunRecord): boolean {
+  return entry.delivery?.status !== "delivered";
+}
+
+/**
+ * Only a known missing result, or an effect-free run whose transcript write was
+ * rejected or aborted, or saved-state repair may mint another public continuation; private retries reconcile.
+ */
+export function resolveRequesterSettleRetryState(params: {
+  state: RequesterSettleWakeBatchState;
+  delivery: SubagentAnnounceDeliveryResult;
+  attemptCount: number;
+  parentOnly: boolean;
+  now: number;
+}): RequesterSettleWakeBatchState | undefined {
+  const { state, delivery, attemptCount, parentOnly } = params;
+  const retryDelay = REQUESTER_SETTLE_WAKE_RETRY_DELAYS_MS[attemptCount - 1];
+  if (
+    delivery.disposition !== "retryable" ||
+    (!parentOnly &&
+      delivery.reason !== "visible_reply_missing" &&
+      delivery.reason !== "requester_state_conflict" &&
+      delivery.reason !== "requester_aborted" &&
+      delivery.reason !== "requester_transcript_conflict") ||
+    delivery.reason === "requester_abandoned" ||
+    attemptCount >= REQUESTER_SETTLE_WAKE_MAX_ATTEMPTS ||
+    retryDelay === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...state,
+    status: "pending",
+    attemptCount,
+    nextAttemptAt: params.now + retryDelay,
+    lastError: delivery.error ?? delivery.reason ?? "undelivered",
+  };
+}
+
 type RequesterSettleWakeBatchCallbacks = {
+  recordRequesterDelivery?: (
+    batch: readonly SubagentRunRecord[],
+    fact: NonNullable<NonNullable<SubagentRunRecord["delivery"]>["requesterDelivery"]>,
+    onPublished: (entries: readonly SubagentRunRecord[]) => void,
+  ) => Promise<void>;
   transitionBatch: (
     batch: readonly SubagentRunRecord[],
     state: RequesterSettleWakeBatchState,
-    onPublished: (entries: readonly SubagentRunRecord[]) => void,
+    onPublished?: (entries: readonly SubagentRunRecord[]) => void,
+    requesterDelivery?: NonNullable<SubagentRunRecord["delivery"]>["requesterDelivery"],
   ) => void | Promise<void>;
   completeBatch: (
     batch: readonly SubagentRunRecord[],
     rearmGeneration?: number,
     delivery?: SubagentAnnounceDeliveryResult,
-    onCommitted?: () => void,
+    onCommitted?: () => void | Promise<void>,
   ) => void | Promise<void>;
 };
+
+/** Finalize the full cohort only after its outcome's durable commit. */
+export function createRequesterSettleBatchCompletion(params: {
+  completeBatch: RequesterSettleWakeBatchCallbacks["completeBatch"];
+  requesterAgentId?: string;
+  requesterSessionKey: string;
+  pause: boolean;
+}) {
+  return async (
+    batch: readonly SubagentRunRecord[],
+    state: RequesterSettleWakeBatchState,
+    delivery?: SubagentAnnounceDeliveryResult,
+    requesterSessionId?: string,
+  ): Promise<void> => {
+    await params.completeBatch(batch, state.rearmGeneration, delivery, async () => {
+      finalizeRequesterFinalAttachment({
+        requesterAgentId: params.requesterAgentId,
+        requesterSessionKey: params.requesterSessionKey,
+        requesterSessionId,
+        batchRunIds: batch.map((entry) => entry.runId).toSorted(),
+        rearmGeneration: state.rearmGeneration,
+        requesterYieldBatch: state.requesterYieldBatch,
+        pause: params.pause,
+        delivered: delivery?.delivered,
+        finalAssistantVisibleText: delivery?.finalAssistantVisibleText,
+      });
+      if (!params.pause) {
+        await finishGoalContinuationSettlement(batch, delivery?.delivered === true);
+      }
+    });
+  };
+}
 
 export type RequesterSettleWakeParams = RequesterSettleWakeBatchCallbacks & {
   requesterSessionKey: string;
   requesterOrigin?: DeliveryContext;
   settledEntry: SubagentRunRecord;
   signal?: AbortSignal;
+  onAccepted?: () => void;
   isSourceCurrent: () => boolean;
+  onDescendantsPending?: (deadline?: number) => void;
 };
 
-const activeRequesterSettleWakeBatches = new Map<string, () => boolean>();
-const REQUESTER_SETTLE_WAKE_MAX_DEFERRALS = 10;
-
-/** Reads stay independent; the first prepared decision owns mutation and delivery. */
-export function createRequesterSettleBatchClaim(
-  key: string,
-  isGatewayCurrent: (() => boolean) | undefined,
-) {
-  const hadGatewayContext = isGatewayCurrent?.() === true;
-  if (isGatewayCurrent && !hadGatewayContext) {
-    return undefined;
-  }
-  const isGatewayClosed = () => {
-    try {
-      return hadGatewayContext && !isGatewayCurrent?.();
-    } catch {
-      // An incompatible captured batch cannot block a fresh Gateway owner.
-      return hadGatewayContext;
-    }
-  };
-  return {
-    isGatewayClosed,
-    claim: (): boolean => {
-      const owner = activeRequesterSettleWakeBatches.get(key);
-      if (owner === isGatewayClosed) {
-        return true;
-      }
-      if (owner?.() === false) {
-        return false;
-      }
-      activeRequesterSettleWakeBatches.set(key, isGatewayClosed);
-      return true;
-    },
-    release(): void {
-      if (activeRequesterSettleWakeBatches.get(key) === isGatewayClosed) {
-        activeRequesterSettleWakeBatches.delete(key);
-      }
-    },
-  };
-}
-
-export function retainedYieldIdentity(state: RequesterSettleWakeBatchState) {
-  return {
-    ...(state.pauseNotice ? { pauseNotice: state.pauseNotice } : {}),
-    ...(state.requesterYieldBatch === true ? { requesterYieldBatch: true as const } : {}),
-    ...(state.afterRequesterYield === true ? { afterRequesterYield: true as const } : {}),
-    ...(state.yieldedFinalDeliverable === true ? { yieldedFinalDeliverable: true as const } : {}),
-    ...(state.rearmGeneration !== undefined ? { rearmGeneration: state.rearmGeneration } : {}),
-  };
-}
-
-export function startRequesterSettleWakeAttempt(
-  state: RequesterSettleWakeBatchState,
-  batchRunIds: RequesterSettleWakeBatchState["batchRunIds"],
-  admissionMarker: Pick<RequesterSettleWakeBatchState, "yieldedFinalDeliverable">,
-): RequesterSettleWakeBatchState {
-  return {
-    status: "dispatching",
-    attemptCount: state.attemptCount + 1,
-    batchRunIds,
-    deferralCount: state.deferralCount,
-    ...retainedYieldIdentity(state),
-    ...admissionMarker,
-  };
-}
-
-export function deferRequesterSettleWakePreparation(
-  state: RequesterSettleWakeBatchState,
-): RequesterSettleWakeBatchState {
-  return { ...state, nextAttemptAt: Date.now() + 30_000 };
-}
-
-/** Returns true when the stale-descendant wait is spent and this batch may dispatch. */
-export function createRequesterSettleBatchDeferral(params: {
-  readDescendants: () => Promise<{ active: number } | undefined>;
-  claimCurrentBatch: () => boolean;
-  readState: () => RequesterSettleWakeBatchState;
-  transitionBatch: (state: RequesterSettleWakeBatchState) => Promise<void>;
-  batchRunIds: RequesterSettleWakeBatchState["batchRunIds"];
-  retryDelayMs: number;
-}) {
-  return async (
-    overrides: Partial<Pick<RequesterSettleWakeBatchState, "status" | "lastError">> = {},
-    countTowardsLimitOverride?: boolean,
-  ): Promise<boolean> => {
-    let countTowardsLimit = countTowardsLimitOverride;
-    if (countTowardsLimit === undefined) {
-      const descendants = await params.readDescendants();
-      if (!descendants) {
-        return false;
-      }
-      countTowardsLimit = descendants.active === 0;
-    }
-    if (!params.claimCurrentBatch()) {
-      return false;
-    }
-    const state = { ...params.readState(), ...overrides };
-    const now = Date.now();
-    if ((state.nextAttemptAt ?? 0) > now) {
-      return false;
-    }
-    // Active work still defers delivery, but cannot recharge a spent wait.
-    const deferralCount =
-      (state.deferralCount ?? 0) >= REQUESTER_SETTLE_WAKE_MAX_DEFERRALS
-        ? REQUESTER_SETTLE_WAKE_MAX_DEFERRALS
-        : countTowardsLimit
-          ? (state.deferralCount ?? 0) + 1
-          : 0;
-    if (countTowardsLimit && deferralCount >= REQUESTER_SETTLE_WAKE_MAX_DEFERRALS) {
-      if (state.deferralCount !== deferralCount) {
-        await params.transitionBatch({ ...state, deferralCount });
-      }
-      // An ended descendant whose own delivery never settles must not cost
-      // this batch its completed results: stop waiting and deliver them.
-      logWarn(
-        `requester settle wake stopped waiting for unsettled descendants after ${deferralCount} deferrals; delivering the drained batch`,
-      );
-      return true;
-    }
-    await params.transitionBatch({
-      status: state.status,
-      attemptCount: state.attemptCount,
-      ...(state.replayCount !== undefined ? { replayCount: state.replayCount } : {}),
-      nextAttemptAt: Math.max(state.nextAttemptAt ?? 0, now + params.retryDelayMs),
-      batchRunIds: params.batchRunIds,
-      ...retainedYieldIdentity(state),
-      ...(state.lastError !== undefined ? { lastError: state.lastError } : {}),
-      deferralCount,
-    });
+export function waitForRequesterDescendants(
+  facts: { unsettled: boolean; active: number; deliveryWaitUntil?: number },
+  frozen: boolean,
+  onPending?: (deadline?: number) => void,
+): boolean {
+  const active = !frozen || facts.active > 0;
+  if (!facts.unsettled || (!active && (facts.deliveryWaitUntil ?? 0) <= Date.now())) {
     return false;
-  };
+  }
+  onPending?.(active ? undefined : facts.deliveryWaitUntil);
+  return true;
 }
 
 export function readSharedBatchState(
@@ -178,14 +143,15 @@ export function readSharedBatchState(
   const states = batch
     .map((entry) => entry.requesterSettleWake)
     .filter((state): state is RequesterSettleWakeState => Boolean(state));
-  const dispatching = states.find((state) => state.status === "dispatching");
-  const source = dispatching ?? states[0];
+  const source = states.find((state) => state.status === "dispatching") ?? states[0];
   return {
     status: source?.status ?? "pending",
-    ...(source?.pauseNotice ? { pauseNotice: source.pauseNotice } : {}),
-    attemptCount: Math.max(0, ...states.map((state) => state.attemptCount)),
-    ...(source?.replayCount !== undefined ? { replayCount: source.replayCount } : {}),
+    attemptCount: Math.max(0, ...states.map((state) => state.attemptCount ?? 0)),
+    ...(source?.privateInput ? { privateInput: source.privateInput } : {}),
     ...(source?.nextAttemptAt !== undefined ? { nextAttemptAt: source.nextAttemptAt } : {}),
+    ...(source?.lastError !== undefined ? { lastError: source.lastError } : {}),
+    ...(source?.progressOperationId ? { progressOperationId: source.progressOperationId } : {}),
+    ...(source?.pauseNotice ? { pauseNotice: source.pauseNotice } : {}),
     ...(source?.batchRunIds ? { batchRunIds: [...source.batchRunIds] } : {}),
     ...(states.some((state) => state.requesterYieldBatch === true)
       ? { requesterYieldBatch: true }
@@ -195,9 +161,30 @@ export function readSharedBatchState(
       : {}),
     ...(source?.yieldedFinalDeliverable === true ? { yieldedFinalDeliverable: true } : {}),
     ...(source?.rearmGeneration !== undefined ? { rearmGeneration: source.rearmGeneration } : {}),
-    ...(source?.lastError !== undefined ? { lastError: source.lastError } : {}),
-    deferralCount: Math.max(0, ...states.map((state) => state.deferralCount ?? 0)),
   };
+}
+
+/** Cancellation closes a wave only after its current task ownership is considered. */
+export function isRequesterSettleDeliveryClosed(params: {
+  requesterRun: SubagentRunRecord | null | undefined;
+  currentRequester: SubagentRunRecord | null | undefined;
+  currentRuns: readonly SubagentRunRecord[];
+  batch: readonly SubagentRunRecord[];
+  requesterYieldBatch: boolean;
+}): boolean {
+  const { requesterRun, currentRequester, currentRuns } = params;
+  const currentBatch = params.batch.map(
+    (entry) => currentRuns.find((current) => isSameSubagentRunOwner(current, entry)) ?? entry,
+  );
+  return (
+    requesterRun?.killReconciliation?.suppressTaskDelivery === true ||
+    requesterRun?.suppressCompletionDelivery === true ||
+    currentRequester?.killReconciliation?.suppressTaskDelivery === true ||
+    currentRequester?.suppressCompletionDelivery === true ||
+    // A yielded cohort reports the members it still holds; requester-wide cancellation
+    // already removed its own. An ordinary wave owes nothing once every member retired.
+    (!params.requesterYieldBatch && currentBatch.every(isSubagentObligationRetired))
+  );
 }
 
 export function captureRequesterRunOwner(requesterRun: SubagentRunRecord | null | undefined) {
@@ -252,9 +239,13 @@ export function resolveRequesterSettlePolicy(
       : {}),
   };
   const admissionMarker = yieldedFinalDeliverable ? { yieldedFinalDeliverable: true as const } : {};
-  // A yield still resumes the requester, but already consumed findings need not
-  // cause another visible final. Restart reconciliation remains owed.
+  // A prior wake may already have consumed every result in this yielded cohort.
   const requireVisibleReply =
     requesterYielded && !hasPrivateRows && completionRows.some(needsRequesterSettleFindings);
   return { privateRows, requireVisibleReply, parentOnly, requesterBinding, admissionMarker };
+}
+
+/** The bounded dispatch budget does not limit receipt-only settlement. */
+export function hasExhaustedRequesterSettleAttempts(state: RequesterSettleWakeState): boolean {
+  return state.status === "pending" && state.attemptCount >= REQUESTER_SETTLE_WAKE_MAX_ATTEMPTS;
 }

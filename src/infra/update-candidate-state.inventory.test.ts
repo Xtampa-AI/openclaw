@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { afterEach, expect, it, beforeEach, describe } from "vitest";
+import { afterEach, expect, it, beforeEach, describe, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { resolveCronStoreSelectionInDatabase } from "../cron/store/paths.js";
 import { runCommandBuffered } from "../process/exec.js";
 import { AGENT_FTS_SCHEMAS } from "../state/openclaw-agent-fts-schema.js";
 import { closeOpenClawStateDatabaseByPath } from "../state/openclaw-state-db-cache.js";
@@ -10,10 +10,12 @@ import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { withStateMigrationBackupForTest } from "../state/openclaw-state-schema.test-support.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
 import { installSqliteFtsTokenizerMismatch } from "./sqlite-index-corruption.test-support.js";
+import { LegacyMigrationSourceClaim } from "./state-migrations.source-snapshot.js";
 import {
   UPDATE_CANDIDATE_PLUGIN_PLAN_FILENAME,
   resolveUpdateCandidateStatePath,
@@ -24,14 +26,84 @@ import {
 } from "./update-candidate-state.diagnostics.js";
 import {
   UpdateCandidateSnapshotInventorySchema,
+  collectStateDatabasePaths,
   readUpdateCandidateStateInventoryInProcess,
   snapshotUpdateCandidateState,
 } from "./update-candidate-state.js";
-import { runUpdateCandidateSnapshotWorker } from "./update-candidate-state.test-support.js";
+import {
+  createStateSnapshotInput,
+  runUpdateCandidateSnapshotWorker,
+} from "./update-candidate-state.test-support.js";
+
+async function resizeFile(file: string, size: number, flag: "w" | "a") {
+  const handle = await fs.open(file, flag);
+  try {
+    await handle.truncate(size);
+  } finally {
+    await handle.close();
+  }
+}
 
 describe("snapshot inventory", () => {
   const dirs = useAutoCleanupTempDirTracker(afterEach);
   afterEach(() => closeOpenClawStateDatabaseForTest());
+
+  it("preserves a closed WAL source family while measuring cold archives", async () => {
+    const root = dirs.make("candidate-cold-inventory-");
+    const stateDir = path.join(root, "source");
+    const stagingRoot = path.join(root, "staging");
+    const source = path.join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+    await fs.mkdir(path.dirname(source), { recursive: true });
+    const database = openNodeSqliteDatabase(source);
+    database.exec("PRAGMA journal_mode=WAL; PRAGMA user_version=7;");
+    database.close();
+    const before = await fs.readFile(source);
+    expect(await fs.readdir(path.dirname(source))).toEqual(["openclaw-agent.sqlite"]);
+
+    await readUpdateCandidateStateInventoryInProcess(
+      createStateSnapshotInput(root, stateDir, stagingRoot),
+    );
+
+    // Inventory must not create source WAL/SHM before the later header inspection.
+    expect(await fs.readdir(path.dirname(source))).toEqual(["openclaw-agent.sqlite"]);
+    expect(await fs.readFile(source)).toEqual(before);
+  });
+
+  it("queues retained custom shared-state roots for exact capture with plugins disabled", async () => {
+    const root = dirs.make("candidate-shared-roots-");
+    const stateDir = path.join(root, "selected");
+    const external = path.join(root, "external");
+    for (const parent of [path.join(stateDir, "voice-calls"), external]) {
+      const file = path.join(parent, "state", "openclaw.sqlite");
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, "");
+    }
+    const discovered = await collectStateDatabasePaths(
+      {
+        stateDir,
+        config: {
+          plugins: {
+            enabled: false,
+            entries: {
+              "voice-call": { enabled: false, config: { store: external } },
+              "@openclaw/voice-call": { config: { store: "~/retained-calls" } },
+            },
+          },
+        },
+        env: { HOME: root, OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" },
+      },
+      { includeUnconfiguredAgents: false },
+    );
+    const shared = path.join(stateDir, "state", "openclaw.sqlite");
+    expect(discovered.get(shared)).toEqual({ spellings: [shared], owners: [{ role: "global" }] });
+    for (const parent of [path.join(stateDir, "voice-calls"), external]) {
+      const file = path.join(parent, "state", "openclaw.sqlite");
+      expect(discovered.get(file)).toEqual({ spellings: [file] });
+    }
+    expect(discovered.has(path.join(root, "retained-calls", "state", "openclaw.sqlite"))).toBe(
+      false,
+    );
+  });
 
   it.each([
     "missing plugin dependency",
@@ -56,12 +128,7 @@ describe("snapshot inventory", () => {
       await fs.mkdir(directory, { recursive: true });
       await fs.writeFile(path.join(directory, "package.json"), '{"name":"@example/demo"}');
       await fs.writeFile(path.join(directory, "index.js"), "export default {};\n");
-      const payload = await fs.open(path.join(directory, "payload.bin"), "w");
-      try {
-        await payload.truncate(size);
-      } finally {
-        await payload.close();
-      }
+      await resizeFile(path.join(directory, "payload.bin"), size, "w");
       return { directory, relative };
     };
     const initial = await writePlugin("initial", 4096);
@@ -202,12 +269,7 @@ describe("snapshot inventory", () => {
       );
     } else {
       const name = change === "added file" ? "late.bin" : "payload.bin";
-      const payload = await fs.open(path.join(initial.directory, name), "a");
-      try {
-        await payload.truncate(16 * 1024 * 1024);
-      } finally {
-        await payload.close();
-      }
+      await resizeFile(path.join(initial.directory, name), 16 * 1024 * 1024, "a");
       largerCopyPath = path.join(targetStateDir, initial.relative, name);
     }
     const sourceDatabase = await fs.readFile(shared);
@@ -216,21 +278,18 @@ describe("snapshot inventory", () => {
       () => true,
       () => false,
     );
-    console.log(
-      "Candidate plugin ownership drift",
-      JSON.stringify({
-        change,
-        pluginBytes: inventory.pluginBytes,
-        exitCode: snapshot.code,
-        copiedNewOwner,
-      }),
-    );
     expect((await fs.readFile(shared)).equals(sourceDatabase)).toBe(true);
-    if (change === "added file") {
+    if (change === "added file" || change === "locator symlink") {
       expect(snapshot.code, snapshot.stderr.toString("utf8")).toBe(0);
     } else {
       expect(snapshot.code, "snapshot must refuse uninventoried bytes").not.toBe(0);
-      expect(snapshot.stderr.toString("utf8")).toContain("changed after snapshot inventory");
+      expect(snapshot.stderr.toString("utf8")).toContain(
+        change === "enlarged file"
+          ? "file exceeds limit of 4096 bytes (got 16777216)"
+          : change === "install record"
+            ? "Plugin record locator was not inventoried"
+            : "changed after snapshot inventory",
+      );
       expectFailurePhase(
         snapshot,
         change === "database registration" ? "database snapshot" : "plugin snapshot",
@@ -241,9 +300,96 @@ describe("snapshot inventory", () => {
   });
 });
 
+describe("snapshot legacy cron identity", () => {
+  const dirs = useAutoCleanupTempDirTracker(afterEach);
+  afterEach(() => {
+    closeOpenClawStateDatabaseForTest();
+    vi.unstubAllEnvs();
+  });
+
+  it.each(["original", "moved", "released envelope", "bound released envelope", "explicit config"])(
+    "preserves only proven source cron partition selection (%s)",
+    async (selector) => {
+      const released = selector.includes("released envelope");
+      const bound = selector === "bound released envelope";
+      const root = await fs.realpath(dirs.make("candidate-cron-identity-"));
+      const stateDir = path.join(root, "source");
+      const targetStateDir = path.join(root, "rehearsal");
+      const env = { OPENCLAW_STATE_DIR: stateDir };
+      const source = openOpenClawStateDatabase({ env }).path;
+      closeOpenClawStateDatabaseForTest();
+      const configDir = path.join(root, "config");
+      const storeKey = path.join(
+        selector === "moved"
+          ? path.join(root, "prior")
+          : selector === "explicit config" || bound
+            ? configDir
+            : stateDir,
+        "cron",
+        "jobs.json",
+      );
+      {
+        using db = openNodeSqliteDatabase(source);
+        db.exec(`DELETE FROM config_machine_state WHERE state_key IN
+        ('cron.defaultStoreKey', 'state.schema.contentVersion');
+        UPDATE schema_meta SET schema_version = 33;
+        PRAGMA user_version = 33;`);
+        db.prepare(`INSERT INTO cron_job_scratch
+        (store_key, job_id, content, revision, updated_at_ms) VALUES (?, 'retained', NULL, 1, 1)`).run(
+          storeKey,
+        );
+        if (selector === "explicit config" || bound) {
+          db.prepare(`INSERT INTO cron_job_scratch
+          (store_key, job_id, content, revision, updated_at_ms) VALUES (?, 'custom', NULL, 1, 1)`).run(
+            path.join(stateDir, "cron", "jobs.json"),
+          );
+        }
+        if (bound) {
+          db.prepare(`INSERT INTO config_machine_state
+          (state_key, value_json, updated_at_ms) VALUES ('cron.defaultStoreKey', ?, 1)`).run(
+            JSON.stringify(storeKey),
+          );
+        }
+      }
+      const original = await fs.readFile(source);
+      const input = createStateSnapshotInput(root, stateDir, targetStateDir);
+      if (released || selector === "explicit config") {
+        vi.stubEnv("OPENCLAW_STATE_DIR", targetStateDir);
+        vi.stubEnv("OPENCLAW_CONFIG_PATH", path.join(targetStateDir, "openclaw.json"));
+      }
+      await runUpdateCandidateSnapshotWorker({
+        ...input,
+        // Released parents omit source selectors and launch with the rehearsal environment.
+        ...(released || selector === "explicit config"
+          ? {
+              env: {
+                HOME: root,
+                OPENCLAW_HOME: root,
+                ...(selector === "explicit config"
+                  ? { OPENCLAW_CONFIG_PATH: path.join(configDir, "openclaw.json") }
+                  : {}),
+              },
+            }
+          : {}),
+      });
+      const copiedEnv = { OPENCLAW_STATE_DIR: targetStateDir };
+      const selection = await withStateMigrationBackupForTest({ env: copiedEnv }, () =>
+        resolveCronStoreSelectionInDatabase(
+          openOpenClawStateDatabase({ env: copiedEnv }).db,
+          undefined,
+          copiedEnv,
+        ),
+      );
+      expect(selection).toMatchObject({ status: "ready", storeKey });
+      expect(await fs.readFile(source)).toEqual(original);
+    },
+  );
+});
+
 describe("snapshot execution approvals", () => {
   const dirs = useAutoCleanupTempDirTracker((cleanup) => {
     afterEach(() => {
+      vi.restoreAllMocks();
       closeOpenClawStateDatabaseForTest();
       cleanup();
     });
@@ -322,17 +468,15 @@ describe("snapshot execution approvals", () => {
           : { version: 1, defaults: { security: "full" }, agents: {} },
       );
       await fs.writeFile(sourcePath, raw);
+      if (interrupted) {
+        vi.spyOn(LegacyMigrationSourceClaim.prototype, "remove").mockRejectedValueOnce(
+          new Error("synthetic interrupted cleanup"),
+        );
+      }
       const imported = await migrateLegacyExecApprovals({
         stateDir: source,
         env,
         detected: detectLegacyExecApprovals({ stateDir: source, doctorOnlyStateMigrations: true }),
-        ...(interrupted
-          ? {
-              removeSource: () => {
-                throw new Error("synthetic interrupted cleanup");
-              },
-            }
-          : {}),
       });
       if (interrupted) {
         expect(imported.warnings.join(" ")).toContain("cleanup failed");
@@ -373,63 +517,6 @@ describe("snapshot execution approvals", () => {
   );
 });
 
-describe("snapshot row identities", () => {
-  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
-  it("preserves sparse row IDs and original bytes when preparing a migration rehearsal", async () => {
-    const root = tempDirs.make("candidate-rowids-");
-    const stateDir = path.join(root, "source");
-    const targetStateDir = path.join(root, "rehearsal");
-    const relative = path.join("agents", "main", "agent", "openclaw-agent.sqlite");
-    const source = path.join(stateDir, relative);
-    await fs.mkdir(path.dirname(source), { recursive: true });
-    await fs.mkdir(targetStateDir);
-    const db = openNodeSqliteDatabase(source);
-    try {
-      db.exec(`
-        PRAGMA user_version = 3;
-        CREATE TABLE evidence(value TEXT);
-        INSERT INTO evidence(rowid, value) VALUES(71, 'preserved');
-      `);
-    } finally {
-      db.close();
-    }
-    const original = await fs.readFile(source);
-    const input = {
-      stateDir,
-      targetStateDir,
-      candidateRoot: fileURLToPath(new URL("../../", import.meta.url)),
-      config: {},
-      env: {
-        ...process.env,
-        OPENCLAW_HOME: root,
-        OPENCLAW_STATE_DIR: stateDir,
-        OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
-        OPENCLAW_WORKSPACE_DIR: path.join(root, "workspace"),
-      },
-    };
-    const inventory = await readUpdateCandidateStateInventoryInProcess(input);
-    await snapshotUpdateCandidateState({
-      ...input,
-      pluginPlanPath: path.join(targetStateDir, inventory.pluginPlan),
-      databaseInventory: [...inventory.databases.keys()],
-    });
-    const snapshot = openNodeSqliteDatabase(path.join(targetStateDir, relative), {
-      readOnly: true,
-    });
-    try {
-      expect(snapshot.prepare("SELECT rowid, value FROM evidence").all()).toEqual([
-        { rowid: 71, value: "preserved" },
-      ]);
-      expect(snapshot.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
-      expect(snapshot.prepare("PRAGMA user_version").get()).toEqual({ user_version: 3 });
-    } finally {
-      snapshot.close();
-    }
-    expect(await fs.readFile(source)).toEqual(original);
-  });
-});
-
 describe("snapshot FTS integrity", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   const ftsTables = ["memory_index_chunks_fts", "session_transcript_fts"];
@@ -445,8 +532,8 @@ describe("snapshot FTS integrity", () => {
     const source = path.join(stateDir, relative);
     await fs.mkdir(path.dirname(source), { recursive: true });
     await fs.mkdir(targetStateDir);
-    const db = openNodeSqliteDatabase(source);
-    try {
+    {
+      using db = openNodeSqliteDatabase(source);
       for (const match of AGENT_FTS_SCHEMAS.join("\n").matchAll(/CREATE VIRTUAL TABLE[^;]+;/gu)) {
         if (!match[0].includes("content =")) {
           db.exec(match[0]);
@@ -460,27 +547,12 @@ describe("snapshot FTS integrity", () => {
         CREATE VIRTUAL TABLE unowned_fts USING fts5(text);
         INSERT INTO unowned_fts(text) VALUES ('ab'||char(65534)||'cd');
       `);
-    } finally {
-      db.close();
     }
-    // Same findings a SQLite tokenizer change reports for a healthy index built by the old runtime.
     for (const table of staleTables) {
       installSqliteFtsTokenizerMismatch(source, table);
     }
     const original = await fs.readFile(source);
-    const input = {
-      stateDir,
-      targetStateDir,
-      candidateRoot: fileURLToPath(new URL("../../", import.meta.url)),
-      config: {},
-      env: {
-        ...process.env,
-        OPENCLAW_HOME: root,
-        OPENCLAW_STATE_DIR: stateDir,
-        OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
-        OPENCLAW_WORKSPACE_DIR: path.join(root, "workspace"),
-      },
-    };
+    const input = createStateSnapshotInput(root, stateDir, targetStateDir);
     const inventory = await readUpdateCandidateStateInventoryInProcess(input);
     const snapshot = snapshotUpdateCandidateState({
       ...input,

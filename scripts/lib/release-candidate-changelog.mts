@@ -93,21 +93,14 @@ export function candidateCumulativeShippedPullRequests(changelog: string, label:
   return pullRequests;
 }
 
-function requireString(value: unknown, label: string) {
-  if (typeof value !== "string") {
-    throw new TypeError(`${label} must be a string`);
-  }
-  return value;
-}
-
 export function loadCandidateShippedBaseline(ref: string, rootDir = process.cwd()) {
   const tagRef = `refs/tags/${ref}`;
-  execFileSync("git", ["rev-parse", "--verify", tagRef + "^{commit}"], {
+  execFileSync("git", ["rev-parse", "--verify", `${tagRef}^{commit}`], {
     cwd: rootDir,
     stdio: ["ignore", "ignore", "pipe"],
   });
   const changelog = loadChangelogCollection({ rootDir, ref: tagRef, recordsOnly: true });
-  const version = requireString(releaseNotesVersionForTag(ref), "release notes version");
+  const version = releaseNotesVersionForTag(ref);
   const source = loadReleaseNotesForTag({ rootDir, ref: tagRef, tag: ref, version });
   candidateContributionRecordPullRequests(
     source.record ?? source.section,
@@ -163,17 +156,14 @@ export function validateCandidateChangelogProvenance({
   const dedicatedVersion = dedicatedSectionVersionForTag(tag);
   if (typeof dedicatedVersion === "string" && dedicatedVersion !== version) {
     try {
-      section = requireString(
-        extractChangelogSection(changelog, dedicatedVersion),
-        "changelog section",
-      );
+      section = extractChangelogSection(changelog, dedicatedVersion);
       sectionVersion = dedicatedVersion;
     } catch {
       // No dedicated section; validate the base section.
     }
   }
   if (section === undefined) {
-    section = requireString(extractChangelogSection(changelog, version), "changelog section");
+    section = extractChangelogSection(changelog, version);
   }
   const recordStart = section.search(/\n### Complete contribution record\r?$/m);
   if (recordStart < 0) {
@@ -282,10 +272,10 @@ export function validateCandidateChangelog({
   targetSha,
 }: StringFields<"rootDir" | "repository" | "tag" | "targetSha">) {
   validateCandidateChangelogLints({ rootDir, targetSha });
-  const version = requireString(releaseNotesVersionForTag(tag), "release notes version");
+  const version = releaseNotesVersionForTag(tag);
   const releaseChangelog = loadReleaseNotesForTag({ rootDir, ref: targetSha, tag, version });
   return {
-    releaseNotes: releaseChangelog.section,
+    releaseNotesText: releaseChangelog.section,
     releaseNotesCheck: validateCandidateReleaseNotes({
       changelog: releaseChangelog.section,
       repository,

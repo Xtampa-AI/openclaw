@@ -17,15 +17,16 @@ content otherwise match the cited upstream files.
 
 Provider names and marks remain the property of their respective owners.
 
-## Particle icon
+## Abliteration icon
 
-`ProviderIcon-particle.svg` uses the official Particle symbol from the inline
-SVG wordmark at https://particle.ai/, retrieved on October 29, 2026. The wordmark
-paths are removed and the view box is cropped to the 35 × 35 symbol. The symbol
-paths retain their original geometry and use `currentColor` for light and dark
-themes.
+`ProviderIcon-abliteration.svg` uses the official favicon mark from
+https://abliteration.ai/icon.svg, referenced by https://abliteration.ai/ and
+retrieved on October 23, 2026. The background plate is removed, the view box is
+cropped to the mark, and fills are normalized to `currentColor`. The three paths
+are combined without changing their geometry. The same mark supplies the plugin
+activity icon and the opaque white package tile.
 
-The name and mark remain the property of Particle.
+The name and mark remain the property of Abliteration AI, Inc.
 
 ## Pi icon
 
@@ -55,6 +56,16 @@ contributed by the LongCat team at Meituan with permission to use it here:
 - The white background plate was removed and the inner glyph recolored to
   `currentColor` so the mark renders on both light and dark themes; the
   geometry otherwise matches the cited source.
+
+## Requesty icon
+
+`ProviderIcon-requesty.svg` is the official Requesty brand mark, contributed by
+the Requesty team with permission to use it here:
+
+- Source: official Requesty logo vector (https://requesty.ai)
+- The wordmark was removed and the mark recolored to `currentColor` so it
+  renders on both light and dark themes; the geometry otherwise matches the
+  supplied source.
 
 ## llama.cpp icon
 

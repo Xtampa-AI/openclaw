@@ -35,7 +35,8 @@ async function startBrowserControlServiceUnlocked(): Promise<BrowserServerState 
   if (!resolved.enabled) {
     return null;
   }
-  // This in-process service has no HTTP listener and must not write browser auth config.
+  // This in-process service has no HTTP listener, so it needs no browser credential. Listeners
+  // (the HTTP server and sandbox bridges) own theirs; a lazy start must never write auth config.
   const hasExtensionProfiles = Object.values(resolved.profiles).some(
     (profile) => profile.driver === "extension",
   );

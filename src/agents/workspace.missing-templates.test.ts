@@ -7,6 +7,7 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
+import { fileDiffersFromTemplate } from "./workspace-template-load.js";
 
 const templates = vi.hoisted(() => ({ dir: "" }));
 vi.mock("./workspace-templates.js", async (importOriginal) => ({
@@ -66,10 +67,11 @@ it("still requires a template to provision a missing workspace file", async () =
 });
 
 it("propagates template read errors other than absence during comparison", async () => {
-  for (const name of ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"]) {
-    await fs.writeFile(path.join(state.workspaceDir, name), `User-authored ${name}\n`);
-  }
+  await fs.writeFile(path.join(state.workspaceDir, "SOUL.md"), "User-authored soul\n");
   await fs.mkdir(path.join(templates.dir, "SOUL.md"));
 
-  await expect(prepare()).rejects.toHaveProperty("code", "EISDIR");
+  await expect(fileDiffersFromTemplate(state.workspaceDir, "SOUL.md")).rejects.toHaveProperty(
+    "code",
+    "EISDIR",
+  );
 });

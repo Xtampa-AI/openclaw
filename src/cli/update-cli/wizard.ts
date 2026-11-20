@@ -2,12 +2,13 @@ import { confirm, isCancel } from "@clack/prompts";
 import { selectStyled } from "../../../packages/terminal-core/src/prompt-select-styled.js";
 import { stylePromptMessage } from "../../../packages/terminal-core/src/prompt-style.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import {
   normalizeUpdateChannel,
   resolveUpdateChannelDisplay,
 } from "../../infra/update-channels.js";
 import { resolveUpdateInstallIdentity } from "../../infra/update-check.js";
-import { defaultRuntime } from "../../runtime.js";
+import { defaultRuntime, ExitError } from "../../runtime.js";
 import { pathExists } from "../../utils.js";
 import { VERSION } from "../../version.js";
 import { reportHostOwnedUpdate } from "./host-owned.js";
@@ -124,12 +125,21 @@ export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promi
     return cancel();
   }
 
-  const { updateCommand } = await import("./update-command.js");
-  await updateCommand({
-    runtimeRecoveryEnv: opts.runtimeRecoveryEnv,
-    channel: requestedChannel ?? undefined,
-    restart,
-    timeout: opts.timeout,
-    acceptCapabilities: opts.acceptCapabilities,
-  });
+  try {
+    const { updateCommand } = await import("./update-command.js");
+    await updateCommand({
+      runtimeRecoveryEnv: opts.runtimeRecoveryEnv,
+      channel: requestedChannel ?? undefined,
+      restart,
+      timeout: opts.timeout,
+      acceptCapabilities: opts.acceptCapabilities,
+      fullIntegrityCheck: opts.fullIntegrityCheck,
+    });
+  } catch (err) {
+    if (err instanceof ExitError) {
+      throw err;
+    }
+    defaultRuntime.error(formatErrorMessage(err));
+    defaultRuntime.exit(1);
+  }
 }

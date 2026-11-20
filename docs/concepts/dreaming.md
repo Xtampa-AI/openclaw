@@ -37,6 +37,14 @@ The built-in SQLite store reads only the selected workspace's state for lookups
 and cleanup. Corrupt JSON in another workspace does not block these operations;
 corrupt JSON in a live record in the selected workspace still reports a storage error.
 
+Dreaming artifact repair prunes recall entries for archived source paths immediately
+after a successful move, removing their phase signals in the same SQLite worker
+transaction. Failed moves leave recall intact, and sources that still exist remain
+eligible. The file move and database cleanup are separate operations: a crash or
+cleanup failure between them leaves dangling entries for the next nightly repair
+to remove. The repair result reports cleanup failures without hiding a completed
+archive.
+
 Long-term promotion still writes only to `MEMORY.md`.
 Deep reports summarize why ranked candidates were not promoted, using counts by
 rejection category without copying rejected snippets or source identifiers.
@@ -92,6 +100,9 @@ Dreaming runs three cooperative phases per sweep, in order: light -> REM -> deep
 ## Session transcript ingestion
 
 Dreaming can ingest session transcripts into the dreaming corpus. Only interactive sessions are eligible. Cron, heartbeat, subagent, and unknown sessions stay out of durable candidate ingestion. Transcript text is not secret-masked before ingestion. Runtime-marked recalled context is removed so recalled snippets cannot be learned again as new memory.
+
+Discovery skips unused transcript revisions. Freshness is checked when each
+transcript is scanned, so later appends remain eligible for ingestion.
 
 Two operator controls exclude sessions from automatic ingestion, each with a recorded reason: the [memory admission policy](/concepts/memory-provenance#admission-keeping-sources-out-of-memory) matches retained hook-source, channel, or chat-type metadata, and [`memory forget`](/cli/memory#memory-forget) records selected session IDs as `forgotten` for future scans. Policy changes do not erase existing candidates or prevent direct file writes. Manual session backfill applies both controls in preview, REM, and apply modes, and preserves source-session origins when staging candidates.
 
@@ -193,6 +204,13 @@ Light and REM phase hits recorded in SQLite-backed plugin state add a small rece
 
 When enabled, `memory-core` auto-manages one cron job for a full dreaming sweep, deduped across the primary runtime workspace and any configured agent workspaces so subagent workspace fan-out does not exclude the main agent's `DREAMS.md` and memory state.
 
+Startup reconciles that job in the background so Gateway connections do not wait
+for the cron store. Failures are logged and retried by runtime reconciliation.
+Stopping or replacing the plugin waits for pending reconciliation to settle.
+Reconciliation preserves a job paused by the operator or auto-disabled by cron,
+including its failure history. Use `openclaw cron enable <job-id>` to resume it;
+schedule and payload repairs still apply while it is stopped.
+
 Plugin reloads preserve the managed schedule. The previous instance stops its
 background callbacks and settles pending diary publication before its replacement
 takes over, so scheduled sweeps can continue without a Gateway restart.
@@ -221,7 +239,7 @@ a repair warning and remain in place.
 
 Dreaming completions use the [subagent queue](/concepts/queue#background-work) at background priority and honor `agents.defaults.subagents.maxConcurrent`. Setting this existing limit to `1` serializes diary and consolidation completions across workspaces and plugins. The sweep coordinator does not consume a completion slot while it waits for phase work. System busyness shows these completions in the `subagent` row.
 
-An explicit multi-agent fleet needs an [ambient system owner](/gateway/config-agents/heartbeat-compaction-and-streaming#agents.defaults.systemagent) for this job. If logs report `Agent-less cron job has no resolvable owner`, choose an existing agent to own the sweep. For example, if that agent is `ops`:
+An explicit multi-agent fleet needs an [ambient system owner](/gateway/config-agents/heartbeat-compaction-and-streaming#agents.defaults.systemagent) to create this job. Without one, reconciliation skips creation and warns once while ownership remains unresolved. Choose an existing agent to own the sweep; reconciliation resumes automatically when the owner is configured. Existing managed jobs keep their current reconciliation behavior. For example, if the owner is `ops`:
 
 ```bash
 openclaw config set agents.defaults.systemAgent.agentId ops

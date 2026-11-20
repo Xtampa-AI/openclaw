@@ -1,10 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getRuntimeConfigWriteApplication } from "../../config/runtime-write-application.js";
+import { expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { createConfigHandlerHarness, createConfigWriteSnapshot } from "./config.test-helpers.js";
 
 const configMocks = vi.hoisted(() => ({
-  replaceConfigFile: vi.fn(),
-  resolveConfigSnapshotHash: vi.fn(),
+  replaceConfigFile: vi.fn(async () => ({ nextConfig: {}, persistedHash: "persisted-hash" })),
+  resolveConfigSnapshotHash: vi.fn(() => "missing-config-revision"),
 }));
 const secretsMocks = vi.hoisted(() => ({
   activeSnapshot: null as {
@@ -13,14 +13,11 @@ const secretsMocks = vi.hoisted(() => ({
   } | null,
 }));
 
-vi.mock("../../config/config.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../config/config.js")>();
-  return {
-    ...actual,
-    replaceConfigFile: configMocks.replaceConfigFile,
-    resolveConfigSnapshotHash: configMocks.resolveConfigSnapshotHash,
-  };
-});
+vi.mock("../../config/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config/config.js")>()),
+  replaceConfigFile: configMocks.replaceConfigFile,
+  resolveConfigSnapshotHash: configMocks.resolveConfigSnapshotHash,
+}));
 
 const restartMocks = vi.hoisted(() => ({
   scheduleGatewayRestart: vi.fn(() => ({ ok: true, delayMs: 0 })),
@@ -36,13 +33,25 @@ vi.mock("../../infra/restart-sentinel.js", async (importOriginal) => ({
   writeRestartSentinel: vi.fn(async () => {}),
 }));
 
-vi.mock("../../secrets/runtime-state.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../secrets/runtime-state.js")>();
-  return {
-    ...actual,
-    getActiveSecretsRuntimeSnapshotState: () => secretsMocks.activeSnapshot,
-  };
-});
+vi.mock("../../secrets/runtime-state.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../secrets/runtime-state.js")>()),
+  getActiveSecretsRuntimeSnapshotState: () => secretsMocks.activeSnapshot,
+}));
+
+const billingMocks = vi.hoisted(() => ({
+  collect: vi.fn((_params: { before: OpenClawConfig; after: OpenClawConfig }): string[] => []),
+}));
+
+// The comparator owns its own tests; these cases prove only the Gateway write wiring.
+vi.mock(
+  "../../commands/doctor/shared/model-billing-route-migration.js",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("../../commands/doctor/shared/model-billing-route-migration.js")
+    >()),
+    collectModelBillingRouteMigrationWarnings: billingMocks.collect,
+  }),
+);
 
 import {
   commitGatewayConfigWrite,
@@ -51,47 +60,38 @@ import {
   shouldAwaitGatewayConfigApplication,
 } from "./config-write-flow.js";
 
-it("awaits transcript additions and title edits only when the reload owner can apply them", () => {
-  const previousConfig: OpenClawConfig = {
-    transcripts: { autoStart: [{ providerId: "fixture", sessionId: "daily", title: "Before" }] },
-  };
-  const nextConfig: OpenClawConfig = {
-    transcripts: { autoStart: [{ providerId: "fixture", sessionId: "daily", title: "After" }] },
-  };
-  const params = { previousConfig, nextConfig, changedPaths: ["transcripts.autoStart"] };
-  expect(shouldAwaitGatewayConfigApplication(params)).toBe(true);
-  expect(shouldAwaitGatewayConfigApplication({ ...params, previousConfig: {} })).toBe(true);
-  expect(
-    shouldAwaitGatewayConfigApplication({
-      ...params,
-      changedPaths: [...params.changedPaths, "gateway.port"],
-    }),
-  ).toBe(false);
-  expect(
-    shouldAwaitGatewayConfigApplication({
-      ...params,
-      nextConfig: { ...nextConfig, gateway: { reload: { mode: "off" } } },
-    }),
-  ).toBe(false);
+const authConfig = (
+  token?: NonNullable<NonNullable<OpenClawConfig["gateway"]>["auth"]>["token"],
+): OpenClawConfig => ({
+  gateway: { auth: { mode: "token", ...(token === undefined ? {} : { token }) } },
 });
+const runtimeConfig = authConfig("runtime-token");
+const authoredConfig = authConfig();
 
+const transcripts: OpenClawConfig = {
+  transcripts: { autoStart: [{ providerId: "fixture", sessionId: "daily", title: "After" }] },
+};
+const coldStorage: OpenClawConfig = {
+  session: { maintenance: { coldStorage: { enabled: true, afterDays: 7 } } },
+};
 it.each([
-  ["hybrid", true],
-  ["off", false],
-] as const)(
-  "awaits cold-storage settings only when reload mode %s can apply them",
-  (mode, awaited) => {
+  ["transcripts", transcripts, ["transcripts.autoStart"], true],
+  [
+    "cold storage",
+    coldStorage,
+    ["session.maintenance.coldStorage.enabled", "session.maintenance.coldStorage.afterDays"],
+    true,
+  ],
+  ["restart", { gateway: { port: 19001 } }, ["gateway.port"], false],
+  ["disabled reload", { gateway: { reload: { mode: "off" } } }, ["transcripts.autoStart"], false],
+] satisfies [string, OpenClawConfig, string[], boolean][])(
+  "awaits %s only when the reload owner can apply it",
+  (_name, next, paths, awaited) => {
     expect(
       shouldAwaitGatewayConfigApplication({
         previousConfig: {},
-        nextConfig: {
-          gateway: { reload: { mode } },
-          session: { maintenance: { coldStorage: { enabled: true, afterDays: 7 } } },
-        },
-        changedPaths: [
-          "session.maintenance.coldStorage.enabled",
-          "session.maintenance.coldStorage.afterDays",
-        ],
+        nextConfig: next,
+        changedPaths: paths,
       }),
     ).toBe(awaited);
   },
@@ -127,154 +127,150 @@ it.each([
   },
 );
 
-describe("commitGatewayConfigWrite", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    configMocks.resolveConfigSnapshotHash.mockReturnValue("missing-config-revision");
-    configMocks.replaceConfigFile.mockResolvedValue({
-      nextConfig: {},
-      persistedHash: "persisted-hash",
-    });
-    secretsMocks.activeSnapshot = null;
-  });
-
-  it("carries a missing file revision into the lock-time compare-and-swap", async () => {
-    const snapshot = {
+it("carries a missing file revision into the lock-time compare-and-swap", async () => {
+  await commitGatewayConfigWrite({
+    snapshot: {
       path: "/tmp/openclaw.json",
       exists: false,
       raw: null,
       hash: "missing-config-revision",
-    };
-
-    await commitGatewayConfigWrite({
-      snapshot: snapshot as never,
-      writeOptions: {},
-      nextConfig: {} satisfies OpenClawConfig,
-    });
-
-    expect(configMocks.replaceConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        baseHash: "missing-config-revision",
-        sourceConfig: {},
-      }),
-    );
+    } as never,
+    writeOptions: {},
+    nextConfig: {},
   });
-
-  it("returns the managed runtime application claimed during the write", async () => {
-    configMocks.replaceConfigFile.mockImplementationOnce(async (params) => {
-      const application = getRuntimeConfigWriteApplication(params.writeOptions);
-      const claim = application?.claim();
-      claim?.settle("applied");
-      return {
-        nextConfig: { hooks: { enabled: true } },
-        persistedHash: "persisted-hash",
-      };
-    });
-
-    const result = await commitGatewayConfigWrite({
-      snapshot: {
-        path: "/tmp/openclaw.json",
-        exists: true,
-        raw: "{}",
-        hash: "base-hash",
-      } as never,
-      writeOptions: {},
-      nextConfig: { hooks: { enabled: true } },
-      awaitRuntimeApplication: true,
-    });
-
-    await expect(result.application).resolves.toBe("applied");
-  });
-
-  it("returns an unclaimed required application when no managed reloader is installed", async () => {
-    const result = await commitGatewayConfigWrite({
-      snapshot: {
-        path: "/tmp/openclaw.json",
-        exists: true,
-        raw: "{}",
-        hash: "base-hash",
-      } as never,
-      writeOptions: {},
-      nextConfig: { hooks: { enabled: true } },
-      awaitRuntimeApplication: true,
-    });
-
-    await expect(result.application).resolves.toBe("unclaimed");
-  });
+  expect(configMocks.replaceConfigFile).toHaveBeenCalledWith(
+    expect.objectContaining({ baseHash: "missing-config-revision", sourceConfig: {} }),
+  );
 });
 
-describe("didActiveSharedGatewayAuthChange", () => {
-  beforeEach(() => {
-    secretsMocks.activeSnapshot = null;
+const tokenA = authConfig("token-a");
+const tokenB = authConfig("token-b");
+const secretRef = authConfig({ source: "env", provider: "default", id: "GATEWAY_TOKEN" });
+it.each([
+  ["runtime-only fields", {}, {}, runtimeConfig, runtimeConfig, undefined, false],
+  ["stale authored source", tokenA, tokenA, tokenB, tokenA, tokenB, true],
+  [
+    "runtime-only siblings",
+    authoredConfig,
+    authoredConfig,
+    runtimeConfig,
+    runtimeConfig,
+    authoredConfig,
+    false,
+  ],
+  [
+    "matching secret source",
+    secretRef,
+    authConfig("old-token"),
+    secretRef,
+    authConfig("new-token"),
+    secretRef,
+    true,
+  ],
+] as const)(
+  "compares shared auth with %s",
+  (_name, sourceConfig, config, fallbackPrev, next, fallbackSource, expected) => {
+    secretsMocks.activeSnapshot = { sourceConfig, config };
+    expect(didActiveSharedGatewayAuthChange({ fallbackPrev, next, fallbackSource })).toBe(expected);
+  },
+);
+
+const writeSnapshot = (sourceConfig: OpenClawConfig) =>
+  createConfigWriteSnapshot(sourceConfig).snapshot;
+const cliModel = (runtime: string): OpenClawConfig => ({
+  agents: {
+    defaults: {
+      model: "anthropic/claude-opus-4-6",
+      models: { "anthropic/claude-opus-4-6": { agentRuntime: { id: runtime } } },
+    },
+  },
+});
+
+it("returns billing-route warnings for a committed model write without logging them early", async () => {
+  const warning = "Billing route changed for agents.defaults.subagents.model (agent main).";
+  billingMocks.collect.mockReset().mockReturnValue([warning]);
+  const {
+    options: { context },
+    logGateway: { warn },
+  } = createConfigHandlerHarness();
+  const result = await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(cliModel("claude-cli")),
+    writeOptions: {},
+    nextConfig: cliModel("openclaw"),
+    context,
   });
+  expect(billingMocks.collect).toHaveBeenCalledWith(
+    expect.objectContaining({ before: cliModel("claude-cli"), after: cliModel("openclaw") }),
+  );
+  expect(result.billingRouteWarnings).toEqual([warning]);
+  // The reply logs with the success response, after application settles.
+  expect(warn).not.toHaveBeenCalled();
+});
 
-  it("preserves runtime-only auth fields absent from the active secrets source", () => {
-    const runtimeConfig: OpenClawConfig = {
-      gateway: { auth: { mode: "token", token: "runtime-token" } },
-    };
-    secretsMocks.activeSnapshot = {
-      sourceConfig: {},
-      config: {},
-    };
-
-    expect(
-      didActiveSharedGatewayAuthChange({ fallbackPrev: runtimeConfig, next: runtimeConfig }),
-    ).toBe(false);
+it("adds and logs billing-route warnings only on a successful reply", async () => {
+  billingMocks.collect.mockReset().mockReturnValue(["route moved"]);
+  const {
+    options: { context },
+    logGateway: { warn },
+  } = createConfigHandlerHarness();
+  const respond = vi.fn();
+  const { reply } = await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(cliModel("claude-cli")),
+    writeOptions: {},
+    nextConfig: cliModel("openclaw"),
+    context,
+    respond,
   });
-
-  it("does not trust active secret values from a stale authored source", () => {
-    secretsMocks.activeSnapshot = {
-      sourceConfig: { gateway: { auth: { mode: "token", token: "token-a" } } },
-      config: { gateway: { auth: { mode: "token", token: "token-a" } } },
-    };
-    const current: OpenClawConfig = {
-      gateway: { auth: { mode: "token", token: "token-b" } },
-    };
-
-    expect(
-      didActiveSharedGatewayAuthChange({
-        fallbackPrev: current,
-        fallbackSource: current,
-        next: { gateway: { auth: { mode: "token", token: "token-a" } } },
-      }),
-    ).toBe(true);
+  reply(false, undefined, { code: "UNAVAILABLE", message: "not applied" });
+  expect(warn).not.toHaveBeenCalled();
+  reply(true, { ok: true });
+  expect(respond).toHaveBeenLastCalledWith(true, {
+    ok: true,
+    billingRouteWarnings: ["route moved"],
   });
+  expect(warn).toHaveBeenCalledWith("route moved");
+});
 
-  it("preserves runtime-only siblings beside authored shared auth fields", () => {
-    secretsMocks.activeSnapshot = {
-      sourceConfig: { gateway: { auth: { mode: "token" } } },
-      config: { gateway: { auth: { mode: "token" } } },
-    };
-    const runtimeConfig: OpenClawConfig = {
-      gateway: { auth: { mode: "token", token: "runtime-token" } },
-    };
-
-    expect(
-      didActiveSharedGatewayAuthChange({
-        fallbackPrev: runtimeConfig,
-        fallbackSource: { gateway: { auth: { mode: "token" } } },
-        next: runtimeConfig,
-      }),
-    ).toBe(false);
+it("keeps the committed write when the billing comparison fails or has nothing to compare", async () => {
+  billingMocks.collect.mockReset().mockImplementation(() => {
+    throw new Error("auth store unavailable");
   });
-
-  it("uses active secret-expanded values when the authored source still matches", () => {
-    const tokenRef = {
-      source: "env" as const,
-      provider: "default",
-      id: "GATEWAY_TOKEN",
-    };
-    secretsMocks.activeSnapshot = {
-      sourceConfig: { gateway: { auth: { mode: "token", token: tokenRef } } },
-      config: { gateway: { auth: { mode: "token", token: "old-token" } } },
-    };
-
-    expect(
-      didActiveSharedGatewayAuthChange({
-        fallbackPrev: { gateway: { auth: { mode: "token", token: tokenRef } } },
-        fallbackSource: { gateway: { auth: { mode: "token", token: tokenRef } } },
-        next: { gateway: { auth: { mode: "token", token: "new-token" } } },
-      }),
-    ).toBe(true);
+  const {
+    options: { context },
+    logGateway: { warn },
+  } = createConfigHandlerHarness();
+  const failed = await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(cliModel("claude-cli")),
+    writeOptions: {},
+    nextConfig: cliModel("openclaw"),
+    context,
   });
+  expect(failed).toMatchObject({ hash: "persisted-hash" });
+  expect(failed).not.toHaveProperty("billingRouteWarnings");
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining("billing route comparison skipped"));
+
+  billingMocks.collect.mockClear();
+  await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(transcripts),
+    writeOptions: {},
+    nextConfig: coldStorage,
+  });
+  const workspace = (dir: string): OpenClawConfig => ({
+    ...cliModel("claude-cli"),
+    agents: { ...cliModel("claude-cli").agents, entries: { main: { workspace: dir } } },
+  });
+  await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(workspace("/work/a")),
+    writeOptions: {},
+    nextConfig: workspace("/work/b"),
+  });
+  expect(billingMocks.collect).not.toHaveBeenCalled();
+
+  // A required cloud worker profile forces the embedded runtime, so it alone is compared.
+  await commitGatewayConfigWrite({
+    snapshot: writeSnapshot(cliModel("claude-cli")),
+    writeOptions: {},
+    nextConfig: { ...cliModel("claude-cli"), cloudWorkers: { requiredProfile: "fixture" } },
+  });
+  expect(billingMocks.collect).toHaveBeenCalledOnce();
 });

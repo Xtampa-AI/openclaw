@@ -55,6 +55,8 @@ export async function uninstallLaunchAgent({
 
   const home = normalizeWindowsPathSeparators(resolveDaemonHomeDir(env));
   const trashDir = path.posix.join(home, ".Trash");
+  // A fixed name would replace an earlier Trash item, which macOS refuses without Full Disk
+  // Access unless this helper put that item there; a new name only adds to the Trash.
   const dest = path.join(trashDir, `${label}-${Date.now()}.plist`);
   try {
     const { trashed } = await removeBootedOutLaunchAgentPlist(plistPath, dest);
@@ -112,16 +114,6 @@ export async function stageLaunchAgent(
   return { plistPath };
 }
 
-async function snapshotLaunchAgentLoadedState(serviceTarget: string): Promise<boolean> {
-  const probe = await probeLaunchAgentState(serviceTarget);
-  if (probe.state === "unknown") {
-    throw new Error(
-      `launchctl print could not determine whether ${serviceTarget} is loaded: ${probe.detail ?? "unknown error"}`,
-    );
-  }
-  return probe.state !== "not-loaded";
-}
-
 async function bootoutLaunchAgent(serviceTarget: string): Promise<void> {
   assertGatewayServiceUpdateCurrent();
   const result = await execLaunchctl(["bootout", serviceTarget]);
@@ -152,7 +144,13 @@ export async function installLaunchAgent(
         const wasEnabled = args.preserveAutoStart
           ? await isLaunchAgentEnabled({ env: args.env })
           : undefined;
-        const wasLoaded = await snapshotLaunchAgentLoadedState(serviceTarget);
+        const probe = await probeLaunchAgentState(serviceTarget);
+        if (probe.state === "unknown") {
+          throw new Error(
+            `launchctl print could not determine whether ${serviceTarget} is loaded: ${probe.detail ?? "unknown error"}`,
+          );
+        }
+        const wasLoaded = probe.state !== "not-loaded";
         const wasRestorable = wasLoaded && previous !== null;
         if (wasLoaded && !wasRestorable) {
           args.warn?.(

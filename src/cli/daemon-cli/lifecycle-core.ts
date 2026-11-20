@@ -1,7 +1,6 @@
-// Gateway service lifecycle command core: install, uninstall, start, stop, restart.
 import { readBestEffortConfig } from "../../config/config.js";
 import { resolveIsNixMode } from "../../config/paths.js";
-import { checkTokenDrift } from "../../daemon/service-audit.js";
+import { checkManagedServiceEnvDrift, checkTokenDrift } from "../../daemon/service-audit.js";
 import { readGatewayServiceLoadState } from "../../daemon/service-load-state.js";
 import {
   collectGatewayServiceStartRepairIssues,
@@ -25,6 +24,7 @@ import { GatewayRestartPreparationError } from "../../infra/restart-intent-error
 import type { GatewayRestartIntent } from "../../infra/restart-intent.js";
 import { isWSL } from "../../infra/wsl.js";
 import { defaultRuntime, ExitError } from "../../runtime.js";
+import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
 import { formatCliCommand } from "../command-format.js";
 import { formatInvalidConfigRecoveryHint } from "../config-recovery-hints.js";
 import { resolveGatewayTokenForDriftCheck } from "./gateway-token-drift.js";
@@ -119,6 +119,15 @@ async function resolveServiceLoadedOrFail(
   return (
     loadState.status === "loaded" ||
     (Boolean(opts.acceptInstalledDefinition) && (await hasInstalledDefinition()))
+  );
+}
+
+/** Only observer cancellation belongs to the root; concurrent service failures still report. */
+export function commandInterrupted(error: unknown): boolean {
+  const signal = getAsyncWorkSignal();
+  return (
+    signal?.aborted === true &&
+    (error === signal.reason || (error instanceof Error && error.cause === signal.reason))
   );
 }
 
@@ -277,6 +286,9 @@ export async function runServiceStart(params: {
       if (postCheckFailed || err instanceof ExitError) {
         throw err;
       }
+      if (commandInterrupted(err)) {
+        return;
+      }
       fail(`${params.serviceNoun} start failed: ${String(err)}`, params.renderStartHints());
       return;
     }
@@ -348,6 +360,9 @@ export async function runServiceStart(params: {
         if (postCheckFailed || err instanceof ExitError) {
           throw err;
         }
+        if (commandInterrupted(err)) {
+          return;
+        }
         fail(`${params.serviceNoun} repair failed: ${String(err)}`, params.renderStartHints());
         return;
       }
@@ -362,6 +377,9 @@ export async function runServiceStart(params: {
   } catch (err) {
     if (postCheckFailed || err instanceof ExitError) {
       throw err;
+    }
+    if (commandInterrupted(err)) {
+      return;
     }
     fail(`${params.serviceNoun} start failed: ${String(err)}`, params.renderStartHints());
   }
@@ -486,11 +504,7 @@ export async function runServiceRestart(params: {
   let handledRepair: ServiceRecoveryResult<"restarted"> | null = null;
   let recoveredLoadedState: boolean | null = null;
   const { prepare: prepareGatewayRestartIntent, clear: clearPreparedRestartIntent } =
-    createServiceRestartIntent({
-      serviceNoun: params.serviceNoun,
-      service: params.service,
-      intent: restartIntent,
-    });
+    createServiceRestartIntent({ ...params, intent: restartIntent });
   const emitScheduledRestart = (
     restartStatus: ReturnType<typeof describeGatewayServiceRestart>,
     serviceLoaded: boolean,
@@ -523,6 +537,9 @@ export async function runServiceRestart(params: {
       if (err instanceof ExitError) {
         throw err;
       }
+      if (commandInterrupted(err)) {
+        return false;
+      }
       fail(`${params.serviceNoun} restart failed: ${String(err)}`);
       return false;
     }
@@ -540,6 +557,9 @@ export async function runServiceRestart(params: {
     } catch (err) {
       if (err instanceof ExitError) {
         throw err;
+      }
+      if (commandInterrupted(err)) {
+        return false;
       }
       fail(`${params.serviceNoun} restart failed: ${String(err)}`);
       return false;
@@ -590,6 +610,9 @@ export async function runServiceRestart(params: {
       if (err instanceof ExitError) {
         throw err;
       }
+      if (commandInterrupted(err)) {
+        return false;
+      }
       const hints = renderRestartFailureHints(err);
       fail(`${params.serviceNoun} repair failed: ${String(err)}`, hints);
       return false;
@@ -597,35 +620,49 @@ export async function runServiceRestart(params: {
   }
 
   if (loaded && !handledRecovery && !configIssue && params.checkTokenDrift) {
+    const warnDrift = (message: string, source?: string) => {
+      const recovery = source
+        ? (resolveDaemonInstallBlockMessage("gateway") ??
+          `Run \`${formatCliCommand("openclaw gateway install --force")}\` to refresh the service ${source}.`)
+        : undefined;
+      const warning = recovery ? `${message} ${recovery}` : message;
+      warnings.push(warning);
+      if (!json) {
+        defaultRuntime.log(`\n⚠️  ${warning}\n`);
+      }
+    };
     try {
       const command = await params.service.readCommand(process.env);
-      const serviceToken = command?.environment?.OPENCLAW_GATEWAY_TOKEN;
       const cfg = await readBestEffortConfig();
-      const driftEnv = {
-        ...process.env,
-        ...command?.environment,
-      };
-      const configToken = await resolveGatewayTokenForDriftCheck({ cfg, env: driftEnv });
-      const driftIssue = checkTokenDrift({ serviceToken, configToken });
-      if (driftIssue) {
-        const recovery =
-          resolveDaemonInstallBlockMessage("gateway") ??
-          `Run \`${formatCliCommand("openclaw gateway install --force")}\` to refresh the service token source.`;
-        const warning = `${driftIssue.message} ${recovery}`;
-        warnings.push(warning);
-        if (!json) {
-          defaultRuntime.log(`\n⚠️  ${warning}\n`);
+      const driftEnv = { ...process.env, ...command?.environment };
+      try {
+        const configToken = await resolveGatewayTokenForDriftCheck({ cfg, env: driftEnv });
+        const issue = checkTokenDrift({
+          serviceToken: command?.environment?.OPENCLAW_GATEWAY_TOKEN,
+          configToken,
+        });
+        if (issue) {
+          warnDrift(issue.message, "token source");
+        }
+      } catch (err) {
+        if (isGatewaySecretRefUnavailableError(err, "gateway.auth.token")) {
+          warnDrift(
+            "Unable to verify gateway token drift: gateway.auth.token SecretRef is configured but unavailable in this command path.",
+          );
         }
       }
-    } catch (err) {
-      if (isGatewaySecretRefUnavailableError(err, "gateway.auth.token")) {
-        const warning =
-          "Unable to verify gateway token drift: gateway.auth.token SecretRef is configured but unavailable in this command path.";
-        warnings.push(warning);
-        if (!json) {
-          defaultRuntime.log(`\n⚠️  ${warning}\n`);
-        }
+      const { collectDurableServiceEnvVars } = await import("../../config/state-dir-dotenv.js");
+      const { collectEnvSecretRefIds } = await import("../../config/resolution-facts.js");
+      const issue = checkManagedServiceEnvDrift({
+        command,
+        durableEnvironment: collectDurableServiceEnvVars({ env: driftEnv, config: cfg }),
+        secretRefKeys: collectEnvSecretRefIds(cfg),
+      });
+      if (issue) {
+        warnDrift(issue.message, "environment");
       }
+    } catch {
+      // Drift inspection is best effort and must not block restart.
     }
   }
 
@@ -633,9 +670,12 @@ export async function runServiceRestart(params: {
   try {
     let restartResult: GatewayServiceRestartResult | undefined;
     if (loaded && !handledRepair && !handledRecovery) {
-      await prepareGatewayRestartIntent();
+      if (!params.opts?.preserveDefinition) {
+        await prepareGatewayRestartIntent();
+      }
       try {
         restartResult = await params.service.restart({
+          prepareRestart: params.opts?.preserveDefinition ? prepareGatewayRestartIntent : undefined,
           preserveDefinition: configIssue ? true : params.opts?.preserveDefinition,
           env: process.env,
           stdout,
@@ -688,6 +728,9 @@ export async function runServiceRestart(params: {
     // A non-exiting runtime unwinds after emission; never replace that result.
     if (postCheckFailed || err instanceof ExitError) {
       throw err;
+    }
+    if (commandInterrupted(err)) {
+      return false;
     }
     const hints = renderRestartFailureHints(err);
     fail(`${params.serviceNoun} restart failed: ${String(err)}`, hints);

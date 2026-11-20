@@ -1,36 +1,35 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcess, type SendHandle, type SpawnOptions } from "node:child_process";
-import { rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { serialize } from "node:v8";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
-import { formatChildRuntimeSpawnWarning } from "../../infra/child-runtime-viability.js";
+import {
+  assertChildRuntimeAvailable,
+  classifyChildRuntimeFailure,
+} from "../../infra/child-runtime-viability.js";
+import { hasErrnoCode } from "../../infra/errno.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
 import {
+  runtimeNeedsTypeScriptLoader,
   resolveRuntimeWorkerArgv,
   resolveRuntimeWorkerUrl,
 } from "../../infra/runtime-worker-url.js";
-import { redactToolPayloadText } from "../../logging/redact.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { truncateUtf8Suffix } from "../../utils/utf8-truncate.js";
 import type { SpawnInitiation } from "../spawn-initiation.js";
 import { waitForBrokerChildCompletion } from "./child-completion.js";
+import { observeBrokerChildDiagnostics } from "./child-diagnostics.js";
 import { BrokerChild } from "./child.js";
 import { terminateBrokerProcessGroup, terminateLostBrokerChild } from "./cleanup.js";
 import type { BrokerExecaOptions, BrokerExecaResult } from "./execa-protocol.js";
 import { BrokerFileReads } from "./file-reads.js";
 import { createBrokerReceiver, createBrokerSender } from "./ipc.js";
-import { holdPipe, restoreStdinPipe } from "./pipe.js";
-import {
-  SpawnBrokerError,
-  type BrokerRequest,
-  type BrokerResponse,
-  type BrokerSpawnOptions,
-} from "./protocol.js";
+import { brokerSpawnOptions, holdPipe, restoreStdinPipe } from "./pipe.js";
+import { SpawnBrokerError, type BrokerRequest, type BrokerResponse } from "./protocol.js";
+import { createNativeResourceAuthority } from "./resource-authority.js";
 import {
   BrokerResourceClaims,
-  createNativeResourceAuthority,
   type BrokerNativeResourceCallbacks,
   type BrokerNativeResourceInput,
   type BrokerNativeResourceLease,
@@ -60,39 +59,6 @@ type Request = {
   resultSettled: boolean;
 };
 
-export function brokerSpawnOptions(options: SpawnOptions): BrokerSpawnOptions | undefined {
-  const stdio = options.stdio ?? "pipe";
-  const entries = typeof stdio === "string" ? [stdio, stdio, stdio] : [...stdio];
-  const normalized: BrokerSpawnOptions["stdio"] = [];
-  for (let fd = 0; fd < Math.max(3, entries.length); fd += 1) {
-    const entry = entries[fd] ?? (fd < 3 ? "pipe" : "ignore");
-    // Only stdin is inherited by the broker. Numeric/anonymous descriptors stay host-owned.
-    if (entry === "inherit" && fd !== 0) {
-      return undefined;
-    }
-    if (entry !== "pipe" && entry !== "ignore" && entry !== "inherit" && entry !== "ipc") {
-      return undefined;
-    }
-    normalized.push(entry);
-  }
-  if (options.signal || options.timeout || options.killSignal) {
-    throw new Error("Unsupported spawn broker cancellation options");
-  }
-  return {
-    cwd: options.cwd instanceof URL ? fileURLToPath(options.cwd) : options.cwd,
-    env: options.env ? { ...options.env } : { ...process.env },
-    argv0: options.argv0,
-    detached: options.detached,
-    shell: options.shell,
-    windowsHide: options.windowsHide,
-    windowsVerbatimArguments: options.windowsVerbatimArguments,
-    serialization: options.serialization,
-    uid: options.uid,
-    gid: options.gid,
-    stdio: normalized,
-  };
-}
-
 export class SpawnBrokerHost {
   readonly entryPath: string;
   private readonly workerUrl: URL;
@@ -120,8 +86,7 @@ export class SpawnBrokerHost {
   private readonly cleanups = new Set<ReturnType<typeof terminateLostBrokerChild>>();
   private readonly cleanupErrors: Error[] = [];
   private readonly resourceClaims: BrokerResourceClaims | undefined;
-  private readonly resourceDirectory: string | undefined;
-  private readonly resourceAuthority: { endpoint: string; secret: string } | undefined;
+  private readonly resourceAuthority: ReturnType<typeof createNativeResourceAuthority> | undefined;
   private startupDeadline = 0;
   private serviceStartup: (() => void) | undefined;
   private markNativeReady: ((pid: number, generation: number) => void) | undefined;
@@ -146,9 +111,7 @@ export class SpawnBrokerHost {
       options.workerUrl ?? resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.spawnBroker);
     this.entryPath = fileURLToPath(this.workerUrl);
     if (options.nativeResources) {
-      const { directory, ...authority } = createNativeResourceAuthority();
-      this.resourceDirectory = directory;
-      this.resourceAuthority = authority;
+      this.resourceAuthority = createNativeResourceAuthority();
       this.resourceClaims = new BrokerResourceClaims({
         transmit: async (request) => {
           if (!this.available) {
@@ -166,19 +129,18 @@ export class SpawnBrokerHost {
       });
     }
     void this.readiness.promise.catch(() => {});
-    try {
-      this.start();
-    } catch (error) {
-      if (this.resourceDirectory) {
-        rmSync(this.resourceDirectory, { recursive: true, force: true });
-      }
-      throw error;
-    }
+    this.start();
     process.once("exit", this.onParentExit);
   }
 
   get pid(): number | undefined {
     return this.process?.pid;
+  }
+  get hasOpenNativeResourceClaims(): boolean {
+    return this.resourceClaims?.hasOpenClaims ?? false;
+  }
+  get nativeResourceAdmissionClosed(): boolean {
+    return this.resourceClaims?.admissionClosed ?? false;
   }
   ready(): Promise<void> {
     return this.closing
@@ -189,6 +151,8 @@ export class SpawnBrokerHost {
   readFile(filePath: string, signal?: AbortSignal): Promise<Buffer> {
     return this.fileReads.read(filePath, signal);
   }
+
+  readonly readFilePage = this.fileReads.readPage.bind(this.fileReads);
 
   captureNativeResource(
     input: BrokerNativeResourceInput,
@@ -205,7 +169,12 @@ export class SpawnBrokerHost {
     return this.resourceClaims.capture(
       {
         ...input,
-        ...this.resourceAuthority,
+        ...(input.moduleUrl.startsWith("file:") &&
+        runtimeNeedsTypeScriptLoader(fileURLToPath(input.moduleUrl))
+          ? { sourceLoaderUrl: import.meta.resolve("tsx/esm/api") }
+          : {}),
+        endpoint: this.resourceAuthority.endpoint,
+        secret: this.resourceAuthority.secret,
         generation: this.generation - 1,
         startupDeadline: this.available ? undefined : this.startupDeadline,
         id: ++this.sequence,
@@ -234,15 +203,14 @@ export class SpawnBrokerHost {
     if (!this.resourceClaims || !this.process) {
       return;
     }
-    const stderr = this.process.stderr instanceof Socket ? this.process.stderr : undefined;
     if (this.closing || this.resourceClaims.hasOpenClaims || this.requests.size > 0) {
       this.process.ref();
-      stderr?.ref();
+      process.ref(this.process.stderr);
       // Newer Bun releases, like Node, reference IPC independently of the child.
       this.process.channel?.ref?.();
     } else {
       this.process.unref();
-      stderr?.unref();
+      process.unref(this.process.stderr);
       this.process.channel?.unref?.();
     }
   }
@@ -369,6 +337,12 @@ export class SpawnBrokerHost {
     if (this.closing) {
       return;
     }
+    try {
+      assertChildRuntimeAvailable();
+    } catch (error) {
+      this.readiness.reject(error);
+      return;
+    }
     const generation = this.generation++;
     const bootstrap: BrokerBootstrap = {
       type: "bootstrap",
@@ -386,24 +360,16 @@ export class SpawnBrokerHost {
       serialization: "advanced",
     });
     this.process = child;
-    let stderrTail = "";
-    child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
-      stderrTail = truncateUtf8Suffix(stderrTail + chunk, 2048);
-    });
-    const exitError = () => {
-      const stderr = redactToolPayloadText(stderrTail).trim();
-      return new Error(
-        `exited with code=${child.exitCode ?? "null"} signal=${child.signalCode ?? "none"}${stderr ? `\nstderr:\n${stderr}` : ""}`,
-      );
-    };
-    // Exit can precede the last stderr bytes; record diagnostics only after the pipe closes.
-    this.brokerClosed = waitForBrokerChildCompletion(child).then(() => {
-      if (this.closing && child.pid && (child.exitCode !== 0 || child.signalCode !== null)) {
+    const exitError = observeBrokerChildDiagnostics(child);
+    let closingAtFailure = false;
+    // A crash can disconnect IPC before close() joins the later native exit.
+    const brokerCompletion = (this.brokerClosed = waitForBrokerChildCompletion(child).then(() => {
+      if (closingAtFailure && child.pid && (child.exitCode !== 0 || child.signalCode !== null)) {
         this.cleanupErrors.push(
           new SpawnBrokerError("Spawn broker shutdown failed", { cause: exitError() }),
         );
       }
-    });
+    }));
     const receiver = createBrokerReceiver();
     const brokerExited = createDeferredCore();
     let ended = false;
@@ -419,10 +385,13 @@ export class SpawnBrokerHost {
       ? undefined
       : setTimeout(checkStartup, SPAWN_BROKER_STARTUP_TIMEOUT_MS);
     this.serviceStartup = checkStartup;
-    const fail = (cause?: Error) => {
+    const fail = (nativeCause?: Error) => {
       if (ended) {
         return;
       }
+      const cause =
+        classifyChildRuntimeFailure({ error: nativeCause, started: ready }) ?? nativeCause;
+      closingAtFailure = this.closing;
       ended = true;
       clearTimeout(startupTimer);
       this.markNativeReady = undefined;
@@ -436,10 +405,11 @@ export class SpawnBrokerHost {
         child.disconnect();
       }
       const error = new SpawnBrokerError(
-        formatChildRuntimeSpawnWarning(cause) ??
-          (this.hasBeenReady
+        cause && hasErrnoCode(cause, "NODE_RUNTIME_UNAVAILABLE")
+          ? cause.message
+          : this.hasBeenReady
             ? "Spawn broker exited; command outcome is unavailable"
-            : `Spawn broker failed before readiness: ${cause?.message ?? "channel lost"}`),
+            : `Spawn broker failed before readiness: ${cause?.message ?? "channel lost"}`,
         { cause },
       );
       const previousReadiness = this.readiness;
@@ -484,7 +454,12 @@ export class SpawnBrokerHost {
           }),
         });
       }
-      if (this.resourceClaims || this.closing || !this.hasBeenReady) {
+      if (
+        this.resourceClaims ||
+        this.closing ||
+        !this.hasBeenReady ||
+        hasErrnoCode(cause, "NODE_RUNTIME_UNAVAILABLE")
+      ) {
         this.readiness.reject(error);
         this.resourceClaims?.fail(error);
         return;
@@ -514,10 +489,21 @@ export class SpawnBrokerHost {
     this.markNativeReady = markReady;
     child.once("error", fail);
     child.once("exit", () => {
+      if (!ended) {
+        closingAtFailure = this.closing;
+      }
       brokerExited.resolve();
-      fail(exitError());
+      if (ready) {
+        fail(exitError());
+      } else {
+        void brokerCompletion.then(() => fail(exitError()));
+      }
     });
-    child.once("disconnect", () => fail(new Error("IPC channel disconnected")));
+    child.once("disconnect", () => {
+      if (ready) {
+        fail(new Error("IPC channel disconnected"));
+      }
+    });
     child.on("message", (raw: unknown, handle: unknown) => {
       if (ended || this.closing) {
         if (handle instanceof Socket) {
@@ -538,6 +524,18 @@ export class SpawnBrokerHost {
       }
       // SAFETY: The version-matched broker is the sole sender on this private IPC channel.
       const message = decoded as BrokerResponse | BrokerResourceResponse;
+      if (message.type === "startup-failed") {
+        if (!ready && this.resourceClaims) {
+          const claims = this.resourceClaims;
+          void this.brokerClosed
+            ?.then(() => claims.closeBeforeStartup())
+            .catch((error: unknown) => {
+              this.cleanupErrors.push(toErrorObject(error, "Spawn broker startup cleanup failed"));
+            });
+        }
+        fail(Object.assign(new Error(message.error.message), message.error));
+        return;
+      }
       if (message.type === "ready") {
         try {
           markReady(message.pid, generation);
@@ -723,8 +721,8 @@ export class SpawnBrokerHost {
       try {
         await this.waitForCleanup();
       } finally {
-        if (this.resourceDirectory) {
-          rmSync(this.resourceDirectory, { recursive: true, force: true });
+        if (this.resourceAuthority?.directory && this.hasBeenReady) {
+          await rm(this.resourceAuthority.directory, { recursive: true, force: true });
         }
       }
     } finally {

@@ -80,7 +80,7 @@ phase-specific gates and `$release-openclaw-ci` for dispatch/recovery.
 Use one release cut named
 exactly `release/YYYY.M.PATCH` (no `-cutN` or staging suffixes), version
 alignment plus changelog and contribution record in one commit so Code SHA =
-Release SHA, Q=C, independently pinned P, and one validation parent.
+Release SHA, Q=C by default, independently pinned P, and one validation parent.
 Record the cut time; aim to seal validation in approximately 20 minutes and
 publish within an hour, with actual timing recorded separately. Backports are
 merged `main` PRs cherry-picked before dispatch (pure-data model/catalog
@@ -101,16 +101,11 @@ that can feed validation, run the integrated exact-HEAD gate:
 pnpm release:push
 ```
 
-This wrapper refreshes and pins `origin/main` and release tags, requires a clean canonical
+This wrapper refreshes and pins `origin/main`, requires a clean canonical
 `release/YYYY.M.PATCH` worktree, captures `HEAD`, verifies that it fast-forwards
 the remote release branch, and runs only a short `git diff --check` plus the
 dependency-free release-changelog layout check. It pushes that captured SHA
-only if the source branch, worktree, and HEAD remain unchanged. The first push
-compares against the newest stable release tag published on `origin` between the main audit merge base
-and the candidate, falling back to the audit merge base if none exists. Later
-pushes compare against the refreshed canonical release head. Already-shipped
-patch-file bytes are not new whitespace errors; changed whitespace and conflict
-markers still fail the same check. Do not use a
+only if the source branch, worktree, and HEAD remain unchanged. Do not use a
 separate `git push`: exact-SHA verification and push stay one operation. A
 failed preflight, concurrent commit, or non-fast-forward remote update blocks
 the push and FRV dispatch. Record the pushed SHA and comparison base in the
@@ -138,26 +133,23 @@ This example qualifies a final version for beta-first publication. Select
 for the prepared button. A beta prerelease uses the beta profile and soak policy.
 Keep that intended selection on later notes-only parents. This admits committed
 publication source, not registry eligibility or publication authority.
-Publish-purpose dispatches run the shared candidate release-notes,
-contribution-record provenance, and changelog-attribution gates at the Code SHA
-before dispatch. A failure prevents dispatch. A record target lost to a squash
-merge needs a corrected record and a new Code SHA. The candidate checklist uses
-the same validators; do not run both dispatch routes. For an existing
-qualification, use the retained-run consumption path below rather than launching
-another run.
+Publish-purpose dispatches first run the `pnpm release:candidate` release-notes
+and contribution-record gates at the Code SHA and refuse to dispatch on failure.
+A record target lost to a squash merge needs a corrected record and a new Code SHA.
 
-Record and reuse C/Q and independently trusted P. For the direct SHA-pinned
-dispatcher, `--workflow-sha`, if explicit, must equal C; its default is Q=C.
-The candidate checklist instead uses `--workflow-sha` for P, as shown above.
-P performs lightweight admission before the dispatcher creates the Q transport
-and dispatches FRV. Missing Q
-contracts need deliberate backports; never borrow future-main requirements.
+Record C/Q and independently trusted P. The helper defaults Q=C; on its
+candidate route, `--workflow-sha <Q>` may select a reviewed main-ancestor Q
+without changing C. P performs lightweight admission before this same helper
+creates the exact Q transport and dispatches FRV. Missing Q contracts need a
+deliberate Q repair or candidate backport; never borrow moving-main requirements.
+Changing Q requires a new request/admission and successful parent; follow
+[qualification-tooling recovery](../../../../docs/reference/full-release-validation/dispatch.md#recover-qualification-tooling-without-changing-the-candidate).
 Beta-publish uses
 `release_profile=beta`, `run_release_soak=false` (`npm-beta-v1` for a qualifying
 canonical beta target). Stable-publish requires `release_profile=stable` or
 `full`, soak, and blocking performance. Beta-profile evidence cannot qualify
-stable. FRV must conclude success with every selected lane passing under this
-branch's strict candidate-owned decision policy; changing P cannot waive failures.
+stable. FRV must conclude success under its pinned
+[release-tooling policy](../../../../docs/reference/full-release-validation/evidence.md#release-tooling-waivers).
 See [shared release boundaries](../SKILL.md#shared-release-boundaries),
 [validation](validation.md), and
 [publication recovery](publication-recovery.md). Diagnose
@@ -170,7 +162,7 @@ replay alone does not prove a flake or a fix. A confirmed product
 defect that a required lane blocks on creates a new Code SHA: the
 update/install path (previous stable updates to the candidate, install smoke,
 pack budget, worker bundle), the bytes to publish, or another required gate
-proven by diagnosis. A diagnosed infrastructure flake or a publish-tooling re-tag never does. A frozen qualification harness repair also creates a new C/Q. Independent P-only
+proven by diagnosis. A diagnosed infrastructure flake or a publish-tooling re-tag never does. A qualification-only harness repair can preserve C and admit a new reviewed Q. Independent P-only
 tooling, credentials, infrastructure, or monitor failures keep C/Q and recover
 the failed surface without relabeling original evidence. Use [publication recovery](publication-recovery.md) for
 classification. Keep PR CI and supporting workflows running while the parent
@@ -276,11 +268,12 @@ another equivalent validation. Its `npm-beta-v1` Telegram package result is
 coverage reuse authenticated mock-provider package Telegram proof for the exact
 FRV-qualified tarball. Separately packed historical
 tarballs and explicit live-provider checks require supplemental Telegram proof
-from the retained, verified `release-ci/*` ref at Q=C with `harness_ref` pinned
-to C; missing or moved transport refs require newly bound candidate evidence,
+from the retained, verified `release-ci/*` ref at admitted Q with `harness_ref` pinned
+to Q and package source pinned to C; missing or moved transport refs require newly bound candidate evidence,
 never main's harness. Keep supplemental run IDs in candidate evidence; do not
 forward them as the publisher's optional postpublish diagnostic input.
-Stable Parallels runs use the candidate checkout's harness and dependency graph;
+Stable Parallels runs use admitted Q's harness and dependency graph (an isolated
+checkout when Q differs from C) against the exact C tarballs;
 beta still defers Parallels unless explicitly selected. Use `--run-parallels`
 only on explicit operator direction. Optional
 `--windows-node-tag <exact-source-tag>` records its approved installer digest
@@ -465,8 +458,8 @@ failure without republishing npm.
 Run [postpublish confidence](validation.md#postpublish-confidence) against the
 exact published package. For a beta-to-latest promotion, retain available
 deferred-lane results, including published-package Telegram, while enforcing
-the shared required publication proofs. The exact FRV and every selected lane
-must succeed; this branch does not support tooling-policy waivers. Run safe
+the shared required publication proofs. The exact FRV must succeed, with any
+tooling-policy waivers already recorded there. Run safe
 independent rosters concurrently while controlling local Docker/VM load.
 Classify failures before admitting a fix to the next beta; do not scan moving
 main or automatically rerun all groups. An operator's beta-attempt cap counts

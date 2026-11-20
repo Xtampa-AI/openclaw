@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createXApiClient, type XPost, type XPostEnvelope } from "./api.js";
+import type { XPost, XPostEnvelope } from "./api.js";
 import { runXEvents, type XCursorState, type XEventStatus } from "./events.js";
+import { createXTestApi as createXApiClient } from "./test-support/api-client.js";
 import { budgetApi, post } from "./test-support/events.js";
 import { createXTestSpend } from "./test-support/spend.js";
 
@@ -12,11 +13,6 @@ function streamFixture() {
   const connected = Promise.withResolvers<void>();
   let stream!: ReadableStreamDefaultController<Uint8Array>;
   const api = createXApiClient({
-    spend: createXTestSpend(),
-    clientId: "client",
-    clientSecret: "secret",
-    refreshToken: "refresh",
-    saveRefreshToken: async () => {},
     bearerToken: "bearer",
     fetch: async (input) => {
       if (input.endsWith("/oauth2/token")) {
@@ -214,11 +210,6 @@ describe("X event transport", () => {
     let fail = true;
     const order: string[] = [];
     const api = createXApiClient({
-      spend: createXTestSpend(),
-      clientId: "client",
-      clientSecret: "secret",
-      refreshToken: "refresh",
-      saveRefreshToken: async () => {},
       fetch: async (input) => {
         const url = new URL(input);
         if (url.pathname.endsWith("/oauth2/token")) {
@@ -297,11 +288,6 @@ describe("X event transport", () => {
       let cursor: XCursorState = { sinceId };
       const encoder = new TextEncoder();
       const api = createXApiClient({
-        spend: createXTestSpend(),
-        clientId: "client",
-        clientSecret: "secret",
-        refreshToken: "refresh",
-        saveRefreshToken: async () => {},
         bearerToken: "bearer",
         fetch: async (input, init) => {
           const url = new URL(input);
@@ -430,9 +416,6 @@ describe("X event transport", () => {
       const polled = Promise.withResolvers<void>();
       const statuses: XEventStatus[] = [];
       const api = createXApiClient({
-        spend: createXTestSpend(),
-        clientId: "client",
-        saveRefreshToken: async () => {},
         clientSecret: "test-client-secret",
         refreshToken: "test-refresh-token",
         bearerToken: "test-app-bearer",

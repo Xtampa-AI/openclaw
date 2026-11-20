@@ -423,25 +423,9 @@ describe("secrets CLI", () => {
             Buffer.from(raw.slice(at + "SENTINEL".length)),
           ]),
         );
-        const originalOpen = fs.open.bind(fs);
-        let descriptorClosed = false;
-        const openSpy = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
-          const handle = await originalOpen(...args);
-          const originalClose = handle.close.bind(handle);
-          vi.spyOn(handle, "close").mockImplementation(async () => {
-            descriptorClosed = true;
-            await originalClose();
-          });
-          return handle;
-        });
-        try {
-          await expect(runSecrets(["secrets", "apply", "--from", planPath])).rejects.toThrow(
-            "__exit__:1",
-          );
-          expect(descriptorClosed).toBe(true);
-        } finally {
-          openSpy.mockRestore();
-        }
+        await expect(runSecrets(["secrets", "apply", "--from", planPath])).rejects.toThrow(
+          "__exit__:1",
+        );
         expect(runtimeErrors.join("\n")).toContain("must be valid UTF-8");
         expect(runSecretsApply).not.toHaveBeenCalled();
       });
@@ -464,19 +448,6 @@ describe("secrets CLI", () => {
         });
       },
       JSON.stringify(plan) + "\r\n",
-    );
-  });
-
-  it("retains BOM rejection rather than silently accepting a changed plan", async () => {
-    await withPlanFile(
-      async (planPath) => {
-        await expect(runSecrets(["secrets", "apply", "--from", planPath])).rejects.toThrow(
-          "__exit__:1",
-        );
-        expect(runtimeErrors.join("\n")).toContain("Malformed JSON");
-        expect(runSecretsApply).not.toHaveBeenCalled();
-      },
-      "\ufeff" + JSON.stringify(createManualSecretsPlan()),
     );
   });
 

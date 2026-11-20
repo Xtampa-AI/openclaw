@@ -1,8 +1,14 @@
+import { isDeepStrictEqual } from "node:util";
 import type { SessionRowFacts } from "../../sessions/session-row-changes.js";
 import type {
   SessionEntryPlaceholder,
   SessionSharingEntry,
 } from "./session-accessor.sqlite-entry-cache.types.js";
+import {
+  attachSessionEntrySnapshots,
+  sessionEntrySnapshotColumnsDefinition,
+  type SessionEntryProjection,
+} from "./session-entry-snapshot-values.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 export type PreparedSessionEntryPredicate = {
@@ -11,7 +17,37 @@ export type PreparedSessionEntryPredicate = {
   state: "acquiring" | "current" | "unknown" | "changed";
   revision: number;
   pending: Set<object>;
+  projection?: SessionEntryProjection;
 };
+
+/** Missing optional full facts cannot certify a predicate that selected snapshots. */
+export function projectSessionEntryPredicatePostimage(
+  predicate: PreparedSessionEntryPredicate,
+  entry: SessionEntry | undefined,
+  fullEntry?: SessionEntry,
+): { entry: SessionEntry | undefined; known: boolean } {
+  const projection = predicate.projection;
+  if (!entry || projection === undefined) {
+    return { entry, known: true };
+  }
+  const snapshots = projection === "full" || (projection !== "list" && projection.length > 0);
+  const selected = snapshots ? fullEntry : entry;
+  if (!selected) {
+    return { entry: undefined, known: false };
+  }
+  const needsProjection =
+    projection !== "full" &&
+    sessionEntrySnapshotColumnsDefinition.some(
+      ([field]) =>
+        Object.hasOwn(selected, field) && (projection === "list" || !projection.includes(field)),
+    );
+  return {
+    entry: needsProjection
+      ? attachSessionEntrySnapshots({ ...selected }, {}, projection)
+      : selected,
+    known: true,
+  };
+}
 
 export type CommittedSessionSharingFacts = {
   entry: SessionSharingEntry | undefined;
@@ -27,11 +63,16 @@ export type SessionSharingAcquisition = {
 };
 
 export type PreparedSessionSharingRead = {
+  followLifecycle?: boolean;
+  /** Transcript compaction preserves the logical session incarnation. */
+  followTranscript?: boolean;
   predicate?: PreparedSessionEntryPredicate;
   pending: Set<object>;
   facts: CommittedSessionSharingFacts | undefined;
   acquisition?: SessionSharingAcquisition;
   generation?: {
+    /** Versioned results follow transcripts; only unversioned results follow lifecycle changes. */
+    followSessionKey?: "transcript" | "lifecycle";
     initiallyAbsent?: true;
     current:
       | Pick<
@@ -46,6 +87,10 @@ export type PreparedSessionSharingRead = {
 export type SessionSharingRetentionRequest = {
   databaseIdentity: string;
   sessionKey: string;
+  /** Input custody owns same-session rollovers; access facts follow committed postimages. */
+  followLifecycle?: boolean;
+  /** Transcript compaction preserves the logical session incarnation. */
+  followTranscript?: boolean;
   predicate?: PreparedSessionEntryPredicate;
 } & (
   | { acquiring: true }
@@ -57,7 +102,7 @@ export function publishRetainedSessionEntryPredicate(
   read: PreparedSessionSharingRead,
   entry: SessionEntry | undefined,
   known: boolean,
-  options?: { preserveMatchingEntry?: boolean },
+  options?: { preserveMatchingEntry?: boolean; fullEntry?: SessionEntry },
 ): void {
   const predicate = read.predicate;
   if (!predicate) {
@@ -66,19 +111,21 @@ export function publishRetainedSessionEntryPredicate(
   if (predicate.state === "changed") {
     return;
   }
+  const postimage = projectSessionEntryPredicatePostimage(predicate, entry, options?.fullEntry);
+  const postimageKnown = known && postimage.known;
   // Seed acquisition with the first committed fact. Later facts must agree before
   // the selecting read can acknowledge them, including superseded receipts.
   if (predicate.state === "acquiring" && predicate.revision === 0) {
-    predicate.entry = entry;
+    predicate.entry = postimage.entry;
     predicate.revision += 1;
-    if (!known) {
+    if (!postimageKnown) {
       predicate.state = "unknown";
     }
     return;
   }
   let matches: boolean | undefined;
   try {
-    matches = known ? predicate.matches(entry) : undefined;
+    matches = postimageKnown ? predicate.matches(postimage.entry) : undefined;
   } catch {
     // A failed comparison fences this claim without stranding the committed batch.
   }
@@ -89,7 +136,7 @@ export function publishRetainedSessionEntryPredicate(
     predicate.revision += 1;
     predicate.state = "changed";
   } else if (!options?.preserveMatchingEntry) {
-    predicate.entry = entry;
+    predicate.entry = postimage.entry;
   }
 }
 
@@ -152,12 +199,17 @@ export function publishRetainedSessionGeneration(
     generation.current = undefined;
   } else if (
     !entry ||
-    generation.current.sessionId !== entry.sessionId ||
-    generation.current.lifecycleRevision !== entry.lifecycleRevision
+    (!generation.followSessionKey && generation.current.sessionId !== entry.sessionId) ||
+    (generation.followSessionKey !== "lifecycle" &&
+      generation.current.lifecycleRevision !== entry.lifecycleRevision)
   ) {
     generation.current = null;
-  } else {
-    // Same-generation policy changes must narrow retained execution before its next effect.
+  } else if (
+    generation.followSessionKey ||
+    generation.current.permissionMode !== entry.permissionMode ||
+    !isDeepStrictEqual(generation.current.toolOverrides, entry.toolOverrides)
+  ) {
+    // Keep the same fact for metadata-only writes; policy changes narrow the next effect.
     generation.current = entry;
   }
 }

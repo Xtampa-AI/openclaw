@@ -13,6 +13,7 @@ import {
 } from "../cli/update-cli/update-command-migrate.js";
 import { writeOpenClawConfig } from "../config/test-helpers.js";
 import * as doctorHealth from "../flows/doctor-health.js";
+import { inspectScopedMigrationSnapshot } from "../infra/sqlite-migration-scoped-snapshot.js";
 import { readStartupMigrationWarning } from "../infra/state-migrations.messages.js";
 import { listAgentDatabaseAdmissionRefusals } from "../state/agent-database-admission.js";
 import { withAgentDatabaseStartupAdmission } from "../state/agent-database-startup.js";
@@ -248,8 +249,24 @@ describe("container image replacement Doctor repair and startup readiness", () =
       const backups = fs
         .readdirSync(path.dirname(databasePath))
         .filter((name) => name.startsWith("openclaw.sqlite.pre-startup-migration-"));
-      expect(backups).toHaveLength(1);
-      const before = new DatabaseSync(path.join(path.dirname(databasePath), backups[0]!), {
+      const fullBackups = backups.filter((name) => !name.endsWith(".scoped.bak"));
+      const credentialBackups = backups.filter((name) => name.endsWith(".scoped.bak"));
+      expect(fullBackups).toHaveLength(1);
+      expect(credentialBackups).toHaveLength(1);
+      const scope = inspectScopedMigrationSnapshot(
+        path.join(path.dirname(databasePath), credentialBackups[0]!),
+      );
+      expect(scope.sourcePath).toBe(fs.realpathSync(databasePath));
+      expect(scope.userVersion).toBe(1);
+      expect(scope.tables.map((table) => table.name)).toEqual([
+        "device_identities",
+        "device_auth_tokens",
+        "gateway_origin_device_tokens",
+        "exec_approvals_config",
+        "sqlite_stat1",
+        "sqlite_stat4",
+      ]);
+      const before = new DatabaseSync(path.join(path.dirname(databasePath), fullBackups[0]!), {
         readOnly: true,
       });
       try {
@@ -372,8 +389,9 @@ describe("container image replacement Doctor repair and startup readiness", () =
             outcome: "refused",
             refusal: { code: "step-refused", message: expect.any(String) },
             warnings: expect.arrayContaining([
-              expect.stringContaining(
-                `${databasePath} metadata schema version 18 does not match 19`,
+              expect.stringMatching(
+                // The cause precedes the location so path redaction cannot swallow it.
+                /metadata schema version 18 does not match 19\. Database: .*openclaw-agent\.sqlite$/u,
               ),
             ]),
           }),

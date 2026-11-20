@@ -200,6 +200,4 @@ export type AuthProfileIdRepairResult = {
   config: OpenClawConfig;
   changes: string[];
   migrated: boolean;
-  fromProfileId?: string;
-  toProfileId?: string;
 };

@@ -8,7 +8,6 @@ import type {
   StableChannelIngressIdentityParams,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { asNullableRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { escapeRegExp } from "openclaw/plugin-sdk/text-utility-runtime";
@@ -238,20 +237,6 @@ function renderInlineItem(item: unknown, topLevel = false, depth = 0): string {
 
 function extractInlineText(items: readonly unknown[], depth = 0): string {
   return items.map((item) => renderInlineItem(item, false, depth)).join("");
-}
-
-// Extraction renders attacker-controlled content shapes; a throw must never tear down the
-// shared SSE stream (the event would replay unacked forever), so failures log and yield "".
-export function extractMessageTextSafely(
-  content: unknown,
-  runtime: { log?: (message: string) => void },
-): string {
-  try {
-    return extractMessageText(content);
-  } catch (error: unknown) {
-    runtime.log?.(`[tlon] Failed to extract message text: ${formatErrorMessage(error)}`);
-    return "";
-  }
 }
 
 export function extractMessageText(content: unknown): string {

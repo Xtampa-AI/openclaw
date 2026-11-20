@@ -39,15 +39,19 @@ export function mergeAcceptedSessionSpawnsForRun(
   return receipts ? [...receipts.values()] : [];
 }
 
-/** Retire only the exact receipt resolved by an inline result or confirmed cancellation. */
+/** A confirmed cancellation preserves acceptance but ends its owed completion. */
 export function retireAcceptedSessionSpawnCompletionForRun(
   instance: OperationalRunInstanceRef,
-  accepted: Pick<AcceptedSessionSpawn, "runId" | "childSessionKey">,
+  spawn: Pick<AcceptedSessionSpawn, "runId" | "childSessionKey">,
 ): void {
   const receipts = acceptedSpawnsByRun.get(instance);
-  const receipt = receipts?.get(accepted.runId);
-  if (receipt?.childSessionKey === accepted.childSessionKey) {
-    receipts?.set(accepted.runId, { ...receipt, expectsCompletionMessage: false });
+  const accepted = receipts?.get(spawn.runId);
+  if (
+    receipts &&
+    accepted?.childSessionKey === spawn.childSessionKey &&
+    accepted.expectsCompletionMessage === true
+  ) {
+    receipts.set(spawn.runId, { ...accepted, expectsCompletionMessage: false });
   }
 }
 

@@ -3,10 +3,10 @@ import type { PluginInstallRecord } from "../config/types.plugins.js";
 import type { GatewayRequestHandler } from "../gateway/server-methods/types.js";
 import type { PluginCapabilityCatalogHostContext } from "./capability-catalog-context.types.js";
 import type { PluginCapabilityCatalog } from "./capability-catalog.types.js";
-import type { NormalizePluginId } from "./config-normalization-shared.js";
 import type { PluginDiscoveryResult } from "./discovery.js";
 import type { PluginManifestRegistry } from "./manifest-registry.js";
 import type { PluginModuleLoaderRecovery } from "./plugin-instance.types.js";
+import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 import type { PluginRuntimeArtifact } from "./plugin-runtime-artifact-selection.js";
 import type { PluginRecord, PluginRegistry, PluginRegistryParams } from "./registry-types.js";
 import type { CreatePluginRuntimeOptions } from "./runtime/types.js";
@@ -45,6 +45,7 @@ export type PluginLoadOptions = {
   runtimeOptions?: CreatePluginRuntimeOptions;
   startupTrace?: {
     detail: (name: string, metrics: ReadonlyArray<readonly [string, number | string]>) => void;
+    run?: <T>(name: string, run: () => T) => T;
   };
   pluginSdkResolution?: PluginSdkResolutionPreference;
   cache?: boolean;
@@ -81,8 +82,8 @@ export type PluginLoadOptions = {
   expectedSourceDigests?: Readonly<Record<string, string>>;
   loadModules?: boolean;
   throwOnLoadError?: boolean;
-  /** Alias identity captured with the supplied metadata generation. */
-  normalizePluginId?: NormalizePluginId;
+  /** Exact lifecycle inventory supplied by a prepared load owner. */
+  metadataSnapshot?: PluginMetadataSnapshot;
   manifestRegistry?: PluginManifestRegistry;
   discovery?: PluginDiscoveryResult;
 };

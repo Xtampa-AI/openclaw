@@ -2,9 +2,7 @@ import { createDeferred } from "openclaw/plugin-sdk/concurrency-runtime";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import {
-  formatEmbeddingModelInput,
   isEmbeddingBatchUnavailableError,
-  resolveEmbeddingInputFormatVersion,
   type EmbeddingInput,
   type MemoryEmbeddingProviderRuntime,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
@@ -18,13 +16,12 @@ import {
   type MemorySearchDeadlineControl,
   type MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
-import { MAX_TIMER_TIMEOUT_MS, resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import {
   withMemoryWorkspaceLock,
   withMemoryWorkspacePreparation,
 } from "../memory-workspace-lock.js";
-import { readSessionResetRecallCutoffMetadata } from "../session-reset-recall-metadata.js";
 import type { EmbeddingProvider } from "./embeddings.js";
 import type { IndexedMemoryChunk } from "./manager-chunk-writer.js";
 import { prepareMemoryIndexInWorker } from "./manager-cpu-worker-runtime.js";
@@ -35,19 +32,21 @@ import {
 } from "./manager-embedding-cache-ops.js";
 import { createMemoryEmbeddingOperationError } from "./manager-embedding-errors.js";
 import {
+  embedMemoryDocuments,
+  embedMemoryQuery,
+  formatMemoryEmbeddingChunks,
   runMemoryEmbeddingBatchTimeoutRetry,
   runMemoryEmbeddingBatchRetryWithSplit,
   runMemoryEmbeddingRetryLoop,
 } from "./manager-embedding-policy.js";
 import { resolveChunkProvenance } from "./manager-index-preparation.js";
-import { readMemoryIndexSource } from "./manager-index-source.js";
+import { prepareSessionIndexSource, readMemoryIndexSource } from "./manager-index-source.js";
 import { memoryPublicationGroup } from "./manager-publication-transfer.js";
 import {
   resolveMemoryIndexProviderIdentities,
   type MemoryIndexProviderIdentity,
 } from "./manager-reindex-state.js";
 import {
-  assertMemorySessionNotForgotten,
   retainIndexedSessionChunks,
   type PreparedMemoryIndexEntry,
 } from "./manager-session-delta.js";
@@ -56,7 +55,7 @@ import type {
   MemoryIndexWorkItem,
   MemorySemanticProviderGeneration,
   MemorySyncProviderGeneration,
-} from "./manager-sync-ops.js";
+} from "./manager-sync-base.js";
 import { logMemoryVectorDegradedWrite } from "./manager-vector-warning.js";
 import { resolveMemoryPathClassification } from "./memory-path-provenance.js";
 import { runEmbeddingOperationWithTimeout } from "./paused-deadline.js";
@@ -125,17 +124,14 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
       provider,
       cacheKeyData: runtime?.cacheKeyData,
       aliases: runtime?.indexIdentityAliases,
+      documentPrefix: this.settings.inputFormat?.document,
     });
-    const providerKey = expectDefined(
-      identities.at(0),
-      "primary memory provider identity",
-    ).providerKey;
-    const database = this.database;
     const generation = {
-      database,
+      database: this.database,
       cacheWritesInvalidated: false,
-      providerKey,
+      providerKey: expectDefined(identities.at(0), "primary memory provider identity").providerKey,
       identities,
+      ...(provider ? { embeddingDimensions: provider.dimensions } : {}),
     };
     this.syncProviderGeneration = provider
       ? { ...generation, kind: "semantic", provider, ...(runtime ? { runtime } : {}) }
@@ -167,6 +163,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
       provider: this.provider,
       cacheKeyData: this.providerRuntime?.cacheKeyData,
       aliases: this.providerRuntime?.indexIdentityAliases,
+      documentPrefix: this.settings.inputFormat?.document,
     });
   }
 
@@ -196,21 +193,12 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
           run: () =>
             batchEmbed({
               agentId: this.agentId,
-              chunks: resolveEmbeddingInputFormatVersion(provider.model)
-                ? missingChunks.map((chunk) => ({
-                    ...chunk,
-                    ...formatEmbeddingModelInput(chunk, provider.model, "document"),
-                    ...(chunk.embeddingInput
-                      ? {
-                          embeddingInput: formatEmbeddingModelInput(
-                            chunk.embeddingInput,
-                            provider.model,
-                            "document",
-                          ),
-                        }
-                      : {}),
-                  }))
-                : missingChunks,
+              chunks: formatMemoryEmbeddingChunks(
+                missingChunks,
+                provider.model,
+                this.settings.inputFormat,
+              ),
+              ...(this.settings.inputFormat ? { documentFormatApplied: true } : {}),
               wait: this.batch.wait,
               concurrency: this.batch.concurrency,
               pollIntervalMs: this.batch.pollIntervalMs,
@@ -298,11 +286,11 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
             timeoutMs,
             message: `memory embeddings batch timed out after ${Math.round(timeoutMs / 1000)}s`,
             run: async (signal) =>
-              await provider.embedBatch(
-                batchItems.map((item) =>
-                  formatEmbeddingModelInput(item.input, provider.model, "document"),
-                ),
-                { signal, inputType: "document" },
+              await embedMemoryDocuments(
+                provider,
+                batchItems.map((item) => item.input),
+                this.settings.inputFormat,
+                { signal },
               ),
           });
           if (!structured) {
@@ -367,14 +355,6 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
     provider: EmbeddingProvider | null = this.provider,
     providerRuntime: MemoryEmbeddingProviderRuntime | undefined = this.providerRuntime,
   ): number {
-    const configuredTimeoutSeconds = this.settings.sync.embeddingBatchTimeoutSeconds;
-    if (
-      kind === "batch" &&
-      typeof configuredTimeoutSeconds === "number" &&
-      configuredTimeoutSeconds > 0
-    ) {
-      return resolveTimerTimeoutMs(configuredTimeoutSeconds * 1000, MAX_TIMER_TIMEOUT_MS);
-    }
     const defaults = EMBEDDING_TIMEOUTS_MS[kind];
     const runtimeTimeoutMs =
       kind === "query"
@@ -397,9 +377,8 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
         message: `memory embedding probe timed out after ${Math.round(timeoutMs / 1000)}s`,
         deadlineControl,
         run: (signal) =>
-          provider.embed(formatEmbeddingModelInput("ping", provider.model, "query"), {
+          embedMemoryQuery(provider, "ping", this.settings, {
             signal,
-            inputType: "query",
             [MEMORY_SEARCH_DEADLINE_CONTROL]: deadlineControl,
           }),
       });
@@ -436,9 +415,8 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
             signal,
             deadlineControl,
             run: async (opSignal) =>
-              await provider.embed(formatEmbeddingModelInput(text, provider.model, "query"), {
+              await embedMemoryQuery(provider, text, this.settings, {
                 signal: opSignal,
-                inputType: "query",
                 ...(deadlineControl ? { [MEMORY_SEARCH_DEADLINE_CONTROL]: deadlineControl } : {}),
               }),
           });
@@ -490,13 +468,13 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
       model: generation?.provider?.model ?? "fts-only",
       now: Date.now(),
       vectorReady,
+      retained,
+      removedIds,
       ...(source === "sessions"
         ? {
             source,
             agentId: this.agentId,
             sessionId: expectDefined(entry.sessionId, "memory index session identity"),
-            retained,
-            removedIds,
           }
         : { source }),
     };
@@ -526,14 +504,6 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
       };
       const activeItems = [...items];
       const replacements = activeItems.map((item) => this.sourceReplacement(item, generation));
-      if (database !== sourceDatabase) {
-        // The published index owns forget authority, including for shadow rebuilds.
-        for (const replacement of replacements) {
-          if (replacement.source === "sessions") {
-            await assertMemorySessionNotForgotten(sourceDatabase, replacement, assertCurrent);
-          }
-        }
-      }
       const prepare = async (): Promise<boolean> => {
         for (let index = activeItems.length - 1; index >= 0; index--) {
           const {
@@ -600,7 +570,6 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
     retain = true,
   ): Promise<PreparedMemoryIndexEntry | null> {
     const kind = entry.kind;
-    const suppliedContent = entry.content;
     const prepare = async (): Promise<PreparedMemoryIndexEntry | null> => {
       if (kind === "multimodal") {
         const multimodalChunk: Awaited<
@@ -639,35 +608,35 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
         };
       }
 
+      const settings = {
+        entry: { path: entry.path, mtimeMs: entry.mtimeMs },
+        chunking: this.settings.chunking,
+        provider:
+          generation?.kind === "semantic"
+            ? { id: generation.provider.id, maxInputTokens: generation.provider.maxInputTokens }
+            : undefined,
+        hardMaxInputTokens: EMBEDDING_BATCH_MAX_TOKENS,
+      };
+      if (source === "sessions" && entry.streamSessionExport) {
+        const prepared = await prepareSessionIndexSource(entry, settings, this.workspaceDir);
+        this.dirty ||= !prepared;
+        return prepared && { entry, source, chunks: prepared.chunks };
+      }
       const read = await readMemoryIndexSource({
         absolutePath: entry.absPath,
         workspaceDir: this.workspaceDir,
         source,
-        suppliedContent,
         memoryFiles: this.memoryFiles,
       });
       if (!read) {
         this.dirty = true;
         return null;
       }
-      const cutoff = readSessionResetRecallCutoffMetadata(entry);
       const prepared = await prepareMemoryIndexInWorker({
-        entry: {
-          path: entry.path,
-          mtimeMs: entry.mtimeMs,
-          lineMap: entry.lineMap,
-          lineProvenance: entry.lineProvenance,
-        },
+        ...settings,
         source,
         content: read.content,
         pathClassification: read.pathClassification,
-        chunking: this.settings.chunking,
-        cutoffLine: cutoff.state === "valid" ? cutoff.cutoffLine : undefined,
-        provider:
-          generation?.kind === "semantic"
-            ? { id: generation.provider.id, maxInputTokens: generation.provider.maxInputTokens }
-            : undefined,
-        hardMaxInputTokens: EMBEDDING_BATCH_MAX_TOKENS,
       });
       return {
         entry:
@@ -677,7 +646,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
       };
     };
     const preparedEntry =
-      source === "sessions" && kind !== "multimodal" && typeof suppliedContent === "string"
+      source === "sessions" && kind !== "multimodal" && entry.streamSessionExport
         ? await withMemoryWorkspacePreparation(this.workspaceDir, prepare)
         : await withMemoryWorkspaceLock(this.workspaceDir, prepare);
     if (!preparedEntry || !retain) {
@@ -686,7 +655,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerEmbeddingCa
     const database = this.database;
     return await retainIndexedSessionChunks(preparedEntry, database, generation, () => {
       if (this.closed || database.closed || this.database !== database) {
-        throw new Error("Memory source owner changed before session delta planning");
+        throw new Error("Memory source owner changed before delta planning");
       }
     });
   }

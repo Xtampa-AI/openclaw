@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
-const { census, definitelyDead, directory, readStat, darwinCommand, nativeDarwinCensus } =
+const { census, definitelyDead, directory, readStat, readlink, darwinCommand, nativeDarwinCensus } =
   vi.hoisted(() => ({
     census: vi.fn(),
     nativeDarwinCensus: vi.fn(),
     definitelyDead: vi.fn(),
     directory: vi.fn(),
     readStat: vi.fn(),
+    readlink: vi.fn(),
     darwinCommand: vi.fn(),
   }));
 vi.mock("../darwin-process-inspection.js", async (importOriginal) => ({
@@ -14,10 +15,15 @@ vi.mock("../darwin-process-inspection.js", async (importOriginal) => ({
   readDarwinProcessCensus: nativeDarwinCensus,
 }));
 vi.mock("node:child_process", () => ({ spawnSync: census, execFile: vi.fn() }));
-vi.mock("node:fs", () => ({ readdirSync: directory, readFileSync: readStat }));
+vi.mock("node:fs", () => ({
+  readdirSync: directory,
+  readFileSync: readStat,
+  readlinkSync: readlink,
+}));
 vi.mock("../../shared/pid-alive.js", () => ({ isPidDefinitelyDead: definitelyDead }));
 import {
   hasLiveOwnedProcessGroupMembers,
+  isProcessGroupGoneByCensus,
   readProcessGroupMembers,
 } from "./service-child-group-ownership.js";
 
@@ -54,6 +60,7 @@ beforeEach(() => {
   rows = new Map([[owner, stat(owner, owner)]]);
   commands = new Map([[owner, "openclaw-doctor\0"]]);
   identities = new Map();
+  readlink.mockReset().mockImplementation(() => String(owner));
   directory.mockReset().mockImplementation(() => ["self", ...Array.from(rows.keys(), String)]);
   readStat.mockReset().mockImplementation((file: string) => {
     const match = /^\/proc\/(\d+)\/(stat|cmdline|status)$/.exec(file);
@@ -69,29 +76,24 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
-  if (bunDescriptor) {
-    Object.defineProperty(process.versions, "bun", bunDescriptor);
-  } else {
-    Reflect.deleteProperty(process.versions, "bun");
-  }
-  if (getuidDescriptor) {
-    Object.defineProperty(process, "getuid", getuidDescriptor);
-  } else {
-    Reflect.deleteProperty(process, "getuid");
+  for (const [target, key, descriptor] of [
+    [process.versions, "bun", bunDescriptor],
+    [process, "getuid", getuidDescriptor],
+  ] as const) {
+    if (descriptor) {
+      Object.defineProperty(target, key, descriptor);
+    } else {
+      Reflect.deleteProperty(target, key);
+    }
   }
 });
 
 const foreignPid = owner + 1;
+const unusualName = "worker ) (with\nname";
 const gone = Object.assign(new Error("gone"), { code: "ENOENT" });
 const denied = Object.assign(new Error("denied"), { code: "EACCES" });
 it.each([
-  [
-    "uninterruptible member",
-    foreignPid,
-    stat(foreignPid, owner, "D", "worker ) (with\nname"),
-    true,
-    false,
-  ],
+  ["uninterruptible member", foreignPid, stat(foreignPid, owner, "D", unusualName), true, false],
   ["live zombie threads", foreignPid, stat(foreignPid, owner, "Z"), true, false],
   ["dead zombie", foreignPid, stat(foreignPid, owner, "Z"), false, true],
   ["foreign group", foreignPid, stat(foreignPid, foreignPid), false, false],
@@ -119,6 +121,41 @@ it.each([
   }
 });
 
+const targetGroup = foreignPid + 10;
+it.each([
+  ["live member", stat(foreignPid, targetGroup, "S"), false, false, false],
+  ["zombie with live threads", stat(foreignPid, targetGroup, "Z"), false, true, false],
+  ["dead zombie only", stat(foreignPid, targetGroup, "Z"), true, true, true],
+  ["member of another group only", stat(foreignPid, foreignPid, "S"), false, false, true],
+  ["unreadable member row", denied, false, false, false],
+] as const)(
+  "confirms a denied group probe from the Linux census: %s",
+  (_name, row, dead, checksLiveness, expected) => {
+    rows.set(foreignPid, row);
+    definitelyDead.mockReturnValue(dead);
+    expect(isProcessGroupGoneByCensus(targetGroup)).toBe(expected);
+    // Only a zombie needs the liveness probe; a running member is alive by its state alone.
+    expect(definitelyDead).toHaveBeenCalledTimes(checksLiveness ? 1 : 0);
+    expect(census).not.toHaveBeenCalled();
+  },
+);
+
+it("keeps a group alive when /proc is not this PID namespace's or the census fails", () => {
+  // A foreign procfs maps PIDs to unrelated processes, so an empty target group proves nothing.
+  readlink.mockReturnValue("1");
+  expect(isProcessGroupGoneByCensus(targetGroup)).toBe(false);
+  expect(directory).not.toHaveBeenCalled();
+  readlink.mockImplementation(() => {
+    throw denied;
+  });
+  expect(isProcessGroupGoneByCensus(targetGroup)).toBe(false);
+  readlink.mockReturnValue(String(owner));
+  directory.mockImplementation(() => {
+    throw denied;
+  });
+  expect(isProcessGroupGoneByCensus(targetGroup)).toBe(false);
+});
+
 it("does not report an empty Linux group after its existing census budget expires", () => {
   let now = 0;
   vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -126,29 +163,18 @@ it("does not report an empty Linux group after its existing census budget expire
     now = 51;
     return stat(owner, owner);
   });
-  expect(() => [...readProcessGroupMembers(50)]).toThrow(
-    new Error(
-      `Process group census exceeded its deadline after reading PID ${owner} (elapsed=51ms, budget=50ms)`,
-    ),
-  );
-  now = 0;
   expect(hasLiveOwnedProcessGroupMembers(50)).toBeUndefined();
   expect(census).not.toHaveBeenCalled();
 });
 
-it.each([
-  ["malformed stat", "private command content", `malformed stat for PID ${owner}`],
-  [
-    "PID mismatch",
-    stat(owner + 1, owner),
-    `stat PID mismatch for PID ${owner} (stat PID=${owner + 1})`,
-  ],
-])("identifies Linux census %s without exposing stat contents", (_name, row, reason) => {
-  rows.set(owner, row);
-  expect(() => [...readProcessGroupMembers(50)]).toThrow(
-    new Error(`Process group census is unavailable: ${reason}`),
-  );
-  expect(hasLiveOwnedProcessGroupMembers(50)).toBeUndefined();
+it("continues the Linux census past a process reaped during its stat read", () => {
+  // do_task_stat leaves ppid=0 and pgid=-1 when lock_task_sighand fails during exit.
+  rows.set(foreignPid, stat(foreignPid, -1, "X", "true", 0));
+  const child = foreignPid + 1;
+  rows.set(child, stat(child, owner));
+  expect(hasLiveOwnedProcessGroupMembers()).toBe(true);
+  rows.delete(child);
+  expect(hasLiveOwnedProcessGroupMembers()).toBe(false);
 });
 
 const ownerRow = { pid: owner, pgid: owner, state: "S" };
@@ -185,9 +211,9 @@ it.each([
 
 it("preserves Linux command argument boundaries and process ancestry in command mode", () => {
   const argv = ["node", "/app with spaces/openclaw.mjs", "doctor", "--profile", "two words"];
-  rows.set(owner, stat(owner, owner + 1, "S", "worker ) (with\nname", owner + 2));
+  rows.set(owner, stat(owner, owner + 1, "S", unusualName, owner + 2));
   commands.set(owner, `${argv.join("\0")}\0`);
-  expect([...readProcessGroupMembers(1_000, { readDarwinCommand: darwinCommand })]).toEqual([
+  expect(inspect()).toEqual([
     { pid: owner, pgid: owner + 1, state: "S", command: { ppid: owner + 2, argv } },
   ]);
 });
@@ -257,9 +283,7 @@ it("does not turn native Darwin inspection failures into an empty census", () =>
   darwinCommand.mockImplementation(() => {
     throw new Error("native process inspection unavailable");
   });
-  expect(() => [...readProcessGroupMembers(1_000, { readDarwinCommand: darwinCommand })]).toThrow(
-    "native process inspection unavailable",
-  );
+  expect(inspect).toThrow("native process inspection unavailable");
 });
 
 it("uses the native census in Darwin Bun when sandboxed ps cannot execute", () => {
@@ -271,7 +295,7 @@ it("uses the native census in Darwin Bun when sandboxed ps cannot execute", () =
   ]);
   expect(hasLiveOwnedProcessGroupMembers()).toBe(false);
   darwinCommand.mockReturnValue({ argv: ["openclaw", "doctor"] });
-  expect([...readProcessGroupMembers(1000, { readDarwinCommand: darwinCommand })]).toEqual([
+  expect(inspect()).toEqual([
     {
       pid: owner,
       pgid: owner,

@@ -32,7 +32,7 @@ import {
 import { NODE_AGENT_CLI_CLAUDE_RUN_COMMAND } from "../infra/node-commands.js";
 import { createNodeDuplexEndpoint } from "../infra/node-duplex-framing.js";
 import { createPluginToolsMcpHandlers } from "../mcp/plugin-tools-handlers.js";
-import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
+import { getInProcessGatewayRequestContext } from "../plugins/runtime/gateway-request-scope.js";
 import { prepareSkillResourceDelivery } from "../skills/runtime/resources.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../state/openclaw-agent-db-resources.js";
 import { buildMcpToolSchema } from "./mcp-http.schema.js";
@@ -66,7 +66,7 @@ export async function prepareNodeClaudeSkillRuntime(
   ) {
     return undefined;
   }
-  const gateway = getPluginRuntimeGatewayRequestScope()?.context;
+  const gateway = getInProcessGatewayRequestContext();
   const target = context.executionTarget;
   const node =
     target.kind === "node" ? gateway?.nodeRegistry.get(target.placement.nodeId) : undefined;
@@ -175,9 +175,7 @@ export async function prepareNodeClaudeSkillRuntime(
         })
       : undefined;
   const combinedSignal = AbortSignal.any([signal, controller.signal]);
-  let closed = false;
   const close = () => {
-    closed = true;
     stop();
     stopClaim?.();
     controller.abort();
@@ -198,7 +196,6 @@ export async function prepareNodeClaudeSkillRuntime(
       const current = memory ? memory.readCurrent() : session;
       const currentPlacement = readPlacement();
       if (
-        closed ||
         !sourceActive ||
         (!memory && !retained?.isCurrent()) ||
         gateway.nodeRegistry.get(node.nodeId) !== node ||
@@ -287,12 +284,10 @@ export async function invokeNodeClaudeSkillRuntime(params: {
   const controller = new AbortController();
   const signal = AbortSignal.any([runtime.signal, controller.signal]);
   let invokeId: string | undefined;
-  let open = true;
   const assertCurrent = composeSessionSourceAssertion([runtime.assertCurrent], (assertSource) => {
     assertSource();
     signal.throwIfAborted();
     if (
-      !open ||
       !invokeId ||
       !registry.isInvokeCurrent(invokeId, runtime.node.nodeId, runtime.node.connId)
     ) {
@@ -401,7 +396,6 @@ export async function invokeNodeClaudeSkillRuntime(params: {
     });
   } finally {
     // Revoke synchronously before awaiting any callback or artifact cleanup.
-    open = false;
     controller.abort();
     signal.removeEventListener("abort", abort);
     endpoint.close();

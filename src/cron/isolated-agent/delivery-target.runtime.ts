@@ -15,6 +15,21 @@ import { DEFAULT_ACCOUNT_ID } from "../../routing/account-id.js";
 export { getLoadedChannelPluginForRead } from "../../channels/plugins/registry-loaded.js";
 export { mapAllowFromEntries } from "../../plugin-sdk/channel-config-helpers.js";
 export { resolveFirstBoundAccountId } from "../../routing/bound-account-read.js";
+export { resolveProactiveDeliveryTargetWithSessionRoute } from "../../infra/outbound/targets.js";
+
+/** Picks the channel's own default account for a delivery that names none and has no binding. */
+export function resolveChannelDefaultAccountIdForDelivery(params: {
+  cfg: OpenClawConfig;
+  channel: ChannelId;
+  agentId: string;
+}): string | undefined {
+  const plugin = resolveOutboundChannelPlugin({ ...params, allowBootstrap: true });
+  const accountId = plugin
+    ? resolveChannelDefaultAccountId({ plugin, cfg: params.cfg })
+    : undefined;
+  // Keep an unnamed default implicit; only a configured account changes the route.
+  return accountId === DEFAULT_ACCOUNT_ID ? undefined : accountId;
+}
 
 /** Picks the channel's own default account for a delivery that names none and has no binding. */
 export function resolveChannelDefaultAccountIdForDelivery(params: {

@@ -54,7 +54,7 @@ describe("logging/logger import", () => {
     });
   });
 
-  it("defers node temp resolution until active logger settings are requested", async () => {
+  it("defers node temp resolution until the file target is explicitly requested", async () => {
     const secureLogDir = path.join(process.cwd(), "secure-openclaw-temp");
     const resolvePreferredOpenClawTmpDir = vi.fn(() => secureLogDir);
     const { module } = await importLoggerWithMockedTempResolver({
@@ -64,9 +64,11 @@ describe("logging/logger import", () => {
 
     expect(resolvePreferredOpenClawTmpDir).not.toHaveBeenCalled();
 
-    module.applyLoggingConfig(undefined);
+    module.setLoggerOverride({ level: "info" });
     try {
-      expect(path.dirname(module.getResolvedLoggerSettings().file)).toBe(secureLogDir);
+      module.getResolvedLoggerSettings();
+      expect(resolvePreferredOpenClawTmpDir).not.toHaveBeenCalled();
+      expect(path.dirname(module.getResolvedLoggerFileTarget().file)).toBe(secureLogDir);
       expect(resolvePreferredOpenClawTmpDir).toHaveBeenCalledOnce();
     } finally {
       module.resetLogger();

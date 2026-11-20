@@ -83,8 +83,8 @@ async function waitForLaunchAgentUnloaded(
   onWait?: (pids: readonly number[]) => void,
 ): Promise<void> {
   const pids = new Set(initialPids);
-  let warned = false;
   const deadline = performance.now() + LAUNCH_AGENT_STOP_TIMEOUT_MS;
+  let warned = false;
   for (;;) {
     const probe = await probeLaunchAgentState(serviceTarget, 5_000);
     assertCurrent?.();
@@ -336,12 +336,8 @@ export async function stopLaunchAgent({
   );
 }
 
-export async function parkCurrentLaunchAgentForMaintenance(
-  params: {
-    env?: GatewayServiceEnv;
-  } = {},
-): Promise<boolean> {
-  const serviceEnv = params.env ?? (process.env as GatewayServiceEnv);
+export async function parkCurrentLaunchAgentForMaintenance(): Promise<boolean> {
+  const serviceEnv = process.env as GatewayServiceEnv;
   const domain = resolveLaunchAgentGuiDomain();
   const label = resolveLaunchAgentLabel(serviceEnv);
   if (!(await isCurrentProcessInsideLaunchdService(label))) {

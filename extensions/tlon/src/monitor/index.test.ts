@@ -16,7 +16,6 @@ import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TLON_PENDING_APPROVAL_LIMIT, type PendingApproval } from "../settings.js";
 import { useTlonMonitorFixture } from "./monitor.test-harness.js";
-import { startFakeUrbitSseServer } from "./urbit-sse-server.test-support.js";
 
 const {
   monitorTlonProvider,
@@ -271,7 +270,7 @@ it.each([
     authenticateMock.mockResolvedValueOnce("urbauth-~zod=proof");
     settingsManagerMock.load.mockResolvedValueOnce(settings);
 
-    await withMonitor(async () => {
+    await withMonitor(async (runtime) => {
       const chatSubscription = getSubscription("chat", "/v3");
       sseClientMock.poke.mockClear();
       ingressMock.receive
@@ -279,8 +278,12 @@ it.each([
         .mockResolvedValueOnce({ kind: "ignored" });
 
       const inviteEvent = [{ ship }];
-      sseClientMock.poke.mockRejectedValueOnce(new Error("DM invite write failed"));
-      await expect(chatSubscription.event(inviteEvent)).rejects.toThrow("DM invite write failed");
+      const failure = new Error("DM invite write failed");
+      sseClientMock.poke.mockRejectedValueOnce(failure);
+      await expect(chatSubscription.event(inviteEvent)).rejects.toBe(failure);
+      expect(runtime.error).toHaveBeenCalledExactlyOnceWith(
+        "[tlon] Error handling chat firehose event: DM invite write failed",
+      );
       await chatSubscription.event(inviteEvent);
 
       expect(sseClientMock.poke).toHaveBeenCalledTimes(2);
@@ -793,11 +796,6 @@ describe("monitorTlonProvider shutdown", () => {
         res.write(": connected\n\n");
         return;
       }
-      if (req.method === "DELETE" && pathname.startsWith("/~/channel/")) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
       res.writeHead(404);
       res.end();
     });
@@ -846,7 +844,8 @@ describe("monitorTlonProvider shutdown", () => {
     expect(requests).toContain("POST /~/login");
     expect(requests.some((request) => request.startsWith("GET /~/scry/"))).toBe(true);
     expect(requests.some((request) => request.startsWith("GET /~/channel/"))).toBe(true);
-    expect(requests.some((request) => request.startsWith("DELETE /~/channel/"))).toBe(true);
+    expect(requests.some((request) => request.startsWith("DELETE /~/channel/"))).toBe(false);
+    expect(subscriptions).toContainEqual([{ action: "delete" }]);
     expect(subscriptions.flat()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ action: "subscribe", app: "channels" }),
@@ -864,11 +863,76 @@ describe("monitorTlonProvider shutdown", () => {
     const createdDir = await fs.mkdtemp(join(os.tmpdir(), "tlon-live-stream-"));
     const stateDir = await fs.realpath(createdDir);
     const controller = new AbortController();
+    const ackedEventIds: number[] = [];
+    const subscriptionsByApp = new Map<string, number>();
     let stream: ServerResponse | undefined;
+    const streamOpened = Promise.withResolvers<ServerResponse>();
     const runtime = { error: vi.fn(), exit: vi.fn(), log: vi.fn() } satisfies RuntimeEnv;
-    const { server, ackedEventIds, subscriptionsByApp, streamOpened } =
-      await startFakeUrbitSseServer();
+
+    const server = createServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+
+      if (req.method === "POST" && pathname === "/~/login") {
+        res.writeHead(200, {
+          "Content-Type": "text/plain",
+          "Set-Cookie": "urbauth-~zod=proof; Path=/",
+        });
+        res.end("ok");
+        return;
+      }
+      if (req.method === "GET" && pathname.startsWith("/~/scry/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      if (req.method === "PUT" && pathname.startsWith("/~/channel/")) {
+        let body = "";
+        req.setEncoding("utf8");
+        req.on("data", (part: string) => {
+          body += part;
+        });
+        req.on("end", () => {
+          const actions = JSON.parse(body) as Array<{
+            id?: number;
+            action?: string;
+            app?: string;
+            "event-id"?: number;
+          }>;
+          for (const item of actions) {
+            if (item.action === "subscribe" && item.app && typeof item.id === "number") {
+              subscriptionsByApp.set(item.app, item.id);
+            }
+            if (item.action === "ack" && typeof item["event-id"] === "number") {
+              ackedEventIds.push(item["event-id"]);
+            }
+          }
+          res.writeHead(204);
+          res.end();
+        });
+        return;
+      }
+      if (req.method === "GET" && pathname.startsWith("/~/channel/")) {
+        res.writeHead(200, {
+          "Cache-Control": "no-cache",
+          "Content-Type": "text/event-stream",
+        });
+        res.write(": connected\n\n");
+        streamOpened.resolve(res);
+        return;
+      }
+      if (req.method === "DELETE" && pathname.startsWith("/~/channel/")) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
     runningServers.push(server);
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
     const address = server.address() as AddressInfo;
     const queue = createChannelIngressQueueForTests<{
       version: 1;
@@ -937,16 +1001,6 @@ describe("monitorTlonProvider shutdown", () => {
 
       // 1) Event 25: 100,000-level channel message (parses over SSE, overflows JSON.stringify in durable ingress).
       const unserializableGroupJson = `{"nest":"chat/~zod/general","response":{"post":{"id":"msg-poison-100k","r-post":{"set":{"essay":{"author":"~nec","content":${buildNestedInlineJson(100_000, "x")},"sent":1700000000001}}}}}}`;
-      // Node 24 overflows JSON.stringify at this depth; Node 26 serializes it. Assert the
-      // drop path only where the runtime actually overflows, and the ack either way.
-      const stringifyOverflows = (() => {
-        try {
-          JSON.stringify(JSON.parse(unserializableGroupJson));
-          return false;
-        } catch (error) {
-          return error instanceof RangeError;
-        }
-      })();
       stream.write(`id: 25\ndata: {"id":${channelsSubId},"json":${unserializableGroupJson}}\n\n`);
       await vi.waitFor(() => expect(ackedEventIds).toContain(25), { timeout: 2_000 });
 
@@ -1038,12 +1092,9 @@ describe("monitorTlonProvider shutdown", () => {
           commandBody: "hello dm",
         },
       ]);
-      const dropLogged = runtime.log.mock.calls.some(
-        ([line]) =>
-          line ===
-          "tlon dropped channels event: Tlon firehose event is too deeply nested to store.",
+      expect(runtime.log).toHaveBeenCalledWith(
+        "tlon dropped channels event: Tlon firehose event is too deeply nested to store.",
       );
-      expect(dropLogged).toBe(stringifyOverflows);
     } finally {
       controller.abort();
       stream?.end();

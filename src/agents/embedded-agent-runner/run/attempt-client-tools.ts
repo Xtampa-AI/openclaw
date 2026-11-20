@@ -5,13 +5,12 @@ import {
   getPluginToolSideEffectOwnerKey,
 } from "../../../plugins/tool-metadata.js";
 import {
-  createClientToolNameConflictError,
+  CLIENT_TOOL_NAME_CONFLICT_PREFIX,
   findClientToolNameConflicts,
   toClientToolDefinitions,
   toToolDefinitions,
 } from "../../agent-tool-definition-adapter.js";
 import { wrapToolWithAbortSignal } from "../../agent-tools.abort.js";
-import { resolveToolLoopDetectionConfig } from "../../agent-tools.js";
 import { isCodeModeExecTool } from "../../code-mode-control-tools.js";
 import { isCoreToolResultMediaTrustedName } from "../../embedded-agent-tool-media.js";
 import type { AgentTool } from "../../runtime/index.js";
@@ -19,6 +18,7 @@ import {
   createToolDefinitionFromAgentTool,
   wrapToolDefinition,
 } from "../../sessions/tools/tool-definition-wrapper.js";
+import { resolveToolLoopDetectionConfig } from "../../tool-loop-detection-config.js";
 import { normalizeToolPolicyName } from "../../tool-policy-shared.js";
 import {
   collectReplaySafeToolNames,
@@ -27,7 +27,6 @@ import {
 } from "../../tool-replay-safety.js";
 import { addClientToolsToToolCatalog } from "../../tool-search-catalog.js";
 import { resolveToolSearchConfig, type ToolSearchCatalogRef } from "../../tool-search.js";
-import { log } from "../logger.js";
 import {
   AGENT_RESERVED_TOOL_NAMES,
   collectRegisteredToolNames,
@@ -36,7 +35,10 @@ import {
 import type { EmbeddedAttemptClientToolCallSlot, EmbeddedRunAttemptParams } from "./types.js";
 
 export function prepareEmbeddedAttemptClientTools(params: {
-  attempt: EmbeddedRunAttemptParams;
+  attempt: Pick<
+    EmbeddedRunAttemptParams,
+    "config" | "sessionId" | "runId" | "onToolOutcome" | "allocateToolOutcomeOrdinal"
+  >;
   catalogToolHookContext: Parameters<typeof toToolDefinitions>[1];
   codeModeControlsEnabledForRun: boolean;
   deferredDirectoryToolsCallable: boolean;
@@ -154,7 +156,7 @@ export function prepareEmbeddedAttemptClientTools(params: {
       existingToolNames: [...clientConflictToolNames, ...AGENT_RESERVED_TOOL_NAMES],
     });
     if (clientToolNameConflicts.length > 0) {
-      throw createClientToolNameConflictError(clientToolNameConflicts);
+      throw new Error(`${CLIENT_TOOL_NAME_CONFLICT_PREFIX} ${clientToolNameConflicts.join(", ")}`);
     }
 
     let clientToolDefs = sourceClientToolDefs.map((definition) =>
@@ -179,6 +181,7 @@ export function prepareEmbeddedAttemptClientTools(params: {
       enabled:
         params.codeModeControlsEnabledForRun || (search.enabled && search.mode !== "directory"),
       catalogRef: params.toolSearchCatalogRef,
+      selection: params.codeModeControlsEnabledForRun ? undefined : search,
     });
     clientToolDefs = clientToolSearch.tools;
     if (clientToolSearch.compacted) {
@@ -188,11 +191,6 @@ export function prepareEmbeddedAttemptClientTools(params: {
         mode: params.codeModeControlsEnabledForRun ? "code-mode" : "tool-search",
         toolCount: clientToolSearch.catalogToolCount,
       });
-      log.debug(
-        params.codeModeControlsEnabledForRun
-          ? `code-mode: cataloged ${clientToolSearch.catalogToolCount} client tools behind exec/wait`
-          : `tool-search: cataloged ${clientToolSearch.catalogToolCount} client tools behind compact prompt surface`,
-      );
     }
 
     const customTools = toToolDefinitions(

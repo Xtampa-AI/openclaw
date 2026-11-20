@@ -1,3 +1,4 @@
+import { asRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it } from "vitest";
 import { evaluateControlUiContext } from "../test-helpers/control-ui-e2e-context.ts";
 import {
@@ -6,6 +7,7 @@ import {
   installMockGateway,
   startControlUiE2eServer,
 } from "../test-helpers/control-ui-e2e.ts";
+import { createTeamScaleSidebarListOwner } from "../test-helpers/control-ui-sidebar-list-fixture.ts";
 import { createControlUiTeamScaleFixture } from "../test-helpers/control-ui-team-scale-fixture.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -19,6 +21,7 @@ suite.define(() => {
     const fixture = createControlUiTeamScaleFixture({ baseUrl: suite.server.baseUrl });
     const archived = fixture.scenario.sessions![1]!;
     archived.archived = true;
+    const lists = createTeamScaleSidebarListOwner(fixture.sidebarListInput);
     await suite.withPage({ serviceWorkers: "block" }, async ({ page, context }) => {
       await context.addInitScript(
         ({ key, entries }) => {
@@ -48,6 +51,18 @@ suite.define(() => {
                 heldMethods: ["users.self"],
               }
             : { ...fixture.scenario, heldMethods: ["connect"] },
+          {
+            requestHandlers: {
+              "sessions.list": (value) => {
+                const params = asRecord(value);
+                if (!params) {
+                  throw new Error("sessions.list requires query parameters");
+                }
+                return lists.list(params).result;
+              },
+              "cron.list": (value) => fixture.listCronJobs(asRecord(value) ?? {}),
+            },
+          },
         );
       const gateway = await install(page);
       await page.goto(
@@ -56,10 +71,6 @@ suite.define(() => {
       await gateway.waitForRequest("connect");
       await gateway.resolveDeferred("connect");
       await page.locator('aside.sidebar[data-snapshot-saved="true"]').waitFor();
-      // Main proves 11 rows with its sessions.list owner fixture (#172946), which this release
-      // lacks; held connects here render one live row, so the saved rows identify the cache.
-      const savedRows = await page.locator(".sidebar-recent-session").count();
-      expect(savedRows).toBeGreaterThan(1);
       const peer = await context.newPage();
       const peerGateway = await install(peer, true);
       await peer.goto(controlUiSessionUrl(suite.server.baseUrl, archived.key, "chat"));
@@ -79,7 +90,7 @@ suite.define(() => {
         );
         await gateway.waitForRequest("connect");
         await page.locator('aside.sidebar[data-snapshot-state="cached"]').waitFor();
-        await expect.poll(() => page.locator(".sidebar-recent-session").count()).toBe(savedRows);
+        await page.locator(".sidebar-recent-session").nth(10).waitFor();
       }
     });
   });

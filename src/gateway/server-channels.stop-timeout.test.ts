@@ -50,7 +50,7 @@ describe("channel stop-timeout recovery", () => {
         lastError: "channel stop timed out after 5000ms",
       });
 
-      await manager.startChannel("discord", DEFAULT_ACCOUNT_ID, { manual: true });
+      await manager.startChannel("discord", DEFAULT_ACCOUNT_ID);
       expect(startAccount).toHaveBeenCalledTimes(2);
       expect(account(manager)).toMatchObject({ running: true, restartPending: false });
     } finally {

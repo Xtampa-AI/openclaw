@@ -1,31 +1,106 @@
 import { expect, it, vi } from "vitest";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { createPluginRecord } from "../plugins/status.test-helpers.js";
 import {
   createAgentDatabaseInspectionRefusal,
   recordAgentDatabaseAdmissions,
 } from "../state/agent-database-admission.js";
 import type { OpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { STARTUP_UNAVAILABLE_GATEWAY_METHODS } from "./methods/core-method-policy.js";
+import type { GatewayStartupModuleMocks } from "./server-startup-module-mocks.test-support.js";
 import type { startGatewayPostAttachRuntime } from "./server-startup-post-attach.js";
 import { logGatewayReady } from "./server-startup-readiness.js";
 import type { GatewayStartupTrace } from "./server-startup-trace.js";
-import type { ReadinessChecker } from "./server/readiness.js";
+import { createPreparedReadinessFixture } from "./server/readiness.test-support.js";
+import type { PreparedReadinessChecker } from "./server/readiness.types.js";
 
 type PostAttachParams = Parameters<typeof startGatewayPostAttachRuntime>[0];
 
+export function createStartupMethodUnlocker(unavailableGatewayMethods: Set<string>) {
+  return () => {
+    for (const method of STARTUP_UNAVAILABLE_GATEWAY_METHODS) {
+      unavailableGatewayMethods.delete(method);
+    }
+  };
+}
+
 export function registerGatewayStartupReadinessTests(params: {
-  start: typeof startGatewayPostAttachRuntime;
+  start: (
+    params: PostAttachParams,
+    runtimeDeps?: GatewayStartupModuleMocks,
+  ) => ReturnType<typeof startGatewayPostAttachRuntime>;
   createParams: (overrides?: Partial<PostAttachParams>) => PostAttachParams;
+  createRuntimeDeps: () => GatewayStartupModuleMocks;
+  path: (...parts: string[]) => string;
+  expectAutonomousSidecarsNotStarted: () => void;
 }): void {
+  it.each([true, false])(
+    "admits update canary readiness only for attributed plugin failures (attributed=%s)",
+    async (attributed) => {
+      const error = "synthetic registration failure";
+      const diagnostic = {
+        level: "error" as const,
+        message: error,
+        ...(attributed ? { pluginId: "startup-fixture" } : {}),
+      };
+      const pluginRegistry = createEmptyPluginRegistry();
+      pluginRegistry.plugins.push(
+        createPluginRecord({
+          id: "startup-fixture",
+          source: params.path("startup-fixture", "index.js"),
+          status: "error",
+          error,
+        }),
+      );
+      pluginRegistry.diagnostics.push({ ...diagnostic });
+      const onStartupPluginsLoaded =
+        vi.fn<NonNullable<PostAttachParams["onStartupPluginsLoaded"]>>();
+      const onSidecarsReady = vi.fn();
+      const startupParams = params.createParams({
+        updateCanary: true,
+        pluginRegistry: createEmptyPluginRegistry(),
+        loadStartupPlugins: async () => ({ pluginRegistry, gatewayMethods: ["ping"] }),
+        onStartupPluginsLoaded,
+        onSidecarsReady,
+      });
+      const runtimeDeps = params.createRuntimeDeps();
+      const startup = params.start(startupParams, runtimeDeps);
+      if (attributed) {
+        await startup;
+      } else {
+        await expect(startup).rejects.toThrow(
+          "Candidate plugin registry reported an unattributed error",
+        );
+      }
+      expect(onSidecarsReady).toHaveBeenCalledTimes(Number(attributed));
+      expect(startupParams.unlockStartupMethods).toHaveBeenCalledTimes(Number(attributed));
+      const published = onStartupPluginsLoaded.mock.lastCall?.[0].pluginRegistry;
+      expect(published?.plugins).toMatchObject([
+        {
+          id: "startup-fixture",
+          status: "error",
+          activated: true,
+          error,
+        },
+      ]);
+      expect(published?.diagnostics).toEqual([diagnostic]);
+      expect(startupParams.startChannels).not.toHaveBeenCalled();
+      params.expectAutonomousSidecarsNotStarted();
+      expect(runtimeDeps.createGatewayUpdateCheck).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([false, true])(
     "does not announce readiness while a core agent is refused (canary=%s)",
     async (updateCanary) => {
       const startup = params.createParams({
         updateCanary,
-        getReadiness: () => ({
+        getReadiness: createPreparedReadinessFixture(() => ({
           ready: false,
           coreReady: false,
           failing: ["agent-database:main"],
           uptimeMs: 0,
-        }),
+        })),
       });
       const runtime = await params.start(startup);
       await runtime.startupSettled;
@@ -53,10 +128,10 @@ export function registerGatewayStartupReadinessTests(params: {
   });
 }
 
-export function expectCoreAgentDatabaseReadiness(
-  getReadiness: ReadinessChecker,
+export async function expectCoreAgentDatabaseReadiness(
+  getReadiness: PreparedReadinessChecker,
   state: OpenClawTestState,
-): void {
+): Promise<void> {
   expect(getReadiness()).toMatchObject({ ready: true, failing: [] });
   try {
     for (const agentId of ["worker", "main", "openclaw", "crestodian"]) {
@@ -67,7 +142,7 @@ export function expectCoreAgentDatabaseReadiness(
       });
       recordAgentDatabaseAdmissions([refusal], { source: "startup", env: state.env });
       const log = { info: vi.fn() };
-      logGatewayReady({ getReadiness, log });
+      await logGatewayReady({ getReadiness, log });
       expect(log.info).toHaveBeenCalledTimes(agentId === "worker" ? 1 : 0);
       expect(getReadiness()).toMatchObject(
         agentId === "worker"

@@ -14,8 +14,6 @@ import { delayForAttempt } from "./native-subagent-retry.js";
 
 type CompletionDeliveryDependencies = {
   deliver: NativeSubagentMonitorRuntime["deliverAgentHarnessCompletion"];
-  retryDelaysMs?: readonly number[];
-  maxRetries?: number;
   children: ReadonlyMap<string, ChildState>;
   parents: ReadonlyMap<string, ParentState>;
   retiredParents: Pick<WeakSet<ParentState>, "has">;
@@ -29,20 +27,13 @@ type CompletionDeliveryDependencies = {
   releaseClientRetentionIfIdle: () => void;
 };
 
-const DEFAULT_COMPLETION_DELIVERY_RETRY_DELAYS_MS = [
-  5_000, 15_000, 30_000, 60_000, 120_000, 300_000,
-];
+const COMPLETION_DELIVERY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 const completionDeliveryOwners = new Map<string, ChildState>();
 
 export class CodexNativeSubagentCompletionDelivery {
-  private readonly retryDelaysMs: readonly number[];
-  private readonly maxRetries: number;
   private readonly attempts = new Map<ChildState, Promise<void>>();
 
-  constructor(private readonly dependencies: CompletionDeliveryDependencies) {
-    this.retryDelaysMs = dependencies.retryDelaysMs ?? DEFAULT_COMPLETION_DELIVERY_RETRY_DELAYS_MS;
-    this.maxRetries = dependencies.maxRetries ?? this.retryDelaysMs.length;
-  }
+  constructor(private readonly dependencies: CompletionDeliveryDependencies) {}
 
   deliverPending(state: ParentState, childState: ChildState): Promise<void> {
     const existing = this.attempts.get(childState);
@@ -152,13 +143,8 @@ export class CodexNativeSubagentCompletionDelivery {
         await this.abandon(state, childState);
         return;
       }
-      const recoveryPending = delivery.recoveryPending;
-      const error =
-        delivery.error ??
-        (recoveryPending
-          ? "requester recovery owns completion"
-          : "completion delivery did not produce a parent response");
-      await this.scheduleRetry(state, childState, error, !recoveryPending);
+      const error = delivery.error ?? "completion delivery did not produce a parent response";
+      await this.scheduleRetry(state, childState, error);
     } catch (error) {
       if (!this.isCurrent(state, childState)) {
         return;
@@ -282,7 +268,8 @@ export class CodexNativeSubagentCompletionDelivery {
         if (
           child.nativeCompletionDelivered ||
           !this.isCurrent(state, child) ||
-          !this.claim(state, child)
+          (child.completionCustody && !child.completionCustody.isCurrent()) ||
+          (child.deliveryOwnerKey && completionDeliveryOwners.get(child.deliveryOwnerKey) !== child)
         ) {
           throw new Error("Native completion retirement is no longer current.");
         }
@@ -314,7 +301,10 @@ export class CodexNativeSubagentCompletionDelivery {
     ) {
       return;
     }
-    if (chargeAttempt && childState.completionDeliveryAttempt >= this.maxRetries) {
+    if (
+      chargeAttempt &&
+      childState.completionDeliveryAttempt >= COMPLETION_DELIVERY_RETRY_DELAYS_MS.length
+    ) {
       embeddedAgentLog.warn("Native subagent completion retries exhausted", {
         childThreadId: childState.childThreadId,
         error,
@@ -323,7 +313,7 @@ export class CodexNativeSubagentCompletionDelivery {
       return;
     }
     const delayMs = delayForAttempt(
-      this.retryDelaysMs,
+      COMPLETION_DELIVERY_RETRY_DELAYS_MS,
       chargeAttempt ? childState.completionDeliveryAttempt++ : childState.completionDeliveryAttempt,
     );
     childState.completionDeliveryTimer = setTimeout(() => {

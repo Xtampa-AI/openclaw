@@ -2,7 +2,6 @@ import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { Value } from "typebox/value";
 import {
   ErrorCodes,
-  errorShape,
   validateCronHistoryParams,
 } from "../../../packages/gateway-protocol/src/index.js";
 import { CronHistoryResultSchema } from "../../../packages/gateway-protocol/src/schema/cron.js";
@@ -15,10 +14,26 @@ import { parseCronRunScopeSuffix } from "../../sessions/session-key-utils.js";
 import { cronJobMatchesCallerScope, readCronCallerScope } from "./cron-caller-scope.js";
 import { assertCronReadCurrent } from "./cron-job-access.js";
 import { createCronSessionVisibility, cronJobIsVisible } from "./cron-visibility.js";
+import { respondError } from "./response.js";
 import type { GatewayRequestHandler } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
 const MAX_CRON_HISTORY_BYTES = 4 * 1024 * 1024;
+
+// Only fixed owner diagnostics may reach logs; chat errors can contain hidden session keys.
+const SAFE_HISTORY_FAILURES = new Set([
+  "session rows are initializing; reload the conversation",
+  "retained transcript is no longer available",
+  "retained transcript changed while reading history",
+  "retained session changed while reading history",
+  "session access changed while reading history",
+  "session changed while reading history; reload the conversation",
+  "session history is rebuilding; retry shortly",
+  "session history window changed; reload the conversation",
+  "session history is busy; retry shortly",
+  "session history is temporarily unavailable; retry shortly",
+  "session history read timed out; retry shortly",
+]);
 
 export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
   const { params, respond, context, client } = opts;
@@ -26,26 +41,22 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
     return;
   }
   if (!params.runId && params.runAtMs === undefined) {
-    respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.INVALID_REQUEST,
-        "cron.history requires an id and exact runId or runAtMs",
-      ),
+    respondError(
+      respond,
+      ErrorCodes.INVALID_REQUEST,
+      "cron.history requires an id and exact runId or runAtMs",
     );
     return;
   }
-  const fail = () =>
-    respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.UNAVAILABLE,
-        "The recorded cron transcript is unavailable. Refresh the run and try again.",
-      ),
+  let phase = "run-selection";
+  const fail = (reason = phase) => {
+    context.logGateway.debug(`cron.history unavailable: ${reason}`);
+    respondError(
+      respond,
+      ErrorCodes.UNAVAILABLE,
+      "The recorded cron transcript is unavailable. Refresh the run and try again.",
     );
-  const storeKey = cronStoreKey(context.cronStorePath);
+  };
   const sessionVisibility = createCronSessionVisibility(client, context);
   const assertAllowed = (sessionKey?: string, agentId?: string) => {
     assertCronReadCurrent(opts);
@@ -72,6 +83,7 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
   };
   try {
     await context.cron.readJob(params.id);
+    const storeKey = context.cron.getStoreKey?.() ?? cronStoreKey(context.cronStorePath);
     await sessionVisibility.prepare();
     const select = () =>
       readCronRunHistoryBinding(storeKey, params.id, {
@@ -108,7 +120,7 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
     };
     const assertCurrent = (transcriptSessionKey?: string) => {
       if (
-        cronStoreKey(context.cronStorePath) !== storeKey ||
+        (context.cron.getStoreKey?.() ?? cronStoreKey(context.cronStorePath)) !== storeKey ||
         resolveSessionStorePathCore(context.getRuntimeConfig().session?.store, { agentId }) !==
           scope.storePath
       ) {
@@ -116,6 +128,7 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
       }
       assertAllowed(transcriptSessionKey, agentId);
     };
+    phase = "transcript-binding";
     const physical = await readSessionHistoryPageInWorker(
       {
         kind: "transcript-binding",
@@ -131,6 +144,7 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
       fail();
       return;
     }
+    phase = "retained-history-read";
     const { handleChatHistoryRequest } = await import("./chat-history-handler.js");
     await handleChatHistoryRequest({
       ...opts,
@@ -152,9 +166,11 @@ export const cronHistoryHandler: GatewayRequestHandler = async (opts) => {
       },
       respond: (ok, payload, error) => {
         if (!ok) {
-          respond(false, undefined, error);
+          // Keep both the public error and diagnostic independent of hidden session identities.
+          fail(error?.message && SAFE_HISTORY_FAILURES.has(error.message) ? error.message : phase);
           return;
         }
+        phase = "retained-history-publication";
         const page = asOptionalRecord(payload);
         const result = {
           messages: page?.messages,

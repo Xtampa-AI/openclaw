@@ -4,7 +4,7 @@ import type { RunEntryCandidateOptions } from "../../agents/embedded-agent-runne
 import type { DeferredEmbeddedRunLifecycleManager } from "../../agents/embedded-agent-runner/run/deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
 import type { FastModeAutoProgressState } from "../../agents/fast-mode.js";
-import type { CompactionRequestBudget } from "../../agents/sessions/compaction/request-budget.js";
+import type { CompactionRequestBudget } from "../../agents/sessions/compaction/request-budget.types.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { CronRunInference } from "../../cron/run-inference.js";
@@ -85,24 +85,17 @@ export type AgentFallbackCycleState = {
   };
 };
 
-type CompletedFallbackCycle = {
-  kind: "completed";
-  runResult: EmbeddedAgentRunResult;
-  fallbackProvider: string;
-  fallbackModel: string;
-  fallbackExhausted: boolean;
-  fallbackAttempts: RuntimeFallbackAttempt[];
-  terminalRunFailed: boolean;
-};
-
 export type AgentFallbackCycleResult =
-  | CompletedFallbackCycle
+  | {
+      kind: "completed";
+      runResult: EmbeddedAgentRunResult;
+      fallbackProvider: string;
+      fallbackModel: string;
+      fallbackExhausted: boolean;
+      fallbackAttempts: RuntimeFallbackAttempt[];
+      terminalRunFailed: boolean;
+    }
   | Extract<AgentTurnInternalResult, { kind: "final" | "aborted" }>;
-
-type AgentFallbackModelPatch = {
-  captureFallbackFailure: (attempts: RuntimeFallbackAttempt[]) => boolean | undefined;
-  captureFailure: (error: unknown) => void;
-};
 
 export type AgentFallbackCycleParams = AgentFallbackRunContext & {
   effectiveRun: FollowupRun["run"];
@@ -120,7 +113,10 @@ export type AgentFallbackCycleParams = AgentFallbackRunContext & {
     | "signalExecutionPhaseForTyping"
   > & { close: () => void };
   notifyUserAboutCompaction: boolean;
-  modelPatch: AgentFallbackModelPatch;
+  modelPatch: {
+    captureFallbackFailure: (attempts: RuntimeFallbackAttempt[]) => boolean | undefined;
+    captureFailure: (error: unknown) => void;
+  };
   shouldSurfaceToControlUi: boolean;
   commitTerminalOutcome: () => void;
   clearRecoveredAutoFallbackPrimaryProbe: (candidate: {

@@ -26,7 +26,12 @@ Related: [Browser tool](/tools/browser)
   `openclaw browser status --json` also works when the selected child command does not
   define its own `--json`.
 
-With --json, invalid tab indexes and local action-input refusals write one standard structured CLI error document to stdout (ok: false, error.type: "cli_error") and exit with status 1 before any browser action is sent. Without --json, the diagnostic remains on stderr.
+With `--json`, local action-input, state, and viewport validation refusals write one JSON error document to
+stdout (`ok: false`, `error.type: "cli_error"`) and exit with status 1. Without
+`--json`, the diagnostic remains on stderr.
+
+Malformed request timeouts, invalid tab indexes, and Gateway request rejections
+also use this JSON failure envelope, including navigation, resize, and cookie requests.
 
 The CLI reserves 10 additional seconds beyond the request timeout for node and
 Gateway transport, allowing browser timeout diagnostics to reach the caller.
@@ -77,7 +82,7 @@ openclaw browser --browser-profile openclaw reset-profile
   Passive status never launches Chrome just to collect these facts.
 - `stop` closes the active control session and clears temporary emulation overrides. This applies even to `attachOnly` and remote CDP profiles, where OpenClaw did not launch the browser process itself. For local managed profiles, `stop` also stops the spawned browser process.
 - `start --headless` applies only to that start request, and only when OpenClaw launches a local managed browser. It does not rewrite `browser.headless` or profile config, and is a no-op for an already-running browser.
-- On Linux hosts without `DISPLAY` or `WAYLAND_DISPLAY`, local managed profiles run headless automatically unless `OPENCLAW_BROWSER_HEADLESS=0`, `browser.headless=false`, or `browser.profiles.<name>.headless=false` explicitly requests a visible browser.
+- Local managed profiles run headless by default on every platform. `OPENCLAW_BROWSER_HEADLESS=0`, `browser.headless=false`, or `browser.profiles.<name>.headless=false` explicitly requests a visible browser; Linux then needs `DISPLAY` or `WAYLAND_DISPLAY`. Externally owned browsers keep their current mode.
 
 ## If the command is missing
 
@@ -118,6 +123,8 @@ openclaw browser delete-profile --name work
 Use a specific profile with `--browser-profile <name>` on any subcommand, for example `openclaw browser --browser-profile work tabs`.
 
 On macOS, `system-profiles` lists real Chrome, Brave, Edge, or Chromium profiles available on the host. `import-profile` decrypts their cookies after one macOS Keychain/Touch ID consent prompt and injects them into a fresh OpenClaw-managed profile. It imports cookies only. Local storage and IndexedDB are unchanged. Some Google sessions use device-bound session credentials (DBSC) and can still require re-authentication after import.
+
+Newer macOS versions can also ask whether the Gateway's Node process may access the browser's data. Until someone answers that prompt on the Gateway host, system-profile discovery and import time out while the rest of the Gateway keeps running.
 
 When the macOS app uses a local Gateway, it can offer this import once and make the isolated imported profile the default for agent browsing. Import always requires an explicit click. Successful import or dismissal suppresses later automatic prompts, and **Settings → General → Browser login** remains available for re-import.
 
@@ -266,6 +273,11 @@ openclaw browser close t1
 
 `tabs` returns `suggestedTargetId` first, then the stable `tabId` (such as `t1`), the optional label, and the raw `targetId`. Pass `suggestedTargetId` back into `focus`, `close`, snapshots, and actions. Assign a label with `open --label`, `tab new --label`, or `tab label`. Labels, tab ids, raw target ids, and unique target-id prefixes are all accepted. The request field is still named `targetId` for compatibility, but it accepts any of these tab references.
 
+For HTTP CDP profiles, `close` confirms that the tab disappears before reporting
+success. If a page prompt keeps it open, resolve the prompt and retry. If the tab
+list cannot be read after the close request, confirm the tab's state in the
+browser before retrying; the close may already have succeeded.
+
 Profiles configured with `driver: "extension"` can additionally return a numeric
 `webExtensionTabId`. It is scoped to the current browser runtime and is intended
 only for calls into Chrome's WebExtensions API. It can change after the browser
@@ -340,6 +352,8 @@ openclaw browser dialog --dismiss --dialog-id d1
 Managed Chrome profiles save ordinary click-triggered downloads into the OpenClaw downloads directory (`/tmp/openclaw/downloads` by default, or the configured temp root). Use `waitfordownload` or `download` when the agent needs to wait for a specific file and return its path. Those explicit waiters own the next download. Uploads accept files from the OpenClaw temp uploads root and OpenClaw-managed inbound media, including `media://inbound/<id>` and sandbox-relative `media/inbound/<id>` references. Nested media refs, traversal, and arbitrary local paths are rejected.
 
 For remote browser nodes, OpenClaw stages private copies and normalizes filenames for portability, including Windows device names and trailing dots or spaces. File bytes remain unchanged.
+
+Explicit download paths and `trace stop --out` preserve filename whitespace where the filesystem supports it. Quote these paths, for example `openclaw browser download <ref> " report.pdf "`. Output paths must stay inside their managed download or trace directory.
 
 If saving a download fails, OpenClaw requests cancellation of the transfer and reports the original save error. Correct the output path or filesystem problem before starting a new download.
 

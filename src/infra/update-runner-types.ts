@@ -39,6 +39,7 @@ type GitUpdateTarget = {
   version?: string;
   schemaVersions?: OpenClawSchemaVersions;
   databaseEngines?: unknown;
+  postgresFamilies?: unknown;
   metadataUnreadable?: string;
 };
 
@@ -94,6 +95,7 @@ export type RunStepOptions = {
   argv: string[];
   cwd: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   input?: string;
   progress?: UpdateStepProgress;

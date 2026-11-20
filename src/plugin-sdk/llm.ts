@@ -1,6 +1,3 @@
-/**
- * Public SDK subpath for LLM streaming, model utils, and validation.
- */
 export type { ApiProvider } from "@openclaw/ai";
 export { resolveProviderContext } from "../../packages/ai/src/provider-types.js";
 export { PROVIDER_MODEL_INPUT } from "../../packages/ai/src/provider-types.js";
@@ -49,6 +46,7 @@ export type {
   ImageContent,
   Message,
   Model,
+  ModelRequestHeaders,
   ModelThinkingLevel,
   ProviderResponse,
   ProviderStreamOptions,

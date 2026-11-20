@@ -1,4 +1,4 @@
-import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../../auto-reply/tokens.js";
+import { extractErrorCode } from "@openclaw/normalization-core/error-coercion";
 import {
   hasAcceptedSessionSpawn,
   hasCompletionMessageSessionSpawn,
@@ -24,6 +24,14 @@ export function resolveCurrentAttemptAssistant(
   // The completed event survives transcript projection and is cleared before a
   // compaction retry. Historical lastAssistant is not evidence of a new response.
   return attempt.currentAttemptAssistant ?? attempt.currentAttemptCompletedAssistant;
+}
+
+/** A prompt error can be flattened; preserve the current provider response's typed failure. */
+export function resolveCurrentAttemptErrorCode(
+  attempt: Parameters<typeof resolveCurrentAttemptAssistant>[0],
+  error: unknown,
+): string | undefined {
+  return extractErrorCode(error) ?? resolveCurrentAttemptAssistant(attempt)?.errorCode;
 }
 
 type ReplayMetadataAttempt = Pick<
@@ -68,7 +76,6 @@ type TerminalAttemptState = Pick<
   | "clientToolCalls"
   | "yieldDetected"
   | "didSendDeterministicApprovalPrompt"
-  | "heartbeatToolResponse"
   | "toolMediaUrls"
   | "toolAudioAsVoice"
   | "toolTrustedLocalMedia"
@@ -96,7 +103,6 @@ export function hasAttemptTerminalState(attempt: TerminalAttemptState): boolean 
     attempt.clientToolCalls ||
     attempt.yieldDetected ||
     attempt.didSendDeterministicApprovalPrompt ||
-    attempt.heartbeatToolResponse ||
     attempt.toolMediaUrls?.some((url) => url.trim().length > 0) ||
     attempt.toolAudioAsVoice ||
     attempt.toolTrustedLocalMedia ||
@@ -114,20 +120,6 @@ export function hasAsyncActivity(toolMetas?: readonly { asyncStarted?: boolean }
   return (toolMetas ?? []).some((entry) => entry.asyncStarted === true);
 }
 
-type AcceptedSessionSpawnContinuationAttempt = Pick<
-  EmbeddedRunAttemptResult,
-  | Exclude<keyof TerminalAttemptState, "hasToolMediaBlockReply">
-  | "assistantTexts"
-  | "terminal"
-  | "sourceReplyDelivered"
-  | "sourceReplyDeliveryState"
->;
-
-type AcceptedSessionSpawnContinuationRun = Pick<
-  RunEmbeddedAgentParams,
-  "currentInboundEventKind" | "inputProvenance" | "replyOperation" | "silentExpected"
->;
-
 /**
  * A visible parent that delegates its entire response to completion children or
  * to a still-running detached media run must remain alive for completion delivery.
@@ -135,8 +127,19 @@ type AcceptedSessionSpawnContinuationRun = Pick<
  * terminal ownership instead.
  */
 export function shouldContinueInteractiveAcceptedSessionSpawns(params: {
-  attempt: AcceptedSessionSpawnContinuationAttempt;
-  run: AcceptedSessionSpawnContinuationRun;
+  attempt: Pick<
+    EmbeddedRunAttemptResult,
+    | Exclude<keyof TerminalAttemptState, "hasToolMediaBlockReply">
+    | "assistantTexts"
+    | "terminal"
+    | "sourceReplyDelivered"
+    | "preparedTerminalReply"
+    | "sourceReplyDeliveryState"
+  >;
+  run: Pick<
+    RunEmbeddedAgentParams,
+    "currentInboundEventKind" | "inputProvenance" | "replyOperation" | "silentExpected"
+  >;
 }): boolean {
   const { attempt, run } = params;
   // Only an in-flight media run still owes this turn its result.
@@ -158,11 +161,7 @@ export function shouldContinueInteractiveAcceptedSessionSpawns(params: {
   ) {
     return false;
   }
-  if (
-    attempt.assistantTexts.some(
-      (text) => text.trim().length > 0 && !isSilentReplyText(text, SILENT_REPLY_TOKEN),
-    )
-  ) {
+  if (attempt.preparedTerminalReply?.terminalReply.disposition === "visible") {
     return false;
   }
   // The media run delivers the result, so progress sends do not replace the owed reply.

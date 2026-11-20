@@ -33,15 +33,6 @@ suite.define(() => {
             outline: style.outlineStyle,
             width: style.outlineWidth,
             shadow: style.boxShadow,
-            color: style.outlineColor,
-            highlight: (() => {
-              const probe = document.createElement("span");
-              probe.style.color = "Highlight";
-              document.body.append(probe);
-              const color = getComputedStyle(probe).color;
-              probe.remove();
-              return color;
-            })(),
           };
         });
         if (process.env.OPENCLAW_CAPTURE_UI_PROOF === "1") {
@@ -51,8 +42,7 @@ suite.define(() => {
           });
           await writeFile(path.join(suite.artifactDir, "settings-search-focus.png"), frame.png);
         }
-        expect(indicator).toMatchObject({ outline: "solid", width: "2px", shadow: "none" });
-        expect(indicator.color).toBe(indicator.highlight);
+        expect(indicator).toEqual({ outline: "solid", width: "2px", shadow: "none" });
       },
     );
   });

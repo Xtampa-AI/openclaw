@@ -2,12 +2,15 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveConfigPath } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.js";
+import { withDatabaseEngineSelection } from "../infra/database-engine/context.js";
+import { resolveDatabaseFamilyEngines } from "../infra/database-engine/registry.js";
 import { bindConfigOwner } from "./config-cli-owner-patch.js";
 
 // Commits one change through a synthetic owner and returns the config.patch request it sent.
 async function commitThroughOwner(
   change: { previous: OpenClawConfig; next: OpenClawConfig },
   hash?: string,
+  patchResponse: Record<string, unknown> = {},
 ) {
   const env = { OPENCLAW_CONFIG_PATH: path.resolve("synthetic-owner", "openclaw.json") };
   const sent: Record<string, unknown>[] = [];
@@ -16,33 +19,46 @@ async function commitThroughOwner(
       sent.push(params);
     }
     // SAFETY: both synthetic responses match the fields the binder reads.
-    return (method === "config.get" ? { path: resolveConfigPath(env), hash } : {}) as R;
+    return (method === "config.get" ? { path: resolveConfigPath(env), hash } : patchResponse) as R;
   };
-  const commit = await bindConfigOwner(requestOwner, env);
-  await commit(change);
-  return sent[0] as { raw: string; baseHash?: string; replacePaths?: string[] };
+  const commit = await withDatabaseEngineSelection(
+    { effectiveEngines: resolveDatabaseFamilyEngines({}) },
+    () => bindConfigOwner(requestOwner, env),
+  );
+  const result = await commit(change);
+  return {
+    result,
+    request: sent[0] as { raw: string; baseHash?: string; replacePaths?: string[] },
+  };
 }
 
 describe("bindConfigOwner", () => {
+  it("returns the owner's billing-route warnings with the restart hint", async () => {
+    const warning = "Billing route changed for agents.defaults.subagents.model (agent main).";
+    const { result } = await commitThroughOwner(
+      { previous: {}, next: { gateway: { reload: { mode: "off" } } } },
+      "base-hash",
+      { restart: { scheduled: true }, billingRouteWarnings: [warning] },
+    );
+    expect(result).toEqual({
+      hint: "The Gateway is restarting to apply it.",
+      warnings: [warning],
+    });
+  });
+
   it("sends only the change, with array replacement and deletion as explicit intent", async () => {
     const previous: OpenClawConfig = {
-      gateway: {
-        reload: { mode: "hybrid" },
-        nodes: {
-          commands: { allow: ["a", "b"] },
-          pairing: { sshVerify: { cidrs: ["10.0.0.0/8"] } },
-        },
-      },
+      gateway: { reload: { mode: "hybrid" }, nodes: { commands: { allow: ["a", "b"] } } },
       agents: { entries: { main: { skills: ["notes"] } } },
+      tools: { toolSearch: { include: [{ source: "mcp" }] } },
     };
     const next: OpenClawConfig = {
-      gateway: {
-        reload: { mode: "off" },
-        nodes: { commands: { allow: ["b"] }, pairing: { sshVerify: false } },
-      },
+      gateway: { reload: { mode: "off" }, nodes: { commands: { allow: ["b"] } } },
       agents: { entries: {} },
+      tools: { toolSearch: false },
     };
-    const request = await commitThroughOwner({ previous, next }, "base-hash");
+    const { request, result } = await commitThroughOwner({ previous, next }, "base-hash");
+    expect(result).toEqual({ hint: undefined, warnings: [] });
     // v2026.10.7 Gateways accept routed writes but close config.patch over these fields.
     const stableConfigPatchFields = new Set([
       "raw",
@@ -56,16 +72,14 @@ describe("bindConfigOwner", () => {
     expect(Object.keys(request).filter((key) => !stableConfigPatchFields.has(key))).toEqual([]);
     expect(request.baseHash).toBe("base-hash");
     expect(JSON.parse(request.raw)).toEqual({
-      gateway: {
-        reload: { mode: "off" },
-        nodes: { commands: { allow: ["b"] }, pairing: { sshVerify: false } },
-      },
+      gateway: { reload: { mode: "off" }, nodes: { commands: { allow: ["b"] } } },
       agents: { entries: { main: null } },
+      tools: { toolSearch: false },
     });
     expect(request.replacePaths).toEqual([
       "gateway.nodes.commands.allow",
-      "gateway.nodes.pairing.sshVerify.cidrs",
       "agents.entries.main.skills",
+      "tools.toolSearch.include",
     ]);
   });
 

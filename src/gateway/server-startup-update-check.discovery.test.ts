@@ -1,8 +1,8 @@
 import { expect, it, vi } from "vitest";
 import { currentUpdateCheckLifecycle } from "../infra/update-check-lifecycle.js";
-import { createGatewayUpdateCheck } from "../infra/update-startup.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
+import { createCommandResult } from "../test-utils/npm-spec-install-test-helpers.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createDeferredGatewayUpdateCheck } from "./server-startup-update-check.js";
 
@@ -19,17 +19,11 @@ it.each([false, true])(
     const state = await createOpenClawTestState({ label: "startup-install-discovery" });
     const scheduler = createTestGatewayScheduler();
     await import("../infra/update-startup.js");
-    command.mockReset().mockResolvedValue({
-      code: 1,
-      stdout: "",
-      stderr: "synthetic unavailable command",
-      signal: null,
-      killed: false,
-      termination: "exit",
-    });
+    command
+      .mockReset()
+      .mockResolvedValue(createCommandResult({ code: 1, stderr: "synthetic unavailable command" }));
     const owner = createDeferredGatewayUpdateCheck({
       scheduler,
-      createUpdateCheck: createGatewayUpdateCheck,
       getConfig: () => ({ update: { checkOnStart } }),
       getPluginRegistry: () => undefined,
       log: { info: vi.fn(), warn: vi.fn() },

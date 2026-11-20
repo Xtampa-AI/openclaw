@@ -14,6 +14,7 @@ function normalizeMarkdownLinkTarget(sourceRelativePath: string, target: string)
   return path.posix.normalize(path.posix.join(path.posix.dirname(sourceRelativePath), target));
 }
 
+// Link destinations are URLs: `plan%20notes.md` names `plan notes.md`.
 function decodeMarkdownLinkPath(value: string): string {
   try {
     return decodeURIComponent(value);

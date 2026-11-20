@@ -6,24 +6,7 @@ import {
   readPublishedSessionIndex,
 } from "./manager-index.test-support.js";
 
-const activity = vi.hoisted(() => ({
-  listener: undefined as ((busy: boolean) => void) | undefined,
-}));
-
-vi.mock("openclaw/plugin-sdk/memory-core-host-engine-foundation", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("openclaw/plugin-sdk/memory-core-host-engine-foundation")>();
-  return {
-    ...actual,
-    observeAgentRunActivity: (_agentId: string, listener: (busy: boolean) => void) => {
-      activity.listener = listener;
-      listener(false);
-      return () => {
-        activity.listener = undefined;
-      };
-    },
-  };
-});
+const { activity } = await vi.hoisted(() => import("./agent-activity.test-support.js"));
 
 const { closeAllMemorySearchManagers, getMemorySearchManager } = await import("./index.js");
 
@@ -35,7 +18,7 @@ describe("memory session delta publication", () => {
   const { createConfig, getFreshManager, seedSessionTranscript } = fixture;
 
   it("yields an interrupted pass and indexes every pending session after the next quiet period", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     onTestFinished(() => {
       vi.useRealTimers();
     });
@@ -94,8 +77,8 @@ describe("memory session delta publication", () => {
     expect(manager.status().dirty).toBe(false);
   });
 
-  it("keeps the published index when a background rebuild is interrupted", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  it("keeps the published index dirty when a background delta is interrupted", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     onTestFinished(() => {
       vi.useRealTimers();
     });
@@ -109,6 +92,8 @@ describe("memory session delta publication", () => {
     );
     onTestFinished(() => manager.close());
     await manager.sync({ reason: "initial", force: true });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await (manager as unknown as { awaitManagerIdle(): Promise<void> }).awaitManagerIdle();
     const database = Reflect.get(manager, "db") as DatabaseSync;
     const before = readPublishedSessionIndex(
       database,
@@ -119,7 +104,6 @@ describe("memory session delta publication", () => {
       ...session,
       messages: [{ role: "user", timestamp: Date.now(), content: "newproof appended" }],
     });
-    Reflect.set(manager, "memoryFullRetryDirty", true);
     fixture.provider.beforeEmbedBatch = async () => {
       fixture.provider.beforeEmbedBatch = null;
       activity.listener?.(true);
@@ -142,7 +126,7 @@ describe("memory session delta publication", () => {
   });
 
   it("settles ten queued turns incrementally with the same search results as a full reindex", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     onTestFinished(() => {
       vi.useRealTimers();
     });

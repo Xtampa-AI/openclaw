@@ -104,6 +104,9 @@ export type UpdateRunRecord = z.infer<typeof UpdateRunRecordSchema>;
 export function toPublicUpdateRun(record: UpdateRunRecord): PublicUpdateRunRecord {
   const origin = { ...record.origin };
   delete origin.updateRecoveryCapture;
+  delete origin.windowsUserSid;
+  delete origin.managedHandoff;
+  delete origin.packageStage;
   const verification = { ...record.verification };
   if (verification.recovery?.serviceRestartSafe === false) {
     verification.recovery = { ...verification.recovery };
@@ -126,6 +129,8 @@ export type CreateUpdateRunInput = Partial<
   settlement?: { reason: string; detail: string };
   /** Record an update its external supervisor accepted, from the time the update started. */
   accepted?: { startedAtMs: number };
+  /** Host-read update-request policy; storage records outcome eligibility only for a new run. */
+  reportResult?: boolean;
 };
 
 export type UpdateRunDiagnostics = Pick<
@@ -143,7 +148,9 @@ export function isAbandonedUpdateRun(
 ): boolean {
   return (
     record.status === "failed" &&
-    (record.reason === "abandoned" || record.reason === LEGACY_UPDATE_RUN_EXPIRED_REASON)
+    (record.reason === "abandoned" ||
+      record.reason === "handoff-terminated" ||
+      record.reason === LEGACY_UPDATE_RUN_EXPIRED_REASON)
   );
 }
 

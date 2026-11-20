@@ -348,7 +348,6 @@ function makeTraceAccount(scenario: DeliveryTraceScenarioName): ResolvedFeishuAc
   traceState.setupCount += 1;
   return {
     accountId: "main",
-    selectionSource: "fallback",
     enabled: true,
     configured: true,
     // Run-unique app id busts the module-level CardKit token cache so every
@@ -371,6 +370,19 @@ function createTraceDispatcher(replyToMessageId?: string, runtime = {}) {
     sendTarget: "oc-trace-chat",
     ...(replyToMessageId ? { replyToMessageId } : {}),
   });
+}
+
+function setupPdfTrace(recorder: WireRecorder) {
+  setupFeishuTrace(recorder, "final-only");
+  traceState.loadedMedia = {
+    buffer: Buffer.from("%PDF-1.7 trace document"),
+    fileName: "report.pdf",
+    contentType: "application/pdf",
+  };
+  traceState.account = {
+    ...makeTraceAccount("final-only"),
+    config: FeishuConfigSchema.parse({ renderMode: "raw", streaming: { mode: "off" } }),
+  };
 }
 
 function setupFeishuTrace(recorder: WireRecorder, scenario: DeliveryTraceScenarioName) {
@@ -402,7 +414,7 @@ function setupFeishuTrace(recorder: WireRecorder, scenario: DeliveryTraceScenari
         completedText += step.text;
         break;
       case "tool-progress":
-        created.replyOptions.onItemEvent?.({
+        await created.replyOptions.onItemEvent?.({
           itemId: `tool:${step.name}`,
           kind: "tool",
           name: step.name,
@@ -440,7 +452,6 @@ function setupFeishuTrace(recorder: WireRecorder, scenario: DeliveryTraceScenari
 
 const FEISHU_TRACE_SCENARIOS: readonly DeliveryTraceScenarioName[] = [
   "streaming-happy",
-  "final-only",
   "cancel-mid-stream",
   "rate-limit-during-preview",
   "overflow-pagination",
@@ -467,7 +478,7 @@ describe("feishu delivery trace goldens", () => {
             if (preFinal) {
               await created.delivery.deliver({ text: "I will check." }, { kind: "final" });
             }
-            created.replyOptions.onItemEvent?.({
+            await created.replyOptions.onItemEvent?.({
               itemId: "tool:lookup",
               kind: "tool",
               name: "web_search",
@@ -570,16 +581,7 @@ describe("feishu delivery trace goldens", () => {
           steps: [{ kind: "final", text: "Critical caption must remain visible" }],
         },
         setup: (recorder) => {
-          setupFeishuTrace(recorder, "final-only");
-          traceState.loadedMedia = {
-            buffer: Buffer.from("%PDF-1.7 trace document"),
-            fileName: "report.pdf",
-            contentType: "application/pdf",
-          };
-          traceState.account = {
-            ...makeTraceAccount("final-only"),
-            config: FeishuConfigSchema.parse({ renderMode: "raw", streaming: { mode: "off" } }),
-          };
+          setupPdfTrace(recorder);
           return async (step) => {
             if (step.kind !== "final") {
               throw new Error("unexpected authoritative-media trace step");
@@ -596,13 +598,7 @@ describe("feishu delivery trace goldens", () => {
               });
               return;
             }
-            const dispatcher = createFeishuReplyDispatcher({
-              cfg: {} as never,
-              agentId: "agent",
-              runtime: {} as never,
-              chatId: "oc-trace-chat",
-              sendTarget: "oc-trace-chat",
-            });
+            const dispatcher = createTraceDispatcher();
             await dispatcher.delivery.deliver(
               { text: step.text, mediaUrl: "https://example.com/download.ogg" },
               { kind: "final" },
@@ -645,23 +641,8 @@ describe("feishu delivery trace goldens", () => {
         steps: [{ kind: "final", text: "Already-visible TTS answer" }],
       },
       setup: (recorder) => {
-        setupFeishuTrace(recorder, "final-only");
-        traceState.loadedMedia = {
-          buffer: Buffer.from("%PDF-1.7 trace document"),
-          fileName: "report.pdf",
-          contentType: "application/pdf",
-        };
-        traceState.account = {
-          ...makeTraceAccount("final-only"),
-          config: FeishuConfigSchema.parse({ renderMode: "raw", streaming: { mode: "off" } }),
-        };
-        const dispatcher = createFeishuReplyDispatcher({
-          cfg: {} as never,
-          agentId: "agent",
-          runtime: {} as never,
-          chatId: "oc-trace-chat",
-          sendTarget: "oc-trace-chat",
-        });
+        setupPdfTrace(recorder);
+        const dispatcher = createTraceDispatcher();
         return async (step) => {
           if (step.kind !== "final") {
             throw new Error("unexpected visible-TTS trace step");

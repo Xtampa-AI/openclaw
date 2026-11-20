@@ -30,6 +30,7 @@ import {
   extractLatestToolOutput,
   buildSlackMpimHistoryReply,
   extractCurrentRuntimeContextTexts,
+  hasCurrentGeneratedMediaDelivery,
   extractUserTurnTexts,
   extractAllRequestTexts,
   extractCurrentImageRequest,
@@ -135,23 +136,17 @@ export function buildImageInspectionReply(
   return undefined;
 }
 
-export function buildImageGenerationCompletionReply(input: ResponsesInputItem[]) {
-  const { current } = splitMockConversationContext(extractLastUserText(input));
-  const completionContexts = [current, ...extractCurrentRuntimeContextTexts(input).toReversed()];
+export function buildAssistantText(input: ResponsesInputItem[], body: Record<string, unknown>) {
+  const prompt = extractLastUserText(input);
+  const completionContexts = [prompt, ...extractCurrentRuntimeContextTexts(input).toReversed()];
   const completedImageMediaPath = completionContexts
     .map(readCompletedImageGenerationMediaPath)
     .find(Boolean);
   if (completedImageMediaPath) {
-    return `Protocol note: generated the QA lighthouse image successfully.\nMEDIA:${completedImageMediaPath}`;
-  }
-  return undefined;
-}
-
-export function buildAssistantText(input: ResponsesInputItem[], body: Record<string, unknown>) {
-  const prompt = extractLastUserText(input);
-  const imageCompletionReply = buildImageGenerationCompletionReply(input);
-  if (imageCompletionReply) {
-    return imageCompletionReply;
+    const reply = "Protocol note: generated the QA lighthouse image successfully.";
+    return hasCurrentGeneratedMediaDelivery(input)
+      ? reply
+      : `${reply}\nMEDIA:${completedImageMediaPath}`;
   }
   const toolOutput = extractToolOutput(input);
   const scenarioToolOutput =

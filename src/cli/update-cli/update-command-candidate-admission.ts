@@ -22,6 +22,7 @@ import {
   usesCandidateUpdateAdmission,
   type UpdateCommandOptions,
 } from "./shared.js";
+import { reportPreMutationUpdateResult } from "./update-command-admission-report.js";
 import { withPrivateStagedPackageInstall } from "./update-command-artifact.js";
 import { inspectUpdateManagedServices } from "./update-command-database-context.js";
 import { handoffUpdateFromGateway } from "./update-command-handoff.js";
@@ -30,7 +31,6 @@ import type { UpdateAdmissionReportParams } from "./update-command-result.js";
 import type { prepareUpdateCommand } from "./update-command-run.js";
 import { withOwnedManagedUpdateEnv } from "./update-command-service-env.js";
 import type { resolveUpdateCommandTarget } from "./update-command-target.js";
-import { reportPreMutationUpdateResult } from "./update-command-terminal.js";
 import { UpdateCommandAbort } from "./update-command-windows-task.js";
 
 type Target = NonNullable<Awaited<ReturnType<typeof resolveUpdateCommandTarget>>>;
@@ -110,8 +110,10 @@ export async function inspectStagedUpdateCandidateAdmission(
     params.assertCurrent?.();
     const nodeRunner = target.packageUpdateNodeRunner ?? resolveNodeRunner();
     const candidateVersion = await readPackageVersion(params.candidateRoot);
+    params.assertCurrent?.();
     const result = await runUpdateCandidateAdmission({
       candidateRoot: params.candidateRoot,
+      assertCurrent: params.assertCurrent,
       nodeRunner,
       env: process.env,
       timeoutMs:
@@ -156,10 +158,12 @@ export async function inspectStagedUpdateCandidateAdmission(
     });
     params.assertCurrent?.();
     if (result.verdict?.verdict === "admit") {
-      target.packageUpdateNodeRunner = nodeRunner;
-      target.packageTargetSchemaVersions = parsePackageOpenClawSchemaVersions(
+      const schemaVersions = parsePackageOpenClawSchemaVersions(
         await tryReadJson<unknown>(path.join(params.candidateRoot, "package.json")),
       );
+      params.assertCurrent?.();
+      target.packageUpdateNodeRunner = nodeRunner;
+      target.packageTargetSchemaVersions = schemaVersions;
       target.targetVersion ??= candidateVersion;
     }
     return result;
@@ -205,7 +209,7 @@ export function applyUpdateCandidateAdmission(params: {
             }
           : {}),
       },
-      { env: run.env },
+      run,
     );
     for (const warning of [
       ...(result.warning ? [result.warning] : []),
@@ -214,7 +218,7 @@ export function applyUpdateCandidateAdmission(params: {
       recordUpdateRunStep(
         run.runId,
         { step: `warning:${warning.code}`, status: "completed", detail: warning.message },
-        { env: run.env },
+        run,
       );
       defaultRuntime.error(`Warning: ${warning.message}`);
     }
@@ -242,6 +246,7 @@ export function applyUpdateCandidateAdmission(params: {
 /** Stage once; the installed process retains service and execution authority. */
 export async function withUpdateCandidateAdmission<T>(
   params: CandidateAdmissionParams & {
+    assertCurrent: () => void;
     stagedPackage?: StagedPackageInstallUpdate;
     candidateAdmission?: Awaited<ReturnType<typeof inspectStagedUpdateCandidateAdmission>>;
   },
@@ -249,6 +254,10 @@ export async function withUpdateCandidateAdmission<T>(
 ): Promise<T | void> {
   const { target, opts, prepared } = params;
   const run = opts.run!;
+  const apply = (result: UpdateCandidateAdmissionResult) => {
+    params.assertCurrent();
+    applyUpdateCandidateAdmission({ target, opts, result });
+  };
   try {
     const inspect = async (stage: StagedPackageInstallUpdate): Promise<T> => {
       await target.assertPackageRuntimeCurrent?.();
@@ -256,14 +265,14 @@ export async function withUpdateCandidateAdmission<T>(
         ...params,
         candidateRoot: stage.root,
         runId: run.runId,
-        assertCurrent: () => run.executorFence?.assertCurrent(),
+        assertCurrent: params.assertCurrent,
       });
-      applyUpdateCandidateAdmission({ target, opts, result });
+      apply(result);
       return await execute(stage);
     };
     if (params.candidateAdmission) {
       // A command keeps its admitted candidate; concurrent config edits are best effort.
-      applyUpdateCandidateAdmission({ target, opts, result: params.candidateAdmission });
+      apply(params.candidateAdmission);
       return await execute(params.stagedPackage);
     }
     if (
@@ -271,13 +280,9 @@ export async function withUpdateCandidateAdmission<T>(
       !usesCandidateUpdateAdmission(opts, prepared.installKind) ||
       target.updateInstallKind !== "package"
     ) {
-      applyUpdateCandidateAdmission({
-        target,
-        opts,
-        result: {
-          owner: "installed",
-          ...(opts.admission === "installed" ? { fallbackReason: "forced-installed" } : {}),
-        },
+      apply({
+        owner: "installed",
+        ...(opts.admission === "installed" ? { fallbackReason: "forced-installed" } : {}),
       });
       return await execute(params.stagedPackage);
     }
@@ -300,7 +305,7 @@ export async function withUpdateCandidateAdmission<T>(
         installEnv: target.packageInstallEnv,
         installTarget: target.packageInstallTarget,
         pauseBeforeVerification: true,
-        assertCurrent: () => run.executorFence?.assertCurrent(),
+        assertCurrent: params.assertCurrent,
       },
       ({ stage }) => inspect(stage),
     );

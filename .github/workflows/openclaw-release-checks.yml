@@ -71,11 +71,6 @@ on:
         required: false
         default: false
         type: boolean
-      telegram_waiver:
-        description: Reviewed stable/full waiver; 2026.8.1/9.1 cover Telegram, 2026.9.5 covers Telegram and Matrix QA-live
-        required: false
-        default: ""
-        type: string
       allow_frozen_target_scenario_omissions:
         description: Allow trusted compatibility filtering for a canonical frozen release target
         required: false
@@ -159,7 +154,9 @@ env:
 
 jobs:
   resolve_target:
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: &linux_runner_ubuntu >-
+      ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}',
+      toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -182,8 +179,6 @@ jobs:
       run_maturity_scorecard: ${{ steps.inputs.outputs.run_maturity_scorecard }}
       allow_unreleased_changelog: ${{ steps.inputs.outputs.allow_unreleased_changelog }}
       skip_package_telegram_e2e: ${{ steps.inputs.outputs.skip_package_telegram_e2e }}
-      telegram_waiver: ${{ steps.inputs.outputs.telegram_waiver }}
-      waived_integration_channels: ${{ steps.inputs.outputs.waived_integration_channels }}
       trusted_qa_tooling_eligible: ${{ steps.trusted_qa_tooling.outputs.eligible }}
       rerun_group: ${{ steps.inputs.outputs.rerun_group }}
       live_suite_filter: ${{ steps.inputs.outputs.live_suite_filter }}
@@ -384,18 +379,6 @@ jobs:
           fi
           echo "sha=${normalized_selected_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Read Telegram waiver target manifest
-        if: inputs.telegram_waiver != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.ref.outputs.sha }}
-        run: |
-          set -euo pipefail
-          # Admission needs package metadata only; never execute the target here.
-          mkdir -p waiver-target
-          gh api "repos/${GITHUB_REPOSITORY}/contents/package.json?ref=${TARGET_SHA}" --jq .content |
-            base64 --decode > waiver-target/package.json
-
       - name: Capture selected inputs
         id: inputs
         env:
@@ -411,7 +394,6 @@ jobs:
           RELEASE_RUN_MATURITY_SCORECARD_INPUT: ${{ inputs.run_maturity_scorecard }}
           RELEASE_ALLOW_UNRELEASED_CHANGELOG_INPUT: ${{ inputs.allow_unreleased_changelog }}
           RELEASE_SKIP_PACKAGE_TELEGRAM_E2E_INPUT: ${{ inputs.skip_package_telegram_e2e }}
-          TELEGRAM_WAIVER: ${{ inputs.telegram_waiver }}
           RELEASE_RERUN_GROUP_INPUT: ${{ inputs.rerun_group }}
           RELEASE_LIVE_SUITE_FILTER_INPUT: ${{ inputs.live_suite_filter }}
           RELEASE_CROSS_OS_SUITE_FILTER_INPUT: ${{ inputs.cross_os_suite_filter }}
@@ -539,26 +521,6 @@ jobs:
                 "$RELEASE_RERUN_GROUP_INPUT" == "all" ]]; then
             skip_package_telegram_e2e=true
           fi
-          waived_channels='[]'
-          if [[ -n "$TELEGRAM_WAIVER" ]]; then
-            waived_channels="$(
-            TARGET_VERSION="$(jq -er '.version | select(type == "string")' waiver-target/package.json)" \
-              RELEASE_PROFILE="$release_profile" node --input-type=module <<'NODE'
-          import { releaseWaivedIntegrationChannels } from './workflow/scripts/full-release-validation-policy.mjs';
-          console.log(JSON.stringify(releaseWaivedIntegrationChannels({
-            telegramWaiver: process.env.TELEGRAM_WAIVER,
-            targetVersion: process.env.TARGET_VERSION,
-            releaseProfile: process.env.RELEASE_PROFILE,
-            rerunGroup: process.env.RELEASE_RERUN_GROUP_INPUT,
-            liveSuiteFilter: process.env.RELEASE_LIVE_SUITE_FILTER_INPUT,
-            releasePackageSpec: process.env.RELEASE_PACKAGE_SPEC_INPUT,
-            packageAcceptancePackageSpec: process.env.RELEASE_PACKAGE_ACCEPTANCE_PACKAGE_SPEC_INPUT,
-            candidateVersion: process.env.CANDIDATE_ARTIFACT_JSON_INPUT?.trim()
-              ? JSON.parse(process.env.CANDIDATE_ARTIFACT_JSON_INPUT).packageVersion : undefined,
-          })));
-          NODE
-            )"
-          fi
           codex_plugin_spec="$RELEASE_CODEX_PLUGIN_SPEC_INPUT"
           if [[ -z "${codex_plugin_spec// }" && "$release_package_spec" =~ ^openclaw@(.+)$ ]]; then
             codex_plugin_spec="npm:@openclaw/codex@${BASH_REMATCH[1]}"
@@ -655,10 +617,6 @@ jobs:
             fi
           fi
 
-          while IFS= read -r waived_channel; do
-            printf -v "qa_live_${waived_channel}_enabled" '%s' false
-          done < <(jq -r '.[]' <<< "$waived_channels")
-
           selection="$(RUN_RELEASE_SOAK="$run_release_soak" QA_FILTER_SEEN="$qa_filter_seen" \
             REPO_LIVE_SUITE_FILTER="$repo_live_suite_filter" node --input-type=module <<'NODE'
           import { createReleaseCheckSelection } from './workflow/scripts/plan-release-workflow-matrix.mjs';
@@ -712,8 +670,6 @@ jobs:
             printf 'run_maturity_scorecard=%s\n' "$run_maturity_scorecard"
             printf 'allow_unreleased_changelog=%s\n' "$allow_unreleased_changelog"
             printf 'skip_package_telegram_e2e=%s\n' "$skip_package_telegram_e2e"
-            printf 'telegram_waiver=%s\n' "$TELEGRAM_WAIVER"
-            printf 'waived_integration_channels=%s\n' "$waived_channels"
             printf 'rerun_group=%s\n' "$RELEASE_RERUN_GROUP_INPUT"
             printf 'live_suite_filter=%s\n' "$live_suite_filter"
             printf 'repo_live_suite_filter=%s\n' "$repo_live_suite_filter"
@@ -851,7 +807,7 @@ jobs:
           printf 'digest=%s\n' "$(jq -er '.digest' "$RUNNER_TEMP/frozen-admission.json")" >> "$GITHUB_OUTPUT"
 
       - name: Upload frozen admission diagnostic
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frozen-source-admission-release-checks-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/frozen-admission.json
@@ -875,8 +831,6 @@ jobs:
           FAIL_FAST: ${{ steps.inputs.outputs.fail_fast }}
           RUN_MATURITY_SCORECARD: ${{ steps.inputs.outputs.run_maturity_scorecard }}
           SKIP_PACKAGE_TELEGRAM_E2E: ${{ steps.inputs.outputs.skip_package_telegram_e2e }}
-          TELEGRAM_WAIVER: ${{ steps.inputs.outputs.telegram_waiver }}
-          WAIVED_INTEGRATION_CHANNELS: ${{ steps.inputs.outputs.waived_integration_channels }}
           ALLOW_UNRELEASED_CHANGELOG: ${{ steps.inputs.outputs.allow_unreleased_changelog }}
           RELEASE_RERUN_GROUP: ${{ inputs.rerun_group }}
           RELEASE_LIVE_SUITE_FILTER: ${{ inputs.live_suite_filter }}
@@ -905,10 +859,6 @@ jobs:
             echo "- Package Acceptance Telegram E2E deferred: \`${SKIP_PACKAGE_TELEGRAM_E2E}\`"
             if [[ "$SKIP_PACKAGE_TELEGRAM_E2E" == "true" ]]; then
               echo "- Package Acceptance Telegram E2E: not run; deferred to postpublish confidence."
-            fi
-            if [[ -n "$TELEGRAM_WAIVER" ]]; then
-              echo "- Source and Package Acceptance Telegram E2E: waived/not run (\`${TELEGRAM_WAIVER}\`); not a pass"
-              echo "- Owner-waived QA-live channels: $(jq -r 'join(", ")' <<< "$WAIVED_INTEGRATION_CHANNELS"); waived/not run, not a pass"
             fi
             echo "- Allow Unreleased changelog packaging: \`${ALLOW_UNRELEASED_CHANGELOG}\`"
             echo "- Rerun group: \`${RELEASE_RERUN_GROUP}\`"
@@ -945,7 +895,7 @@ jobs:
     name: Prepare release package artifact
     needs: [resolve_target]
     if: needs.resolve_target.outputs.package_required == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 35
     permissions:
       actions: read
@@ -979,7 +929,7 @@ jobs:
           filter: blob:none
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -1132,7 +1082,7 @@ jobs:
       - name: Upload release package artifact
         id: release_package_upload
         if: needs.resolve_target.outputs.package_mode != 'artifact'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: |
@@ -1144,7 +1094,7 @@ jobs:
       - name: Upload shared prerelease plugin registry artifact
         id: prepublish_plugin_registry_upload
         if: needs.resolve_target.outputs.package_mode != 'artifact' && steps.package.outputs.plugin_registry_manifest_sha256 != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-prepublish-plugin-registry-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/prepublish-plugin-registry/
@@ -1445,7 +1395,7 @@ jobs:
     name: Resolve Windows-node release artifacts
     needs: [resolve_target]
     if: needs.resolve_target.outputs.windows_node_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1593,7 +1543,7 @@ jobs:
     name: Resolve Windows-node main source
     needs: [resolve_target]
     if: needs.resolve_target.outputs.windows_node_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1665,7 +1615,7 @@ jobs:
       openai_model: openai/gpt-5.6-luna
       ubuntu_runner: ubuntu-24.04
       windows_runner: windows-2025
-      macos_runner: macos-26
+      macos_runner: xcode-27
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -1682,7 +1632,7 @@ jobs:
       actions: read
       contents: read
       id-token: write
-    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@fb45902950fd4f62d20a37dbbafac27e916917f2
+    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@76a48a68607d8cb7cc0ae607dbc46c920f07495a
     with:
       candidate_artifact_name: ${{ needs.prepare_release_package.outputs.windows_node_artifact_name }}
       candidate_artifact_run_id: ${{ github.run_id }}
@@ -1690,7 +1640,7 @@ jobs:
       candidate_version: ${{ needs.prepare_release_package.outputs.package_version }}
       windows_node_source: release
       windows_node_source_sha: ${{ needs.resolve_windows_node_release_artifacts.outputs.prerelease_release_sha }}
-      windows_node_workflow_sha: fb45902950fd4f62d20a37dbbafac27e916917f2
+      windows_node_workflow_sha: 76a48a68607d8cb7cc0ae607dbc46c920f07495a
       windows_node_release_tag: ${{ needs.resolve_windows_node_release_artifacts.outputs.prerelease_tag }}
       windows_node_release_asset_name: ${{ needs.resolve_windows_node_release_artifacts.outputs.prerelease_asset_name }}
       windows_node_release_asset_sha256: ${{ needs.resolve_windows_node_release_artifacts.outputs.prerelease_asset_sha256 }}
@@ -1704,7 +1654,7 @@ jobs:
       actions: read
       contents: read
       id-token: write
-    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@fb45902950fd4f62d20a37dbbafac27e916917f2
+    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@76a48a68607d8cb7cc0ae607dbc46c920f07495a
     with:
       candidate_artifact_name: ${{ needs.prepare_release_package.outputs.windows_node_artifact_name }}
       candidate_artifact_run_id: ${{ github.run_id }}
@@ -1712,7 +1662,7 @@ jobs:
       candidate_version: ${{ needs.prepare_release_package.outputs.package_version }}
       windows_node_source: release
       windows_node_source_sha: ${{ needs.resolve_windows_node_release_artifacts.outputs.stable_release_sha }}
-      windows_node_workflow_sha: fb45902950fd4f62d20a37dbbafac27e916917f2
+      windows_node_workflow_sha: 76a48a68607d8cb7cc0ae607dbc46c920f07495a
       windows_node_release_tag: ${{ needs.resolve_windows_node_release_artifacts.outputs.stable_tag }}
       windows_node_release_asset_name: ${{ needs.resolve_windows_node_release_artifacts.outputs.stable_asset_name }}
       windows_node_release_asset_sha256: ${{ needs.resolve_windows_node_release_artifacts.outputs.stable_asset_sha256 }}
@@ -1726,7 +1676,7 @@ jobs:
       actions: read
       contents: read
       id-token: write
-    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@fb45902950fd4f62d20a37dbbafac27e916917f2
+    uses: openclaw/openclaw-windows-node/.github/workflows/release-candidate-e2e.yml@76a48a68607d8cb7cc0ae607dbc46c920f07495a
     with:
       candidate_artifact_name: ${{ needs.prepare_release_package.outputs.windows_node_artifact_name }}
       candidate_artifact_run_id: ${{ github.run_id }}
@@ -1734,7 +1684,7 @@ jobs:
       candidate_version: ${{ needs.prepare_release_package.outputs.package_version }}
       windows_node_source: main
       windows_node_source_sha: ${{ needs.resolve_windows_node_main_source.outputs.main_source_sha }}
-      windows_node_workflow_sha: fb45902950fd4f62d20a37dbbafac27e916917f2
+      windows_node_workflow_sha: 76a48a68607d8cb7cc0ae607dbc46c920f07495a
       allow_protocol_mismatch: false
 
   live_repo_e2e_release_checks:
@@ -1762,6 +1712,7 @@ jobs:
       shared_image_artifact_namespace: release-live
       shared_image_policy: no-push-artifact
     secrets: &live_e2e_release_secrets
+      ABLITERATION_API_KEY: ${{ secrets.ABLITERATION_API_KEY }}
       AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
       AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
       BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}
@@ -1913,7 +1864,7 @@ jobs:
       published_upgrade_survivor_baseline: ${{ inputs.qualification_baselines_json != '' && fromJSON(inputs.qualification_baselines_json).upgradeBaseline || (needs.resolve_target.outputs.package_acceptance_package_spec == '' && format('openclaw@{0}', needs.prepare_release_package.outputs.upgrade_baseline) || 'openclaw@latest') }}
       published_upgrade_survivor_baselines: ${{ needs.prepare_release_package.outputs.upgrade_survivor_baselines }}
       published_upgrade_survivor_scenarios: ${{ needs.prepare_release_package.outputs.upgrade_survivor_scenarios }}
-      telegram_mode: ${{ (needs.resolve_target.outputs.telegram_waiver != '' || needs.resolve_target.outputs.skip_package_telegram_e2e == 'true') && 'none' || 'mock-openai' }}
+      telegram_mode: ${{ needs.resolve_target.outputs.skip_package_telegram_e2e == 'true' && 'none' || 'mock-openai' }}
       shared_image_artifact_namespace: release-package
       candidate_artifact_json: ${{ needs.resolve_target.outputs.package_acceptance_package_spec == '' && needs.prepare_release_package.outputs.candidate_artifact_json || '' }}
       shared_image_policy: no-push-artifact
@@ -1989,7 +1940,7 @@ jobs:
     name: Run QA Lab parity lane (${{ matrix.lane }})
     needs: [resolve_target]
     if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 30
     permissions:
       contents: read
@@ -2097,7 +2048,7 @@ jobs:
       - name: Upload parity lane artifacts
         id: upload_parity_lane_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-parity-${{ matrix.lane }}-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -2151,7 +2102,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-parity-${{ matrix.lane }}-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_lab_parity_lane_release_checks-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -2162,7 +2113,7 @@ jobs:
     name: Run QA Lab parity report
     needs: [resolve_target, qa_lab_parity_lane_release_checks]
     if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 20
     permissions:
       contents: read
@@ -2215,14 +2166,14 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download parity lane statuses
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_parity_lane_artifacts.outputs.status_ids }}
           path: .artifacts/release-check-status/
           merge-multiple: true
 
       - name: Download parity lane artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_parity_lane_artifacts.outputs.payload_ids }}
           path: .artifacts/qa-e2e/
@@ -2239,11 +2190,6 @@ jobs:
             --validated-file "$validated_file"
           jq -e 'length == 2 and all(.[]; .status == "success")' "$validated_file" >/dev/null
 
-      - name: Build private QA runtime
-        env:
-          NODE_OPTIONS: --max-old-space-size=8192
-        run: pnpm build qaRuntime
-
       - name: Generate parity report
         id: generate_report
         run: |
@@ -2258,7 +2204,7 @@ jobs:
       - name: Upload parity artifacts
         id: upload_parity_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-parity-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -2277,7 +2223,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-parity-report-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_lab_parity_report_release_checks-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -2470,7 +2416,7 @@ jobs:
       - name: Upload runtime-pair lane artifacts
         id: upload_runtime_parity_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-runtime-pair-lane-${{ matrix.lane }}-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -2490,7 +2436,7 @@ jobs:
 
       - name: Upload runtime-pair lane status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-internal-status-qa-runtime-pair-lane-${{ matrix.lane }}-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_lab_runtime_pair_lane_release_checks-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -2501,7 +2447,7 @@ jobs:
     name: Verify QA Lab runtime-pair lanes
     needs: [resolve_target, qa_lab_runtime_pair_lane_release_checks]
     if: always() && needs.resolve_target.result == 'success' && needs.resolve_target.outputs.qa_parity_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 15
     permissions:
       actions: read
@@ -2548,7 +2494,7 @@ jobs:
       - name: Download runtime-pair lane statuses
         id: download_runtime_pair_statuses
         if: always() && steps.resolve_runtime_pair_artifacts.outcome == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_runtime_pair_artifacts.outputs.status_ids }}
           path: .artifacts/release-check-status/
@@ -2557,7 +2503,7 @@ jobs:
       - name: Download runtime-pair lane artifacts
         id: download_runtime_pair_artifacts
         if: always() && steps.resolve_runtime_pair_artifacts.outcome == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_runtime_pair_artifacts.outputs.payload_ids }}
           path: .artifacts/qa-e2e/
@@ -2587,7 +2533,7 @@ jobs:
       - name: Upload runtime parity artifacts
         id: upload_runtime_parity_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-runtime-parity-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -2606,7 +2552,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-runtime-parity-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_lab_runtime_parity_release_checks-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -2617,7 +2563,7 @@ jobs:
     name: Enforce QA Lab runtime tool coverage
     needs: [resolve_target, qa_lab_runtime_parity_release_checks]
     if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 15
     permissions:
       contents: read
@@ -2669,7 +2615,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download runtime parity status
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_runtime_parity_artifacts.outputs.status_ids }}
           path: .artifacts/release-check-status/
@@ -2698,7 +2644,7 @@ jobs:
 
       - name: Download runtime parity artifacts
         if: steps.verify_runtime_parity_status.outputs.ready == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_runtime_parity_artifacts.outputs.payload_ids }}
           path: .artifacts/qa-e2e/
@@ -2715,7 +2661,7 @@ jobs:
 
       - name: Upload runtime tool coverage artifacts
         if: ${{ always() && steps.verify_runtime_parity_status.outputs.ready == 'true' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-runtime-tool-coverage-${{ needs.resolve_target.outputs.revision }}
           path: .artifacts/qa-e2e/runtime-pair-core-report/
@@ -2771,7 +2717,7 @@ jobs:
     outputs:
       conclusion: ${{ steps.dispatch.outputs.conclusion || steps.dispatch.outcome }}
       identity_verified: ${{ steps.dispatch.outputs.identity_verified }}
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 210
     permissions:
       actions: write
@@ -2909,7 +2855,7 @@ jobs:
     name: Run QA Lab live Discord lane
     needs: [resolve_target]
     if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_discord_enabled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 60
     permissions:
       contents: read
@@ -2984,7 +2930,7 @@ jobs:
       - name: Upload Discord QA artifacts
         id: upload_discord_qa_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-live-discord-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -3003,7 +2949,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-live-discord-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_live_discord_release_checks-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -3014,7 +2960,7 @@ jobs:
     name: Run QA Lab live WhatsApp lane
     needs: [resolve_target]
     if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_whatsapp_enabled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 60
     concurrency:
       group: qa-live-whatsapp-shared
@@ -3073,7 +3019,7 @@ jobs:
       - name: Upload WhatsApp QA artifacts
         id: upload_whatsapp_qa_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-live-whatsapp-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -3092,7 +3038,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-live-whatsapp-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_live_whatsapp_release_checks-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -3103,7 +3049,7 @@ jobs:
     name: Run QA Lab live Slack lane
     needs: [resolve_target]
     if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_slack_enabled == 'true'
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     timeout-minutes: 60
     permissions:
       contents: read
@@ -3159,7 +3105,7 @@ jobs:
       - name: Upload Slack QA artifacts
         id: upload_slack_qa_artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-qa-live-slack-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/qa-e2e/
@@ -3178,7 +3124,7 @@ jobs:
 
       - name: Upload advisory status
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-check-status-qa-live-slack-${{ needs.resolve_target.outputs.revision }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/release-check-status/qa_live_slack_release_checks-${{ github.run_id }}-${{ github.run_attempt }}.env
@@ -3212,7 +3158,7 @@ jobs:
       - qa_live_whatsapp_release_checks
       - qa_live_slack_release_checks
     if: always()
-    runs-on: ${{ vars.OPENCLAW_RELEASE_RUNNER_GROUP != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(vars.OPENCLAW_RELEASE_RUNNER_GROUP), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: *linux_runner_ubuntu
     permissions:
       actions: read
       contents: read
@@ -3293,7 +3239,7 @@ jobs:
         id: download_advisory_statuses
         if: steps.resolve_advisory_evidence.outcome == 'success' && steps.resolve_advisory_evidence.outputs.status_ids != ''
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ steps.resolve_advisory_evidence.outputs.status_ids }}
           path: .artifacts/release-check-status

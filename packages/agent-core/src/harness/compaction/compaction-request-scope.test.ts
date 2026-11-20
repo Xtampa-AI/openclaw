@@ -1,22 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMessage } from "../../types.js";
 import type { SessionTreeEntry } from "../types.js";
-import { parseCompactionDetails } from "./compaction-details.js";
 import { compactWithoutSummary, prepareCompaction } from "./compaction.js";
 import {
+  createCompactionModel,
   createContextUsage,
   createMessageEntry as messageEntry,
 } from "./compaction.test-support.js";
+import { compactWith, responseStream } from "./shard-fixtures.test-support.js";
 
 const settings = { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1 };
-const internalSources = [
-  { label: "Inter-session input", metadata: { provenance: { kind: "inter_session" } } },
-  { label: "Internal system input", metadata: { provenance: { kind: "internal_system" } } },
-  { label: "Synthetic input", metadata: { synthetic: true as const } },
-  { label: "Operator input", metadata: { operatorMessage: { turnScoped: true } } },
-];
-
-function assistant(text: string, timestamp: number): AgentMessage {
+function assistant(text: string, timestamp: number): Extract<AgentMessage, { role: "assistant" }> {
   return {
     role: "assistant",
     content: [{ type: "text", text }],
@@ -34,7 +28,7 @@ function prepare(entries: SessionTreeEntry[], pendingEntryId?: string) {
     entries,
     settings,
     "unresolved",
-    pendingEntryId ? { requestFromEntryId: pendingEntryId } : undefined,
+    pendingEntryId ? { requestBoundary: { entryId: pendingEntryId, preserve: false } } : undefined,
   );
   if (!result.ok || !result.value) {
     throw new Error("expected compactable history");
@@ -43,63 +37,165 @@ function prepare(entries: SessionTreeEntry[], pendingEntryId?: string) {
 }
 
 describe("manual compaction requests", () => {
-  it("leaves request state unspecified for legacy callers", () => {
-    const entries = [
-      messageEntry({ role: "user", content: "Summarize this history", timestamp: 1 }, 0),
-      messageEntry(assistant("Working on it.", 2), 1),
+  it("preserves a prior pending request when fallback has no authoritative replacement", () => {
+    const request = "Review the patch; do not deploy it.";
+    const entries: SessionTreeEntry[] = [
+      messageEntry(assistant("Prior retained work", 1), 0),
+      {
+        type: "compaction",
+        id: "prior-compaction",
+        parentId: "entry-0",
+        timestamp: new Date(2).toISOString(),
+        firstKeptEntryId: "entry-0",
+        tokensBefore: 100,
+        summary: `## Latest unresolved user request\n${JSON.stringify(request)}\n\nPrior work continues.`,
+        details: { readFiles: [], modifiedFiles: [], latestUnresolvedUserRequest: request },
+      },
+      messageEntry(assistant("Still working.", 3), 2),
+      messageEntry(assistant("Still working after a tool result.", 4), 3),
     ];
-    const result = prepareCompaction(entries, settings);
-    expect(result.ok).toBe(true);
-    if (!result.ok || !result.value) {
+    const prepared = prepareCompaction(entries, settings);
+    if (!prepared.ok || !prepared.value) {
       throw new Error("expected compactable history");
     }
-    expect(result.value.requestState).toBeUndefined();
+    expect(prepared.value.latestUnresolvedUserRequest).toBeUndefined();
+
+    const fallback = compactWithoutSummary(prepared.value);
+    expect(fallback.ok).toBe(true);
+    if (fallback.ok) {
+      expect(fallback.value.summary).toContain(
+        `## Latest unresolved user request\n${JSON.stringify(request)}`,
+      );
+      expect(fallback.value.summary).toContain("Prior work continues.");
+    }
   });
 });
 
 describe("run-owned compaction requests", () => {
-  it.each(internalSources)(
-    "retains the $label source when its split turn falls back without a summary",
-    ({ label, metadata }) => {
-      const source = "Inspect the worker artifact; do not publish it.";
-      const input = Object.assign(
-        { role: "user" as const, content: source, timestamp: 3 },
-        metadata,
-      );
-      const entries = [
-        messageEntry({ role: "user", content: "An earlier human task", timestamp: 1 }, 0),
-        messageEntry(assistant("That task is complete.", 2), 1),
-        messageEntry(input, 2),
-        messageEntry(assistant("The internal task is still running.", 4), 3),
+  it.each([null, "Review the new patch; do not deploy."])(
+    "reconciles the prior generated request when the current request is %s",
+    async (currentRequest) => {
+      const priorSummary =
+        'Prior context.\n\n## Latest unresolved user request\n"Completed human task"\n\n## Decisions\nKeep useful facts.';
+      const entries: SessionTreeEntry[] = [
+        messageEntry(assistant("Prior retained work", 1), 0),
+        {
+          type: "compaction",
+          id: "prior-compaction",
+          parentId: "entry-0",
+          timestamp: new Date(2).toISOString(),
+          firstKeptEntryId: "entry-0",
+          tokensBefore: 100,
+          summary: priorSummary,
+          details: {
+            readFiles: ["src/prior.ts"],
+            modifiedFiles: ["src/changed.ts"],
+            latestUnresolvedUserRequest: "Completed human task",
+          },
+        },
+        messageEntry(assistant("Completed prior work.", 3), 1),
+        messageEntry(
+          Object.assign(
+            { role: "user" as const, content: currentRequest ?? "Internal work", timestamp: 4 },
+            currentRequest ? {} : { provenance: { kind: "internal_system" } },
+          ),
+          2,
+        ),
+        messageEntry(assistant("Continuing.", 5), 3),
       ];
-      const preparation = prepare(entries);
-      expect(preparation.requestState).toBe("none");
-      expect(preparation.isSplitTurn).toBe(true);
-      const result = compactWithoutSummary(preparation);
+      let suppliedPriorSummary = "";
+      const result = await compactWith(prepare(entries), createCompactionModel(), {
+        runtime: {
+          completeSimple: async (_model, context) => {
+            const prompt = context.messages[0];
+            const content = prompt?.content;
+            const text =
+              typeof content === "string"
+                ? content
+                : content?.map((block) => (block.type === "text" ? block.text : "")).join("");
+            const previous = /<previous-summary>\n([\s\S]*?)\n<\/previous-summary>/u.exec(
+              text ?? "",
+            );
+            if (previous) {
+              suppliedPriorSummary = previous[1] ?? "";
+            }
+            return assistant(previous ? suppliedPriorSummary : "Current turn context.", 6);
+          },
+        },
+      });
       if (!result.ok) {
         throw result.error;
       }
-      expect(result.value.summary).toContain(`[${label}]: ${source}`);
-      expect(result.value.firstKeptEntryId).toBe("entry-3");
+      expect(suppliedPriorSummary).toBe(priorSummary);
+      expect(result.value.summary).not.toContain('"Completed human task"');
+      expect(result.value.summary).toContain("Keep useful facts.");
+      expect(result.value.summary.match(/## Latest unresolved user request/gu) ?? []).toHaveLength(
+        currentRequest ? 1 : 0,
+      );
+      if (currentRequest) {
+        expect(result.value.summary).toContain(JSON.stringify(currentRequest));
+      }
+      expect(result.value.details).toEqual({
+        readFiles: ["src/prior.ts"],
+        modifiedFiles: ["src/changed.ts"],
+        ...(currentRequest ? { latestUnresolvedUserRequest: currentRequest } : {}),
+      });
     },
   );
 
-  it.each(internalSources)(
-    "does not revive completed human work for an independent $label run",
-    ({ metadata }) => {
-      const input = Object.assign(
-        { role: "user" as const, content: "An independent internal task", timestamp: 3 },
-        metadata,
-      );
-      const entries = [
-        messageEntry({ role: "user", content: "Completed human task", timestamp: 1 }, 0),
-        messageEntry(assistant("Completed.", 2), 1),
-        messageEntry(input, 2),
-        messageEntry(assistant("Working on the internal task.", 4), 3),
-      ];
-      expect(prepare(entries).latestUnresolvedUserRequest).toBeUndefined();
-    },
-  );
+  it("clears stale model-generated pending asks when the owner selects none", async () => {
+    const entries = [
+      messageEntry({ role: "user", content: "Completed human task", timestamp: 1 }, 0),
+      messageEntry(assistant("Completed.", 2), 1),
+      messageEntry(
+        Object.assign(
+          { role: "user" as const, content: "Independent internal task", timestamp: 3 },
+          { provenance: { kind: "internal_system" } },
+        ),
+        2,
+      ),
+    ];
+    const result = await compactWith(prepare(entries), createCompactionModel(), {
+      streamFn: () =>
+        responseStream(
+          assistant(
+            "## Pending user asks\n- Completed human task\n\n## Decisions\nKeep the useful facts.",
+            4,
+          ),
+        ),
+    });
+    if (!result.ok) {
+      throw result.error;
+    }
+    expect(result.value.summary).toContain("## Pending user asks\nNone.");
+    expect(result.value.summary).not.toContain("Completed human task");
+    expect(result.value.summary).toContain("Keep the useful facts.");
+  });
+
+  it("attributes a split internal run without reviving completed human work", () => {
+    const source = "Inspect the worker artifact; do not publish it.";
+    const entries = [
+      messageEntry({ role: "user", content: "Completed human task", timestamp: 1 }, 0),
+      messageEntry(assistant("Completed.", 2), 1),
+      messageEntry(
+        Object.assign(
+          { role: "user" as const, content: source, timestamp: 3 },
+          { provenance: { kind: "inter_session" } },
+        ),
+        2,
+      ),
+      messageEntry(assistant("The internal task is still running.", 4), 3),
+    ];
+    const preparation = prepare(entries);
+    expect(preparation.requestSelection).toEqual({ state: "none" });
+    expect(preparation.latestUnresolvedUserRequest).toBeUndefined();
+    expect(preparation.isSplitTurn).toBe(true);
+    const result = compactWithoutSummary(preparation);
+    if (!result.ok) {
+      throw result.error;
+    }
+    expect(result.value.summary).toContain(`[Inter-session input]: ${source}`);
+  });
 
   it("keeps the admitted human request across later internal updates", () => {
     const request = "Review the patch; do not deploy it.";
@@ -119,7 +215,10 @@ describe("run-owned compaction requests", () => {
       ),
       messageEntry(assistant("Review continues.", 6), 5),
     ];
-    expect(prepare(entries, "entry-2").latestUnresolvedUserRequest).toBe(request);
+    expect(prepare(entries, "entry-2")).toMatchObject({
+      requestSelection: { state: "unresolved", request },
+      latestUnresolvedUserRequest: request,
+    });
   });
 
   it("does not carry a prior checkpoint's pending ask into a new internal run", () => {
@@ -132,7 +231,8 @@ describe("run-owned compaction requests", () => {
         timestamp: new Date(2).toISOString(),
         firstKeptEntryId: "entry-0",
         tokensBefore: 100,
-        summary: '## Latest unresolved user request\n"Old human ask"\n\nPrior work completed.',
+        summary:
+          'Generated recovery context.\n\n## Pending user asks\n- Old human ask\n\n## Decisions\nPrior work completed.\n\n## Latest unresolved user request\n"Old human ask"\n\n',
         details: { readFiles: [], modifiedFiles: [], latestUnresolvedUserRequest: "Old human ask" },
       },
       messageEntry(
@@ -147,111 +247,15 @@ describe("run-owned compaction requests", () => {
       messageEntry(assistant("Working on cron.", 4), 3),
     ];
     const preparation = prepare(entries);
+    expect(preparation.requestSelection).toEqual({ state: "none" });
     expect(preparation.latestUnresolvedUserRequest).toBeUndefined();
     const fallback = compactWithoutSummary(preparation);
     expect(fallback.ok).toBe(true);
     if (fallback.ok) {
       expect(fallback.value.summary).not.toContain("Old human ask");
+      expect(fallback.value.summary).toContain("Generated recovery context.");
+      expect(fallback.value.summary).toContain("## Pending user asks\nNone.");
       expect(fallback.value.summary).toContain("Prior work completed.");
     }
-  });
-});
-
-describe("processed request recovery across compaction", () => {
-  function checkpoint(request: string): SessionTreeEntry {
-    return {
-      type: "compaction",
-      id: "checkpoint",
-      parentId: "entry-0",
-      timestamp: new Date(2).toISOString(),
-      firstKeptEntryId: "entry-0",
-      tokensBefore: 100,
-      summary:
-        "Prior context.\n\n## Pending user asks\n- " +
-        request +
-        "\n\n## Decisions\nKeep the review offline.\n\n## Latest unresolved user request\n" +
-        JSON.stringify(request) +
-        "\n\n",
-      details: { readFiles: [], modifiedFiles: [], latestUnresolvedUserRequest: request },
-    };
-  }
-  it("recovers the admitted request after its processed entry leaves the semantic window", () => {
-    const request = "Review only; do not deploy.";
-    const entries = [
-      messageEntry(assistant("Retained work", 1), 0),
-      checkpoint(request),
-      messageEntry(
-        Object.assign(
-          { role: "user" as const, content: "Worker progress", timestamp: 3 },
-          { provenance: { kind: "inter_session" } },
-        ),
-        2,
-      ),
-      messageEntry(assistant("Continuing review", 4), 3),
-    ];
-    const prepared = prepare(entries, "already-compacted-request");
-    expect(prepared.latestUnresolvedUserRequest).toBe(request);
-    const result = compactWithoutSummary(prepared);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(parseCompactionDetails(result.value.details)?.latestUnresolvedUserRequest).toBe(
-        request,
-      );
-    }
-    const missingUnprocessed = prepareCompaction(entries, settings, "unresolved", {
-      requestFromEntryId: "already-compacted-request",
-      preserveFromEntryId: "already-compacted-request",
-    });
-    expect(missingUnprocessed.ok).toBe(false);
-  });
-  it("clears model-written pending asks for a new internal run without deleting decisions", () => {
-    const request = "Old human task";
-    const entries = [
-      messageEntry(assistant("Retained work", 1), 0),
-      checkpoint(request),
-      messageEntry(
-        Object.assign(
-          { role: "user" as const, content: "Independent cron task", timestamp: 3 },
-          { provenance: { kind: "internal_system" } },
-        ),
-        2,
-      ),
-      messageEntry(assistant("Working on cron", 4), 3),
-    ];
-    const prepared = prepare(entries);
-    expect(prepared.requestState).toBe("none");
-    const result = compactWithoutSummary(prepared);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.value.summary).not.toContain(request);
-      expect(result.value.summary).toContain("## Pending user asks\nNone.");
-      expect(result.value.summary).toContain("Keep the review offline.");
-    }
-  });
-  it("does not strip a matching latest-request heading embedded in literal text", () => {
-    const request = "Literal test";
-    const literal =
-      'literal prefix ## Latest unresolved user request\n"Literal test"\n\nquoted example';
-    const entry = checkpoint(request);
-    if (entry.type !== "compaction") {
-      throw new Error("checkpoint");
-    }
-    entry.summary = literal;
-    const prepared = prepareCompaction(
-      [
-        messageEntry(assistant("Retained work", 1), 0),
-        entry,
-        messageEntry(assistant("Continuing", 3), 2),
-      ],
-      settings,
-    );
-    if (!prepared.ok || !prepared.value) {
-      throw new Error("expected preparation");
-    }
-    const result = compactWithoutSummary(prepared.value);
-    if (!result.ok) {
-      throw result.error;
-    }
-    expect(result.value.summary).toContain(literal);
   });
 });

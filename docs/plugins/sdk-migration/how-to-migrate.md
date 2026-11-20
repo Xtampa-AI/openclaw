@@ -810,7 +810,27 @@ metadata through the worker. `statSessionEntrySync` remains available through
 only projects those values and does not query SQLite. `buildSessionEntry`
 also reads durable snapshots in the worker when an `onTranscriptMessage`
 observer is supplied, then invokes the observer on the caller with the original
-messages and timestamps.
+messages and timestamps. Because this legacy callback cannot retract observations,
+durable exports retain its original messages until each entry succeeds, discard
+abandoned attempts, and invoke the callback once per message in the successful
+snapshot. This applies to both full builders and streaming calls that supply the
+legacy observer; those calls may retain the full original message payloads.
+
+For memory indexing, use `streamSessionEntry(path, options, stream)` or
+`streamSessionEntries(inputs)` from the same SDK surface. `onPage` receives
+consecutive rendered lines, their source line map, timestamps, and provenance;
+return a promise to apply backpressure. `onReset` means earlier pages belong to
+an abandoned export and must be discarded before accepting new pages. The
+returned summary retains the persisted entry hash and reset-recall metadata.
+Durable SQLite exports release each read transaction before delivering a page;
+incognito exports recheck the actor's live authority before each disclosure.
+
+`buildSessionEntry`, `buildSessionEntries`, and `matchesSessionEntryPrefixHash`
+retain their complete-entry contracts. The builders collect streamed pages for
+callers that need the full document; they are not bounded-memory consumers.
+File-based archives and a single large record can also require their original
+input in memory. Memory indexing, startup scanning, and dreaming consume the
+stream without collecting the full rendered document.
 
 ## Prepare session entry changes
 
@@ -1520,9 +1540,10 @@ write `agents.entries`. This compatibility window adds no runtime warnings.
 
     | Need | Typed-public import or injected API |
     | --- | --- |
-    | New system event producers | `api.runtime.system.enqueueSystemEvent` |
+    | Immediate session event producers | `api.runtime.system.captureSessionEventTarget` and `enqueueSessionEvent` |
+    | Passive system event producers | `api.runtime.system.enqueueSystemEvent` |
     | System event snapshot inspection and consumption | `openclaw/plugin-sdk/system-event-runtime` |
-    | Heartbeat wake requests | `api.runtime.system.requestHeartbeat` |
+    | Periodic monitoring | Ordinary [automation jobs](/automation/cron-jobs) |
     | Channel activity telemetry | `api.runtime.channel.activity.record` and `.get` |
     | `createDedupeCache`, `resolveGlobalDedupeCache` | `openclaw/plugin-sdk/dedupe-runtime` |
     | Safe local-file/media paths, regular-file checks, and symlink-parent checks | `openclaw/plugin-sdk/security-runtime` (itself a deprecated broad barrel) |
@@ -1539,10 +1560,11 @@ write `agents.entries`. This compatibility window adds no runtime warnings.
     adopting ordinary exec policy; there is no replacement command-text detector.
 
     These are symbol-specific mappings, not replacements for the whole barrel.
-    Private-local entries such as `heartbeat-runtime`, `delivery-queue-runtime`,
+    Private-local entries such as `delivery-queue-runtime`,
     `fetch-runtime`, `runtime-fetch`, and `file-lock` are JavaScript-only host
-    exports, not typed third-party APIs. Heartbeat event/summary/visibility
-    helpers, pending-delivery drain, transport readiness, concurrency, and file
+    exports, not typed third-party APIs. `heartbeat-runtime` has been removed;
+    see the [executor removal mappings](/plugins/sdk-migration/removed-surfaces#heartbeat-executor-and-wake-helpers).
+    Pending-delivery drain, transport readiness, concurrency, and file
     locking do not have equivalent modern typed-public mappings here. Adapt
     plugin-owned behavior or request a focused public contract for the missing
     host capability.

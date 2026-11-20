@@ -3,6 +3,9 @@ import { z } from "zod";
 import { ALL_THINKING_LEVELS } from "../auto-reply/thinking.shared.js";
 import { AgentModelSchema, DecisionModelSchema } from "./zod-schema.agent-model.js";
 
+/** Persisted client-side summary ceiling; the active model token budget may require less. */
+export const AgentCompactionMaxSummaryCharsSchema = z.number().int().min(1_000).max(200_000);
+
 export const AgentRuntimePolicySchema = z
   .strictObject({
     id: z.string().optional(),
@@ -86,7 +89,7 @@ export const AgentEntryBaseSchema = z.strictObject({
   cwd: z.string().optional(),
   agentDir: z.string().optional(),
   model: AgentModelSchema.optional(),
-  utilityModel: z.string().optional(),
+  utilityModel: AgentModelSchema.optional(),
   decisionModel: DecisionModelSchema.optional(),
   models: AgentModelMapSchema.optional(),
   modelPolicy: AgentModelPolicySchema.optional(),
@@ -119,6 +122,12 @@ export const AgentEntryBaseSchema = z.strictObject({
   embeddedAgent: z
     .strictObject({
       executionContract: z.union([z.literal("default"), z.literal("strict-agentic")]).optional(),
+    })
+    .optional(),
+  compaction: z
+    .strictObject({
+      /** Override the default persisted client-side summary character ceiling. */
+      maxSummaryChars: AgentCompactionMaxSummaryCharsSchema.optional(),
     })
     .optional(),
   params: z.record(z.string(), z.unknown()).optional(),

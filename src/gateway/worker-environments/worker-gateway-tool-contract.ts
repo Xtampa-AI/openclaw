@@ -12,11 +12,13 @@ export type WorkerGatewayToolSink = { send(frame: WorkerGatewayToolUpdateFrame):
 
 export type WorkerGatewayToolRuntime = {
   applyPromptToolsAllow(toolsAllow?: string[]): string[];
-  getInheritedPublicationToolName(): string | undefined;
+  getAdditionalInheritedToolNames(): readonly string[];
   getSurface(identity: WorkerConnectionIdentity): Promise<WorkerToolSurface>;
   getPromptProjection(identity: WorkerConnectionIdentity): Promise<{
     tools: NonNullable<WorkerInferenceContext["tools"]>;
     toolSchemaDirectoryPrompt?: string;
+    /** Run-granted deferred tools, listed in the turn's context instead of the cached directory. */
+    runGrantedToolDirectory?: string;
   }>;
   invoke(
     identity: WorkerConnectionIdentity,

@@ -12,6 +12,8 @@ export const deferredPluginMigrationSchema = z.object({
 });
 
 export type DeferredPluginMigration = z.infer<typeof deferredPluginMigrationSchema>;
+
+/** Doctor can reword guidance without changing the requirements protecting retained inputs. */
 export function sameDeferredPluginMigrationInputs(
   current: readonly DeferredPluginMigration[],
   expected: readonly DeferredPluginMigration[],

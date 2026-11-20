@@ -38,6 +38,7 @@ it.each([true, false])(
     registerCodexTestSessionIdentity(params.sessionFile, params.sessionId, params.sessionKey);
     const wire = await createLeasedCodexLifecycleHarness({
       agentDir: params.agentDir,
+      codexHome: path.join(params.agentDir, "codex-home"),
       respond: createLifecycleRequest(async (method, requestParams) => {
         if (method === "thread/start") {
           return threadStartResult(++nextThread === 1 ? "app-thread" : "reply-thread");
@@ -78,7 +79,6 @@ it.each([true, false])(
       appServer: { ...createAppServerOptions(), start: wire.acquireOptions.startOptions! },
       usesSupervisionConnection: false,
       clientAuthProfileId: null,
-      requestAuthProfileId: undefined,
     });
     const preparation: AgentHarnessSessionPreparationV1 = {
       version: 1,
@@ -111,10 +111,12 @@ it.each([true, false])(
       await lease!.runtime.joinCleanup?.();
     }
     try {
-      await runCodexAppServerAttempt(params, {
-        pluginConfig,
-        clientFactory: async () => acquire(wire.acquireOptions),
-      });
+      await expect(
+        runCodexAppServerAttempt(params, {
+          pluginConfig,
+          clientFactory: async () => acquire(wire.acquireOptions),
+        }),
+      ).resolves.toBeDefined();
       expect(wire.request.mock.calls.some(([method]) => method === "turn/start")).toBe(true);
     } finally {
       if (retainLease) {

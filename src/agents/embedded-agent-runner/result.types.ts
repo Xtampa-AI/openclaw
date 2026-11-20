@@ -14,7 +14,7 @@ import type { ReplyExpectation } from "../reply-completion.js";
 import type { AgentRuntimeCredentialSource } from "../runtime-plan/credential-source.types.js";
 import type { NormalizedUsage } from "../usage.js";
 
-type EmbeddedAgentMeta = {
+export type EmbeddedAgentMeta = {
   sessionId: string;
   sessionFile?: string;
   provider: string;
@@ -27,6 +27,9 @@ type EmbeddedAgentMeta = {
     provider?: string;
     category?: string;
     review?: ProviderRefusalReview;
+    /** Physical request facts used only to retry the same model and account. */
+    accessProgram?: "standard" | "daybreak_blue" | "daybreak_red";
+    authProfileId?: string;
     nativeThreadId?: string;
     nativeTurnId?: string;
   };
@@ -87,7 +90,7 @@ type EmbeddedAgentMeta = {
   terminalReceipt?: Omit<AgentRunTerminalReceipt, "terminalDisposition">;
 };
 
-type TraceAttempt = {
+export type TraceAttempt = {
   provider: string;
   model: string;
   result:
@@ -106,7 +109,7 @@ type TraceAttempt = {
   status?: number;
 };
 
-type ToolSummaryTrace = {
+export type ToolSummaryTrace = {
   calls: number;
   tools: string[];
   failures?: number;
@@ -115,9 +118,9 @@ type ToolSummaryTrace = {
   totalToolTimeMs?: number;
 };
 
-type EmbeddedRunLivenessState = "working" | "paused" | "blocked" | "abandoned";
+export type EmbeddedRunLivenessState = "working" | "paused" | "blocked" | "abandoned";
 
-type EmbeddedRunFailureSignal = {
+export type EmbeddedRunFailureSignal = {
   kind: "execution_denied";
   source: "tool";
   toolName?: string;
@@ -151,6 +154,8 @@ export type EmbeddedAgentRunMeta = {
   livenessState?: EmbeddedRunLivenessState;
   timeoutPhase?: AgentRunTimeoutPhase;
   providerStarted?: boolean;
+  /** Target of a fallback/restoration notice confirmed by the transcript writer for this run. */
+  modelFallbackTranscriptToModel?: string;
   /** Producer-owned terminal cause; the fallback owner decides whether a chain was stopped. */
   modelFallbackStopReason?:
     | "agent_run_terminal_timeout"
@@ -182,6 +187,7 @@ export type EmbeddedAgentRunMeta = {
       | "incomplete_turn"
       | "hook_block";
     message: string;
+    code?: string;
     /** True only when model fallback can retry this terminal error without repeating side effects. */
     fallbackSafe?: boolean;
     /** True when the payload includes a trusted structured terminal tool summary. */

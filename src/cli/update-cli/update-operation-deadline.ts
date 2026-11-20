@@ -1,3 +1,4 @@
+import { withSqliteDatabaseAdmissionWait } from "../../infra/sqlite-worker-database-admission-relay.js";
 import { hasCommandProcessCleanupError } from "../../process/exec-result.js";
 import { withCommandProcessScope } from "../../process/exec-spawn.js";
 import { createDeferredCore } from "../../shared/deferred.js";
@@ -77,7 +78,21 @@ export function createUpdateOperationDeadline<E extends Error = Error>(
       return await withCommandProcessScope(async () => {
         assertCurrent();
         const work = Promise.resolve()
-          .then(operation)
+          .then(() =>
+            withSqliteDatabaseAdmissionWait(
+              {
+                // The relay compares this value against Date.now(), so translate
+                // the monotonic deadline's remaining budget into an epoch timestamp.
+                get deadlineAtMs() {
+                  return admission
+                    ? Date.now() + Math.max(0, admission.deadlineAtMs - performance.now())
+                    : undefined;
+                },
+                assertActive: assertCurrent,
+              },
+              operation,
+            ),
+          )
           .then(
             (value) => ({ value }),
             (error: unknown) => ({ error }),

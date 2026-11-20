@@ -12,11 +12,7 @@ import {
 } from "../../scripts/lib/managed-child-process.mts";
 import type { GatewayClient } from "../../src/gateway/client.js";
 import { extractFirstTextBlock } from "../../src/shared/chat-message-content.js";
-import {
-  assertCodexHarnessReply,
-  type CodexHarnessAgentResult,
-  type CapturedAgentEvent,
-} from "./gateway-codex-harness.js";
+import type { CapturedAgentEvent } from "./gateway-codex-harness.js";
 
 type NativeSubagentProbeParams = {
   annotate: TestContext["annotate"];
@@ -40,7 +36,7 @@ type NativeSubagentProbeHarness = {
       includeAllSessions?: boolean;
       message: string;
     },
-  ) => Promise<CodexHarnessAgentResult>;
+  ) => Promise<{ runId: string; text: string; events: CapturedAgentEvent[] }>;
   recordCodexAttemptIdentity: (params: {
     events: CapturedAgentEvent[];
     runId: string;
@@ -308,9 +304,7 @@ export async function verifyCodexNativeSubagentBridgeProbe(
       runId: followup.runId,
       sessionKey: params.sessionKey,
     });
-    assertCodexHarnessReply(followup, () =>
-      expect(followup.text.trim()).toBe(`${followupParentToken} ${followupToken}`),
-    );
+    expect(followup.text.trim()).toBe(`${followupParentToken} ${followupToken}`);
     expect(observedCodexThreadIds.get(params.sessionKey)).toBe(parentThreadId);
     const thread = await observeAssignment(followupToken);
     const turns = threadTurns(thread);
@@ -356,7 +350,7 @@ export async function verifyCodexNativeSubagentBridgeProbe(
     command: `/codex resume ${childThreadId}`,
     expectedText: [
       "controlled by its parent",
-      "cannot resume an unloaded multi-agent v2 sub-agent through its parent",
+      "cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it",
     ],
   });
   await requestAgentText({

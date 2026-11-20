@@ -477,6 +477,8 @@ on:
         default: true
         type: boolean
     secrets:
+      ABLITERATION_API_KEY:
+        required: false
       AZURE_SPEECH_KEY:
         required: false
       AZURE_SPEECH_REGION:
@@ -631,7 +633,13 @@ env:
 
 jobs:
   validate_selected_ref:
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(!inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04'))) || (!inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    runs-on: &linux_runner_small >-
+      ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}',
+      toJSON(inputs.runner_group), toJSON(!inputs.use_github_hosted_runners && github.repository ==
+      'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404'
+      || 'ubuntu-24.04'))) || (!inputs.use_github_hosted_runners && github.repository ==
+      'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404'
+      || 'ubuntu-24.04') }}
     timeout-minutes: 30
     outputs:
       test_bun_artifact_id: ${{ steps.test_bun_artifact.outputs.artifact-id }}
@@ -655,7 +663,7 @@ jobs:
           esac
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -740,7 +748,7 @@ jobs:
       - name: Upload Bun test runtime
         id: test_bun_artifact
         if: inputs.test_runtime == 'bun' && !inputs.prepare_only
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ job.check_run_id }}
           path: ${{ runner.temp }}/test-bun.tar.gz
@@ -1192,7 +1200,7 @@ jobs:
           printf 'fs_safe_native_contract=%s\n' "$(jq -r '[.evaluations[].contracts[] | select(.consumer == "fs-safe-native") | .mode][0] // "required"' "$RUNNER_TEMP/frozen-admission.json")" >> "$GITHUB_OUTPUT"
 
       - name: Upload frozen admission diagnostic
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frozen-source-admission-reusable-${{ inputs.shared_image_artifact_namespace }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/frozen-admission.json
@@ -1201,7 +1209,7 @@ jobs:
 
   plan_release_workflow_matrices:
     needs: validate_selected_ref
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
+    runs-on: ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON('ubuntu-24.04'))) || ('ubuntu-24.04') }}
     timeout-minutes: 10
     outputs:
       live_docker_count: ${{ steps.plan.outputs.live_docker_count }}
@@ -1270,7 +1278,11 @@ jobs:
     name: ${{ inputs.test_runtime == 'bun' && 'validate_release_live_cache (Bun advisory)' || 'validate_release_live_cache' }}
     needs: validate_selected_ref
     if: (!inputs.prepare_only) && inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'live-cache')
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404') }}
+    runs-on: &linux_runner_medium >-
+      ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}',
+      toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' ||
+      'blacksmith-8vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' ||
+      'blacksmith-8vcpu-ubuntu-2404') }}
     timeout-minutes: 30
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -1308,7 +1320,7 @@ jobs:
         name: Download Bun test runtime
         id: test_bun_download
         if: inputs.test_runtime == 'bun'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.validate_selected_ref.outputs.test_bun_artifact_id }}
           path: ${{ runner.temp }}/test-bun-runtime
@@ -1417,7 +1429,11 @@ jobs:
     name: ${{ inputs.test_runtime == 'bun' && 'validate_special_e2e (Bun advisory)' || 'validate_special_e2e' }}
     needs: validate_selected_ref
     if: (!inputs.prepare_only) && inputs.include_repo_e2e && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'openshell-e2e')
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: &linux_runner_xlarge >-
+      ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}',
+      toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' ||
+      'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' ||
+      'blacksmith-32vcpu-ubuntu-2404') }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -1475,9 +1491,9 @@ jobs:
           trap 'rm -f "$package_path"' EXIT
           curl -LsSf --connect-timeout 10 --max-time 120 \
             -o "$package_path" \
-            https://github.com/NVIDIA/OpenShell/releases/download/v0.0.116/openshell_0.0.116-1_amd64.deb
+            https://github.com/NVIDIA/OpenShell/releases/download/v0.1.3/openshell_0.1.3-1_amd64.deb
           printf '%s  %s\n' \
-            883b5223399dd30a2b33b7f76817fd81295d610ce6f2d04a0266fc7cfbf87575 \
+            64000b75aaf7d23763ad43aef6d9d6386325cba7bb636a64539a13ce98f88108 \
             "$package_path" | sha256sum --check -
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_path"
           openshell --version
@@ -1616,15 +1632,14 @@ jobs:
             --server-san 127.0.0.1 --server-san localhost --server-san host.openshell.internal
           cat > "$fixture_root/gateway.toml" <<TOML
           [openshell]
-          version = 1
+          version = 2
           [openshell.gateway]
-          compute_drivers = ["docker"]
+          compute_driver = "docker"
           [openshell.gateway.mtls_auth]
           enabled = true
           [openshell.drivers.docker]
-          sandbox_namespace = "$gateway_name"
-          network_name = "$gateway_name"
-          grpc_endpoint = "https://host.openshell.internal:$gateway_port"
+          sandbox_label = "$gateway_name"
+          grpc_endpoint = "https://127.0.0.1:$gateway_port"
           TOML
           RUST_LOG=info openshell-gateway --config "$fixture_root/gateway.toml" \
             --bind-address 0.0.0.0 --port "$gateway_port" \
@@ -1703,7 +1718,7 @@ jobs:
           always() && inputs.include_repo_e2e &&
           (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id) &&
           matrix.suite_id == 'openshell-e2e'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openshell-gateway-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/openshell-e2e-${{ github.run_id }}-${{ github.run_attempt }}.log
@@ -1714,7 +1729,7 @@ jobs:
     needs: [validate_selected_ref, prepare_docker_e2e_image, plan_release_workflow_matrices]
     if: (!inputs.prepare_only) && inputs.include_release_path_suites && inputs.docker_lanes == '' && needs.plan_release_workflow_matrices.outputs.docker_e2e_count != '0'
     name: Docker E2E (${{ matrix.label }})
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -1873,7 +1888,7 @@ jobs:
 
       - name: Download OpenClaw Docker E2E package
         if: contains(matrix.profiles, inputs.release_test_profile) && steps.plan.outputs.needs_package == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.prepare_docker_e2e_image.outputs.package_artifact_id }}
           path: .artifacts/docker-e2e-package
@@ -1900,7 +1915,7 @@ jobs:
 
       - name: Download prerelease plugin registry artifact
         if: steps.plan.outputs.needs_package == '1' && needs.prepare_docker_e2e_image.outputs.prepublish_plugin_registry_artifact_id != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: &prerelease_registry_download_with
           artifact-ids: ${{ needs.prepare_docker_e2e_image.outputs.prepublish_plugin_registry_artifact_id }}
           path: .artifacts/prepublish-plugin-registry
@@ -1943,7 +1958,7 @@ jobs:
 
       - name: Download Docker E2E image artifact
         if: contains(matrix.profiles, inputs.release_test_profile) && inputs.shared_image_policy == 'no-push-artifact' && needs.prepare_docker_e2e_image.outputs.needs_e2e_image == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: &docker_e2e_image_download_with
           artifact-ids: ${{ needs.prepare_docker_e2e_image.outputs.image_artifact_id }}
           path: .artifacts/docker-e2e-images
@@ -2075,7 +2090,7 @@ jobs:
 
       - name: Upload Docker E2E chunk artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-${{ matrix.shard_id || matrix.chunk_id }}
           path: .artifacts/docker-tests/
@@ -2084,7 +2099,7 @@ jobs:
   plan_docker_lane_groups:
     needs: validate_selected_ref
     if: (!inputs.prepare_only) && inputs.docker_lanes != ''
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404') }}
+    runs-on: ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404') }}
     timeout-minutes: 90
     outputs:
       groups_json: ${{ steps.groups.outputs.groups_json }}
@@ -2098,7 +2113,7 @@ jobs:
           fetch-depth: 1
 
       - name: Set up baseline probe Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -2125,7 +2140,7 @@ jobs:
 
       - name: Upload published baseline evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.groups.outputs.artifact_name }}
           path: .artifacts/upgrade-baseline-checks/
@@ -2135,7 +2150,7 @@ jobs:
     needs: [validate_selected_ref, prepare_docker_e2e_image, plan_docker_lane_groups]
     if: (!inputs.prepare_only) && inputs.docker_lanes != '' && needs.plan_docker_lane_groups.outputs.groups_json != '[]'
     name: Docker E2E targeted lanes (${{ matrix.group.label }})
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: ${{ matrix.group.timeout_minutes || 60 }}
     strategy:
       fail-fast: false
@@ -2292,7 +2307,7 @@ jobs:
 
       - name: Download OpenClaw Docker E2E package
         if: steps.plan.outputs.needs_package == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.prepare_docker_e2e_image.outputs.package_artifact_id }}
           path: .artifacts/docker-e2e-package
@@ -2307,7 +2322,7 @@ jobs:
 
       - name: Download targeted prerelease plugin registry artifact
         if: steps.plan.outputs.needs_package == '1' && needs.prepare_docker_e2e_image.outputs.prepublish_plugin_registry_artifact_id != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: *prerelease_registry_download_with
 
       - name: Validate targeted prerelease plugin registry contents
@@ -2326,7 +2341,7 @@ jobs:
       - &docker_e2e_image_download_step
         name: Download Docker E2E image artifact
         if: inputs.shared_image_policy == 'no-push-artifact' && needs.prepare_docker_e2e_image.outputs.needs_e2e_image == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: *docker_e2e_image_download_with
 
       - &docker_e2e_image_load_step
@@ -2435,7 +2450,7 @@ jobs:
 
       - name: Upload targeted Docker E2E artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-${{ steps.plan.outputs.artifact_suffix }}
           path: .artifacts/docker-tests/
@@ -2445,7 +2460,7 @@ jobs:
     needs: [validate_selected_ref, prepare_docker_e2e_image]
     if: (!inputs.prepare_only) && inputs.include_openwebui && inputs.docker_lanes == '' && (inputs.release_test_profile == 'stable' || inputs.release_test_profile == 'full')
     name: Docker E2E (openwebui)
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON((vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || inputs.use_github_hosted_runners) && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || ((vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || inputs.use_github_hosted_runners) && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: ${{ !inputs.use_github_hosted_runners && inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON((vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || inputs.use_github_hosted_runners) && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || ((vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || inputs.use_github_hosted_runners) && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
     timeout-minutes: 60
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -2522,7 +2537,7 @@ jobs:
 
       - name: Download OpenClaw Docker E2E package
         if: steps.plan.outputs.needs_package == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.prepare_docker_e2e_image.outputs.package_artifact_id }}
           path: .artifacts/docker-e2e-package
@@ -2582,7 +2597,7 @@ jobs:
 
       - name: Upload Open WebUI Docker E2E artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-openwebui
           path: .artifacts/docker-tests/
@@ -2592,7 +2607,7 @@ jobs:
     name: Prepare shared Docker E2E image
     needs: validate_selected_ref
     if: inputs.prepare_only || inputs.include_release_path_suites || inputs.include_openwebui || inputs.docker_lanes != ''
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: ${{ inputs.release_test_profile == 'full' && 90 || 60 }}
     permissions:
       actions: read
@@ -2740,7 +2755,7 @@ jobs:
           echo "required=$source_package_required" >> "$GITHUB_OUTPUT"
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -2950,7 +2965,7 @@ jobs:
 
       - name: Download current-run OpenClaw Docker E2E package
         if: steps.plan.outputs.needs_package == '1' && needs.validate_selected_ref.outputs.package_artifact_present == 'true' && inputs.package_artifact_run_id == github.run_id
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ inputs.package_artifact_id }}
           path: .artifacts/docker-e2e-package
@@ -2959,7 +2974,7 @@ jobs:
 
       - name: Download previous-run OpenClaw Docker E2E package
         if: steps.plan.outputs.needs_package == '1' && needs.validate_selected_ref.outputs.package_artifact_present == 'true' && inputs.package_artifact_run_id != github.run_id
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ inputs.package_artifact_id }}
           path: .artifacts/docker-e2e-package
@@ -3134,7 +3149,7 @@ jobs:
       - name: Upload OpenClaw Docker E2E package
         id: upload_package
         if: steps.plan.outputs.needs_package == '1' && needs.validate_selected_ref.outputs.package_artifact_present != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-package-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -3161,7 +3176,7 @@ jobs:
 
       - name: Download prerelease plugin registry artifact
         if: steps.plan.outputs.needs_package == '1' && inputs.prepublish_plugin_registry_artifact_id != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ inputs.prepublish_plugin_registry_artifact_id }}
           path: .artifacts/prepublish-plugin-registry
@@ -3221,7 +3236,7 @@ jobs:
       - name: Upload prerelease plugin registry artifact
         id: upload_prepublish_plugin_registry
         if: steps.create_prepublish_plugin_registry.outputs.manifest_sha256 != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-e2e-prepublish-plugin-registry-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/prepublish-plugin-registry/
@@ -3409,7 +3424,7 @@ jobs:
       - name: Upload Docker E2E image artifact
         id: upload_image_artifact
         if: inputs.shared_image_policy == 'no-push-artifact' && steps.plan.outputs.needs_e2e_image == '1' && inputs.shared_image_artifact_id == ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.image_artifact.outputs.artifact_name }}
           path: ${{ steps.image_artifact.outputs.artifact_path }}
@@ -3482,7 +3497,7 @@ jobs:
     name: Bind full release candidate evidence
     needs: [validate_selected_ref, prepare_docker_e2e_image]
     if: inputs.emit_candidate_evidence && needs.prepare_docker_e2e_image.result == 'success'
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(!inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04'))) || (!inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
+    runs-on: *linux_runner_small
     timeout-minutes: 15
     permissions:
       actions: read
@@ -3491,7 +3506,7 @@ jobs:
       candidate_evidence_json: ${{ steps.candidate_binding.outputs.json }}
     steps:
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -3587,6 +3602,7 @@ jobs:
           fetch-depth: 1
           path: .release-harness
           persist-credentials: false
+          sparse-checkout: scripts
 
       - name: Restore exact trusted workflow revision
         env:
@@ -3630,11 +3646,6 @@ jobs:
             throw new Error("trusted harness checkout did not resolve to the authenticated workflow SHA");
           }
           NODE
-
-      - name: Setup trusted release harness
-        uses: ./.release-harness/.github/actions/setup-release-harness
-        with:
-          node-version: ${{ env.NODE_VERSION }}
 
       - name: Create full release candidate evidence
         id: candidate_evidence
@@ -3698,13 +3709,21 @@ jobs:
             local digest="$4"
             local run_id="$5"
             local run_attempt="$6"
-            local artifact_json
-            # Bash clears errexit inside this substitution; preserve verifier failures explicitly.
-            artifact_json="$(
-              bash .release-harness/scripts/docker/shared-image-artifact.sh \
-                verify-upload "$label" "$id" "$name" "$digest" "$run_id" "$run_attempt" --json
-            )" || return
-            jq -er '.expires_at' <<< "$artifact_json"
+            bash .release-harness/scripts/docker/shared-image-artifact.sh \
+              verify-upload "$label" "$id" "$name" "$digest" "$run_id" "$run_attempt"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" |
+              jq -er \
+                --arg id "$id" \
+                --arg name "$name" \
+                --arg digest "sha256:${digest}" \
+                --arg run_id "$run_id" \
+                'select(
+                  (.id | tostring) == $id and
+                  .name == $name and
+                  .digest == $digest and
+                  .expired == false and
+                  (.workflow_run.id | tostring) == $run_id
+                ) | .expires_at'
           }
           package_expiry="$(
             artifact_expiry \
@@ -3831,7 +3850,7 @@ jobs:
 
       - name: Upload full release candidate evidence
         id: upload_candidate_evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: full-release-candidate-v2-${{ needs.prepare_docker_e2e_image.outputs.candidate_request_sha256 }}
           path: ${{ runner.temp }}/full-release-candidate/full-release-candidate.json
@@ -3896,7 +3915,7 @@ jobs:
   prepare_live_test_image:
     needs: [validate_selected_ref, plan_release_workflow_matrices]
     if: inputs.include_live_suites && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-') || startsWith(inputs.live_suite_filter, 'docker-live-models'))
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: 60
     permissions:
       contents: read
@@ -3969,16 +3988,20 @@ jobs:
             echo "exists=0" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Setup hosted Docker builder
+        if: inputs.shared_image_policy == 'no-push-artifact' && inputs.use_github_hosted_runners
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Setup Docker builder
-        if: inputs.shared_image_policy == 'no-push-artifact'
+        if: inputs.shared_image_policy == 'no-push-artifact' && !inputs.use_github_hosted_runners
         uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
           cache-key: Dockerfile
 
       - name: Build shared live-test image
-        if: inputs.shared_image_policy == 'no-push-artifact'
+        if: inputs.shared_image_policy == 'no-push-artifact' && !inputs.use_github_hosted_runners
         uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
-        with:
+        with: &live_image_build
           context: .
           file: ./Dockerfile
           target: build
@@ -3992,6 +4015,11 @@ jobs:
           load: true
           push: false
 
+      - name: Build shared live-test image on hosted runner
+        if: inputs.shared_image_policy == 'no-push-artifact' && inputs.use_github_hosted_runners
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: *live_image_build
+
       # Keep trusted tooling outside the target's Docker build context. A frozen
       # target must not accidentally package the current checkout into its image.
       - name: Checkout trusted release harness
@@ -4004,7 +4032,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -4035,7 +4063,7 @@ jobs:
       - name: Upload live-test image artifact
         id: upload_image_artifact
         if: inputs.shared_image_policy == 'no-push-artifact'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.image_artifact.outputs.artifact_name }}
           path: ${{ steps.image_artifact.outputs.artifact_path }}
@@ -4047,7 +4075,7 @@ jobs:
     name: Docker live models (${{ matrix.provider_label }})
     needs: [validate_selected_ref, prepare_live_test_image, plan_release_workflow_matrices]
     if: (!inputs.prepare_only) && inputs.include_live_suites && inputs.live_model_providers == '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models') && needs.plan_release_workflow_matrices.outputs.live_models_count != '0'
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -4134,7 +4162,7 @@ jobs:
 
       - name: Download live-test image artifact
         if: contains(matrix.profiles, inputs.release_test_profile) && inputs.shared_image_policy == 'no-push-artifact'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: &live_test_image_download_with
           artifact-ids: ${{ needs.prepare_live_test_image.outputs.image_artifact_id }}
           path: .artifacts/live-test-image
@@ -4142,7 +4170,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -4228,7 +4256,7 @@ jobs:
     name: Docker live models (selected providers)
     needs: [validate_selected_ref, prepare_live_test_image]
     if: (!inputs.prepare_only) && inputs.include_live_suites && inputs.live_model_providers != '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models')
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: 45
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -4298,11 +4326,11 @@ jobs:
 
       - name: Download live-test image artifact
         if: inputs.shared_image_policy == 'no-push-artifact'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: *live_test_image_download_with
 
       - name: Setup supported Node runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -4433,7 +4461,7 @@ jobs:
     name: Native live suites (${{ matrix.label }})${{ inputs.test_runtime == 'bun' && ' (Bun advisory)' || '' }}
     needs: validate_selected_ref
     if: (!inputs.prepare_only) && inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || (startsWith(inputs.live_suite_filter, 'native-live-') && !startsWith(inputs.live_suite_filter, 'native-live-extensions-media') && inputs.live_suite_filter != 'native-live-extensions-a-k'))
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_medium
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -4557,9 +4585,9 @@ jobs:
             # Pinned while the release OpenCode workspace lacks Global regions: deepseek-v4.1-flash
             # returns 400 "requires Global regions", and upstream metadata deprecated the V4 Flash
             # routes. Restore dynamic selection (drop OPENCLAW_LIVE_GATEWAY_MODELS) once the
-            # workspace enables Global. Explicit live selection resolves through the bundled
-            # seed catalog, so keep the stable smoke on its current GPT-5.6 Luna route.
-            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/gpt-5.6-luna OPENCLAW_LIVE_GATEWAY_SMOKE=1 OPENCLAW_LIVE_GATEWAY_MAX_MODELS=1 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
+            # workspace enables Global. Release-workspace discovery stopped listing glm-5.3 on
+            # 2026-10-18, so the smoke pins glm-5.2.
+            command: OPENCLAW_LIVE_GATEWAY_PROVIDERS=opencode-go OPENCLAW_LIVE_GATEWAY_MODELS=opencode-go/glm-5.2 OPENCLAW_LIVE_GATEWAY_SMOKE=1 OPENCLAW_LIVE_GATEWAY_MAX_MODELS=1 node .release-harness/scripts/test-live-shard.mjs native-live-src-gateway-profiles
             timeout_minutes: 45
             profile_env_only: false
             profiles: stable
@@ -4595,7 +4623,7 @@ jobs:
             profiles: stable full
           - suite_id: native-live-test
             label: Native live test harnesses
-            command: OPENCLAW_LIVE_CODEX_NODE_EXEC_TIMEOUT=1 node .release-harness/scripts/test-live-shard.mjs native-live-test
+            command: OPENCLAW_LIVE_CODEX_NODE_EXEC_TIMEOUT=1 OPENCLAW_LIVE_OWNER_ASSIGNMENT=1 node .release-harness/scripts/test-live-shard.mjs native-live-test
             timeout_minutes: 60
             profile_env_only: false
             profiles: stable full
@@ -4794,7 +4822,7 @@ jobs:
       - name: Download Bun test runtime
         id: test_bun_download
         if: inputs.test_runtime == 'bun' && steps.selection.outputs.run == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.validate_selected_ref.outputs.test_bun_artifact_id }}
           path: ${{ runner.temp }}/test-bun-runtime
@@ -4827,7 +4855,7 @@ jobs:
     name: Docker live suites (${{ matrix.label }})
     needs: [validate_selected_ref, prepare_live_test_image, plan_release_workflow_matrices]
     if: (!inputs.prepare_only) && needs.plan_release_workflow_matrices.outputs.live_docker_count != '0'
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_xlarge
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -4920,7 +4948,7 @@ jobs:
 
       - name: Setup supported Node runtime
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || inputs.live_suite_filter == matrix.suite_group)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -4943,7 +4971,7 @@ jobs:
 
       - name: Download live-test image artifact
         if: steps.codex_compat.outputs.run_lane != 'false' && contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || inputs.live_suite_filter == matrix.suite_group) && inputs.shared_image_policy == 'no-push-artifact'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: *live_test_image_download_with
 
       - name: Verify and load live-test image artifact
@@ -5028,7 +5056,7 @@ jobs:
     name: Live media suites (${{ matrix.label }})${{ inputs.test_runtime == 'bun' && ' (Bun advisory)' || '' }}
     needs: validate_selected_ref
     if: (!inputs.prepare_only) && inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'native-live-extensions-media') || inputs.live_suite_filter == 'native-live-extensions-a-k')
-    runs-on: ${{ inputs.runner_group != '' && fromJSON(format('{{"group":{0},"labels":{1}}}', toJSON(inputs.runner_group), toJSON(inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404'))) || (inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404') }}
+    runs-on: *linux_runner_medium
     container:
       image: ghcr.io/openclaw/openclaw-live-media-runner:ubuntu-24.04
       credentials:
@@ -5092,6 +5120,7 @@ jobs:
             profile_env_only: false
             profiles: full
     env:
+      ABLITERATION_API_KEY: ${{ matrix.suite_id == 'native-live-extensions-a-k' && secrets.ABLITERATION_API_KEY || '' }}
       AZURE_SPEECH_KEY: ${{ matrix.suite_id == 'native-live-extensions-a-k' && secrets.AZURE_SPEECH_KEY || '' }}
       AZURE_SPEECH_REGION: ${{ matrix.suite_id == 'native-live-extensions-a-k' && secrets.AZURE_SPEECH_REGION || '' }}
       BASETEN_API_KEY: ${{ matrix.suite_id == 'native-live-extensions-a-k' && secrets.BASETEN_API_KEY || '' }}
@@ -5224,7 +5253,7 @@ jobs:
       - name: Download Bun test runtime
         id: test_bun_download
         if: inputs.test_runtime == 'bun' && contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-extensions-media-video' && startsWith(matrix.suite_id, 'native-live-extensions-media-video-')))
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.validate_selected_ref.outputs.test_bun_artifact_id }}
           path: ${{ runner.temp }}/test-bun-runtime

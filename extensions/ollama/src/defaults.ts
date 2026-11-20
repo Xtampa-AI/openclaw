@@ -1,4 +1,4 @@
-import { isCloudModelRef } from "@openclaw/model-catalog-core/model-catalog-refs";
+import { isCloudModelRef } from "openclaw/plugin-sdk/model-ref-parse";
 
 export const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 export const OLLAMA_DEFAULT_API_KEY = "ollama-local";
@@ -26,15 +26,14 @@ export const OLLAMA_CLOUD_DEFAULT_MODELS = [
   {
     id: "minimax-m2.7",
     contextWindow: 196_608,
-    // Ollama Cloud rejects larger requests: "exceeds model's maximum output tokens (131072)".
-    maxTokens: 131_072,
+    // https://platform.minimax.io/docs/api-reference/text-chat
+    maxTokens: 204_800,
     capabilities: ["completion", "thinking", "tools"],
   },
   {
     id: "minimax-m3",
     contextWindow: 524_288,
-    // Ollama Cloud caps output at 131,072 tokens and rejects a larger request.
-    maxTokens: 131_072,
+    maxTokens: 524_288,
     capabilities: ["completion", "thinking", "tools", "vision"],
   },
   {

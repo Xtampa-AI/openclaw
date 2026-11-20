@@ -1,6 +1,7 @@
 /** Shared durable channel-ingress admission, pump, retention, and shutdown lifecycle. */
+import { randomUUID } from "node:crypto";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { hasSqliteWorkerOutcomeUnknown } from "../../infra/sqlite-worker-contract.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import {
   getGatewayRestartDrainSignal,
   getGatewaySuspendAdmissionPhase,
@@ -9,8 +10,15 @@ import {
   waitForGatewayRestartFenceSettlement,
 } from "../../process/gateway-work-admission.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { sleep } from "../../utils/sleep.js";
-import { createChannelIngressDrain, type ChannelIngressDrain } from "./ingress-drain.js";
+import {
+  createChannelIngressDrainOwner,
+  DEFAULT_INGRESS_START_LIMIT,
+  type ChannelIngressDrain,
+} from "./ingress-drain.js";
+import {
+  createChannelIngressAdmission,
+  type ChannelIngressAdmissionContext,
+} from "./ingress-monitor-admission.js";
 import { createAdmissionClaimLock, waitForPending } from "./ingress-monitor-tasks.js";
 import type {
   ChannelIngressMonitorDeliveryResult,
@@ -25,8 +33,6 @@ import {
   DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
 } from "./ingress-retry-policy.js";
 import { ChannelIngressUnavailableError } from "./ingress-unavailable.js";
-
-const DEFAULT_APPEND_RETRY_DELAYS_MS = [0, 100, 300] as const;
 
 export type {
   ChannelIngressMonitorDeliveryResult,
@@ -53,6 +59,43 @@ export const CHANNEL_INGRESS_RETENTION_DEFAULTS = Object.freeze({
 export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetadata = unknown>(
   options: CreateChannelIngressMonitorOptions<TRaw, TBody, TStoredPayload, TMetadata>,
 ) {
+  // Bounded debug observations; never record queue keys, payloads, or errors.
+  const diagnosticId = randomUUID();
+  const diagnosticLog = createSubsystemLogger("channels/ingress");
+  let diagnosticCount = 0;
+  const observe = (phase: string, facts: Record<string, string | number | boolean> = {}) => {
+    if (diagnosticCount >= 96) {
+      return;
+    }
+    try {
+      if (!diagnosticLog.isEnabled("debug")) {
+        return;
+      }
+      diagnosticCount += 1;
+      diagnosticLog.debug(
+        "ingress monitor " +
+          JSON.stringify({
+            monitor: diagnosticId,
+            sequence: diagnosticCount,
+            phase,
+            running,
+            stopped,
+            aborted: drainAbortSignal.aborted,
+            restartAborted: getGatewayRestartDrainSignal().aborted,
+            restarting: isGatewayRestartDraining(),
+            suspend: getGatewaySuspendAdmissionPhase(),
+            requested,
+            pumping: pumping !== undefined,
+            inspections: activeInspections.size,
+            deliveries: activeDeliveries.size,
+            ...facts,
+            exhausted: diagnosticCount === 96,
+          }),
+      );
+    } catch {
+      // Observations cannot change admission or delivery.
+    }
+  };
   const now = options.now ?? Date.now;
   const waitForDeliveryIdleBeforeRepump = options.waitForDeliveryIdleBeforeRepump ?? false;
   const retention =
@@ -66,17 +109,19 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
     : shutdown.signal;
   const activeDeliveries = new Set<Promise<unknown>>();
   const activeInspections = new Set<Promise<unknown>>();
+  const startLimit = options.drain?.startLimit ?? DEFAULT_INGRESS_START_LIMIT;
   // Released deferrals lend start slots while stop still joins their callbacks.
   // Bound open callbacks to startLimit + this budget; held lanes cannot lend slots.
   const deferredStartCapacityLimit =
-    options.drain?.deferredLaneOccupancy === "release" ? (options.drain.startLimit ?? 0) : 0;
+    options.drain?.deferredLaneOccupancy === "release" ? startLimit : 0;
   let deferredStartCapacity = 0;
   const deferredClaims = new Set<Promise<void>>();
   type Queue = ChannelIngressQueue<TStoredPayload, TMetadata>;
   const suppliedQueue = options.queue;
   const queueFactory = typeof suppliedQueue === "function" ? suppliedQueue : () => suppliedQueue;
   let queue: Queue | undefined = typeof suppliedQueue === "function" ? undefined : suppliedQueue;
-  let drain: ReturnType<typeof createChannelIngressDrain> | undefined;
+  type Drain = ReturnType<typeof createChannelIngressDrainOwner<TStoredPayload, TMetadata>>;
+  let drain: Drain | undefined;
   let running = false;
   let stopped = false;
   let requested = false;
@@ -93,6 +138,8 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   const withAdmissionClaimLock = createAdmissionClaimLock();
   let stopTask: Promise<void> | undefined;
   let lastReportedActive = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let recoveryRequested = true;
 
   const clearSuspensionSubscription = (): void => {
     suspensionDrainPending = false;
@@ -147,22 +194,35 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   const waitForPumpIdle = () => waitForPending(() => (pumping ? [pumping] : []), true);
   const waitForDeferredClaims = () => waitForPending(() => deferredClaims);
 
-  const getDrain = (): ReturnType<typeof createChannelIngressDrain> => {
-    drain ??= createChannelIngressDrain<TStoredPayload, TMetadata>(
+  const getDrain = (): Drain => {
+    drain ??= createChannelIngressDrainOwner<TStoredPayload, TMetadata>(
       {
         ...options.drain,
         queue: getQueue(),
         abortSignal: drainAbortSignal,
         now,
+        onClaimSettled: requestDrain,
+        onRetryAt: (retryAt) => {
+          clearTimeout(retryTimer);
+          retryTimer = undefined;
+          if (retryAt !== undefined && running && !isAborted()) {
+            retryTimer = setTimeout(
+              requestDrain,
+              Math.min(2_147_483_647, Math.max(0, retryAt - now())),
+            );
+            retryTimer.unref?.();
+          }
+        },
         retryPolicy: options.drain?.retryPolicy ?? {
           maxAttempts: DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
           deadLetterMinAgeMs: DEFAULT_INGRESS_RETRY_DEAD_LETTER_MIN_AGE_MS,
         },
         formatError: options.drain?.formatError ?? formatErrorMessage,
-        dispatchClaimedEvent: async (claim, lifecycle) => {
+        dispatchClaimedEvent: async (claim, lifecycle, admittedLaneKey) => {
+          observe("claim-entered");
           // Preparation owns cancellation settlement as well as the inspection read.
           const inspection = (async () => {
-            if (!running || isAborted() || lifecycle.abortSignal.aborted) {
+            if (shouldStopDispatch() || lifecycle.abortSignal.aborted) {
               await lifecycle.onCancelled?.();
               return undefined;
             }
@@ -180,18 +240,20 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
               throw options.payload.createClaimError("invalid-version", claim);
             }
             const raw = options.payload.deserialize(decoded.body, { claim });
-            const claimedLaneKey = claim.laneKey ?? options.drain?.deriveLaneKey?.(claim);
-            const facts = await inspect(raw, {
-              phase: "claim",
-              claimedId: claim.id,
-              claimedLaneKey,
-            });
-            if (!running || isAborted() || lifecycle.abortSignal.aborted) {
-              await lifecycle.onCancelled?.();
-              return undefined;
-            }
-            if (!facts || facts.eventId !== claim.id || facts.laneKey !== claimedLaneKey) {
-              throw options.payload.createClaimError("identity-mismatch", claim);
+            if (admittedLaneKey === undefined) {
+              const claimedLaneKey = claim.laneKey ?? options.drain?.deriveLaneKey?.(claim);
+              const facts = await inspect(raw, {
+                phase: "claim",
+                claimedId: claim.id,
+                claimedLaneKey,
+              });
+              if (!running || isAborted() || lifecycle.abortSignal.aborted) {
+                await lifecycle.onCancelled?.();
+                return undefined;
+              }
+              if (!facts || facts.eventId !== claim.id || facts.laneKey !== claimedLaneKey) {
+                throw options.payload.createClaimError("identity-mismatch", claim);
+              }
             }
             return { raw };
           })();
@@ -259,7 +321,6 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
             trackDeferredClaim();
             try {
               await settle();
-              requestDrain();
             } finally {
               settleDeferredClaim();
             }
@@ -293,6 +354,7 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
               if (!running || isAborted() || lifecycle.abortSignal.aborted) {
                 return wrappedLifecycle.onCancelled?.();
               }
+              observe("deliver-entered");
               return options.deliver(raw, wrappedLifecycle, claim);
             })
             .finally(() => {
@@ -302,6 +364,8 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
               if (releasedStartCapacity) {
                 releasedStartCapacity = false;
                 deferredStartCapacity -= 1;
+              } else if (handedOff) {
+                requestDrain();
               }
               publishActivity();
             });
@@ -310,6 +374,7 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
           let result: ChannelIngressMonitorDeliveryResult | void;
           try {
             result = await delivery;
+            observe("deliver-returned", { outcome: result?.kind ?? "void" });
           } catch (error) {
             if (deferredHandoff && deferredClaim && !deferredClaimSettled) {
               await wrappedLifecycle.onFailed?.(error);
@@ -403,10 +468,13 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   };
 
   const runPump = async (): Promise<void> => {
+    observe("pump-entered");
     try {
       for (;;) {
         requested = false;
+        observe("prune-entered");
         await pruneIfDue("pump");
+        observe("prune-returned");
         // Stop may win the async prune race; keep lazy drain creation behind this fence.
         if (!running || isAborted()) {
           break;
@@ -414,17 +482,24 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
         const activeDrain = getDrain();
         // Claiming and durable admission are mutually exclusive so a row cannot
         // dispatch before its transport-owned post-append acknowledgement finishes.
-        const { started } = await withAdmissionClaimLock(() =>
-          activeDrain.drainOnce({
+        observe("claim-lock-wait");
+        const { started } = await withAdmissionClaimLock(() => {
+          observe("drain-entered");
+          const recoverStaleClaims = recoveryRequested;
+          recoveryRequested = false;
+          return activeDrain.drainOnce({
+            recoverStaleClaims,
             shouldStop: () =>
-              !running ||
-              isAborted() ||
-              getGatewaySuspendAdmissionPhase() !== "accepting" ||
-              (options.drain?.startLimit !== undefined &&
-                activeDeliveries.size + activeInspections.size - deferredStartCapacity >=
-                  options.drain.startLimit),
-          }),
-        );
+              shouldStopDispatch() ||
+              activeDeliveries.size + activeInspections.size - deferredStartCapacity >= startLimit,
+          });
+        });
+        observe("drain-returned", { started });
+        if (isGatewayRestartDraining() || getGatewayRestartDrainSignal().aborted) {
+          // A fence can close during the snapshot; retain the existing rollback wake.
+          requestDrain();
+          break;
+        }
         if (waitForDeliveryIdleBeforeRepump) {
           await waitForActiveDeliveries();
           await activeDrain.waitForIdle();
@@ -479,6 +554,7 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   );
 
   const requestDrain = (): void => {
+    observe("drain-requested");
     if (!running || isAborted() || getGatewayRestartDrainSignal().aborted) {
       // A stale request here makes waitForIdle busy-spin on resolved awaits.
       requested = false;
@@ -510,52 +586,20 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
     publishActivity();
   };
 
-  const clearPollTimer = () => {
+  const clearTimers = () => {
     clearInterval(pollTimer);
     pollTimer = undefined;
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
   };
 
   const pause = async (): Promise<void> => {
     running = false;
     requested = false;
     releaseRestartFenceWake();
-    clearPollTimer();
+    clearTimers();
     publishActivity();
     await waitForPumpIdle();
-  };
-
-  const admitOnce = async (params: {
-    facts: ChannelIngressMonitorFacts;
-    payload: TStoredPayload;
-    receivedAt: number;
-  }): Promise<Awaited<ReturnType<Queue["enqueue"]>>> => {
-    let lastError: unknown;
-    for (const delayMs of options.appendRetryDelaysMs ?? DEFAULT_APPEND_RETRY_DELAYS_MS) {
-      if (delayMs > 0) {
-        await sleep(delayMs);
-      }
-      try {
-        return await getQueue().enqueue(params.facts.eventId, params.payload, {
-          receivedAt: params.receivedAt,
-          laneKey: params.facts.laneKey,
-        });
-      } catch (error) {
-        if (hasSqliteWorkerOutcomeUnknown(error)) {
-          throw error;
-        }
-        lastError = error;
-      }
-    }
-    // Accepted transport input must fail closed if every durable append attempt fails.
-    if (lastError instanceof Error) {
-      throw lastError;
-    }
-    throw new Error(
-      lastError === undefined
-        ? "Channel ingress append failed without an error."
-        : formatErrorMessage(lastError),
-      { cause: lastError },
-    );
   };
 
   const assertAdmissionOpen = (): void => {
@@ -568,54 +612,64 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
     }
   };
 
-  type AdmissionOptions = {
-    receivedAt: number;
-    facts?: ChannelIngressMonitorFacts;
-    onDurablyAdmitted: () => void;
-    pruneTask?: Promise<void>;
-  };
-  const admitRaw = async (raw: TRaw, admitOptions: AdmissionOptions) => {
-    try {
-      const facts = admitOptions.facts ?? (await inspect(raw, { phase: "admission" }));
-      if (!facts) {
-        return { kind: "ignored" } as const;
-      }
-      admitOptions.pruneTask ??= pruneIfDue("admission");
-      await admitOptions.pruneTask;
-      const { receivedAt } = admitOptions;
-      const body = options.payload.serialize(raw, { facts, receivedAt });
-      const payload =
-        options.payload.storage === "raw-event"
-          ? ({ version: options.payload.version, rawEvent: body } as TStoredPayload)
-          : options.payload.encode({ version: options.payload.version, body });
-      const queueResult = await admitOnce({ facts, payload, receivedAt });
-      admitOptions.onDurablyAdmitted();
-      await options.onDurableAdmission?.(raw, {
-        facts,
-        receivedAt,
-        isNew: queueResult.kind === "accepted",
-      });
-      return { kind: "durable", queueResult } as const;
-    } catch (error) {
-      await options.onAdmissionFailure?.(raw, error);
-      throw error;
-    }
-  };
+  const shouldStopDispatch = () =>
+    !running ||
+    isAborted() ||
+    isGatewayRestartDraining() ||
+    getGatewayRestartDrainSignal().aborted ||
+    getGatewaySuspendAdmissionPhase() !== "accepting";
+  const admitRawBatch = createChannelIngressAdmission<TRaw, TBody, TStoredPayload, TMetadata>({
+    payload: options.payload,
+    prepareAdmission: options.prepareAdmission,
+    signal: drainAbortSignal,
+    reuseAdmissionFactsForFreshClaims: options.reuseAdmissionFactsForFreshClaims,
+    appendRetryDelaysMs: options.appendRetryDelaysMs,
+    onDurableAdmission: options.onDurableAdmission,
+    onAdmissionFailure: options.onAdmissionFailure,
+    inspect: (raw) => inspect(raw, { phase: "admission" }),
+    getQueue,
+    // Retention is maintenance: a busy database must not cost the transport its
+    // only delivery of this event. The next admission prunes again.
+    pruneBeforeAdmission: () => pruneIfDue("admission").catch(reportError),
+    getIdleDrain: () =>
+      // Wrappers own dispatch context; only prepared identities can skip reconciliation.
+      // Released deferrals and post-adoption deliveries must finish first.
+      !options.runPumpTask &&
+      (!options.drain?.reconcileStoredLaneKey || options.reuseAdmissionFactsForFreshClaims) &&
+      !waitForDeliveryIdleBeforeRepump &&
+      !shouldStopDispatch() &&
+      startLimit > 0 &&
+      activeDeliveries.size === 0 &&
+      activeInspections.size === 0 &&
+      !pumping &&
+      !requested &&
+      !drainIdleWake
+        ? getDrain()
+        : undefined,
+    recoverUntrackedClaim: (idleDrain) => {
+      idleDrain.dispose();
+      drain = undefined;
+      recoveryRequested = true;
+      requestDrain();
+    },
+    scheduleDrainIdleWake,
+  });
 
   const scheduleAdmission = async <T>(
-    work: (admitOptions: AdmissionOptions) => Promise<T>,
+    work: (admitOptions: ChannelIngressAdmissionContext) => Promise<T>,
     admitOptions?: { receivedAt?: number },
   ): Promise<T> => {
+    observe("admission-entered");
     assertAdmissionOpen();
     const receivedAt = admitOptions?.receivedAt ?? now();
-    let durablyAdmitted = false;
+    let needsDrain = false;
     // Append retries stay serialized so backoff cannot invert one lane's arrival order.
     const admission = admissionTail.then(() =>
       withAdmissionClaimLock(() =>
         work({
           receivedAt,
-          onDurablyAdmitted: () => {
-            durablyAdmitted = true;
+          onDurablyAdmitted: (alreadyClaimed) => {
+            needsDrain ||= !alreadyClaimed;
           },
         }),
       ),
@@ -625,10 +679,12 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
       () => undefined,
     );
     try {
-      return await admission;
+      const result = await admission;
+      observe("admission-returned", { needsDrain });
+      return result;
     } finally {
       // A lost transport acknowledgement must not strand an already durable row.
-      if (durablyAdmitted) {
+      if (needsDrain) {
         requestDrain();
       }
     }
@@ -639,23 +695,17 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
       raw: TRaw,
       admitOptions?: { receivedAt?: number; facts?: ChannelIngressMonitorFacts },
     ) =>
-      scheduleAdmission(
-        (sharedOptions) =>
-          admitRaw(raw, {
-            ...sharedOptions,
-            ...(admitOptions?.facts ? { facts: admitOptions.facts } : {}),
-          }),
-        admitOptions,
-      ),
-    admitBatch: (rawEvents: readonly TRaw[], admitOptions?: { receivedAt?: number }) =>
       scheduleAdmission(async (sharedOptions) => {
-        const results = [];
-        for (const raw of rawEvents) {
-          results.push(await admitRaw(raw, sharedOptions));
-        }
-        return results;
+        const [result] = await admitRawBatch([raw], {
+          ...sharedOptions,
+          ...(admitOptions?.facts ? { facts: admitOptions.facts } : {}),
+        });
+        return result!;
       }, admitOptions),
+    admitBatch: (rawEvents: readonly TRaw[], admitOptions?: { receivedAt?: number }) =>
+      scheduleAdmission((sharedOptions) => admitRawBatch(rawEvents, sharedOptions), admitOptions),
     start: () => {
+      observe("start-requested");
       if (running || stopped || isAborted()) {
         return;
       }
@@ -678,7 +728,16 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
           requestDrain();
         }
       });
-      pollTimer = setInterval(requestDrain, options.pollIntervalMs);
+      // Admissions and claim settlements wake normal work; only abandoned or
+      // externally enqueued rows need a bounded recovery sweep.
+      recoveryRequested = true;
+      pollTimer = setInterval(
+        () => {
+          recoveryRequested = true;
+          requestDrain();
+        },
+        Math.max(5 * 60_000, options.pollIntervalMs),
+      );
       pollTimer.unref?.();
       requestDrain();
     },
@@ -687,12 +746,13 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
     pause,
     stop: () => {
       stopTask ??= (async () => {
+        observe("stop-entered");
         stopped = true;
         running = false;
         requested = false;
         clearSuspensionSubscription();
         releaseRestartFenceWake();
-        clearPollTimer();
+        clearTimers();
         publishActivity();
         // Every transport callback accepted before stop keeps its durable-append guarantee.
         await admissionTail;

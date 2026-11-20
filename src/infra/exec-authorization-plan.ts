@@ -36,7 +36,6 @@ type ExecAuthorizationTransport =
       kind: "shell-wrapper";
       wrapperSegment: ExecCommandSegment;
       wrapperArgv: string[];
-      wrapperPrefix: string;
       inlineCommand: string;
     };
 
@@ -45,7 +44,6 @@ type ExecAuthorizationTrustMode = "executable" | "exact-command" | "prompt-only"
 export type ExecAuthorizationCandidate = {
   sourceSegment: ExecCommandSegment;
   sourceStep: CommandStep;
-  sourceStepId?: string;
   transport: ExecAuthorizationTransport;
   trustMode: ExecAuthorizationTrustMode;
   allowAlways: boolean;
@@ -53,7 +51,6 @@ export type ExecAuthorizationCandidate = {
 };
 
 type ExecAuthorizationGroup = {
-  opToNext?: ShellChainOperator | null;
   candidates: ExecAuthorizationCandidate[];
 };
 
@@ -97,6 +94,7 @@ const NON_REUSABLE_RISKS = new Set<CommandRisk["kind"]>(["inline-eval"]);
 const UNANALYZABLE_RISKS = new Set<CommandRisk["kind"]>([
   "command-substitution",
   "dynamic-executable",
+  "dynamic-assignment",
   "line-continuation",
   "heredoc",
   "here-string",
@@ -199,10 +197,12 @@ function stepReasons(
   return uniqueStrings(reasons);
 }
 
+// `$[...]` is legacy Bash arithmetic: like `$((...))`, it re-evaluates its decoded text, so
+// array subscripts built from ANSI-C escapes can run command substitution.
 function isShellExpansionDynamicArgument(risk: CommandRisk): boolean {
   return (
     risk.kind === "dynamic-argument" &&
-    /(?:\$[A-Za-z0-9_@*?#$!-]|\$\{|`|\$\(|[<>]\()/u.test(risk.text)
+    /(?:\$[A-Za-z0-9_@*?#$!-]|\$\{|`|\$\(|\$\[|[<>]\()/u.test(risk.text)
   );
 }
 
@@ -251,7 +251,7 @@ function shellWrapperPreludeReasons(params: {
   return uniqueStrings(reasons);
 }
 
-function isPathScopedExecutableToken(token: string): boolean {
+export function isPathScopedExecutableToken(token: string): boolean {
   return token.includes("/") || token.includes("\\");
 }
 
@@ -301,7 +301,7 @@ function wrapperPrefixForStep(step: CommandStep): string {
 }
 
 function hasCommandPrelude(step: CommandStep): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/u.test(wrapperPrefixForStep(step).trimStart());
+  return /^[A-Za-z_][A-Za-z0-9_]*\+?=/u.test(wrapperPrefixForStep(step).trimStart());
 }
 
 function positionalCarrierSteps(params: {
@@ -400,7 +400,6 @@ function createCandidate(params: {
   return {
     sourceSegment: params.segment,
     sourceStep: params.step,
-    ...(params.step.id ? { sourceStepId: params.step.id } : {}),
     transport: params.transport,
     trustMode,
     allowAlways:
@@ -417,15 +416,11 @@ function groupsFromSteps(params: {
   transport: ExecAuthorizationTransport;
   risks: readonly CommandRisk[];
 }): ExecAuthorizationGroup[] {
-  const finalizeGroup = (
-    steps: CommandStepWithSegment[],
-    opToNext: ShellChainOperator | null,
-  ): ExecAuthorizationGroup => {
+  const finalizeGroup = (steps: CommandStepWithSegment[]): ExecAuthorizationGroup => {
     const transport = params.transport;
     const risks = params.risks;
     const relationship = steps.length > 1 ? "pipeline" : "simple";
     return {
-      opToNext,
       candidates: steps.map((entry) =>
         createCandidate({
           step: entry.step,
@@ -462,12 +457,12 @@ function groupsFromSteps(params: {
       current.push(entry);
       continue;
     }
-    groups.push(finalizeGroup(current, operator ?? ";"));
+    groups.push(finalizeGroup(current));
     current = [entry];
   }
 
   if (current.length > 0) {
-    groups.push(finalizeGroup(current, null));
+    groups.push(finalizeGroup(current));
   }
 
   return groups;
@@ -524,7 +519,6 @@ function wrapperPayloadPlan(params: {
     kind: "shell-wrapper",
     wrapperSegment: wrapper.segment,
     wrapperArgv: wrapper.segment.argv,
-    wrapperPrefix: wrapperPrefixForStep(wrapper.step),
     inlineCommand: wrapperRisk.payload,
   };
   const operatorsForWrapper = wrapper.step.id
@@ -670,7 +664,6 @@ export async function planExecAuthorization(params: {
   command?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
-  platform?: string | null;
 }): Promise<ExecAuthorizationPlan> {
   const command =
     params.command ??
@@ -703,7 +696,6 @@ export async function planExecAuthorization(params: {
         command: inlineCommand,
         cwd: params.cwd,
         env: params.env,
-        platform: params.platform,
       });
       if (shellPlan.ok) {
         const nestedSegments = shellPlan.groups.flatMap((group) =>
@@ -718,7 +710,6 @@ export async function planExecAuthorization(params: {
                 kind: "shell-wrapper",
                 wrapperSegment,
                 wrapperArgv: wrapperSegment.argv,
-                wrapperPrefix: "",
                 inlineCommand,
               };
               return {
@@ -766,7 +757,6 @@ export async function planExecAuthorization(params: {
             {
               cwd: params.cwd,
               env: params.env,
-              platform: normalizePlanningPlatform(params.platform),
             },
             segment.sourceArgv,
           )

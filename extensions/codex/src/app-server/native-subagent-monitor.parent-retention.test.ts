@@ -28,6 +28,29 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+async function setupParentRetention(agentDir: string, releaseCustody = () => {}) {
+  const client = createClient();
+  const runtime = createRuntime();
+  ensureCodexAppServerClientRuntime(client.client, { agentDir });
+  await retainCodexAppServerLiveThread(client.client, "parent-thread");
+  const monitor = new CodexNativeSubagentMonitor(client.client, runtime, {
+    retainParentThread: (threadId) => protectCodexAppServerLiveThread(client.client, threadId),
+  });
+  onTestFinished(async () => {
+    await monitor.retireParent("parent-thread");
+    await monitor.dispose();
+    releaseCustody();
+    client.close();
+  });
+  const releaseForResume = () =>
+    releaseCodexBoundLiveThread({
+      client: client.client,
+      threadId: "parent-thread",
+      lifecycleTiming: createCodexThreadLifecycleTimingTracker(false),
+    });
+  return { client, runtime, monitor, releaseForResume };
+}
+
 it("keeps an interrupted assignment resumable without pinning its restored parent", async () => {
   const identity = { kind: "session" as const, agentId: "main", sessionId: "parent-session" };
   const binding = {
@@ -57,27 +80,21 @@ it("keeps an interrupted assignment resumable without pinning its restored paren
     { kind: "record-native-subagent-assignment", owner: historyOwner, assignment },
     () => undefined,
   );
-  const client = createClient();
+  const custody = createNativeSubagentCompletionCustodyFixture();
+  const { client, runtime, monitor, releaseForResume } = await setupParentRetention(
+    "/workspace/agent",
+    () => custody.root.release(),
+  );
   client.setThreadRead(
     "child-thread",
     threadRead({ turnId: "interrupted-turn", status: "interrupted", threadStatus: "notLoaded" }),
   );
-  ensureCodexAppServerClientRuntime(client.client, { agentDir: "/workspace/agent" });
-  await retainCodexAppServerLiveThread(client.client, binding.threadId);
-  const runtime = createRuntime();
-  const custody = createNativeSubagentCompletionCustodyFixture();
   runtime.captureAgentHarnessCompletionCustody.mockImplementation(async () =>
     custody.root.retain(),
   );
-  const monitor = new CodexNativeSubagentMonitor(client.client, runtime, {
-    retainParentThread: (threadId) => protectCodexAppServerLiveThread(client.client, threadId),
-  });
-  onTestFinished(async () => {
-    await monitor.retireParent(binding.threadId);
-    await monitor.dispose();
-    custody.root.release();
-    client.close();
-  });
+  const bindingGuard = await store.prepareNativeSubagentGuard(identity, historyOwner);
+  expect(bindingGuard).toBeDefined();
+  onTestFinished(() => bindingGuard?.release());
   const parent = await monitor.registerParent({
     parentThreadId: binding.threadId,
     agentId: "main",
@@ -86,18 +103,13 @@ it("keeps an interrupted assignment resumable without pinning its restored paren
     historyOwner,
     assignmentStore: createNativeSubagentAssignmentStore({
       bindingStore: store,
+      assertBindingCurrent: bindingGuard!.assertCurrent,
       identity,
       owner: historyOwner,
     }),
   });
   await parent.ready;
   await parent.unregister();
-  const releaseForResume = () =>
-    releaseCodexBoundLiveThread({
-      client: client.client,
-      threadId: binding.threadId,
-      lifecycleTiming: createCodexThreadLifecycleTimingTracker({ enabled: false }),
-    });
   await expect(releaseForResume()).resolves.toBe(true);
   expect(await store.readNativeSubagentAssignments?.(identity, historyOwner)).toEqual([assignment]);
   expect(runtime.deliverAgentHarnessCompletion).not.toHaveBeenCalled();
@@ -116,35 +128,18 @@ it("keeps an interrupted assignment resumable without pinning its restored paren
 
 it("permits parent cold resume once every child is terminal, while preserving undelivered results", async () => {
   vi.useFakeTimers();
-  const client = createClient();
-  const runtime = createRuntime();
+  const { client, runtime, monitor, releaseForResume } = await setupParentRetention(
+    "/tmp/codex-parent-retention",
+  );
   runtime.deliverAgentHarnessCompletion.mockResolvedValue({
     delivered: false,
     path: "direct",
     error: "requester temporarily unavailable",
   });
-  ensureCodexAppServerClientRuntime(client.client, { agentDir: "/tmp/codex-parent-retention" });
-  await retainCodexAppServerLiveThread(client.client, "parent-thread");
-  const monitor = new CodexNativeSubagentMonitor(client.client, runtime, {
-    retainParentThread: (threadId) => protectCodexAppServerLiveThread(client.client, threadId),
-    recoveryPollDelaysMs: [],
-    completionDeliveryRetryDelaysMs: [100],
-  });
-  onTestFinished(async () => {
-    await monitor.retireParent("parent-thread");
-    await monitor.dispose();
-    client.close();
-  });
   const parent = await registerParent(monitor);
   await notifyChildStarted(client, "parent-thread", "child-a");
   await notifyChildStarted(client, "parent-thread", "child-b");
   await parent.unregister();
-  const releaseForResume = () =>
-    releaseCodexBoundLiveThread({
-      client: client.client,
-      threadId: "parent-thread",
-      lifecycleTiming: createCodexThreadLifecycleTimingTracker(),
-    });
 
   await client.notify(
     nativeCompletionNotification({ agentPath: "child-a", result: "first result" }),
@@ -171,7 +166,7 @@ it("permits parent cold resume once every child is terminal, while preserving un
 
   runtime.deliverAgentHarnessCompletion.mockResolvedValue({ delivered: true, path: "direct" });
   await continued.unregister();
-  await vi.advanceTimersByTimeAsync(100);
+  await vi.advanceTimersByTimeAsync(5_000);
   const settled = await registerParent(monitor);
   expect(settled.listPendingChildren()).toEqual([]);
   await settled.unregister();

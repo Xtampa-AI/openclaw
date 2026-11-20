@@ -32,7 +32,9 @@ export function createRuntimeAuthDeadline(params: {
   const withAuthDeadline = <T>(
     step: string,
     operation: (signal: AbortSignal) => Promise<T>,
+    requestSignal?: AbortSignal,
   ): Promise<T> => {
+    const signal = requestSignal ? AbortSignal.any([authSignal, requestSignal]) : authSignal;
     const deadline = params.getDeadline?.() ?? startupDeadline;
     const remainingMs =
       deadline.kind === "bounded" ? deadline.deadlineAtMs - Date.now() : undefined;
@@ -48,8 +50,8 @@ export function createRuntimeAuthDeadline(params: {
     }
     return withTimeout(
       racePromiseWithAbortSignal(
-        () => operation(authSignal),
-        authSignal,
+        () => operation(signal),
+        signal,
         () =>
           createAbortError(
             `${params.provider} ${step} aborted; authentication capability is closed. Retry the run when authentication is available.`,

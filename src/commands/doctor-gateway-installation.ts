@@ -15,9 +15,11 @@ import type {
 import { GatewayServiceAuthorityError } from "../daemon/service-update-authority.js";
 import { readGatewayServiceState, type GatewayService } from "../daemon/service.js";
 import { isSystemdUnitActive, type SystemdUnitScope } from "../daemon/systemd.js";
+import type { HealthFinding } from "../flows/health-checks.js";
 import { assertGatewayServiceMutationAllowed } from "../infra/gateway-supervision.js";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { reportGatewayServiceFailure } from "./doctor-service-audit.js";
 
 export type DoctorGatewayInstallationMaintenance = {
   managerUid?: number;
@@ -59,6 +61,7 @@ export async function installDoctorGatewayService(
       | { kind: "definition" | "installation"; root: string };
     args: GatewayServiceInstallArgs;
     runtime: RuntimeEnv;
+    onFinding?: (finding: HealthFinding) => void;
   },
 ): Promise<void> {
   try {
@@ -135,7 +138,11 @@ export async function installDoctorGatewayService(
     if (err instanceof GatewayServiceAuthorityError || hasCommandProcessCleanupError(err)) {
       throw err;
     }
-    params.runtime.error(`Gateway service update failed: ${String(err)}`);
+    reportGatewayServiceFailure(
+      `Gateway service update failed: ${String(err)}`,
+      params.runtime,
+      params.onFinding,
+    );
   }
 }
 

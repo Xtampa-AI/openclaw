@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { ALL_THINKING_LEVELS } from "../auto-reply/thinking.shared.js";
 import { isValidNonNegativeByteSizeString } from "./byte-size.js";
-import { AgentModelMapSchema, AgentModelPolicySchema } from "./zod-schema.agent-entry-base.js";
+import {
+  AgentCompactionMaxSummaryCharsSchema,
+  AgentModelMapSchema,
+  AgentModelPolicySchema,
+} from "./zod-schema.agent-entry-base.js";
 import {
   AgentModelSchema,
   AgentToolModelSchema,
@@ -23,7 +27,6 @@ const EmbeddedAgentConfigSchema = z.strictObject({
   cyberFailover: z
     .strictObject({
       mode: z.union([z.literal("auto"), z.literal("off")]).optional(),
-      model: z.string().min(1).optional(),
       cooloffMs: z.number().int().positive().optional(),
     })
     .optional(),
@@ -44,7 +47,7 @@ export const AgentDefaultsBaseSchema = z.strictObject({
   params: z.record(z.string(), z.unknown()).optional(),
   model: AgentModelSchema.optional(),
   modelSelectionScope: z.enum(["session", "agent", "global"]).optional(),
-  utilityModel: z.string().optional(),
+  utilityModel: AgentModelSchema.optional(),
   decisionModel: DecisionModelSchema.optional(),
   imageModel: AgentToolModelSchema.optional(),
   mediaModels: z
@@ -142,6 +145,8 @@ export const AgentDefaultsBaseSchema = z.strictObject({
       thinkingLevel: z.union([AgentThinkingLevelSchema, z.literal("inherit")]).optional(),
       /** Embedded OpenClaw keepRecentTokens budget used for cut-point selection. */
       keepRecentTokens: z.number().int().positive().optional(),
+      /** Maximum persisted client-side summary characters. Default: 16000. */
+      maxSummaryChars: AgentCompactionMaxSummaryCharsSchema.optional(),
       /** Identifier-preservation instruction policy for compaction summaries. */
       identifierPolicy: z.union([z.literal("strict"), z.literal("off")]).optional(),
       /** Preserve this many most-recent user/assistant turns verbatim in compaction summary context. */
@@ -180,8 +185,6 @@ export const AgentDefaultsBaseSchema = z.strictObject({
         .strictObject({
           /** Enable the pre-compaction memory flush (default: true). */
           enabled: z.boolean().optional(),
-          /** Optional provider/model override used only for pre-compaction memory flush turns. */
-          model: z.string().optional(),
           /** Run the memory flush when context is within this many tokens of the compaction threshold. */
           softThresholdTokens: z.number().int().nonnegative().optional(),
           /**

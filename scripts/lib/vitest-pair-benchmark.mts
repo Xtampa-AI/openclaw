@@ -33,7 +33,7 @@ import {
 } from "./vitest-pair-benchmark-contract.mts";
 
 const CHILD_TIMEOUT_MS = 15 * 60 * 1000;
-export const VITEST_PAIR_HARNESS_DEADLINE_MS = 165 * 60 * 1000;
+const VITEST_PAIR_HARNESS_DEADLINE_MS = 165 * 60 * 1000;
 
 type RunCommandOptions = {
   bin: string;
@@ -234,6 +234,9 @@ export function buildBenchmarkCommandEnv(
     PATH: ambientEnv.PATH,
     TMPDIR: path.join(cacheRoot, "tmp"),
     npm_config_cache: npmCache,
+    // Both source cuts must use the benchmark's selected pnpm, even when their
+    // packageManager fields name older releases.
+    pnpm_config_pm_on_fail: "ignore",
     npm_execpath: packageManager.executable,
   };
 }

@@ -1,10 +1,7 @@
 import { isCurrentPluginMetadataSnapshotRuntimeGeneration } from "../../../plugins/current-plugin-metadata-snapshot.js";
 import { loadPluginMetadataSnapshot } from "../../../plugins/plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "../../../plugins/plugin-metadata-snapshot.types.js";
-import {
-  getPreparedModelRuntimeBorrowedSnapshot,
-  getPreparedModelRuntimePluginGeneration,
-} from "../../prepared-model-runtime-generation-scope.js";
+import { getPreparedModelRuntimeBorrowedSnapshot } from "../../prepared-model-runtime-generation-scope.js";
 import {
   preparedModelRuntimeConfigsMatch,
   type PreparedModelRuntimeSnapshot,
@@ -48,18 +45,20 @@ export function resolvePreparedRuntimeWorkspaces(params: RunEmbeddedAgentParamsW
     workspaceDir: requestedWorkspaceResolution.workspaceDir,
     isCanonicalWorkspace: requestedWorkspaceResolution.isCanonicalWorkspace,
   };
-  const generation = params.pluginGeneration ?? getPreparedModelRuntimePluginGeneration();
-  const borrowed = generation ? getPreparedModelRuntimeBorrowedSnapshot(generation) : undefined;
+  const borrowed = params.pluginGeneration
+    ? getPreparedModelRuntimeBorrowedSnapshot(params.pluginGeneration)
+    : undefined;
+  // The live parent owns inventory placement, including launch workspace overrides.
   const borrowedWorkspace =
     params.preparedModelRuntimeMode !== "isolated-read-only" &&
     borrowed?.workspaceDir &&
+    // Runs carry config projections; match by model-runtime fingerprint like lease borrowing.
     params.config !== undefined &&
     preparedModelRuntimeConfigsMatch(borrowed.config, params.config) &&
     borrowed.agentId === requestedWorkspaceResolution.agentId &&
     borrowed.agentDir === params.agentDir
       ? resolveRunWorkspaceDir({ ...params, workspaceDir: borrowed.workspaceDir })
       : undefined;
-  // An admitted generation keeps its own workspace identity; only rooted selection applies.
   const sharedRuntimeWorkspace =
     borrowedWorkspace ??
     (params.pluginGeneration

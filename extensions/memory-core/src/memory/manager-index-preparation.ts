@@ -9,6 +9,10 @@ import {
   type MemoryEntryProvenance,
   type MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-indexing";
+import type {
+  SessionEntryStream,
+  SessionEntrySummary,
+} from "openclaw/plugin-sdk/memory-core-host-engine-sessions";
 import type { EmbeddingProvider } from "./embeddings.js";
 import type { IndexedMemoryChunk } from "./manager-chunk-writer.js";
 import { chunkSessionContentAtResetBoundary } from "./manager-reset-chunk-boundary.js";
@@ -21,15 +25,17 @@ export type MemoryIndexEntry = {
   size: number;
   hash: string;
   kind?: "markdown" | "multimodal";
-  content?: string;
   contentText?: string;
-  lineMap?: number[];
-  lineProvenance?: MemoryEntryProvenance[];
   sessionId?: string;
+  /** Session sources stream their export again while chunking, under this entry's state. */
+  streamSessionExport?: (stream: SessionEntryStream) => Promise<SessionEntrySummary | null>;
 };
 
 export type MemoryIndexPreparationInput = {
-  entry: Pick<MemoryIndexEntry, "path" | "mtimeMs" | "lineMap" | "lineProvenance">;
+  entry: Pick<MemoryIndexEntry, "path" | "mtimeMs"> & {
+    lineMap?: number[];
+    lineProvenance?: MemoryEntryProvenance[];
+  };
   source: MemorySource;
   content: string;
   pathClassification: Awaited<ReturnType<typeof resolveMemoryPathClassification>>;
@@ -94,7 +100,6 @@ export function prepareMemoryIndexChunks({
       chunk.text = [previous.text, ...following].join("\n");
       chunk.startLine = previous.startLine;
       chunk.hash = hashText(chunk.text);
-      chunk.embeddingInput = { text: chunk.text };
       baseChunks.pop();
     }
     chunk.provenance = resolveChunkProvenance(entry, source, chunk, pathClassification.originClass);
@@ -108,6 +113,8 @@ export function prepareMemoryIndexChunks({
       ? enforceEmbeddingMaxInputTokens(provider, baseChunks, hardMaxInputTokens)
       : baseChunks
   ).map((chunk): IndexedMemoryChunk => {
+    // Plain text already lives in chunk.text; repeating it doubles the worker payload.
+    delete chunk.embeddingInput;
     const start = chunk.entryStartLine ?? chunk.startLine;
     const end = chunk.entryEndLine ?? chunk.endLine;
     const span = `${start}:${end}`;
@@ -130,7 +137,7 @@ export function prepareMemoryIndexChunks({
 }
 
 export function resolveChunkProvenance(
-  entry: Pick<MemoryIndexEntry, "lineProvenance" | "mtimeMs">,
+  entry: Pick<MemoryIndexEntry, "mtimeMs"> & { lineProvenance?: readonly MemoryEntryProvenance[] },
   source: MemorySource,
   chunk: MemoryChunk,
   pathOriginClass: MemoryEntryProvenance["originClass"],

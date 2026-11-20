@@ -12,7 +12,11 @@ import {
   CLAUDE_CLI_MODEL_ALIASES,
   CLAUDE_CLI_SESSION_ID_FIELDS,
 } from "./cli-constants.js";
-import { parseClaudeCliJsonlEvent, parseClaudeCliJsonlLifecycleEvent } from "./cli-output.js";
+import {
+  classifyClaudeCliErrorCode,
+  parseClaudeCliJsonlEvent,
+  parseClaudeCliJsonlLifecycleEvent,
+} from "./cli-output.js";
 import {
   normalizeClaudeBackendConfig,
   resolveClaudeCliAutoCompactEnv,
@@ -61,6 +65,7 @@ const CLAUDE_NATIVE_TOOL_CAPABILITIES: Readonly<Record<string, string>> = {
   bash: "exec",
   webfetch: "web_fetch",
   websearch: "web_search",
+  askuserquestion: "ask_user",
 };
 
 function projectClaudeNativeToolAuthority(nativeTools: readonly string[]): readonly string[] {
@@ -205,6 +210,7 @@ export function buildAnthropicCliBackend(
       appendClaudeCliToolNamingGuidance(systemPrompt, openClawMcpToolNames),
     projectNativeToolAuthority: projectClaudeNativeToolAuthority,
     resolveManagedNativeTools: resolveClaudeManagedNativeTools,
+    nativeToolSearch: "ToolSearch",
     sideQuestionToolMode: "disabled",
     ownsNativeCompaction: true,
     manualCompaction: {
@@ -301,6 +307,15 @@ export function buildAnthropicCliBackend(
           // the conversation prefix after workspace edits or commits. OpenClaw
           // supplies workspace instructions; Git state can be read with tools.
           CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS: "1",
+          ...(context.toolAvailability
+            ? {
+                ENABLE_TOOL_SEARCH:
+                  context.toolAvailability.discovery?.includes("ToolSearch") ||
+                  context.toolAvailability.native.includes("ToolSearch")
+                    ? "true"
+                    : "false",
+              }
+            : {}),
           ...resolveClaudeCliAutoCompactEnv(context.contextTokenBudget),
           ...(context.contextWindow === "200k" ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" } : {}),
           ...resolveClaudeCliThinkingEnv(context.thinkingLevel, context.modelId),
@@ -321,6 +336,7 @@ export function buildAnthropicCliBackend(
       return supportProbe ? supportProbe.then(prepare) : prepare();
     },
     parseJsonlEvent: parseClaudeCliJsonlEvent,
+    classifyErrorCode: classifyClaudeCliErrorCode,
     parseJsonlLifecycleEvent: parseClaudeCliJsonlLifecycleEvent,
     resolveExecutionArgs: (context) =>
       resolveClaudeCliExecutionArgs(context, {

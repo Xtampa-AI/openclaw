@@ -6,6 +6,7 @@ import { collectBaseArrayPaths, formatConfigPatchPath } from "../config/patch-re
 import { resolveConfigPath } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.js";
 import { resolveIdentityPathViaExistingAncestorSync as identity } from "../infra/boundary-path.js";
+import { getDatabaseEngineSelection } from "../infra/database-engine/context.js";
 import { isPlainObject } from "../infra/plain-object.js";
 import { shortenHomePath } from "../utils.js";
 import type { OwnerRequest } from "./local-state-owner.js";
@@ -123,7 +124,7 @@ function buildConfigOwnerPatch(
 /**
  * Bind a routed config change to the file the running Gateway writes. The change is prepared
  * from this command's own read; the returned commit sends it as one config.patch against the
- * owner's revision and returns the restart hint, if any.
+ * owner's revision and returns the restart hint, if any, plus the owner's billing-route warnings.
  */
 export async function bindConfigOwner(requestOwner: OwnerRequest, env: NodeJS.ProcessEnv) {
   const current = await requestOwner<{ hash?: unknown; path?: unknown }>("config.get", {});
@@ -133,13 +134,27 @@ export async function bindConfigOwner(requestOwner: OwnerRequest, env: NodeJS.Pr
       `The running Gateway owns this state directory but uses config file ${typeof current.path === "string" ? shortenHomePath(current.path) : "<unknown>"}, not ${shortenHomePath(selected)}. Nothing was sent and no settings were saved. Rerun with the Gateway's config path, or stop the Gateway through its service owner and rerun this exact command.`,
     );
   }
+  // Owner-routed writes inspect installed plugin state without write custody.
+  if (!getDatabaseEngineSelection()) {
+    const { readConfigSnapshotForEngineSelection } =
+      await import("../commands/config-preflight-snapshot.js");
+    await readConfigSnapshotForEngineSelection();
+  }
   return async (change: { previous: OpenClawConfig; next: OpenClawConfig }) => {
-    const result = await requestOwner<{ restart?: unknown; restartPending?: unknown }>(
-      "config.patch",
-      buildConfigOwnerPatch(change, current.hash),
-    );
-    return result.restart || result.restartPending
-      ? "The Gateway is restarting to apply it."
-      : undefined;
+    const result = await requestOwner<{
+      restart?: unknown;
+      restartPending?: unknown;
+      billingRouteWarnings?: unknown;
+    }>("config.patch", buildConfigOwnerPatch(change, current.hash));
+    return {
+      hint:
+        result.restart || result.restartPending
+          ? "The Gateway is restarting to apply it."
+          : undefined,
+      // Older Gateways omit the field; the owner computed it against its own credentials.
+      warnings: Array.isArray(result.billingRouteWarnings)
+        ? result.billingRouteWarnings.filter((warning) => typeof warning === "string")
+        : [],
+    };
   };
 }

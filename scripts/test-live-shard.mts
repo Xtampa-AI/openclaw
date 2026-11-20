@@ -79,6 +79,7 @@ const OPTIONAL_LIVE_SHARD_FILE_ENVS = new Map([
     ["OPENCLAW_LIVE_SUBAGENT_STRESS"],
   ],
   ["src/agents/tools/sessions-send-peer.live.test.ts", ["OPENCLAW_LIVE_SUBAGENT_STRESS"]],
+  ["src/agents/tools/sessions-send-retained-child.live.test.ts", ["OPENCLAW_LIVE_RETAINED_CHILD"]],
   ["src/agents/tools/image-tool.ollama.live.test.ts", ["OPENCLAW_LIVE_OLLAMA_IMAGE"]],
   ["src/agents/tools/image-tool.providers.live.test.ts", ["OPENCLAW_LIVE_IMAGE_TOOL_TEST"]],
   ["extensions/openai/realtime-meeting.live.test.ts", ["OPENCLAW_LIVE_GPT_LIVE"]],
@@ -96,9 +97,14 @@ const OPTIONAL_LIVE_SHARD_FILE_ENVS = new Map([
   ["src/gateway/gateway-codex-bind.live.test.ts", ["OPENCLAW_LIVE_CODEX_BIND"]],
   ["src/gateway/gateway-codex-harness.live.test.ts", ["OPENCLAW_LIVE_CODEX_HARNESS"]],
   ["src/gateway/gateway-openai-long-context.live.test.ts", ["OPENCLAW_LIVE_OPENAI_LONG_CONTEXT"]],
+  [
+    "src/gateway/gateway-personal-native-child-abort.live.test.ts",
+    ["OPENCLAW_LIVE_CODEX_HARNESS_PERSONAL_STOP"],
+  ],
   ["src/gateway/gateway-trajectory-export.live.test.ts", ["OPENCLAW_LIVE_CODEX_HARNESS"]],
   ["src/infra/push-apns-http2.live.test.ts", ["OPENCLAW_LIVE_APNS_REACHABILITY"]],
   ["test/e2e/crabbox-sandbox.live.test.ts", ["OPENCLAW_E2E_CRABBOX"]],
+  ["test/gateway-local-codex-goal-resume.live.test.ts", ["OPENCLAW_LIVE_CODEX_GOAL_RESUME"]],
   ["test/image-generation.infer-cli.live.test.ts", ["OPENCLAW_LIVE_INFER_CLI_TEST"]],
 ]);
 const SKIPPED_ASSERTION_STATUSES = new Set(["disabled", "pending", "skipped", "todo"]);
@@ -270,7 +276,12 @@ function isExtensionInRange(file: string, start: string, end: string) {
 }
 
 function isSourceGatewayLiveTest(file: string) {
-  return file.startsWith("src/gateway/") || file.startsWith("src/system-agent/");
+  // The thinking experiment is deliberately manual-only; its dedicated command
+  // records observations and refuses CI execution, rather than qualifying a release.
+  return (
+    file !== "src/gateway/gateway-thinking-probe.live.test.ts" &&
+    (file.startsWith("src/gateway/") || file.startsWith("src/system-agent/"))
+  );
 }
 
 function isGatewayBackendLiveTest(file: string) {
@@ -323,42 +334,6 @@ function isXaiLiveTest(file: string) {
 
 function isMoonshotLiveTest(file: string) {
   return file.startsWith("extensions/moonshot/");
-}
-
-// The frozen 2026.9.8, 2026.9.9 and 2026.9.33 candidates retain three intentionally skipped single-case
-// live files. The trusted tooling checkout owns shard selection, so omit those
-// candidate files here rather than weakening the per-file passing-assertion guard.
-const RELEASE_2026_9_8_AND_9_WAIVED_LIVE_FILES = new Set([
-  "src/gateway/gateway-progress-refresh.live.test.ts",
-  "src/agents/embedded-agent-runner.responses-output-limit.live.test.ts",
-  "test/gateway-subagent-restart.live.test.ts",
-]);
-const RELEASE_WAIVED_LIVE_FILES = new Map<string, ReadonlySet<string>>([
-  ["2026.9.8", RELEASE_2026_9_8_AND_9_WAIVED_LIVE_FILES],
-  ["2026.9.9", RELEASE_2026_9_8_AND_9_WAIVED_LIVE_FILES],
-  // Extended-stable 2026.9.33 is cut from the 2026.9.9 line with the same skips.
-  ["2026.9.33", RELEASE_2026_9_8_AND_9_WAIVED_LIVE_FILES],
-]);
-
-export function withoutReleaseWaivedLiveFiles(
-  files: string[],
-  candidateVersion: string | undefined,
-) {
-  const waived = candidateVersion ? RELEASE_WAIVED_LIVE_FILES.get(candidateVersion) : undefined;
-  return waived ? files.filter((file) => !waived.has(file)) : files;
-}
-
-function readCandidateVersion(repoRoot = process.cwd()) {
-  try {
-    const manifest: unknown = JSON.parse(
-      fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
-    );
-    return isUnknownRecord(manifest) && typeof manifest.version === "string"
-      ? manifest.version
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -496,7 +471,7 @@ export function resolveLiveShardPreparation(files: string[]): LiveShardPreparati
   if (
     files.some(isSourceGatewayLiveTest) ||
     files.some((file) => file.startsWith("test/e2e/qa-lab/runtime/")) ||
-    files.includes("src/infra/heartbeat-runner.live.test.ts") ||
+    files.includes("src/infra/session-event-wake.live.test.ts") ||
     files.includes("src/agents/tools/image-tool.providers.live.test.ts") ||
     files.includes("extensions/openai/openai.live.test.ts")
   ) {
@@ -826,7 +801,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 
   let files;
   try {
-    files = withoutReleaseWaivedLiveFiles(selectLiveShardFiles(shard), readCandidateVersion());
+    files = selectLiveShardFiles(shard);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     usage();

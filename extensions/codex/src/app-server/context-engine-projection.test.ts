@@ -5,6 +5,7 @@ import {
   type AgentMessage,
 } from "openclaw/plugin-sdk/agent-core";
 import { describe, expect, it } from "vitest";
+import { makeTextToolResult } from "../../../test-support/message-fixtures.test-support.js";
 import {
   buildCodexContinuityCalibration,
   fitCodexProjectedContextForTurnStart,
@@ -65,30 +66,36 @@ describe("projectContextEngineAssemblyForCodex", () => {
     );
   });
 
-  it("retains captionless prepared images in source order within the context budget", async () => {
-    const first = { type: "image" as const, mimeType: "image/png", data: "first-image-bytes" };
-    const second = { ...first, data: "second-image-bytes" };
-    const older = { role: "user" as const, content: [first], timestamp: 1 };
-    const newer = { role: "user" as const, content: [second], timestamp: 2 };
-    const budget = 2 * IMAGE_BLOCK_TOKENS * 4 + 100;
-    const result = await projectContextEngineAssemblyForCodex({
-      assembledMessages: [older, newer],
-      prompt: "Compare the saved images.",
-      maxRenderedContextChars: budget,
-      prepareFileContext: async (message) => ({ images: message === older ? [first] : [second] }),
-    });
-    const groups = result.imageGroups ?? [];
-    expect(groups.map((group) => group.images)).toEqual([[first], [second]]);
-    expect(groups.map((group) => result.promptText.slice(group.start, group.end))).toEqual([
-      "[user]\n",
-      "[user]\n",
-    ]);
-    expect(groups[0]!.end).toBeLessThan(groups[1]!.start);
-    expect(result.promptText).toContain("Compare the saved images.");
-    const range = result.promptContextRange;
-    const renderedChars = range ? range.end - range.start : 0;
-    expect(renderedChars + groups.length * IMAGE_BLOCK_TOKENS * 4).toBeLessThanOrEqual(budget);
-  });
+  it.each(["user", "assistant"] as const)(
+    "retains prepared %s images in source order within the context budget",
+    async (role) => {
+      const first = { type: "image" as const, mimeType: "image/png", data: "first-image-bytes" };
+      const second = { ...first, data: "second-image-bytes" };
+      const older = { role: "user" as const, content: [first], timestamp: 1 };
+      const newer =
+        role === "user"
+          ? { role, content: [second], timestamp: 2 }
+          : textMessage(role, "Saved image");
+      const budget = 2 * IMAGE_BLOCK_TOKENS * 4 + 100;
+      const result = await projectContextEngineAssemblyForCodex({
+        assembledMessages: [older, newer],
+        prompt: "Compare the saved images.",
+        maxRenderedContextChars: budget,
+        prepareFileContext: async (message) => ({ images: message === older ? [first] : [second] }),
+      });
+      const groups = result.imageGroups ?? [];
+      expect(groups.map((group) => group.images)).toEqual([[first], [second]]);
+      expect(groups.map((group) => result.promptText.slice(group.start, group.end))).toEqual([
+        "[user]\n",
+        role === "user" ? "[user]\n" : "[assistant]\nSaved image",
+      ]);
+      expect(groups[0]!.end).toBeLessThan(groups[1]!.start);
+      expect(result.promptText).toContain("Compare the saved images.");
+      const range = result.promptContextRange;
+      const renderedChars = range ? range.end - range.start : 0;
+      expect(renderedChars + groups.length * IMAGE_BLOCK_TOKENS * 4).toBeLessThanOrEqual(budget);
+    },
+  );
 
   it("drops a duplicate trailing current prompt from assembled history", async () => {
     const currentUserMessage = {
@@ -177,9 +184,8 @@ describe("projectContextEngineAssemblyForCodex", () => {
       ],
       prompt: "next",
     });
-    expect(ordered.promptText).toContain(
-      "[user]\none\n\n[assistant]\ntwo\n\n[toolResult]\ntool result [content omitted]",
-    );
+    expect(ordered.promptText).toContain("[user]\none\n\n[assistant]\ntwo");
+    expect(ordered.promptText).not.toContain("[toolResult]");
   });
 
   it("preserves stable user provenance while leaving legacy user rows unattributed", async () => {
@@ -241,7 +247,7 @@ describe("projectContextEngineAssemblyForCodex", () => {
     expect(history[0]).not.toHaveProperty("content");
   });
 
-  it("frames projected history as reference data and omits tool payloads", async () => {
+  it("drops omitted tool-only events while retaining mixed assistant text", async () => {
     const result = await projectContextEngineAssemblyForCodex({
       assembledMessages: [
         {
@@ -256,19 +262,49 @@ describe("projectContextEngineAssemblyForCodex", () => {
           toolCallId: "call-1",
           toolName: "exec",
           isError: false,
-          content: [{ type: "toolResult", toolUseId: "call-1", content: "API_KEY=sk-secret" }],
+          content: [{ type: "text", text: "API_KEY=sk-secret" }],
           timestamp: 2,
-        } as unknown as AgentMessage,
+        },
+        {
+          ...textMessage("assistant", "The operation completed."),
+          content: [
+            { type: "text", text: "The operation completed." },
+            { type: "toolCall", id: "call-2", name: "read", arguments: { path: "example.txt" } },
+          ],
+        } as AgentMessage,
       ],
       prompt: "continue",
     });
 
     expect(result.promptText).toContain("quoted reference data");
-    expect(result.promptText).toContain("tool call: exec [input omitted]");
-    expect(result.promptText).toContain("tool result: call-1 [content omitted]");
+    expect(result.promptText).toContain("[assistant]\nThe operation completed.");
+    expect(result.promptText).not.toContain("tool call");
+    expect(result.promptText).not.toContain("tool result");
+    expect(result.promptText).not.toContain("call-1");
     expect(result.promptText).not.toContain("sk-secret");
     expect(result.promptText).not.toContain("cat .env");
   });
+
+  it.each([true, false])(
+    "does not spend the history window on omitted tools (prior prose: %s)",
+    async (priorProse) => {
+      const instruction = "Keep the blue database available until verification finishes.";
+      const tools: AgentMessage[] = Array.from({ length: 12 }, (_, index) =>
+        makeTextToolResult(`call-${index}`, "read", "Completed synthetic read.", false, index + 2),
+      );
+      const result = await projectContextEngineAssemblyForCodex({
+        assembledMessages: [...(priorProse ? [textMessage("user", instruction)] : []), ...tools],
+        maxRenderedContextChars: 256,
+        prompt: "Continue.",
+      });
+      if (priorProse) {
+        expect(result.promptText).toContain(`[user]\n${instruction}`);
+      } else {
+        expect(result.promptText).toBe("Continue.");
+      }
+      expect(result.promptText).not.toContain("[content omitted]");
+    },
+  );
 
   it("preserves tool payload context for thread bootstrap projections", async () => {
     const shared = { recursive: true };
@@ -412,7 +448,9 @@ describe("projectContextEngineAssemblyForCodex", () => {
     ).toBe("[truncated 369 chars from older context]");
   });
 
-  it.each(["unchanged", "hook", "preserved"] as const)(
+  // Images exist only with a projected context range (run-attempt-prompt.ts maps
+  // them through contextRange), so the range-less preserved path carries none.
+  it.each(["unchanged", "hook"] as const)(
     "keeps images with complete historical source spans after fitting %s context",
     (mode) => {
       const before = "history\n";
@@ -436,9 +474,7 @@ describe("projectContextEngineAssemblyForCodex", () => {
       const fitted = fitCodexProjectedContextForTurnStart({
         promptText,
         imageGroups,
-        ...(mode === "preserved"
-          ? { preservedRange: { start: before.length, end: promptText.length } }
-          : { contextRange: { start: before.length, end: before.length + context.length } }),
+        contextRange: { start: before.length, end: before.length + context.length },
         ...(mode === "hook"
           ? {
               requestRange: {
@@ -490,7 +526,8 @@ describe("projectContextEngineAssemblyForCodex", () => {
     });
 
     expect(fitted.promptText).not.toContain("historical screenshot");
-    expect(fitted.promptText.endsWith("x".repeat(100))).toBe(true);
+    expect(fitted.promptText).toContain("Current user request:");
+    expect(fitted.promptText.endsWith("x".repeat(50))).toBe(true);
     expect(fitted.imageGroups).toBeUndefined();
   });
 
@@ -544,6 +581,51 @@ describe("projectContextEngineAssemblyForCodex", () => {
     expect(fitted).not.toContain(before);
     expect(fitted).toContain("tail");
   });
+
+  it.each(["preserved", "request", "after-context"] as const)(
+    "keeps the instruction and both content boundaries of an oversized current request (%s)",
+    (mode) => {
+      // Shape of a hook agent message: instruction, opening untrusted-content
+      // marker, a large body, closing marker, then the run's trailing guidance.
+      const instruction = "Reply with ONLY the final codeword.";
+      const request =
+        `${instruction}\n<<<EXTERNAL_UNTRUSTED_CONTENT id="a1">>>\n${"b".repeat(5_000)}` +
+        `\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="a1">>>\nCollect results in this turn.`;
+      const context = `older ${"c".repeat(300)}`;
+      const maxChars = 400;
+      const fit = () => {
+        if (mode === "preserved") {
+          return fitCodexProjectedContextForTurnStart({
+            promptText: request,
+            preservedRange: { start: 0, end: request.length },
+            maxChars,
+          });
+        }
+        const header = "\n</conversation_context>\n\nCurrent user request:\n";
+        return fitCodexProjectedContextForTurnStart({
+          promptText: `${context}${header}${request}${mode === "request" ? "\nhook" : ""}`,
+          contextRange: { start: 0, end: context.length },
+          ...(mode === "request"
+            ? {
+                requestRange: {
+                  start: context.length,
+                  end: context.length + header.length + request.length,
+                },
+              }
+            : {}),
+          maxChars,
+        });
+      };
+      const { promptText: fitted } = fit();
+
+      expect(fitted.length).toBeLessThanOrEqual(maxChars);
+      expect(fitted).toContain(instruction);
+      expect(fitted).toContain('<<<EXTERNAL_UNTRUSTED_CONTENT id="a1">>>');
+      expect(fitted).toMatch(/\[truncated \d+ chars from the middle of the current request\]/);
+      expect(fitted).toContain("Collect results in this turn.");
+      expect(fitted).not.toContain("older");
+    },
+  );
 
   it("keeps the original input when a hook appends context without a projection", async () => {
     const prompt = "current prompt survives";
@@ -653,9 +735,6 @@ describe("resolveCodexContinuityProjectionMaxChars", () => {
       undefined,
     );
     expect(buildCodexContinuityCalibration({ promptChars: 200_000, inputTokens: 0 })).toBe(
-      undefined,
-    );
-    expect(buildCodexContinuityCalibration({ promptChars: Number.NaN, inputTokens: 64_000 })).toBe(
       undefined,
     );
   });

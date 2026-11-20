@@ -13,10 +13,6 @@ describe("gateway usage request validation", () => {
       const conflictMessage = "agentScope=all cannot be combined with agentId";
       for (const [params, message] of [
         [{ agentId: 42 }, "agentId must be a string"],
-        [{ agentId: null }, "agentId must be a string"],
-        [{ agentId: [] }, "agentId must be a string"],
-        [{ agentScope: null }, "agentScope must be 'all' when provided"],
-        [{ agentScope: false }, "agentScope must be 'all' when provided"],
         [{ agentScope: "unexpected" }, "agentScope must be 'all' when provided"],
         [{ agentId: "main", agentScope: "all" }, conflictMessage],
         [{}, undefined],

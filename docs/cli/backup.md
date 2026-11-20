@@ -23,6 +23,13 @@ credentials, sessions, and optionally workspaces. Save them locally or upload to
 a named [storage location](/concepts/storage-locations). SQLite snapshots and Git
 history provide database-focused alternatives.
 
+Archive creation, verification, and restore reports strip terminal escape sequences
+and display embedded newlines, tabs, and carriage returns as `\n`, `\t`, and `\r`.
+Archive paths, restored data, and `--json` output retain their original values.
+Quoted archive paths and restore targets preserve leading and trailing whitespace in file and
+directory names. Required paths must not be blank; `~/` expands from the effective
+OpenClaw home.
+
 ```bash
 openclaw backup create
 openclaw backup create --output ~/Backups
@@ -66,6 +73,24 @@ uses PostgreSQL, stop the Gateway through its service owner first. A running
 Gateway causes a refusal: “stop through the service owner, then rerun.” Backup
 never stops it automatically. The requirement also applies to `create --to`.
 
+Mixed-engine installations use the same commands and archive format. Each
+store's physical engine and selected shared connection determine its capture;
+the default engine alone does not determine backup behavior. Archive restore
+validates the archived configuration under offline custody, restores PostgreSQL
+stores into fresh namespaces, and publishes verified matching anchors with the
+recovered family selections last. Git restore also verifies its matched artifacts
+and loads a fresh namespace. Activate recovered stores with their corresponding
+family selections before runtime admission.
+SQLite stores remain SQLite. Config includes, active fragments, and companion
+files retain their existing capture and verification rules.
+
+The archive records the path and manifest hash of every PostgreSQL capsule its
+producer generated. Verification and restore use that list; copied exports are
+preserved as ordinary files and are never imported or consumed. For older
+archives without the list, only declared global/agent snapshots can be imported.
+Unlisted exports remain files, with a warning to re-run backup with this version
+on the source installation before recovering plugin PostgreSQL stores.
+
 A PostgreSQL capture contains the original anchor, a sanitized SQLite export
 image, and a format-2 manifest with the profile, engine, store UUID, versions,
 active fragments, allocation facts, sizes, and hashes. The manifest contains no
@@ -79,7 +104,7 @@ restore and update-recovery behavior.
 - The archive embeds a schema-version-1 `manifest.json` with the resolved source paths and archive layout. Additive ownership metadata records configured agent ids and roots, including agent roots already covered by another asset; existing archive layout and older archives remain supported. New archives also record the current-layout SQLite snapshots captured at creation; standalone verification rejects missing or mismatched inventory entries. Legacy archives without this inventory remain readable, but verification reports `sqliteInventoryVerified: false` because complete database coverage cannot be established. An empty inventory means no current-layout databases were captured (for example, a config-only export), not a full database recovery point.
 - Without `--to`, default output is a timestamped `.tar.gz` archive in the current working directory. Local timestamped filenames use your machine's local timezone and include the UTC offset. If the current working directory is inside a backed-up source tree, OpenClaw falls back to your home directory for the default archive location. With `--to`, the default archive is temporary; pass `--output` as well to retain a local copy.
 - Existing archive files are never overwritten. Output paths inside the source state/workspace trees are rejected to avoid self-inclusion.
-- `openclaw backup verify <archive>` checks that the archive contains exactly one root manifest, rejects traversal-style archive paths and unsafe symbolic links, confirms every manifest-declared payload exists, and validates the root SQLite snapshot and agent snapshots listed in the manifest or captured durable registry. It rejects sidecars for those snapshots and checks their integrity and database roles, including each agent's identity. Other files, including plugin snapshots already validated during creation, remain opaque during verification and restore. `openclaw backup create --verify` runs that validation immediately after writing the archive.
+- `openclaw backup verify <archive>` checks that the archive contains exactly one root manifest, rejects traversal-style archive paths and unsafe symbolic links, confirms every manifest-declared payload exists, and validates the root SQLite snapshot and agent snapshots listed in the manifest or captured durable registry. It rejects sidecars for those snapshots and checks their integrity and database roles, including each agent's identity. For each producer-declared PostgreSQL store, including plugins and retained Matrix roots, it verifies the capture manifest hash, export artifacts, and both captured anchors. Restore then rehydrates each store through its provider. Other files, including ordinary plugin files, remain opaque. `openclaw backup create --verify` runs that validation immediately after writing the archive.
 - Full archives include the active config and its required `$include` files, including dependencies outside the state directory. They preserve authored bytes, comments, and environment placeholders; resolved secrets are not written into the config copy. These additional files may contain sensitive data, so protect the archive accordingly.
 - AppleDouble metadata named `._*.sqlite`, such as `._cron.sqlite`, is excluded from state and agent database roots only when its file signature confirms the format. Real SQLite files and hardlink aliases with these names follow the same ownership rules as other databases.
 - Full archives refuse unresolved include graphs, files that change during config capture, and include aliases that cannot be represented safely. Fix missing or unreadable files, use regular-file include paths, or pause concurrent edits and retry. `--no-include-workspace` still includes required config dependencies, even within an excluded workspace.
@@ -230,8 +255,28 @@ the live state directory or any configured live agent directory. Restore
 verifies the archive and its SQLite databases before creating or writing the
 target, refuses a non-empty target, and removes an incomplete extraction if
 anything fails. It never restores in place and has no `--force` mode. The
-extracted layout retains the archive root, manifest, and `payload/` paths
-exactly as recorded in the archive.
+extracted layout retains the archive root, manifest, and `payload/` paths.
+For PostgreSQL stores, restore rehydrates
+shared state, agents, Workboard, Logbook, Team Reports, and retained Matrix roots
+into fresh namespaces, then replaces the extracted historical anchors with
+verified matching anchors. All stores are prepared before any anchor is
+published; a failed restore drops its new namespaces and cleans the target.
+After successful publication, restore consumes the generated PostgreSQL export
+files. New archives record the generated capsule paths and their manifest hashes.
+Verification and restore use only that inventory; copied PostgreSQL exports and
+other unlisted files remain opaque and are preserved. Older archives can import
+only global and agent snapshots proven by their existing database inventory.
+For automatic recovery of plugin PostgreSQL stores from a legacy archive, re-run
+backup with this version on the source installation. Unmanaged SQLite files
+remain opaque.
+
+PostgreSQL archive restore requires its captured configuration and resolves each
+family through that recovered configuration. Make its external connection
+SecretRef available before restoring; point that secret at the recovery server
+when recovering to another server. The live installation's family selections do
+not override the archive. The recovered config is published after every store
+passes verification, with its matching anchors.
+The original PostgreSQL namespaces remain untouched.
 
 <Warning>
   Restoring an archive is time travel. Messaging-channel credentials with
@@ -243,6 +288,9 @@ exactly as recorded in the archive.
   `plugin-skills/` symlink index is also omitted; run `openclaw skills list` or
   start an agent session after activation to rebuild it from plugin metadata.
 </Warning>
+
+Archive restore completes matched PostgreSQL restoration into fresh namespaces
+before returning. Activate the recovered state together with its family selections.
 
 Activation is a separate offline operator step. Stop the Gateway, move the
 restored state asset into place or point `OPENCLAW_STATE_DIR` at that asset,
@@ -281,6 +329,14 @@ path and actual content source through the same classifier. A support bundle
 reports refused inputs without including their contents. These checks do not
 parse workspace manifests or scan for other state roots.
 
+Database discovery for updates, database porting, and Git backups inspects known
+core database paths and declared plugin database resources, including retained
+stores from disabled plugins. It does not traverse unrelated state directories
+such as historical repair backups. Permission errors in those unrelated trees
+do not block a schema crossing; privacy and permission checks still apply to
+selected database sources. Full archives retain their broader traversal and
+error handling.
+
 The marker is an exclusion instruction, not proof of artifact ownership or
 permission to reopen, adopt, or delete it. Producers must durably write it before
 raw data, including in each independently movable staging or capture directory.
@@ -311,7 +367,7 @@ The repository contains one directory per committed snapshot. Each snapshot dire
 - `manifest.json`
 - `database.sqlite`
 
-Snapshot creation verifies the live database before reading it, uses SQLite's online backup API to capture committed WAL state without holding one long read transaction, closes the live database, compacts the private copy with `VACUUM`, verifies the generated database again, and publishes the completed directory without overwriting existing paths. Global snapshots remove every delivery queue row before compaction, including pending work, failed ownership fences, and completion receipts or records used to prevent duplicate sends, so neither payload detail nor ownership tombstones are published or retained in free pages. Restoring this sanitized, portable snapshot is therefore not an exactly-once delivery continuation boundary. This is an intentional privacy and no-replay portability tradeoff.
+Snapshot creation verifies the live database before reading it, uses SQLite's online backup API to capture committed WAL state without holding one long read transaction, closes the live database, compacts into a sibling file in the private staging directory with `VACUUM INTO`, verifies the generated database again, and publishes the completed directory without overwriting existing paths. Global snapshots remove every delivery queue row before compaction, including pending work, failed ownership fences, and completion receipts or records used to prevent duplicate sends, so neither payload detail nor ownership tombstones are published or retained in free pages. Restoring this sanitized, portable snapshot is therefore not an exactly-once delivery continuation boundary. This is an intentional privacy and no-replay portability tradeoff.
 
 Do not copy live `.sqlite`, `-wal`, `-shm`, or `-journal` files as a portability artifact. Copy only completed snapshot directories.
 
@@ -338,6 +394,8 @@ Snapshots from supported older schema versions can be verified and restored with
 
 Verification validates a private content-pinned copy so pathname races cannot swap the bytes SQLite inspects. By default, that temporary copy is created beside the snapshot repository and removed before the command returns. The staging root and its ancestor chain must prevent other users from replacing it. POSIX roots must be current-user-owned and not group/world writable; sticky ancestors such as `/tmp` are accepted for user-owned children. macOS ACL grants that expose or make staging replaceable are rejected. Windows roots and ancestors must be owned by the current user or a trusted OS principal, with ACLs that deny untrusted staging access. For a read-only mount or network share, pass `--scratch <existing-private-directory>` on storage with equivalent encryption and destination controls.
 
+When the Windows filesystem helper verifies that an ancestor is a local volume root, DELETE-self alone does not make that ancestor replaceable. Child deletion, ownership and DACL changes, unknown rights, and private repository access are still checked. Helpers that cannot verify volume-root identity retain the stricter refusal; drive-letter or path spelling alone never grants this exception. Network shares remain unsupported as private staging roots.
+
 Snapshot creation applies the same owner, ACL, ancestor, and path-identity checks to the repository before staging or publishing database bytes. Newly created directory edges and final publication metadata are synchronized through the shared `fs-safe` durability boundary before success is reported on supported filesystems.
 
 Restore repeats verification and writes only to a fresh target. It refuses an existing target, `-wal`, `-shm`, or `-journal` sidecar and never performs an in-place replacement of a live OpenClaw database. The target parent has the same path-security requirements as verification scratch. Activating a restored database remains an explicit offline operator step.
@@ -346,8 +404,12 @@ Snapshot repositories are local directories. Scheduling, upload, retention, incr
 
 ## Versioned Git backups
 
+Human-readable Git backup reports escape control characters in paths, commit subjects, and diagnostics. Push-failure diagnostics keep escaped lines separated so credential redaction preserves the stderr and stdout tails. JSON values and recorded diagnostics are unchanged.
+
 `openclaw backup git create --all` also includes PostgreSQL stores discovered
-through activated plugins' declared backup resources, including Workboard.
+through declared plugin backup resources, including retained roots. Each store
+uses its family and resource identity, so multiple PostgreSQL stores have
+distinct Git destinations.
 `--global` and `--agent <id>` keep their existing source selection. For a
 PostgreSQL source, Git backup routing captures the same sanitized export image,
 anchor, and format-2 manifest. Stop the Gateway through
@@ -410,8 +472,9 @@ doctor --fix` when adopting an older restored database for the current runtime.
 Historical global tables retain their recorded DDL; current indexes and columns
 are applied only by normal schema migration, not by Git backup verification.
 
-With `--all`, only agents removed from the configuration have their scopes
-pruned. If a configured agent's database is missing or cannot pass snapshot
+With `--all`, agents removed from the configuration and PostgreSQL stores no
+longer discovered have their declared backup artifacts pruned. Unmanaged files
+and historical Git refs remain available. If a configured agent's database is missing or cannot pass snapshot
 validation, its previous backup scope stays unchanged while other agents are
 backed up. The command reports that agent as degraded in CLI warnings, JSON
 `warnings`, and the recorded backup outcome. No scope is created if that agent
@@ -505,11 +568,25 @@ output-limit error, retry with a smaller `--limit`. An oversized commit subject
 can exceed the limit even with `--limit 1`; inspect that history directly with
 Git. OpenClaw reports the failure without returning partial history entries.
 
-Verification restores the selected snapshot into private scratch space, checks each table's row count and SHA-256, runs `PRAGMA integrity_check` and `PRAGMA foreign_key_check`, and removes the scratch copy. Restore writes only to a fresh target and refuses existing `-wal`, `-shm`, and `-journal` sidecars:
+For SQLite, verification restores the selected snapshot into private scratch space, checks each table's row count and SHA-256, runs `PRAGMA integrity_check` and `PRAGMA foreign_key_check`, and removes the scratch copy. For PostgreSQL, it verifies the matched export hashes and anchor locally, without connecting to the server or creating a namespace. Restore writes only to a fresh target and refuses existing `-wal`, `-shm`, and `-journal` sidecars:
+
+If temporary-file cleanup fails during Git backup creation, verification, or
+restore, OpenClaw warns on stderr without replacing the primary outcome.
+Inspect the named private temporary directory for leftover backup data.
 
 ```bash
 openclaw backup git restore --repository ~/Backups/openclaw-git --ref <commit> --global --target ./restored/openclaw.sqlite
+openclaw backup git restore --repository ~/Backups/openclaw-git --ref <commit> --store workboard --target ./restored/workboard.sqlite
 ```
+
+Use `--store <id>` for plugin and additional-root scopes recorded under `stores/`
+in the repository. Choose exactly one of `--global`, `--agent <id>`, or
+`--store <id>` for verification or restore.
+
+New PostgreSQL Git captures bind the source store to the scope manifest;
+verification and restore reject a capsule copied from another store. Older
+captures remain readable without this binding, so keep their complete scope
+artifacts together when editing Git history.
 
 Restore rebuilds content-backed FTS5 indexes after loading their content tables. It deliberately omits the derived `session_transcript_index_state` projection so Gateway startup reconciliation rebuilds transcript search. `vec0` virtual tables are not materialized because the extension is unavailable in the restore process; memory indexing recreates them and schedules a full reindex.
 
@@ -517,6 +594,11 @@ Git backup creation, restore, and verification stream table data instead of
 retaining complete table dumps in memory. Restores still require space for the
 materialized Git files and the private SQLite staging copy; verification does
 not write a second set of table dumps.
+
+Local Git content commands allow one second per MiB, with a two-minute minimum
+and a 24-hour maximum. Creation sizes this deadline from the refreshed artifacts;
+restore and verification use each blob's committed size. Metadata commands and
+remote pushes keep their existing deadlines.
 
 ## Schedule backups
 
@@ -652,11 +734,17 @@ whether it is outside the state directory, inside a workspace, or nested under
 an otherwise regenerable managed state root. `--no-include-workspace` omits
 ordinary workspace sources, not configured agent directories.
 
+State-only archives also omit registered managed chat worktrees, including
+pending or recovering allocations and live worktrees under a previous
+`worktreeRoot`. Only recorded checkout paths are excluded; neighboring files and
+paths from removed registrations remain eligible. Config, credentials, and
+agent databases nested inside an excluded checkout remain included.
+
 `--only-config` skips state, agent, credentials-directory, workspace, and
 plugin-resource discovery and archives only the active config file path.
 
 OpenClaw first plans resources from configuration. It captures the root SQLite
-database online, then derives and freezes registered-agent ownership from that
+database online, then derives registered-agent ownership from that
 private snapshot for database discovery and archive traversal. Paths are resolved before comparison: config, credentials, workspaces, and agents
 already covered by another included root are not duplicated as top-level
 sources. A custom agent root becomes a distinct `agent` asset only when no
@@ -696,6 +784,13 @@ Transient filename rules apply across all selected roots, including every agent 
 If an entry disappears during traversal or before it can be opened, the archive continues with the surviving entries. Each omitted path appears in the result's `skipped` list with reason `vanished`, and in the result's `warnings` and text summary. Required source roots and staged captures must still exist; permission and I/O errors still fail the archive. Changes that could redirect a read outside the selected roots also fail. Files are opened before their archive headers are written, so a vanished file cannot leave a partial entry.
 
 Chromium singleton entries coordinate one running browser on one host and are recreated when that profile starts; the rest of the profile's `user-data/` remains in the archive. Sandbox skills workspaces are generated copies of current skill sources and are materialized again when OpenClaw prepares the next sandbox context after restore; adjacent sandbox registry and other durable state remain included.
+
+On Windows, SQLite discovery retries `EBUSY` or `EPERM` reads twice with short
+backoff and logs a warning when the retry succeeds. If a retained file still
+cannot be read, backup capture refuses with its path and error code. Check read
+permissions or close the program using that file, then retry the backup or
+update. Unreadable files are never assumed to be non-SQLite or silently skipped;
+an update must capture them safely before replacing the installation.
 
 Managed SQLite snapshots cover the shared OpenClaw database, the quarantine and
 integrity-verification store, and per-agent databases declared by configuration,
@@ -811,8 +906,9 @@ scratch even when it is old. Cleanup failures preserve the published archive
 and appear as warnings with the scratch path in both text and JSON output.
 The owned prefix also lets cleanup coordinate with a new creator before its
 token exists, without mistaking that allocation for legacy scratch.
-If cleanup wins before the creator claims its directory, creation retries with
-a fresh directory. A changed directory identity is still rejected.
+If temporary-directory allocation or lifetime admission fails, creation reports
+the underlying error; rerun the backup command. A changed directory identity is
+still rejected.
 Scratch observed by the scan that disappears before cleanup is recorded as
 already reclaimed, without a warning or a claim that this pass removed it.
 

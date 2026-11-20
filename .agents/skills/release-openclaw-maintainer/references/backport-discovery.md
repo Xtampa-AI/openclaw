@@ -1,8 +1,9 @@
 # Evidence-Driven Backport Discovery
 
 Use this before selecting backports for any OpenClaw release line: regular
-beta/stable, extended-stable, or a release-repair branch. It is an audit before the candidate is
-mutated, not a title search and not permission to expand a frozen release.
+beta/stable, extended-stable, or a release-repair branch. Audit each selected fix
+before applying it; complete the full inventory before freezing the candidate.
+This is not a title search or permission to expand a frozen release.
 
 ## Start from the shared ledger
 
@@ -10,6 +11,17 @@ Start with [shared candidates and assessments](hotfix-ledger-management.md),
 including carry-forward and sibling-release evidence; sync new findings and
 decisions back. Empty/incomplete records do not replace the pinned inventory
 or P0/P1 discovery below. Use local evidence when access is unavailable.
+
+## Select by release track
+
+- **Extended-stable:** generally take only P0 and P1 hotfixes.
+- **Stable:** also consider significant P2 fixes that are easy to port.
+- **Beta:** allow a broader P2 set when fixes are reasonably small, portable,
+  and low risk.
+
+Assess actual impact, dependency closure, and maintenance risk, not just labels.
+These are selection defaults, not permission to expand frozen intake, bypass
+approval, or weaken validation. Record exceptions and rationale in the ledger.
 
 ## Freeze the Audit
 
@@ -193,7 +205,15 @@ That decision invalidates affected evidence; it never authorizes publication of
 untested changes.
 
 Before changing release refs, present the complete categorized ledger and the
-proposed set for maintainer approval. After approval, apply each backport directly
+proposed set for maintainer approval unless selection authority was explicitly
+delegated. During open preparation, a maintainer may instead approve an exact,
+dependency-closed group while independent discovery continues. Record that
+approval and the unfinished audit scope; do not call the full inventory complete
+or advance its scan cursor until every entry is accounted for. Follow the
+[owner intake procedure](release-owner.md#prepare-and-admit-hotfixes) to integrate
+ready approved groups without waiting for unrelated audit lanes.
+
+After approval, apply each backport directly
 to the canonical release branch with `git cherry-pick -x`, one at a time in
 dependency order; do not open individual or combined backport PRs. Follow
 [backports and new fixes](../SKILL.md#backports-and-new-fixes) for CI recovery
@@ -224,7 +244,10 @@ Every porting brief contains these steps for each pick, in order:
 2. Confirm the defect exists on the baseline (`git show <baseline>:<path>`)
    before porting.
 3. Cherry-pick with `-x`, resolve conflicts, and note any adaptation as
-   `Release adaptation:` in the commit body.
+   `Release adaptation:` in the commit body. Immediately update the shared
+   [hotfix assessment](hotfix-ledger-management.md) after every adaptation;
+   record newly discovered validation errors and subsequent repairs as they
+   occur, not only when the pick or batch is finished.
 4. Run targeted tests and typechecks for the touched owners only. Wrap every
    local command in `timeout`; full local gates are not a worker's job.
 5. Commit, then append the pick's result to the lane report before the next

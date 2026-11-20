@@ -5,7 +5,6 @@ import { getActivePluginRegistry } from "../plugins/runtime.js";
 import type { AgentHarnessHostCapabilities } from "./harness/host-capability-types.js";
 import type { AgentHarness } from "./harness/types.js";
 const streamSimpleMock = vi.fn();
-const readFileMock = vi.fn();
 const parseSessionEntriesMock = vi.fn();
 const migrateSessionEntriesMock = vi.fn();
 const buildSessionContextMock = vi.fn();
@@ -59,25 +58,10 @@ const preparedRuntimeSnapshotState = vi.hoisted(() => ({
   useSnapshotPluginRegistry: false,
 }));
 
-vi.mock("../llm/stream.js", async () => {
-  const original = await vi.importActual<typeof import("../llm/stream.js")>("../llm/stream.js");
-  return {
-    ...original,
-    streamSimple: (...args: unknown[]) => streamSimpleMock(...args),
-  };
-});
-
-vi.mock("node:fs/promises", async () => {
-  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
-  return {
-    ...actual,
-    default: {
-      ...actual,
-      readFile: (...args: unknown[]) => readFileMock(...args),
-    },
-    readFile: (...args: unknown[]) => readFileMock(...args),
-  };
-});
+vi.mock("../llm/stream.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../llm/stream.js")>()),
+  streamSimple: (...args: unknown[]) => streamSimpleMock(...args),
+}));
 
 vi.mock("./sessions/session-manager.js", () => ({
   buildSessionContext: (...args: unknown[]) => buildSessionContextMock(...args),
@@ -281,7 +265,8 @@ vi.mock("../plugins/provider-runtime.js", () => ({
 
 // Provider ownership and public-surface loading have dedicated owner suites. BTW stubs those
 // boundaries so its orchestration tests do not rediscover every plugin.
-vi.mock("../plugins/providers.js", () => ({
+vi.mock("../plugins/providers.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/providers.js")>()),
   resolveProviderRefOwnership: () => ({ status: "unowned" as const }),
 }));
 
@@ -338,7 +323,9 @@ vi.mock("./auth-profiles/session-override.js", () => ({
   resolveSessionAuthSelection: (...args: unknown[]) => resolveSessionAuthSelectionMock(...args),
 }));
 
+// mock-isolation: BTW fixtures capture debug output without loading process-wide diagnostic owners.
 vi.mock("../logging/diagnostic.js", () => ({
+  logSessionStateChange: vi.fn(),
   diagnosticLogger: {
     debug: (...args: unknown[]) => diagDebugMock(...args),
   },
@@ -359,7 +346,6 @@ vi.mock("../config/sessions/session-entry-read-runtime.js", async (importOrigina
 
 export {
   streamSimpleMock,
-  readFileMock,
   parseSessionEntriesMock,
   migrateSessionEntriesMock,
   buildSessionContextMock,

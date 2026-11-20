@@ -1,50 +1,77 @@
 import { clearRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { markGatewayRestartTrace } from "../../gateway/restart-trace.js";
 import type { GatewayServerOptions, GatewayStartupOperation } from "../../gateway/server-public.js";
+import type { GatewayInstallationReplacement } from "../../gateway/stale-install.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import type { GatewayBootLifecycleCompletion } from "../../infra/gateway-boot-lifecycle.js";
 import { acquireGatewayLock } from "../../infra/gateway-lock.js";
 import type { GatewayOwnerSupervisor } from "../../infra/gateway-owner-lease.types.js";
 import type { GatewayRestartEmitter } from "../../infra/restart.js";
 import { SqliteIntegrityWorkerInterruptedError } from "../../infra/sqlite-integrity-worker-error.js";
 import type { SubsystemLogger } from "../../logging/subsystem.js";
+import { ExitError } from "../../runtime.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { drainGlobalSingletonLifecycleState } from "../../shared/global-singleton.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { formatCliCommand } from "../command-format.js";
+import { getGatewayStartupStopExitCode } from "../signal-exit-barrier.js";
 import { measureGatewayBootstrapStep } from "../startup-trace.js";
 import { resolveGatewayShutdownBudget } from "./run-loop-shutdown-budget.js";
 
 const lifecycleRuntimeLoader = createLazyImportLoader(() => import("./lifecycle.runtime.js"));
 
-/** Prime lifecycle code and acquire initial custody before installing signal handlers. */
+/** A stop accepted before the run loop owns signals unwinds startup with the signal's status. */
+function assertGatewayStartupNotStopped(): void {
+  const code = getGatewayStartupStopExitCode();
+  if (code !== undefined) {
+    throw new ExitError(code);
+  }
+}
+
+/**
+ * Prime lifecycle code and acquire initial custody before installing signal handlers.
+ * Until then the CLI signal owner holds any stop; custody is released before startup unwinds.
+ */
 export async function prepareGatewayRunLoop(
   params: { lockPort?: number; lifecycleLockDeadlineMs?: number },
   logger: Pick<SubsystemLogger, "info" | "warn">,
 ) {
+  assertGatewayStartupNotStopped();
   // Updates rotate dist chunks; signal handling must retain this exact runtime.
   const lifecycleRuntime = await measureGatewayBootstrapStep(
     "cli.bootstrap.lifecycle-runtime",
     () => lifecycleRuntimeLoader.load(),
   );
-  const supervisor = lifecycleRuntime.detectGatewayRespawnSupervisorIdentity(
-    process.env,
-    process.platform,
-    { includeLinuxOpenClawGatewayServiceMarker: true },
-  );
+  const supervisor = lifecycleRuntime.detectGatewayRespawnSupervisorIdentity();
   const supervisorMode = supervisor?.kind ?? null;
   const restartDecision = lifecycleRuntime.resolveGatewayRestartDecision();
   // Resolve the native deadline before acquiring custody that needs final settlement.
   const startupBudget = await resolveGatewayShutdownBudget(supervisorMode, logger);
-  const lock = await measureGatewayBootstrapStep("cli.bootstrap.gateway-lock", () =>
-    acquireGatewayLock({
-      port: params.lockPort,
-      listenerMode: supervisorMode ? "supervised" : "foreground",
-      supervisor,
-      ...(params.lifecycleLockDeadlineMs !== undefined
-        ? { lifecycleDeadlineMs: params.lifecycleLockDeadlineMs }
-        : {}),
-    }),
-  );
+  let lock: Awaited<ReturnType<typeof acquireGatewayLock>>;
+  try {
+    lock = await measureGatewayBootstrapStep("cli.bootstrap.gateway-lock", () =>
+      acquireGatewayLock({
+        port: params.lockPort,
+        listenerMode: supervisorMode ? "supervised" : "foreground",
+        supervisor,
+        ...(params.lifecycleLockDeadlineMs !== undefined
+          ? { lifecycleDeadlineMs: params.lifecycleLockDeadlineMs }
+          : {}),
+        // Each attempt, including those of an ownership wait, refuses after a stop.
+        assertCurrent: assertGatewayStartupNotStopped,
+      }),
+    );
+  } catch (error) {
+    // Acquisition rolls back its own custody; an accepted stop owns the outcome.
+    assertGatewayStartupNotStopped();
+    throw error;
+  }
+  if (getGatewayStartupStopExitCode() !== undefined) {
+    // No run-loop handler will see this stop, so release custody here.
+    await lock?.release();
+    logger.info("released Gateway state ownership after a stop during startup");
+    assertGatewayStartupNotStopped();
+  }
   return { lifecycleRuntime, supervisor, supervisorMode, restartDecision, startupBudget, lock };
 }
 
@@ -54,6 +81,7 @@ export type GatewayRunLoopStartOptions = Pick<
   | "startupStartedAt"
   | "hostLifecycle"
   | "startupOperation"
+  | "exitAfterStartupFailure"
   | "gatewayStateOwner"
 > & { requestHotReloadRecovery?: GatewayRestartEmitter };
 
@@ -75,6 +103,14 @@ export function createGatewayRestartRecovery(
     | { controller: AbortController; settled: ReturnType<GatewayRestartStartupFailureHandler> }
     | undefined;
   return {
+    reportInstallationReplacement(
+      replacement: GatewayInstallationReplacement,
+    ): GatewayBootLifecycleCompletion {
+      logger.error(
+        `${replacement.message} Cannot continue in this process. Run: ${formatCliCommand(supervisor ? "openclaw gateway restart" : "openclaw gateway run")}`,
+      );
+      return { outcome: "planned_restart", reason: "gateway.installation_replaced" };
+    },
     reportStartupFailure(error: unknown, retryFailed: boolean) {
       const stack = error instanceof Error && error.stack ? `\n${error.stack}` : "";
       logger.error(
@@ -141,15 +177,7 @@ export function createGatewayRestartRecovery(
   };
 }
 
-export function createGatewayStartupOperations(): {
-  run: GatewayStartupOperation;
-  close(): void;
-  cancelledWith(error: unknown): boolean;
-  failedWith(error: unknown): boolean;
-  getStopCompletion(): Promise<void> | undefined;
-  retainStopCompletion(completion: Promise<void>): void;
-  drain(): Promise<void>;
-} {
+export function createGatewayStartupOperations() {
   const scope = new AsyncWorkScope();
   let stopCompletion: Promise<void> | undefined;
   let failure: { error: unknown } | undefined;
@@ -176,8 +204,9 @@ export function createGatewayStartupOperations(): {
   };
   return {
     run,
+    signal: scope.signal,
     getStopCompletion: () => stopCompletion,
-    retainStopCompletion: (completion) => {
+    retainStopCompletion: (completion: Promise<void>) => {
       stopCompletion = completion;
     },
     close: () => scope.beginClose(),

@@ -23,11 +23,10 @@ import { AUTH_STORE_VERSION, reportCommittedInlineAuthFailure } from "./constant
 import type { InlineAuthFailureOperations } from "./inline-usage-kernel.js";
 import { publishInlineAuthFailure } from "./inline-usage-publication.js";
 import {
-  assertAuthProfileMigrationCandidates,
+  prepareAuthProfileMigrationCandidates,
   assertAuthProfileMigrationStateAtDatabasePath,
 } from "./legacy-source-diagnostic.js";
 import { resolveLegacyAuthProfileSourceCandidates } from "./legacy-source-files.js";
-import { getRuntimeAuthProfileStoreCredentialMutationToken } from "./mutation-lineage.js";
 import { withAuthProfileCleanup } from "./operation-cleanup.js";
 import { shouldUseMainOwnerForLocalOAuthCredential } from "./ownership.js";
 import {
@@ -84,25 +83,29 @@ export async function withAuthProfileUsage<T>(
   env.OPENCLAW_STATE_DIR = resolveStateDir(env);
   const selectedDir = resolveRuntimeAuthProfileAgentDir(agentDir);
   const context = captureOpenClawStateWorkerContext({ env });
+  const capturedOwnership = resolveSharedAuthStoreOwnershipAsync(context).then(
+    (value) => ({ ok: true, value }) as const,
+    (error: unknown) => ({ ok: false, error }) as const,
+  );
   const localPath = selectedDir ? resolveAuthProfileDatabasePath(selectedDir) : undefined;
   const legacyPath = resolveAuthProfileDatabasePath(resolveSharedMainAuthAgentDir(env));
-  const readers = new Map<string, ReturnType<typeof prepareAgentAuthProfileRowsRead>>();
+  const readers = new Map<string, Awaited<ReturnType<typeof prepareAgentAuthProfileRowsRead>>>();
   const executions = new Map<
     string,
     Result<ReturnType<typeof captureOpenClawAgentDatabaseExecution>, unknown>
   >();
-  const credentialToken = (databasePath: string) =>
-    getRuntimeAuthProfileStoreCredentialMutationToken(undefined, profileId, {
-      owner: { kind: "resolved", databasePath, sharedDatabasePath: databasePath },
-    });
-  const credentialTokens = new Map(
-    [
-      ...new Set([context.admission.databasePath, legacyPath, ...(localPath ? [localPath] : [])]),
-    ].map((databasePath) => [databasePath, credentialToken(databasePath)]),
-  );
   let preparation: ReturnType<typeof reserveAuthProfileUsagePreparation> | undefined;
   let committed: AuthProfileUsageReceipt | undefined;
   const executeUsage = async (): Promise<T> => {
+    preparation = reserveAuthProfileUsagePreparation(
+      [
+        context.admission.identity,
+        ...[...new Set([...(mode ? [] : [legacyPath]), ...(localPath ? [localPath] : [])])].map(
+          (pathname) => readDatabasePathIdentitySync(pathname),
+        ),
+      ].flatMap((identity) => [identity.key, `path:${identity.canonicalPath}`]),
+    );
+
     for (const databasePath of new Set([
       ...(mode ? [] : [legacyPath]),
       ...(localPath ? [localPath] : []),
@@ -114,7 +117,7 @@ export async function withAuthProfileUsage<T>(
       };
       readers.set(
         databasePath,
-        prepareAgentAuthProfileRowsRead({
+        await prepareAgentAuthProfileRowsRead({
           databasePath,
           agentId: target.agentId,
           env,
@@ -129,16 +132,6 @@ export async function withAuthProfileUsage<T>(
         executions.set(databasePath, { ok: false, error });
       }
     }
-    preparation = reserveAuthProfileUsagePreparation(
-      [
-        context.admission.identity,
-        ...[...readers.keys()].map((pathname) => readDatabasePathIdentitySync(pathname)),
-      ].flatMap((identity) => [identity.key, `path:${identity.canonicalPath}`]),
-    );
-    const capturedOwnership = resolveSharedAuthStoreOwnershipAsync(context).then(
-      (value) => ({ ok: true, value }) as const,
-      (error: unknown) => ({ ok: false, error }) as const,
-    );
     await preparation.ready;
     const ownershipResult = await capturedOwnership;
     if (!ownershipResult.ok) {
@@ -191,16 +184,8 @@ export async function withAuthProfileUsage<T>(
       agentDir: useShared ? undefined : selectedDir,
       env,
     });
-    const sourcePaths = [
-      ...new Set([...(mode ? [] : [sharedPath]), ...(localPath ? [localPath] : [])]),
-    ];
-    const credentialOwnerChanged = () =>
-      sourcePaths.some((sourcePath) => {
-        const previous = credentialTokens.get(sourcePath)!;
-        const current = credentialToken(sourcePath);
-        return current.revision !== previous.revision || current.known !== previous.known;
-      });
-    const assertOwnerCurrent = () => {
+    const sourcePaths = new Set([...(mode ? [] : [sharedPath]), ...(localPath ? [localPath] : [])]);
+    const assertCurrent = () => {
       context.admission.assertCurrent();
       context.maintenanceScope?.assertAdmission();
       for (const sourcePath of sourcePaths) {
@@ -217,46 +202,21 @@ export async function withAuthProfileUsage<T>(
         throw new Error("Auth profile shared owner changed before write admission");
       }
       assertAuthProfileMigrationStateAtDatabasePath(databasePath);
-      assertAuthProfileMigrationCandidates({
-        databasePath,
-        candidates,
-        hasCredentials: () => Object.keys(selected.profiles).length > 0,
-      });
     };
-    const assertCurrent = () => {
-      assertOwnerCurrent();
-      if (credentialOwnerChanged()) {
-        throw new Error("Auth profile credential owner changed during usage preparation");
-      }
-    };
-    assertOwnerCurrent();
+    await prepareAuthProfileMigrationCandidates({
+      databasePath,
+      candidates,
+      hasCredentials: Object.keys(selected.profiles).length > 0,
+      assertCurrent,
+    });
+    assertCurrent();
     const providerAliases = resolveProviderAuthAliasMap({ env });
     let recordingStarted = false;
     const operation = consume({
       observed,
       async record(reduction, providerKey) {
         recordingStarted = true;
-        const reconcileRemovedProfile = async (): Promise<AuthProfileUsageReceipt | undefined> => {
-          assertOwnerCurrent();
-          if (!credentialOwnerChanged()) {
-            return undefined;
-          }
-          const currentRows = await read(databasePath);
-          assertOwnerCurrent();
-          const current = loadPersistedAuthProfileStoreFromRows(currentRows, databasePath) ?? {
-            version: AUTH_STORE_VERSION,
-            profiles: {},
-          };
-          const fresh = scopedSharedStore
-            ? mergeAuthProfileStores(scopedSharedStore, current)
-            : current;
-          if (fresh.profiles[profileId]) {
-            throw new Error("Auth profile credential owner changed during usage preparation");
-          }
-          // A preceding removal settles without dispatching a write or publishing stale rows.
-          return createAuthProfileUsageReceipt(fresh);
-        };
-        const input: AuthProfileUsageInput = structuredClone({
+        const input: AuthProfileUsageInput = {
           profileId,
           reduction,
           inherited,
@@ -264,7 +224,7 @@ export async function withAuthProfileUsage<T>(
           providerAliases,
           scopedSharedStore,
           expectedCredential: selected.profiles[profileId],
-        });
+        };
         let receipt: AuthProfileUsageReceipt | undefined;
         const publish = async (
           result: AuthProfileUsageResult,
@@ -279,7 +239,7 @@ export async function withAuthProfileUsage<T>(
           committed = receipt;
           if (receipt.result) {
             await publishInlineAuthFailure(owner, receipt, readTarget, assertCurrent);
-            store.usageStats = { ...store.usageStats, [profileId]: receipt.result.next };
+            store.usageStats = { ...store.usageStats, [profileId]: receipt.result };
             if (reduction.kind === "success" && !inherited) {
               store.lastGood = {
                 ...Object.fromEntries(
@@ -296,10 +256,6 @@ export async function withAuthProfileUsage<T>(
         };
         try {
           if (databasePath === context.admission.databasePath) {
-            const removed = await reconcileRemovedProfile();
-            if (removed) {
-              return removed;
-            }
             return await runOpenClawStateWorkerOperation(
               context,
               async (scope) =>
@@ -325,10 +281,6 @@ export async function withAuthProfileUsage<T>(
           return await runOpenClawAgentWriteAdmission(
             target,
             async () => {
-              const removed = await reconcileRemovedProfile();
-              if (removed) {
-                return removed;
-              }
               const client = await openOpenClawAgentSqliteWorkerStore<InlineAuthFailureOperations>(
                 target,
                 { execution },

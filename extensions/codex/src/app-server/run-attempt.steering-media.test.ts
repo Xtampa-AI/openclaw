@@ -70,7 +70,6 @@ async function createMediaFixture(scenario: Scenario, managed = false) {
     name: params.modelId,
     input: ["text", "image"],
   };
-  params.toolAuthorityFingerprint = "steering-media-authority";
   await fs.mkdir(params.workspaceDir, { recursive: true });
   let mediaDir = params.workspaceDir;
   if (managed) {
@@ -175,7 +174,9 @@ async function createMediaFixture(scenario: Scenario, managed = false) {
   const options: QueueOptions = {
     debounceMs: 0,
     isInboundUserMessage: true,
-    toolAuthorityFingerprint: params.toolAuthorityFingerprint,
+    get toolAuthorityFingerprint() {
+      return params.toolAuthorityFingerprint;
+    },
     waitForTranscriptCommit: true,
     images: mixed ? [inline] : [],
     // Deliberately disagree with the recorder's canonical facts and layout.
@@ -255,16 +256,15 @@ async function withActiveMediaTurn(
   vi.useFakeTimers();
   const controller = new AbortController();
   const started = createDeferred<void>();
-  const run = runCodexAppServerAttempt({
-    ...fixture.params,
-    abortSignal: controller.signal,
-    onAgentEvent: (event) => {
-      if (event.stream === "lifecycle" && event.data.phase === "start") {
-        started.resolve();
-      }
-      return fixture.params.onAgentEvent?.(event);
-    },
-  });
+  const onAgentEvent = fixture.params.onAgentEvent;
+  fixture.params.abortSignal = controller.signal;
+  fixture.params.onAgentEvent = (event) => {
+    if (event.stream === "lifecycle" && event.data.phase === "start") {
+      started.resolve();
+    }
+    return onAgentEvent?.(event);
+  };
+  const run = runCodexAppServerAttempt(fixture.params);
   try {
     // Polling waitFor advances fake time while cold runtime preparation is still loading.
     await started.promise;

@@ -9,11 +9,10 @@ import type {
   SourceDeliveryTarget,
 } from "./source-delivery-plan.types.js";
 import { normalizeTargetForProvider } from "./target-normalization.js";
+
 export type {
-  SourceDeliveryMessageToolTarget,
   SourceDeliveryOutcome,
   SourceDeliveryPlan,
-  SourceDeliveryTarget,
   SourceDeliveryVisibleDelivery,
 } from "./source-delivery-plan.types.js";
 

@@ -1,18 +1,28 @@
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { deserialize } from "node:v8";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isRecord, isStringArray } from "@openclaw/normalization-core/record-coerce";
 import { scheduleOpenClawCompileCacheFlush } from "../../node-compile-cache.mjs";
+import type { AuthProfileReadDatabaseOpener } from "../agents/auth-profiles/sqlite-read-pool.js";
 import { routeLogsToStderr } from "../logging/console.js";
 import { withArtifactPreservingStateReads } from "../state/artifact-preserving-state-reads.js";
+import { assertStateDatabaseAccessAllowed } from "./gateway-state-owner.js";
 import { jsonFieldBatches } from "./json-field-transfer.js";
+import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { isPrivateDirectoryCreationRefused } from "./private-directory-creation.js";
 import { SQLITE_READONLY_CHILD_ARG } from "./runtime-process-entrypoints.js";
+import { useConnectionScopedSqliteDatabaseAdmissionFacts } from "./sqlite-database-admission.js";
 import {
   formatSqliteErrorCodeSuffix,
   formatSqliteReadOnlyInspectionFailure,
   isSqliteLockError,
+  sqliteExtendedResultCode,
 } from "./sqlite-error-diagnostics.js";
+import { hasVerifiedLiveSqliteOwner } from "./sqlite-live-owner.js";
+import {
+  forkSqlitePrivateSnapshotInProcess,
+  readSqlitePrivateSnapshotFamily,
+} from "./sqlite-private-snapshot-fork.js";
 import { readSqliteAuthSchema } from "./sqlite-readonly-auth-schema.js";
 import { encodeSqliteAuthTransferFrame } from "./sqlite-readonly-auth-transfer.js";
 import {
@@ -31,9 +41,11 @@ import {
   SQLITE_READONLY_WORKER_MAX_BUFFER,
   SQLITE_INSPECTION_CONTENTION_PREFIX,
   SQLITE_SNAPSHOT_ALLOCATION_REFUSED_PREFIX,
+  SQLITE_SNAPSHOT_CAPACITY_PREFIX,
   isSqliteSnapshotStagingMode,
   type SqliteReadOnlyWorkerResult,
 } from "./sqlite-readonly-worker-protocol.js";
+import { isSqliteSnapshotCapacityError } from "./sqlite-snapshot-capacity-error.js";
 import { beginSqliteSnapshotRetirement } from "./sqlite-snapshot-retirement.js";
 import {
   createSqliteSnapshotStagingTokenSync,
@@ -57,10 +69,17 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
   const stagingRoot = args[2] || undefined;
   if (
     (mode !== "sync" &&
+      mode !== "private-fork" &&
+      mode !== "update-generation" &&
       mode !== "async" &&
+      mode !== "staged-sync" &&
+      mode !== "staged-async" &&
+      mode !== "metadata" &&
+      mode !== "backup-engine" &&
+      mode !== "backup-engine-preserving" &&
+      mode !== "state-sqlite-populated" &&
       mode !== "consolidated" &&
       mode !== "reclaim" &&
-      mode !== "update-generation" &&
       !isSqliteSnapshotStagingMode(mode)) ||
     !pathname
   ) {
@@ -70,23 +89,54 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
     };
   }
   try {
-    if (args.length > 4 || (args[3] !== undefined && mode !== "sync")) {
-      throw new Error(
-        "SQLite source identity is supported only for artifact-preserving sync copies",
-      );
-    }
-    if (mode === "update-generation") {
-      // Committed generation reads need SQLite; keep them off the lightweight
-      // source-revision worker and its standalone build graph.
-      const { readUpdateDatabaseGenerationObservation } =
-        await import("./update-database-generations.js");
-      return {
-        ok: true,
-        generation: JSON.stringify(readUpdateDatabaseGenerationObservation(pathname)),
-      };
+    if (
+      args.length > 4 ||
+      (args[3] !== undefined &&
+        mode !== "sync" &&
+        mode !== "staged-sync" &&
+        mode !== "metadata" &&
+        mode !== "backup-engine" &&
+        mode !== "backup-engine-preserving" &&
+        mode !== "private-fork")
+    ) {
+      throw new Error("SQLite source identity is supported only for sync or metadata snapshots");
     }
     const expectedSourceIdentity =
-      args[3] === undefined ? undefined : readDatabaseFileIdentity(JSON.parse(args[3]));
+      args[3] === undefined || mode === "private-fork"
+        ? undefined
+        : readDatabaseFileIdentity(JSON.parse(args[3]));
+    const staged = mode === "staged-sync" || mode === "staged-async";
+    if (staged && !stagingRoot) {
+      throw new Error("SQLite staged snapshot requires its owner-allocated directory");
+    }
+    if (mode === "state-sqlite-populated") {
+      const [{ inspectPhysicalStoreInProcess }, { inspectStateSqlite }] = await Promise.all([
+        import("./database-engine/physical-store-inspection.js"),
+        import("../state/openclaw-state-db-engine.js"),
+      ]);
+      return {
+        ok: true,
+        hasExistingData: await inspectPhysicalStoreInProcess(pathname, true, (db) => {
+          const facts = inspectStateSqlite(db);
+          return !facts.hasEngineAnchor && facts.hasExistingData;
+        }),
+      };
+    }
+    if (mode === "backup-engine" || mode === "backup-engine-preserving") {
+      const { readBackupEngineInProcess } =
+        await import("./database-engine/physical-store-inspection.js");
+      return {
+        ok: true,
+        engine: await readBackupEngineInProcess(pathname, mode === "backup-engine-preserving"),
+      };
+    }
+    if (mode === "update-generation") {
+      const { readUpdateDatabaseGenerations } = await import("./update-database-generations.js");
+      return {
+        ok: true,
+        generation: JSON.stringify(readUpdateDatabaseGenerations([pathname])[pathname]),
+      };
+    }
     if (mode === "staging-reconcile") {
       reconcileSqliteSnapshotRetirement(pathname);
       return { ok: true, location: pathname };
@@ -146,7 +196,16 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
       return { ok: true, warnings };
     }
     let prepared: PreparedSqliteReadOnlyLocation;
-    if (mode === "consolidated") {
+    if (mode === "private-fork") {
+      if (!stagingRoot || args[3] === undefined) {
+        throw new Error("SQLite private fork requires staging and its captured family");
+      }
+      prepared = await forkSqlitePrivateSnapshotInProcess(
+        pathname,
+        readSqlitePrivateSnapshotFamily(JSON.parse(args[3])),
+        stagingRoot,
+      );
+    } else if (mode === "consolidated") {
       if (!stagingRoot || path.dirname(path.resolve(pathname)) !== path.resolve(stagingRoot)) {
         throw new Error(
           "SQLite consolidation requires its caller-owned private snapshot directory",
@@ -155,11 +214,37 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
       // The backup owner admits a child staging token before reading the private
       // WAL family. Parent loss cannot let reclamation race its native backup.
       prepared = await createOnlineReadOnlyBackup(pathname, stagingRoot);
+    } else if (mode === "metadata") {
+      if (!expectedSourceIdentity) {
+        throw new Error("SQLite metadata snapshot requires a captured source identity");
+      }
+      assertExistingDatabaseIdentity(
+        pathname,
+        expectedSourceIdentity.key,
+        expectedSourceIdentity.birthtime,
+      );
+      assertStateDatabaseAccessAllowed(pathname);
+      const liveOwner = hasVerifiedLiveSqliteOwner(pathname);
+      prepared = liveOwner
+        ? await createOnlineReadOnlyBackup(pathname, stagingRoot)
+        : await prepareSqliteReadOnlyCopyInProcess(pathname, stagingRoot, expectedSourceIdentity);
+      try {
+        assertExistingDatabaseIdentity(
+          pathname,
+          expectedSourceIdentity.key,
+          expectedSourceIdentity.birthtime,
+        );
+        assertStateDatabaseAccessAllowed(pathname);
+      } catch (error) {
+        await prepared.cleanupAsync();
+        throw error;
+      }
     } else {
+      const destination = staged && stagingRoot ? { directory: stagingRoot } : stagingRoot;
       prepared =
-        mode === "sync"
-          ? await prepareSqliteReadOnlyCopyInProcess(pathname, stagingRoot, expectedSourceIdentity)
-          : await prepareSqliteReadOnlyLocationInProcess(pathname, stagingRoot);
+        mode === "sync" || mode === "staged-sync"
+          ? await prepareSqliteReadOnlyCopyInProcess(pathname, destination, expectedSourceIdentity)
+          : await prepareSqliteReadOnlyLocationInProcess(pathname, destination);
     }
     releaseSnapshotTempDirectory(prepared.cleanupRoot ?? path.dirname(prepared.location));
     return { ok: true, location: prepared.location };
@@ -169,10 +254,19 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
       (mode === "staging-create" || mode === "staging-create-legacy") &&
       isPrivateDirectoryCreationRefused(error);
     const prefix =
+      (isSqliteSnapshotCapacityError(error) ? SQLITE_SNAPSHOT_CAPACITY_PREFIX : "") +
       (contention ? SQLITE_INSPECTION_CONTENTION_PREFIX : "") +
       (allocationRefused ? SQLITE_SNAPSHOT_ALLOCATION_REFUSED_PREFIX : "");
+    // Only engine probes transport native codes; released snapshot responses stay unchanged.
+    const errcode =
+      mode === "backup-engine" ||
+      mode === "backup-engine-preserving" ||
+      mode === "state-sqlite-populated"
+        ? sqliteExtendedResultCode(error)
+        : undefined;
     return {
       ok: false,
+      ...(errcode === undefined ? {} : { errcode }),
       message: `${prefix}${formatSqliteReadOnlyInspectionFailure(error)}`,
     };
   }
@@ -306,7 +400,8 @@ function runSession(): void {
         if (
           !isRecord(read) ||
           typeof read.expectedIdentity !== "string" ||
-          !read.expectedIdentity.startsWith("file:")
+          !read.expectedIdentity.startsWith("file:") ||
+          (read.expectedBirthtime !== undefined && typeof read.expectedBirthtime !== "string")
         ) {
           throw new Error(
             operation
@@ -314,7 +409,7 @@ function runSession(): void {
               : "Auth profile read requires captured physical ownership",
           );
         }
-        const { expectedIdentity } = read;
+        const { expectedIdentity, expectedBirthtime } = read;
         if (operation) {
           if (typeof read.command !== "string") {
             throw new Error("Invalid SQLite read-only operation encoding");
@@ -331,12 +426,12 @@ function runSession(): void {
           if (!sqliteReadOnlyOperations.has(request)) {
             throw new Error(`Unknown SQLite read-only operation: ${request.type}`);
           }
-          assertExistingDatabaseIdentity(pathname, expectedIdentity);
-          const value = await sqliteReadOnlyOperations.execute(request, {
+          assertExistingDatabaseIdentity(pathname, expectedIdentity, expectedBirthtime);
+          const value = sqliteReadOnlyOperations.execute(request, {
             path: pathname,
             env: process.env,
           });
-          assertExistingDatabaseIdentity(pathname, expectedIdentity);
+          assertExistingDatabaseIdentity(pathname, expectedIdentity, expectedBirthtime);
           const handle = transfers.start(
             [{ kind: "result", value: { operation: request.type, value } }].values(),
             { kinds: ["result"] },
@@ -348,12 +443,18 @@ function runSession(): void {
         // Domain code stays child-only; importing it from the host would reverse storage ownership.
         const { readAuthProfileRowsReadOnly } =
           await import("../agents/auth-profiles/sqlite-json.js");
+        const openReadOnlyDatabase: AuthProfileReadDatabaseOpener =
+          read.artifactPreserving === true
+            ? (await import("./sqlite-snapshot-source.js")).openSqliteReadOnlyDatabase
+            : (databasePath, options) =>
+                openNodeSqliteDatabase(databasePath, { ...options, readOnly: true });
         if (stopping) {
           return;
         }
-        assertExistingDatabaseIdentity(pathname, expectedIdentity);
+        assertExistingDatabaseIdentity(pathname, expectedIdentity, expectedBirthtime);
         const rows = readAuthProfileRowsReadOnly(
           pathname,
+          openReadOnlyDatabase,
           readSqliteAuthSchema(read.schema),
           expectedIdentity,
           read.retainReader === true,
@@ -361,7 +462,7 @@ function runSession(): void {
         if (read.artifactPreserving === true) {
           rows.cacheable = false;
         }
-        assertExistingDatabaseIdentity(pathname, expectedIdentity);
+        assertExistingDatabaseIdentity(pathname, expectedIdentity, expectedBirthtime);
         function* rowFields() {
           for (const batch of jsonFieldBatches(rows)) {
             yield { kind: "fields", value: batch };
@@ -389,9 +490,10 @@ function runSession(): void {
       typeof message.id !== "number" ||
       !Number.isSafeInteger(message.id) ||
       !("args" in message) ||
-      !Array.isArray(message.args) ||
-      (message.args[0] !== "sync" && !isSqliteSnapshotStagingMode(message.args[0])) ||
-      !message.args.every((arg): arg is string => typeof arg === "string")
+      !isStringArray(message.args) ||
+      (message.args[0] !== "sync" &&
+        message.args[0] !== "private-fork" &&
+        !isSqliteSnapshotStagingMode(message.args[0]))
     ) {
       stop(true);
       return;
@@ -418,6 +520,7 @@ function runSession(): void {
 if (process.argv[2] === SQLITE_READONLY_CHILD_ARG) {
   // One-shot stdout is the JSON result, and sessions may inherit a JSON caller's stdout.
   routeLogsToStderr();
+  useConnectionScopedSqliteDatabaseAdmissionFacts();
   if (process.argv[3] === "session" && process.send) {
     runSession();
   } else {

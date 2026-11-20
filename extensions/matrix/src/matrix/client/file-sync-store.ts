@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   MemoryStore,
   SyncAccumulator,
@@ -6,9 +7,10 @@ import {
   type IStoredClientOpts,
 } from "matrix-js-sdk/lib/matrix.js";
 import { createAsyncLock } from "openclaw/plugin-sdk/async-lock-runtime";
+import { materializeErrorStack } from "openclaw/plugin-sdk/error-runtime";
 import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { getMatrixRuntime } from "../../runtime.js";
-import { LogService } from "../sdk/logger.js";
+import { emitMatrixLog, LogService } from "../sdk/logger.js";
 import { claimCurrentTokenStorageState } from "./storage.js";
 import {
   MATRIX_SYNC_CACHE_VERSION,
@@ -22,6 +24,11 @@ import {
 
 const PERSIST_DEBOUNCE_MS = 250;
 
+export type MatrixSyncIngressHandler = (
+  sync: ISyncResponse,
+  context: { hasSavedSync: boolean },
+) => Promise<void>;
+
 function syncDataToSyncResponse(syncData: ISyncData): ISyncResponse {
   return {
     next_batch: syncData.nextBatch,
@@ -33,6 +40,30 @@ function syncDataToSyncResponse(syncData: ISyncData): ISyncResponse {
 }
 
 export class SqliteBackedMatrixSyncStore extends MemoryStore {
+  private readonly diagnosticId = randomUUID();
+  private diagnosticCount = 0;
+  private observe(phase: string, facts: Record<string, string | number | boolean> = {}): void {
+    if (this.diagnosticCount >= 48) {
+      return;
+    }
+    this.diagnosticCount += 1;
+    try {
+      emitMatrixLog("debug", "MatrixSyncIngress", [
+        JSON.stringify({
+          store: this.diagnosticId,
+          sequence: this.diagnosticCount,
+          phase,
+          bound: Boolean(this.syncIngressHandler),
+          frozen: this.frozen,
+          admissionPending: this.syncIngressAdmission !== null,
+          ...facts,
+          exhausted: this.diagnosticCount === 48,
+        }),
+      ]);
+    } catch {
+      // Diagnostics cannot change sync-cursor custody.
+    }
+  }
   private readonly persistLock = createAsyncLock();
   private readonly accumulator = new SyncAccumulator();
   private savedSync: ISyncData | null = null;
@@ -44,6 +75,8 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
   private frozen = false;
   private persistTimer: NodeJS.Timeout | null = null;
   private persistPromise: Promise<void> | null = null;
+  private syncIngressHandler: MatrixSyncIngressHandler | undefined;
+  private syncIngressAdmission: Promise<void> | null = null;
 
   static async create(storageRootDir: string): Promise<SqliteBackedMatrixSyncStore> {
     let store: PluginStateKeyedStore<MatrixSyncCacheRecord, 2> | undefined;
@@ -55,6 +88,7 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
       );
       persisted = await readPersistedStoreFromStore({ storageRootDir, store });
     } catch (error) {
+      materializeErrorStack(error);
       unavailableError = error;
       LogService.warn("MatrixSyncCacheStore", "Failed to load Matrix sync cache:", error);
     }
@@ -95,6 +129,38 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
     return this.hadCleanShutdownOnLoad;
   }
 
+  async bindSyncIngress(handler: MatrixSyncIngressHandler): Promise<() => void> {
+    if (this.frozen || this.syncIngressHandler) {
+      throw new Error("Matrix sync ingress is already bound or the sync store is frozen");
+    }
+    this.syncIngressHandler = handler;
+    this.observe("bound", { savedSync: this.savedSync !== null });
+    const dispose = () => {
+      if (this.syncIngressHandler === handler) {
+        this.observe("unbound");
+        this.syncIngressHandler = undefined;
+      }
+    };
+    try {
+      if (this.savedSync) {
+        const cachedSync = syncDataToSyncResponse(this.savedSync);
+        await this.runSyncIngress(() => handler(cachedSync, { hasSavedSync: true }));
+      }
+    } catch (error) {
+      dispose();
+      throw error;
+    }
+    return dispose;
+  }
+
+  override setSyncToken(token: string): void {
+    // Classic sync assigns its next token before delivering events. Admission
+    // owns that advance while bound, including in-memory retries after failure.
+    if (!this.frozen && !this.syncIngressHandler) {
+      super.setSyncToken(token);
+    }
+  }
+
   override getSavedSync(): Promise<ISyncData | null> {
     return Promise.resolve(this.savedSync ? structuredClone(this.savedSync) : null);
   }
@@ -103,14 +169,62 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
     return Promise.resolve(this.savedSync?.nextBatch ?? null);
   }
 
-  override setSyncData(syncData: ISyncResponse): Promise<void> {
-    if (this.frozen) {
-      return Promise.resolve();
+  override async setSyncData(syncData: ISyncResponse): Promise<void> {
+    const eventCount =
+      this.diagnosticCount < 48
+        ? [
+            ...Object.values(syncData.rooms?.join ?? {}),
+            ...Object.values(syncData.rooms?.leave ?? {}),
+          ].reduce((count, room) => count + (room.timeline?.events?.length ?? 0), 0)
+        : 0;
+    if (eventCount > 0) {
+      this.observe("sync-received", { eventCount });
     }
+    if (this.frozen) {
+      return;
+    }
+    const handler = this.syncIngressHandler;
+    if (handler) {
+      await this.runSyncIngress(async () => {
+        if (eventCount > 0) {
+          this.observe("handler-entered");
+        }
+        await handler(syncData, { hasSavedSync: this.hadSavedSyncOnLoad });
+        if (eventCount > 0) {
+          this.observe("handler-returned");
+        }
+        if (!this.frozen) {
+          super.setSyncToken(syncData.next_batch);
+          this.acceptSyncData(syncData);
+          if (eventCount > 0) {
+            this.observe("cursor-accepted");
+          }
+        }
+      });
+      return;
+    }
+    this.acceptSyncData(syncData);
+    if (eventCount > 0) {
+      this.observe("cursor-accepted-unbound");
+    }
+  }
+
+  private acceptSyncData(syncData: ISyncResponse): void {
     this.accumulator.accumulate(syncData);
     this.savedSync = this.accumulator.getJSON();
     this.markDirtyAndSchedulePersist();
-    return Promise.resolve();
+  }
+
+  private runSyncIngress(operation: () => Promise<void>): Promise<void> {
+    const pending = Promise.resolve(this.syncIngressAdmission)
+      .then(operation)
+      .finally(() => {
+        if (this.syncIngressAdmission === pending) {
+          this.syncIngressAdmission = null;
+        }
+      });
+    this.syncIngressAdmission = pending;
+    return pending;
   }
 
   override getClientOptions() {
@@ -161,6 +275,7 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
   async freezeSyncCursorPersistence(): Promise<void> {
     this.frozen = true;
     this.clearPersistTimer();
+    await this.syncIngressAdmission;
     while (this.persistPromise) {
       await this.persistPromise;
     }
@@ -213,11 +328,9 @@ export class SqliteBackedMatrixSyncStore extends MemoryStore {
     this.dirty = false;
     const payload: PersistedMatrixSyncStore = {
       version: MATRIX_SYNC_CACHE_VERSION,
-      savedSync: this.savedSync ? structuredClone(this.savedSync) : null,
+      savedSync: this.savedSync,
       cleanShutdown: this.cleanShutdown,
-      ...(this.savedClientOptions
-        ? { clientOptions: structuredClone(this.savedClientOptions) }
-        : {}),
+      ...(this.savedClientOptions ? { clientOptions: this.savedClientOptions } : {}),
     };
     try {
       await writeMatrixSyncCacheStateToStore({

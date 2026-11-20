@@ -5,7 +5,7 @@ import {
   listSessionTranscriptCorpusEntriesForAgent as listSessionTranscriptCorpusEntriesFromHost,
   readSessionResetRecallCutoff as readSessionResetRecallCutoffFromHost,
 } from "../../packages/memory-host-sdk/src/engine-sessions.js";
-import { assertBoundIncognitoMemorySyncAccess } from "../../packages/memory-host-sdk/src/host/session-memory-authority.js";
+import { assertBoundIncognitoMemorySyncAccess } from "../../packages/memory-host-sdk/src/host/openclaw-runtime-session.js";
 import {
   listSessionTranscriptArchivesReadOnly,
   listSessionTranscriptInstances,
@@ -55,7 +55,7 @@ export async function loadMemorySearchSessionStore(
   };
 }
 
-/** @deprecated Await loadArchivedSessionsAsync. Final compatibility day: 2026-12-31. */
+/** @deprecated Await loadArchivedSessionsAsync. Final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
 export function loadArchivedSessions(
   params: Parameters<typeof listSessionTranscriptArchivesReadOnly>[0],
 ) {
@@ -77,7 +77,6 @@ export {
   extractKeywords,
   isCronRunSessionKey,
   isDreamingNarrativeSessionStoreKey,
-  matchesSessionEntryPrefixHash,
   parseUsageCountedSessionIdFromFileName,
   readTranscriptStatsBatchReadOnlyAsync,
   readTranscriptStatsBatchReadOnlySync,
@@ -85,6 +84,8 @@ export {
   sessionPathForSessionIdentity,
   statSessionEntry,
   statSessionEntrySync,
+  streamSessionEntries,
+  streamSessionEntry,
 } from "../../packages/memory-host-sdk/src/engine-sessions.js";
 
 // Internal actor sources are not part of the released plugin call signatures.
@@ -102,12 +103,15 @@ export const readSessionResetRecallCutoff: (
 ) => ReturnType<typeof readSessionResetRecallCutoffFromHost> = readSessionResetRecallCutoffFromHost;
 
 export type {
+  SessionEntryPage,
+  SessionEntryStream,
+  SessionEntrySummary,
   SessionFileEntry,
   SessionFileState,
   SessionTranscriptCorpusEntry,
 } from "../../packages/memory-host-sdk/src/engine-sessions.js";
 
-/** @deprecated Await loadMemorySessionMetadataAsync. Final compatibility day: 2026-12-31. */
+/** @deprecated Await loadMemorySessionMetadataAsync. Final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
 export function loadMemorySessionMetadata(params: {
   agentId: string;
   sessionId: string;
@@ -186,7 +190,7 @@ export async function loadMemorySessionMetadataBatchAsync(params: {
   );
 }
 
-/** @deprecated Await resolveMemorySessionTargetsAsync. Final compatibility day: 2026-12-31. */
+/** @deprecated Await resolveMemorySessionTargetsAsync. Final compatibility day: 2026-12-31. Removal in the first January 2027 stable release. */
 export function resolveMemorySessionTargets(params: MemorySessionSelectors): MemorySessionTarget[] {
   warnPluginSdkDeprecation({
     family: "memory-session-sync-inventory",

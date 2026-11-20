@@ -1,21 +1,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
-import { SqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
+import { observeDiagnosticsTimelinePhases } from "../../infra/diagnostics-timeline.js";
+import { wrapSqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
+import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import type { AgentDatabaseRequestExecutionSource } from "../../state/openclaw-agent-execution-admission-contract.js";
 import { captureOpenClawAgentDatabaseExecution } from "../../state/openclaw-agent-execution.js";
 import { captureSessionPendingInputWorkerCustody } from "./session-accessor.sqlite-pending-inputs.js";
+import { prepareSqliteScope } from "./session-accessor.sqlite-read-scope.js";
 import { prepareSessionEntryReplacementDatabase } from "./session-accessor.sqlite-replacement-worker.js";
-import { resolveSqliteSessionKey } from "./session-accessor.sqlite-scope-helpers.js";
+import {
+  resolveSqliteSessionKey,
+  toDatabaseOptions,
+} from "./session-accessor.sqlite-scope-helpers.js";
 import type { SessionEntryTargetPatchScope } from "./session-accessor.types.js";
 import type {
   SessionActor,
   SessionActorAuthority,
   SessionActorLifetime,
 } from "./session-actor-contract.js";
+import { acquireSessionActorStorage } from "./session-actor-storage-acquisition.js";
 import {
   getSessionActorStorageBinding,
-  acquireSessionActorStorage,
   captureSessionActorStorageOwner,
 } from "./session-actor-storage-binding.js";
 import type { SessionActorStorageAuthority } from "./session-actor-storage-contract.js";
@@ -75,7 +81,7 @@ export async function acquireSessionInputActor(
     ...requestedTarget,
     target: { ...requestedTarget.target, canonicalKey: sessionKey },
   };
-  const database = {
+  let database = {
     agentId,
     path: target.readSource?.path ?? target.storePath,
     env: target.env,
@@ -102,6 +108,22 @@ export async function acquireSessionInputActor(
           databaseIdentity: memory.actor.target.database.incarnation,
         },
       },
+    };
+  }
+  if (!target.readSource) {
+    // Fresh targets retain a logical selector; the scope owner selects its physical store.
+    const prepared = toDatabaseOptions(
+      await prepareSqliteScope({
+        agentId,
+        storePath: target.storePath,
+        sessionKey,
+        env: target.env,
+      }),
+    );
+    database = {
+      agentId: prepared.agentId,
+      path: resolveOpenClawAgentSqlitePath(prepared),
+      env: prepared.env,
     };
   }
   const { createSessionActorFactory } = await import("./session-actor-durable.js");
@@ -159,7 +181,10 @@ export function withSessionInputActor<T>(
   return inputActor.run(binding, run);
 }
 
-export async function getSessionInputActor(scope: { agentId: string; sessionKey: string }) {
+export async function getSessionInputActor(
+  scope: { agentId: string; sessionKey: string },
+  targetPending = false,
+) {
   const binding = inputActor.getStore();
   if (!binding) {
     const memory = getSessionActorStorageBinding(scope);
@@ -192,11 +217,14 @@ export async function getSessionInputActor(scope: { agentId: string; sessionKey:
     }
     return undefined;
   }
+  using acquisitionPhase = observeDiagnosticsTimelinePhases("session.inputActor.acquire");
   const acquired = await binding.acquire();
+  acquisitionPhase[Symbol.dispose]();
   if (!acquired) {
     return undefined;
   }
   if (
+    !targetPending &&
     acquired.target.target.canonicalKey !== resolveSqliteSessionKey(scope.sessionKey, scope.agentId)
   ) {
     throw new Error("Input actor differs from the recorder's admitted target");
@@ -225,15 +253,15 @@ export async function getSessionInputActor(scope: { agentId: string; sessionKey:
 export function throwSessionInputActorFailure(
   outcome: {
     kind: "rolled-back" | "stale-version" | "unknown";
-    error: { name: string; message: string };
+    error: { name: string; message: string; cause?: unknown };
   },
   authorityFailure?: unknown,
 ): never {
   if (outcome.kind === "unknown") {
-    throw new SqliteWorkerError(outcome.error.message, "outcome-unknown");
+    throw wrapSqliteWorkerError(outcome.error.message, "outcome-unknown", outcome.error);
   }
   if (authorityFailure !== undefined) {
     throw toErrorObject(authorityFailure, "Input actor authority rejected the operation");
   }
-  throw Object.assign(new Error(outcome.error.message), { name: outcome.error.name });
+  throw toErrorObject(outcome.error, outcome.error.message);
 }

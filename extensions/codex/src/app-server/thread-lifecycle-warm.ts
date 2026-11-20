@@ -12,16 +12,14 @@ import {
   unsubscribeCodexThreadBestEffort,
 } from "./attempt-client-cleanup.js";
 import {
-  isCodexAppServerLiveThreadBackgroundOnly,
-  waitForCodexAppServerThreadBackgroundCleanup,
-} from "./client-runtime-thread-state.js";
-import {
   consumeCodexAppServerLiveThread,
   isCodexAppServerClientRuntimeLive,
   isCodexAppServerLiveThreadClaimed,
+  isCodexAppServerLiveThreadBackgroundOnly,
   isCodexAppServerLiveThreadProtected,
   releaseCodexAppServerLiveThread,
   readCodexLiveThreadEphemeralPolicy,
+  waitForCodexAppServerThreadBackgroundCleanup,
 } from "./client-runtime.js";
 import { wasCodexAppServerThreadClosed } from "./client-thread-closure.js";
 import { createCodexEphemeralThreadPolicy } from "./client-thread-owner.js";
@@ -313,7 +311,9 @@ export async function releaseCodexBoundLiveThread(
           );
         }
         // Siblings may keep the old process alive after this exact thread stops.
-        await racePromiseWithAbortSignal(Promise.race(stopped), options.signal, exitWaitAbortError);
+        await options.lifecycleTiming.measure("retired-thread-runtime-release", () =>
+          racePromiseWithAbortSignal(Promise.race(stopped), options.signal, exitWaitAbortError),
+        );
       } else if (released && threadClosed) {
         // A live previous owner keeps the per-home writer lock until it unloads the thread
         // (codex rollout/src/writer_lock.rs); managed clients unload on unsubscribe. A
@@ -387,16 +387,7 @@ export async function tryReuseCodexLiveThread(
       if (!creationPolicy && params.appServer.serviceTier === "ultrafast") {
         throw new CodexIncognitoPolicyChangeError("compaction settings");
       }
-      await params.buildFinalConfigPatch?.(
-        {
-          action: "resume",
-          binding,
-          ...(options.nativeModelInputTools
-            ? { nativeModelInputTools: options.nativeModelInputTools }
-            : {}),
-        },
-        params.client,
-      );
+      await prepareCodexThreadFinalConfigPatch(params, options.nativeModelInputTools, binding);
       throwIfAborted();
       params.assertCurrent?.();
       return { kind: "ready", binding: { ...binding, lifecycle: { action: "resumed" } } };
@@ -404,12 +395,7 @@ export async function tryReuseCodexLiveThread(
     return { kind: "rotate" };
   }
 
-  if (
-    !binding.clientId ||
-    binding.clientId !== clientId ||
-    (params.inferenceRoute && !getCodexInferenceThread(params.client, binding.threadId)) ||
-    (ringZeroActive && !incognito)
-  ) {
+  if (!binding.clientId || binding.clientId !== clientId || (ringZeroActive && !incognito)) {
     return { kind: "resume" };
   }
 

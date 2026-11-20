@@ -68,6 +68,16 @@ Details: [Plugins](/tools/plugin)
 Self-hosted Mattermost on a private/LAN/tailnet address: outbound Mattermost API requests pass through an SSRF guard that blocks private and internal IPs by default. Opt in with `channels.mattermost.network.dangerouslyAllowPrivateNetwork: true` (per account: `channels.mattermost.accounts.<id>.network.dangerouslyAllowPrivateNetwork`).
 </Note>
 
+## Inbound batching
+
+Set `messages.inbound.byChannel.mattermost` (milliseconds) to combine rapid,
+consecutive text posts from the same sender in the same channel and thread.
+The default is the global `messages.inbound.debounceMs`, or `0` when unset.
+A different sender or thread ends the previous batch; attachments and control
+commands flush buffered text before their own dispatch. Channel batches preserve
+arrival order through turn admission. Stopping the monitor cancels buffered work
+and leaves unadopted durable posts available for recovery.
+
 ## Native slash commands
 
 Native slash commands are opt-in. When enabled, OpenClaw registers `oc_*` slash commands on every team the bot is a member of and receives callback POSTs on the gateway HTTP server.
@@ -257,6 +267,39 @@ Example:
 }
 ```
 
+## Posts from other bots
+
+Mattermost marks every post created by a bot account with `from_bot`. OpenClaw uses that marker to tell bot posts apart from human posts. The receiving bot's own posts are always ignored.
+
+`channels.mattermost.allowBots` controls whether posts from other bot accounts can start a turn:
+
+- `true` (default): bot posts follow the same access and mention rules as human posts.
+- `"mentions"`: in channels, a bot post must @mention this bot, match a mention pattern, or use an `onchar` prefix. Thread participation does not count, so two bots replying in the same thread cannot keep waking each other. Unmentioned bot posts are kept as channel context. Direct messages from bots are unaffected.
+- `false`: bot posts are ignored.
+
+Account values override the channel-wide value. For an individual channel, `groups.<channelId>.allowBots` overrides `groups["*"].allowBots`, then the account value.
+
+Accepted bot posts pass through [bot loop protection](/channels/bot-loop-protection). When two bots exchange more than `maxEventsPerWindow` posts in one channel within `windowSeconds`, the receiving bot ignores the other one for `cooldownSeconds`. Set `channels.mattermost.botLoopProtection`, `channels.mattermost.accounts.<id>.botLoopProtection`, or `channels.mattermost.groups.<channelId>.botLoopProtection`; values merge key by key over `groups["*"]`, the account, and `channels.defaults.botLoopProtection`. Each suppressed post is logged as `mattermost: drop bot post (bot-loop-protection channel=<id> sender=<id>)`.
+
+The default budget (20 posts in 60 seconds) stops fast loops. Agent replies often take tens of seconds, so two agents sharing a channel can stay under it. For that setup, combine `allowBots: "mentions"` with a longer window:
+
+```json5
+{
+  channels: {
+    mattermost: {
+      allowBots: "mentions",
+      botLoopProtection: {
+        maxEventsPerWindow: 6,
+        windowSeconds: 600,
+        cooldownSeconds: 1800,
+      },
+    },
+  },
+}
+```
+
+Only Mattermost bot accounts carry the marker. An integration that posts with a regular user's access token looks like a person to OpenClaw.
+
 ## Targets for outbound delivery
 
 Use these target formats with `openclaw message send` or cron/webhooks:
@@ -269,6 +312,7 @@ Use these target formats with `openclaw message send` or cron/webhooks:
 | `@username`                         | DM (username resolved via the Mattermost API)                 |
 
 Outbound sends support at most one attachment per message; split multiple files into separate sends.
+Unsupported binary attachment objects are rejected before any message is posted.
 
 Set `channels.mattermost.mediaMaxMb` to limit each inbound download and outbound
 attachment in MiB. `accounts.<id>.mediaMaxMb` overrides the channel root, then
@@ -391,7 +435,11 @@ Send messages with clickable buttons. When a user clicks a button, the agent rec
 
 Buttons come from the semantic `presentation` payload (in normal agent replies and in `message action=send`). OpenClaw renders value buttons as Mattermost interactive buttons, keeps URL buttons visible in the message text, and downgrades select menus to readable text.
 
-The options an `ask_user` question offers are also rendered as buttons, and tapping one answers
+Mattermost does not expose OpenClaw's built-in [`ask_user`](/tools/ask-user) tool.
+The agent asks in ordinary messages instead. Native agent runtimes can have
+their own question tools, whose behavior is separate from this availability rule.
+
+The options in a runtime-authored question are rendered as buttons, and tapping one answers
 that question directly. The question stays answerable by typing, and an option the Gateway does
 not index stays in the prose instead: the "Other…" choice, and any prompt that asks more than one
 question or whose question is multi-select, secret, or does not offer two to four distinct options.

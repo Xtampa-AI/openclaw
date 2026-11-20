@@ -3,8 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
-import { hasErrnoCode } from "./errno.js";
-import { executeGitCommand, gitNullConfigPath, normalizeGitPathForFilesystem } from "./git-exec.js";
+import { ignoreMissingPath } from "./errno.js";
+import {
+  executeGitCommand,
+  gitNullConfigPath,
+  normalizeGitPathForFilesystem,
+  quoteGitConfig,
+} from "./git-exec.js";
 import {
   DEV_BRANCH,
   isBetaTag,
@@ -16,15 +21,19 @@ import { compareSemverStrings } from "./update-check.js";
 import { isFullGitObjectId, type DevUpdateTarget } from "./update-dev-target.js";
 import {
   readGitRefFetchTarget,
-  readGitTargetSchemaVersions,
   readGitUpdateFetchTarget,
   type GitFetchTarget,
 } from "./update-git-metadata.js";
 import { cleanupUpdateTemporaryDirectory } from "./update-maintenance.js";
 import { isFailedUpdateStep } from "./update-run-step.js";
 import { runStep } from "./update-runner-command.js";
-import { createGitStepFactory, gitCleanCheckArgs } from "./update-runner-git-commands.js";
+import {
+  createGitStepFactory,
+  gitCleanCheckArgs,
+  resolveGitNoLazyFetchArgs,
+} from "./update-runner-git-commands.js";
 import { runGitCandidatePreflight } from "./update-runner-git-preflight.js";
+import { readGitTargetSchemaVersions } from "./update-runner-git-schema.js";
 import { runClassifiedGitStep } from "./update-runner-git-steps.js";
 import type { CommandRunner, RunStepOptions, UpdateRunnerOptions } from "./update-runner-types.js";
 import type { UpdateStepResult } from "./update-step-result.js";
@@ -71,10 +80,23 @@ export async function classifyPartialCloneGitFailure(params: {
         'git fetch "<promisor-remote>" --stdin).',
     );
   }
-  const fsck = await params
-    .runCommand(
-      ["git", "--no-lazy-fetch", "-C", params.root, "fsck", "--connectivity-only", "--no-dangling"],
-      { cwd: params.root, timeoutMs: params.timeoutMs },
+  const fsck = await resolveGitNoLazyFetchArgs(params.runCommand, {
+    cwd: params.root,
+    timeoutMs: params.timeoutMs,
+  })
+    .then((noLazyFetchArgs) =>
+      params.runCommand(
+        [
+          "git",
+          ...noLazyFetchArgs,
+          "-C",
+          params.root,
+          "fsck",
+          "--connectivity-only",
+          "--no-dangling",
+        ],
+        { cwd: params.root, timeoutMs: params.timeoutMs },
+      ),
     )
     .catch(() => undefined);
   const fsckOutput = `${fsck?.stdout ?? ""}\n${fsck?.stderr ?? ""}`.trim();
@@ -86,10 +108,6 @@ export async function classifyPartialCloneGitFailure(params: {
       "corruption with git fsck. Retry the update; if it recurs, inspect the repository with " +
       "git fsck before attempting repair.",
   );
-}
-
-function quoteGitConfig(value: string): string {
-  return `"${value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"').replace(/\n/gu, "\\n").replace(/\t/gu, "\\t").replaceAll("\b", "\\b")}"`;
 }
 
 function gitConfigEntry(key: string, value: string): string {
@@ -163,11 +181,7 @@ export async function withGitTargetInspectionRoot<T>(
     );
     await fs
       .copyFile(path.resolve(params.root, shallow), path.join(inspectionRoot, "shallow"))
-      .catch((error: unknown) => {
-        if (!hasErrnoCode(error, "ENOENT")) {
-          throw error;
-        }
-      });
+      .catch(ignoreMissingPath);
     const objectIds = new Set<string>();
     const branchObjects = new Set<string>();
     for (const ref of refs.trim().split("\n").filter(Boolean)) {
@@ -308,6 +322,9 @@ export async function prepareGitMutation(params: {
           ...(target.databaseEngines === undefined
             ? {}
             : { databaseEngines: target.databaseEngines }),
+          ...(target.postgresFamilies === undefined
+            ? {}
+            : { postgresFamilies: target.postgresFamilies }),
         }
       : { metadataUnreadable: target.reason }),
   });
@@ -380,11 +397,17 @@ export async function fetchGitUpdateTarget(params: {
   let devSource: (GitFetchTarget & { revision?: string }) | null = null;
   const result = (ok: boolean) => ({ ok, refreshedRemotes, ...(devSource ? { devSource } : {}) });
   if (channel === "dev" && devTarget?.mode === "detached" && isFullGitObjectId(devTarget.ref)) {
-    // A pinned commit needs no remote freshness. Probe privately without allowing
-    // promised-object hydration; the normal candidate/transfer owners still verify its contents.
+    // A pinned commit needs no remote freshness. Avoid promised-object hydration
+    // when Git supports it; candidate/transfer owners still verify its contents.
+    const probe = step("git-resolve-target");
+    const noLazyFetchArgs = await resolveGitNoLazyFetchArgs(probe.runCommand, {
+      cwd: root,
+      timeoutMs: probe.timeoutMs,
+      env: probe.env,
+    });
     const options = step(
       "git-resolve-target",
-      "--no-lazy-fetch",
+      ...noLazyFetchArgs,
       "cat-file",
       "--batch-check=%(objectname) %(objecttype)",
     );
@@ -458,21 +481,22 @@ export async function fetchGitUpdateTarget(params: {
   // Implicit Dev updates use the same live source as discovery. Only an explicit
   // detached target may search for its requested object on other remotes.
   const authority =
-    channel !== "dev"
-      ? tagRemote
-      : devTarget?.mode === "detached"
-        ? (targetRemote ?? (targetRef?.startsWith("refs/heads/") ? "origin" : undefined))
-        : devSource?.remote;
+    devTarget?.mode === "detached"
+      ? (targetRemote ?? (targetRef?.startsWith("refs/heads/") ? "origin" : undefined))
+      : devSource?.remote;
   if (channel === "dev" && devTarget?.mode !== "detached" && !devSource) {
     return devTarget ? { ...result(false), reason: "tracked-upstream-invalid" } : result(true);
   }
-  const fetchRemotes = authority
-    ? [authority]
-    : channel !== "dev" || remoteRef || targetRef?.startsWith("refs/tags/")
+  const fetchRemotes =
+    channel !== "dev"
       ? []
-      : targetRef && !isFullGitObjectId(targetRef)
-        ? remotes.filter((candidate) => candidate === "origin")
-        : remotes;
+      : authority
+        ? [authority]
+        : remoteRef || targetRef?.startsWith("refs/tags/")
+          ? []
+          : targetRef && !isFullGitObjectId(targetRef)
+            ? remotes.filter((candidate) => candidate === "origin")
+            : remotes;
   const fetchConfigKey = `remote.${devSource?.remote}.fetch`;
   const exclusions = devSource
     ? await runStep(step("git-config-update-upstream", "config", "--get-all", fetchConfigKey))

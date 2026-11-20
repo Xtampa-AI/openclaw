@@ -483,7 +483,14 @@ wait_for_run() {
       break
     fi
     jobs_json="$(gh_read run view --repo "$GITHUB_REPOSITORY" "$run_id" --json jobs --jq '.jobs' || true)"
-    failed_json="$(jq -c '[.[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")]' <<< "${jobs_json}")" || return 1
+    # Job-level continue-on-error preserves the run conclusion, not raw job results.
+    # Only this notification is optional; publication and admission failures still block.
+    failed_json="$(jq -c --arg workflow "$workflow" '
+      [.[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")
+        | select(($workflow == "openclaw-npm-release.yml" and
+          .name == "Notify Windows of published Gateway packages" and
+          (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")) | not)]
+    ' <<< "${jobs_json}")" || return 1
     if [[ -n "${failed_json}" ]] && jq -e 'length > 0' <<< "$failed_json" >/dev/null; then
       echo "${workflow} has failed jobs before the workflow completed: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}" >&2
       jq '.[] | {name, conclusion, url}' <<< "$failed_json" >&2 || true
@@ -741,16 +748,42 @@ write_clawhub_runtime_state() {
     --bootstrap-completed "${plugin_clawhub_bootstrap_completed:-false}" > "${output_path}"
 }
 
+# Rendering and canonical readback share the frozen notice context.
+run_github_release_notes() {
+  local regular_stable_version="" notice_body_file="" release_json
+  local -a render_args=(
+    --root "${GITHUB_WORKSPACE}" --ref "${TARGET_SHA}"
+    --tag "${RELEASE_TAG}" --repository "${GITHUB_REPOSITORY}"
+    "$@"
+  )
+  if [[ "${RELEASE_NPM_DIST_TAG:-}" == "extended-stable" ]]; then
+    render_args+=(--main-package-version "$(jq -er '.version | strings' "${GITHUB_WORKSPACE}/.release-harness/package.json")")
+    if [[ -f "${RUNNER_TEMP}/release-notes.md" ]]; then
+      # Preparation already froze Latest. Reuse it across later workflow steps.
+      notice_body_file="${RUNNER_TEMP}/release-notes.md"
+    elif release_json="$(gh_read release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft,body 2>/dev/null)" &&
+      [[ "$(printf '%s' "${release_json}" | jq -r .isDraft)" == false ]]; then
+      # A fresh recovery keeps the public notice even after Latest has advanced.
+      notice_body_file="${RUNNER_TEMP}/existing-public-release-body.md"
+      printf '%s' "${release_json}" | jq -er '.body | strings' > "${notice_body_file}" || return 1
+      assert_initial_release_body "$(cat "${notice_body_file}")" || return 1
+    fi
+    if [[ -n "${notice_body_file}" ]]; then
+      render_args+=(--notice-body "${notice_body_file}")
+    else
+      regular_stable_version="$(gh_read api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" || return 1
+      render_args+=(--regular-stable-version "${regular_stable_version#v}")
+    fi
+  fi
+  node --import "${GITHUB_WORKSPACE}/.release-harness/scripts/tsx.mjs" "${GITHUB_WORKSPACE}/.release-harness/scripts/render-github-release-notes.mts" \
+    "${render_args[@]}"
+}
+
 render_github_release_notes() {
   local output_file="$1"
   local verification_file="${2:-}"
   local metadata_file="${3:-}"
-  local regular_stable_version=""
   local -a render_args=(
-    node --import "${GITHUB_WORKSPACE}/.release-harness/scripts/tsx.mjs" "${GITHUB_WORKSPACE}/.release-harness/scripts/render-github-release-notes.mts"
-    --root "${GITHUB_WORKSPACE}" --ref "${TARGET_SHA}"
-    --tag "${RELEASE_TAG}"
-    --repository "${GITHUB_REPOSITORY}"
     --output "${output_file}"
   )
 
@@ -763,11 +796,7 @@ render_github_release_notes() {
   if [[ -n "${metadata_file}" ]]; then
     render_args+=(--metadata-output "${metadata_file}")
   fi
-  if [[ "${RELEASE_NPM_DIST_TAG:-}" == "extended-stable" ]]; then
-    regular_stable_version="$(jq -er '.version | strings' "${GITHUB_WORKSPACE}/.release-harness/package.json")"
-    render_args+=(--regular-stable-version "${regular_stable_version}")
-  fi
-  "${render_args[@]}"
+  run_github_release_notes "${render_args[@]}"
 }
 
 verify_release_tag_target() {
@@ -797,14 +826,12 @@ verify_release_tag_target() {
 canonical_release_body_matches() {
   local body_file="$1"
   local -a verify_args=(
-    --root "$GITHUB_WORKSPACE" --ref "$TARGET_SHA"
-    --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --verify-body "$body_file"
+    --verify-body "$body_file"
   )
   if [[ "${RELEASE_EVIDENCE_MODE}" != "authorized-beta-focused-v1" && -f "${FULL_RELEASE_VALIDATION_MANIFEST_DIR:-}/full-release-validation-manifest.json" ]] && grep -q '^### Release verification$' "$body_file"; then
     verify_args+=(--validation-manifest "${FULL_RELEASE_VALIDATION_MANIFEST_DIR}/full-release-validation-manifest.json")
   fi
-  node --import "${GITHUB_WORKSPACE}/.release-harness/scripts/tsx.mjs" "${GITHUB_WORKSPACE}/.release-harness/scripts/render-github-release-notes.mts" \
-    "${verify_args[@]}"
+  run_github_release_notes "${verify_args[@]}"
 }
 
 assert_initial_release_body() {
@@ -1249,7 +1276,7 @@ sync_npm_beta_floor() {
 verify_published_release() {
   local release_version evidence_path canonical_evidence_path clawhub_runtime_state_path bootstrap_run_arg_present
   local expected_attempt expected_id run_attempt run_id run_label run_url target_sha
-  local validation_file workflow_ref telegram_waiver verifier
+  local validation_file workflow_ref verifier
   local -a verify_args
 
   release_version="${RELEASE_TAG#v}"
@@ -1340,13 +1367,8 @@ verify_published_release() {
     echo "Release validation evidence changed after prepublish validation." >&2
     exit 1
   fi
-  telegram_waiver=""
-  if [[ "${RELEASE_EVIDENCE_MODE}" != "authorized-beta-focused-v1" ]]; then
-    telegram_waiver="$(jq -r '.validationInputs.telegramWaiver // ""' "${validation_file}")"
-  fi
   run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
   jq \
-    --arg telegram_waiver "${telegram_waiver}" \
     --arg release_publish_run_id "$GITHUB_RUN_ID" \
     --arg validation_label "${run_label}" \
     --arg validation_run_id "${run_id}" \
@@ -1354,7 +1376,6 @@ verify_published_release() {
     --arg validation_target_sha "${target_sha}" \
     --arg validation_url "${run_url}" \
     --arg validation_workflow_ref "${workflow_ref}" '
-      (if $telegram_waiver == "" then . else .telegramWaiver = $telegram_waiver end) |
       .releasePublishRunId = $release_publish_run_id |
       .workflowRuns += [{
         id: $validation_run_id,
@@ -1391,9 +1412,7 @@ append_release_proof_to_github_release() {
   tarball="$(jq -er '.openclawNpmTarball | select(type == "string" and length > 0)' "${evidence_path}")"
   integrity="$(jq -er '.openclawNpmIntegrity | select(type == "string" and length > 0)' "${evidence_path}")"
 
-  if [[ "$(jq -r '.telegramWaiver // ""' "${evidence_path}")" == "${release_version}-owner-approved" ]]; then
-    telegram_line="- Telegram integration checks: waived by the release owner for ${release_version} (source QA, Package Acceptance, published-package E2E); not run."
-  elif [[ -n "${NPM_TELEGRAM_RUN_ID// }" ]]; then
+  if [[ -n "${NPM_TELEGRAM_RUN_ID// }" ]]; then
     telegram_line="- npm Telegram beta E2E: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${NPM_TELEGRAM_RUN_ID}"
   else
     telegram_line="- npm Telegram beta E2E: not supplied"

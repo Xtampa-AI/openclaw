@@ -4,7 +4,6 @@ import {
   markdownToText,
   sanitizeHtml,
   stripInvisibleUnicode,
-  type WebContentExtractionRequest,
   type WebContentExtractorPlugin,
 } from "openclaw/plugin-sdk/web-content-extractor";
 
@@ -108,37 +107,38 @@ function exceedsEstimatedHtmlNestingDepth(html: string, maxDepth: number): boole
   return false;
 }
 
-async function extractWithReadability(request: WebContentExtractionRequest) {
-  const cleanHtml = await sanitizeHtml(request.html);
-  if (
-    cleanHtml.length > READABILITY_MAX_HTML_CHARS ||
-    exceedsEstimatedHtmlNestingDepth(cleanHtml, READABILITY_MAX_ESTIMATED_NESTING_DEPTH)
-  ) {
-    return null;
-  }
-  try {
-    const [{ Readability }, { parseHTML }] = await loadReadabilityDeps();
-    const { document } = parseHTML(cleanHtml, { location: { href: request.url } });
-    const textMode = request.extractMode === "text";
-    const reader = new Readability(document);
-    const parsed = reader.parse();
-    if (!parsed) {
-      return null;
-    }
-    const title = parsed.title || undefined;
-    const rendered = htmlToMarkdown(parsed.content ?? "", { linksAsText: textMode });
-    const text = stripInvisibleUnicode(textMode ? markdownToText(rendered.text) : rendered.text);
-    return text ? { text, title: title ?? rendered.title } : null;
-  } catch {
-    return null;
-  }
-}
-
 export function createReadabilityWebContentExtractor(): WebContentExtractorPlugin {
   return {
     id: "readability",
     label: "Readability",
     autoDetectOrder: 10,
-    extract: extractWithReadability,
+    extract: async (request) => {
+      const cleanHtml = await sanitizeHtml(request.html);
+      if (
+        cleanHtml.length > READABILITY_MAX_HTML_CHARS ||
+        exceedsEstimatedHtmlNestingDepth(cleanHtml, READABILITY_MAX_ESTIMATED_NESTING_DEPTH)
+      ) {
+        return null;
+      }
+      try {
+        const [{ Readability }, { parseHTML }] = await loadReadabilityDeps();
+        const { document } = parseHTML(cleanHtml, { location: { href: request.url } });
+        const textMode = request.extractMode === "text";
+        const reader = new Readability(document);
+        const parsed = reader.parse();
+        if (!parsed) {
+          return null;
+        }
+        const title = parsed.title || undefined;
+        // Render the selected HTML because textContent joins adjacent block elements.
+        const rendered = htmlToMarkdown(parsed.content ?? "", { linksAsText: textMode });
+        const text = stripInvisibleUnicode(
+          textMode ? markdownToText(rendered.text) : rendered.text,
+        );
+        return text ? { text, title: title ?? rendered.title } : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }

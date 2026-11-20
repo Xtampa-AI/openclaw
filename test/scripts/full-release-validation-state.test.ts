@@ -233,19 +233,19 @@ describe("full release execution plan", () => {
       ]),
       blockers: [expect.objectContaining({ kind: "reused_evidence_invalid" })],
     });
-    const differentTooling = runPlanSubprocess(
+    const unverifiableTooling = runPlanSubprocess(
       {
         childPhaseVersion: 3,
         childReuse: { normalCi: { ...selection, workflowSha: "c".repeat(40) } },
       },
       { PATH: `${root}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}` },
     );
-    expect(differentTooling.result.status).toBe(2);
-    expect(JSON.parse(readFileSync(differentTooling.output, "utf8"))).toMatchObject({
+    expect(unverifiableTooling.result.status).toBe(2);
+    expect(JSON.parse(readFileSync(unverifiableTooling.output, "utf8"))).toMatchObject({
       blockers: [
         expect.objectContaining({
           kind: "reused_evidence_invalid",
-          message: expect.stringContaining("same tooling is required"),
+          message: expect.stringContaining("invalid workflow commit tree"),
         }),
       ],
     });
@@ -281,54 +281,101 @@ describe("full release execution plan", () => {
     expect(affectedActiveRunIds([reused], [{ runId: "101" }])).toEqual([]);
   });
 
-  it("retains the published empty retry field in the original execution-plan digest", () => {
-    const current = executionPlan(
-      { childPhaseVersion: 3, rerunGroup: "ci" },
-      { attemptEvidenceVersion: 3, candidateRequest: canonicalCandidateRequest() },
-    );
-    // The published v2026.9.6 artifact hashes this ordered wire shape.
-    const digestPayload = {
-      knownFlakyJobs: [],
-      ...Object.fromEntries(
-        [
-          "attemptEvidenceVersion",
-          "blockers",
-          "candidate",
-          "candidateRequest",
-          "children",
-          "errors",
-          "evidenceReuse",
-          "gates",
-          "kind",
-          "parentRunAttempt",
-          "parentRunId",
-          "releaseProfile",
-          "repository",
-          "rerunGroup",
-          "targetSha",
-          "trustedWorkflow",
-          "version",
-          "workflowRef",
-          "workflowSha",
-        ].map((key) => [key, current[key]]),
-      ),
-    };
-    const retained = {
-      ...current,
-      knownFlakyJobs: [],
-      sha256: createHash("sha256").update(JSON.stringify(digestPayload)).digest("hex"),
-    };
-    const before = JSON.stringify(retained);
-    expect(validateReleaseExecutionPlanArtifact(retained)).toEqual(retained);
-    expect(JSON.stringify(retained)).toBe(before);
-    expect(retained.sha256).not.toBe(current.sha256);
-    expect(() =>
-      validateReleaseExecutionPlanArtifact({ ...retained, knownFlakyJobs: ["normalCi:test"] }),
-    ).toThrow("knownFlakyJobs must be empty");
-    expect(() =>
-      validateReleaseExecutionPlanArtifact({ ...retained, knownFlakyJobs: undefined }),
-    ).toThrow("knownFlakyJobs must be empty");
-  });
+  it.each([
+    { includeVersion: false, coveragePolicy: undefined },
+    { includeVersion: true, coveragePolicy: undefined },
+    { includeVersion: true, coveragePolicy: "npm-beta-v1" },
+    { includeVersion: true, coveragePolicy: "npm-stable-v1" },
+  ])(
+    "reads retained $coveragePolicy plans with targetVersion=$includeVersion",
+    ({ includeVersion, coveragePolicy }) => {
+      const coverage = coveragePolicy
+        ? coveragePolicy === "npm-beta-v1"
+          ? betaCoverage
+          : stableCoverage
+        : undefined;
+      const current = coverage
+        ? coveragePlan(coverage)
+        : executionPlan(
+            { childPhaseVersion: 3, rerunGroup: "ci" },
+            {
+              attemptEvidenceVersion: 3,
+              candidateRequest: canonicalCandidateRequest(),
+              candidate: candidateBinding(),
+            },
+          );
+      const recorded = { ...current };
+      if (!includeVersion) {
+        delete recorded.targetVersion;
+      }
+      // Reproduce the shipped wire ordering, not the current writer's digest.
+      // Empty retired retry metadata is part of the recorded wire shape, not a grant.
+      const digestPayload = {
+        ...(coveragePolicy ? { targetVersion: recorded.targetVersion, coveragePolicy } : {}),
+        knownFlakyJobs: [],
+        ...Object.fromEntries(
+          [
+            "attemptEvidenceVersion",
+            "blockers",
+            "candidate",
+            "candidateRequest",
+            "children",
+            "errors",
+            "evidenceReuse",
+            "gates",
+            "kind",
+            "parentRunAttempt",
+            "parentRunId",
+            "releaseProfile",
+            "repository",
+            "rerunGroup",
+            "targetSha",
+            ...(includeVersion && !coveragePolicy ? ["targetVersion"] : []),
+            "trustedWorkflow",
+            "version",
+            "workflowRef",
+            "workflowSha",
+          ].map((key) => [key, recorded[key]]),
+        ),
+      };
+      const retained = {
+        ...recorded,
+        knownFlakyJobs: [],
+        sha256: createHash("sha256").update(JSON.stringify(digestPayload)).digest("hex"),
+      };
+      const before = serializeReleaseArtifact(retained);
+      const root = tempDirs.make("frv-retained-plan-");
+      const output = join(root, "plan.json");
+      writeFileSync(output, before);
+      const restored = runCollector("plan", {
+        FULL_RELEASE_EXECUTION_PLAN_PATH: output,
+        FULL_RELEASE_RESTORE_PLAN: "true",
+        FULL_RELEASE_PLAN_INPUTS_JSON: "must-not-be-read",
+        CANDIDATE_REQUEST_JSON: JSON.stringify(current.candidateRequest),
+        RELEASE_PROFILE: coverage?.releaseProfile ?? "stable",
+        RERUN_GROUP: coverage?.rerunGroup ?? "ci",
+        ...(coveragePolicy ? { COVERAGE_POLICY: coveragePolicy } : {}),
+      });
+      expect(restored.status, restored.stderr).toBe(0);
+      expect(readFileSync(output, "utf8")).toBe(before);
+      expect(validateReleaseExecutionPlanArtifact(retained)).toEqual(retained);
+      expect(serializeReleaseArtifact(retained)).toBe(before);
+      expect(retained.sha256).not.toBe(current.sha256);
+      expect(() =>
+        validateReleaseExecutionPlanArtifact({ ...retained, knownFlakyJobs: ["normalCi:test"] }),
+      ).toThrow("knownFlakyJobs must be empty");
+      expect(() =>
+        validateReleaseExecutionPlanArtifact({ ...retained, knownFlakyJobs: undefined }),
+      ).toThrow("knownFlakyJobs must be empty");
+      const wrongVersion = { ...retained, targetVersion: "2026.8.2" };
+      wrongVersion.sha256 = releaseExecutionPlanSha256(wrongVersion);
+      expect(() => validateReleaseExecutionPlanArtifact(wrongVersion)).toThrow(
+        coveragePolicy
+          ? "release coverage policy"
+          : "release candidate binding request differs from the execution plan",
+      );
+    },
+  );
 
   it("preserves legacy embedded-manifest reuse bytes across repeated validation", () => {
     const candidate = candidateBinding();
@@ -678,83 +725,6 @@ describe("full release execution plan", () => {
     },
   );
 
-  it.each([{ liveSuiteFilter: "TELEGRAM" }, { releasePackageSpec: "openclaw@2026.8.2" }])(
-    "rejects a Telegram waiver outside its owner-approved scope: %j",
-    (override) => {
-      expect(() =>
-        plan({
-          telegramWaiver: "2026.8.1-owner-approved",
-          targetVersion: "2026.8.1",
-          releaseProfile: "stable",
-          ...override,
-        }),
-      ).toThrow(/Telegram waiver/u);
-    },
-  );
-
-  it("seals the Telegram waiver and exact version 2026.9.5 into the immutable plan", () => {
-    const version = "2026.9.5";
-    const waiver = { telegramWaiver: `${version}-owner-approved`, targetVersion: version };
-    const artifact = executionPlan(
-      {
-        ...waiver,
-        releaseProfile: "stable",
-        releasePackageSpec: `openclaw@${version}`,
-        children: {},
-      },
-      waiver,
-    );
-    expect(validateReleaseExecutionPlanArtifact(artifact)).toMatchObject(waiver);
-    for (const result of ["success", "failure"]) {
-      const claimed = {
-        ...artifact,
-        children: artifact.children.map((plannedChild) =>
-          plannedChild.key === "npmTelegram" ? { ...plannedChild, result } : plannedChild,
-        ),
-      };
-      expect(() =>
-        validateReleaseExecutionPlanArtifact({
-          ...claimed,
-          sha256: releaseExecutionPlanSha256(claimed),
-        }),
-      ).toThrow("Telegram waiver requires an unrun Telegram child");
-    }
-    const changed = { ...artifact, targetVersion: "2026.8.2" };
-    expect(() => validateReleaseExecutionPlanArtifact(changed)).toThrow(/digest/u);
-    expect(() =>
-      validateReleaseExecutionPlanArtifact({
-        ...changed,
-        sha256: releaseExecutionPlanSha256(changed),
-      }),
-    ).toThrow(/Telegram waiver/u);
-    expect(() => validateReleaseExecutionPlanArtifact(artifact, { telegramWaiver: "" })).toThrow(
-      /Telegram waiver/u,
-    );
-    const candidate = candidateBinding();
-    expect(() =>
-      executionPlan(
-        { ...waiver, releaseProfile: "stable", children: {} },
-        { ...waiver, attemptEvidenceVersion: 2, candidate, candidateRequest: candidate.request },
-      ),
-    ).toThrow("Telegram waiver target version differs from the release candidate");
-    const manifest = fullReleaseCandidateManifestFixture(candidateRequestInput());
-    manifest.package.version = version;
-    const matchingCandidate = buildFullReleaseCandidateBinding({
-      manifest,
-      artifact: candidate.evidenceArtifact,
-    });
-    const sealedCandidatePlan = executionPlan(
-      { ...waiver, releaseProfile: "stable", children: {} },
-      {
-        ...waiver,
-        attemptEvidenceVersion: 2,
-        candidate: matchingCandidate,
-        candidateRequest: matchingCandidate.request,
-      },
-    );
-    expect(validateReleaseExecutionPlanArtifact(sealedCandidatePlan)).toMatchObject(waiver);
-  });
-
   it.each([
     ["target", { targetSha: "c".repeat(40) }],
     ["soak", { releaseSoak: false }],
@@ -1068,12 +1038,6 @@ process.stdout.write(JSON.stringify({
         },
       },
     );
-    expect(() =>
-      validateReleaseExecutionPlanArtifact({
-        ...artifact,
-        targetVersion: "2026.8.29",
-      }),
-    ).toThrow("digest");
     const incompleteArtifact = {
       ...artifact,
       evidenceReuse: { ...artifact.evidenceReuse, selectedRunId: "" },
@@ -1468,7 +1432,11 @@ describe("release decision policy", () => {
     expect(classifyReleaseSnapshot({ children: [snapshot] }).state).toBe("blocked_complete");
   });
 
-  it("accepts a human child rerun with retained earlier jobs in a reused plan", async () => {
+  it("accepts a targeted runtime child rerun with retained sibling evidence", async () => {
+    const runtime = "bun";
+    const sibling = "node";
+    const failedName = `checks-node-core-fast-isolated (${runtime})`;
+    const siblingName = `checks-node-core-fast-isolated (${sibling})`;
     const original = child("normalCi");
     const planned = hydrateReusedPlan([original], {
       children: [
@@ -1493,22 +1461,35 @@ describe("release decision policy", () => {
       readAttemptJobs: async (_runId, attempt) =>
         attempt === 1
           ? [
-              { name: "lint", status: "completed", conclusion: "success" },
-              { name: "test", status: "completed", conclusion: "failure" },
+              { name: siblingName, status: "completed", conclusion: "success" },
+              { name: failedName, status: "completed", conclusion: "failure" },
             ]
-          : [{ name: "test", status: "completed", conclusion: "success" }],
+          : [{ name: failedName, status: "completed", conclusion: "success" }],
     });
     expect(result.errors).toEqual([]);
+    expect(terminalPolicyPass(result)).toBe(true);
+    expect(classifyReleaseSnapshot({ children: [result] }).state).toBe("passed");
     expect(result).toMatchObject({
       observedRunAttempts: [1, 2],
       plannedRunAttempt: 1,
       runAttempt: 2,
       triggeringActor: "release-operator",
     });
-    expect(result.jobs).toEqual([
-      expect.objectContaining({ name: "lint", acceptedRunAttempt: 1, conclusion: "success" }),
-      expect.objectContaining({ name: "test", acceptedRunAttempt: 2, conclusion: "success" }),
-    ]);
+    expect(result.jobs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: siblingName,
+          acceptedRunAttempt: 1,
+          conclusion: "success",
+        }),
+        expect.objectContaining({
+          name: failedName,
+          acceptedRunAttempt: 2,
+          conclusion: "success",
+        }),
+      ]),
+    );
+    expect(result.jobs).toHaveLength(2);
   });
 
   it.each(["queued", "in_progress"])(
@@ -1880,6 +1861,43 @@ describe("release state artifacts", () => {
       stateExpected(),
     );
   }
+
+  it("carries recovered parent gate outcomes through selection and final verification", () => {
+    const base = executionPlan({ rerunGroup: "ci" });
+    const sealedPlan = {
+      ...base,
+      gates: base.gates.map((gate: Record<string, any>) =>
+        gate.name === "Qualify release npm artifacts"
+          ? Object.assign({}, gate, { required: true, result: "failure" })
+          : gate,
+      ),
+    };
+    sealedPlan.sha256 = releaseExecutionPlanSha256(sealedPlan);
+    const effectiveGates = sealedPlan.gates.map((gate: Record<string, any>) =>
+      gate.name === "Qualify release npm artifacts"
+        ? Object.assign({}, gate, { result: "success" })
+        : gate,
+    );
+    const decision = collectorArtifact("decision", 2, sealedPlan);
+    const drain = collectorArtifact("drain", 2, sealedPlan);
+    const expected = { ...stateExpected(), effectiveGates };
+
+    expect(() => selectPair(sealedPlan, decision, drain)).toThrow(
+      "release decision omits baseline blockers",
+    );
+    expect(
+      selectReleaseStateArtifacts(
+        sealedPlan,
+        [{ name: "full-release-decision-77-2", payload: decision }],
+        [{ name: "full-release-diagnostics-77-2", payload: drain }],
+        expected,
+      ),
+    ).toMatchObject({ decision: { state: "passed" }, drain: { state: "passed" } });
+    expect(verifyReleaseStateArtifacts(sealedPlan, decision, drain, expected)).toMatchObject({
+      decision: { state: "passed" },
+      drain: { state: "passed" },
+    });
+  });
 
   it("uses one policy for decision, drain, and final verification", () => {
     expect(
@@ -2781,7 +2799,6 @@ console.log(JSON.stringify({
     { name: "unchanged evidence artifact", mutation: "none", blocker: "" },
     {
       name: "changed evidence artifact",
-      waived: false,
       mutation: "digest",
       blocker: "provenance_mismatch",
     },
@@ -2865,17 +2882,21 @@ printf '%s\\n' '{"id":101,"event":"workflow_dispatch","path":".github/workflows/
     }
   });
 
-  it.each([
-    { rerunGroup: "ci", childKey: "normalCi", jobName: "test", conclusion: "success" },
-    {
-      rerunGroup: "ci",
-      childKey: "normalCi",
-      jobName: "install-smoke (linux)",
-      conclusion: "failure",
-    },
-  ])(
-    "binds the $rerunGroup manifest to the candidate ($conclusion proof jobs)",
-    ({ rerunGroup, childKey, jobName, conclusion }) => {
+  it.each(
+    [
+      { rerunGroup: "ci", childKey: "normalCi", jobName: "test", conclusion: "success" },
+      {
+        rerunGroup: "ci",
+        childKey: "normalCi",
+        jobName: "install-smoke (linux)",
+        conclusion: "failure",
+      },
+    ].flatMap((entry) =>
+      [true, false].map((recordVersion) => Object.assign({}, entry, { recordVersion })),
+    ),
+  )(
+    "binds the $rerunGroup manifest to the candidate ($conclusion proof jobs, recorded version=$recordVersion)",
+    ({ rerunGroup, childKey, jobName, conclusion, recordVersion }) => {
       const root = tempDirs.make("frv-generated-candidate-manifest-");
       const decisionPath = join(root, "decision.json");
       const drainPath = join(root, "drain.json");
@@ -2886,6 +2907,10 @@ printf '%s\\n' '{"id":101,"event":"workflow_dispatch","path":".github/workflows/
         { rerunGroup },
         { attemptEvidenceVersion: 2, candidate, candidateRequest: candidate.request },
       );
+      if (!recordVersion) {
+        delete sealedPlan.targetVersion;
+        sealedPlan.sha256 = releaseExecutionPlanSha256(sealedPlan);
+      }
       const plannedChild = sealedPlan.children.find(
         (entry: Record<string, any>) => entry.key === childKey,
       );
@@ -2927,7 +2952,11 @@ printf '%s\\n' '{"id":101,"event":"workflow_dispatch","path":".github/workflows/
         runAttempt: 1,
       });
       const childEvidence = { [childKey]: { ...attempt, effectiveRunAttempt: 1 } };
-      const manifest = { ...generatedManifest(sealedPlan), childEvidence };
+      const manifest = {
+        ...generatedManifest(sealedPlan),
+        validationInputs: { targetVersion: candidate.package.version },
+        childEvidence,
+      };
       writeFileSync(executionPlanPath, JSON.stringify(sealedPlan));
       writeFileSync(decisionPath, JSON.stringify(decisionArtifact));
       writeFileSync(drainPath, JSON.stringify(drainArtifact));

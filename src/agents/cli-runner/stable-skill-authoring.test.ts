@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SkillLibraryAuthoringCapability } from "../../skills/library/authoring.js";
-import { resolveStableCliSkillAuthoring } from "./stable-skill-authoring.js";
+
+let resolveStableCliSkillAuthoring: typeof import("./stable-skill-authoring.js").resolveStableCliSkillAuthoring;
 
 const human = (
   defaultTarget: "workspace" | "personal",
@@ -13,6 +14,11 @@ const human = (
   invoke: async () => {
     throw new Error("live grant must not be reached from an internal turn");
   },
+});
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ resolveStableCliSkillAuthoring } = await import("./stable-skill-authoring.js"));
 });
 
 describe("resolveStableCliSkillAuthoring", () => {

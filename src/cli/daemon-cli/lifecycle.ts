@@ -35,8 +35,13 @@ import {
 import { probePortUsage } from "../../infra/ports-probe.js";
 import { resolveGatewayRestartDrainTimeoutMs } from "../../infra/restart-budget.js";
 import type { GatewayRestartIntent } from "../../infra/restart-intent.js";
-import { hasCommandProcessCleanupError } from "../../process/exec-result.js";
+import {
+  hasCommandProcessCleanupError,
+  ignoreNonCleanupCommandError,
+} from "../../process/exec-result.js";
+import { withCommandProcessScope } from "../../process/exec-spawn.js";
 import { defaultRuntime } from "../../runtime.js";
+import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
 import { createNullWriter } from "../../shared/null-writer.js";
 import { formatCliCommand } from "../command-format.js";
 import {
@@ -50,6 +55,7 @@ import {
 } from "./lifecycle-audit.js";
 import { resolveGatewayConfigPorts, resolveGatewayLifecycleContext } from "./lifecycle-context.js";
 import {
+  commandInterrupted,
   runServiceRestart,
   runServiceStart,
   runServiceStop,
@@ -61,6 +67,7 @@ import {
 } from "./lifecycle-safe-restart.js";
 import { signalGatewayRestart } from "./lifecycle-unmanaged.js";
 import { createDaemonActionContext } from "./response.js";
+import { createGatewayRestartDeadline } from "./restart-health-deadline.js";
 import {
   DEFAULT_RESTART_HEALTH_ATTEMPTS,
   DEFAULT_RESTART_HEALTH_DELAY_MS,
@@ -68,11 +75,11 @@ import {
   renderGatewayPortHealthDiagnostics,
   renderRestartDiagnostics,
   terminateStaleGatewayPids,
+  waitForGatewayHttpReadiness,
   waitForGatewayHealthyListener,
   waitForGatewayHealthyRestart,
 } from "./restart-health.js";
 import { renderGatewayServiceStartHints } from "./shared.js";
-import { verifyGatewayStartReadiness } from "./start-health.js";
 import { repairLoadedGatewayServiceForStart } from "./start-repair.js";
 import type { DaemonLifecycleOptions } from "./types.js";
 
@@ -242,13 +249,23 @@ async function runExternalSupervisorRestart(opts: DaemonLifecycleOptions): Promi
   }
 
   const healthWait = resolveRestartListenerHealthWait(restartIntent);
-  const health = await waitForGatewayHealthyListener({
-    port: lockIdentity.port,
-    attempts: healthWait.attempts,
-    delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
-    previousLockIdentity: signaled.previousLockIdentity,
-    waitIndefinitelyForPreviousOwner: healthWait.waitIndefinitelyForPreviousOwner,
-  });
+  let health: Awaited<ReturnType<typeof waitForGatewayHealthyListener>>;
+  try {
+    health = await waitForGatewayHealthyListener({
+      port: lockIdentity.port,
+      attempts: healthWait.attempts,
+      delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
+      previousLockIdentity: signaled.previousLockIdentity,
+      waitIndefinitelyForPreviousOwner: healthWait.waitIndefinitelyForPreviousOwner,
+      signal: getAsyncWorkSignal(),
+    });
+  } catch (err) {
+    // An accepted interrupt owns the exit status; a cancelled wait is not a restart failure.
+    if (!commandInterrupted(err)) {
+      throw err;
+    }
+    return false;
+  }
   if (!health.healthy) {
     const message = `Gateway restart timed out after ${healthWait.timeoutSeconds}s waiting for health checks.`;
     fail(message, renderGatewayPortHealthDiagnostics(health));
@@ -321,14 +338,62 @@ export async function runDaemonStart(opts: DaemonLifecycleOptions = {}) {
         state,
         issues,
       }),
-    postStartCheck: ({ fail, warnings }) =>
-      verifyGatewayStartReadiness({
-        service,
-        expectedPort,
-        resolveContext: () => resolveGatewayLifecycleContext(service),
-        fail,
-        warnings,
-      }),
+    postStartCheck: async ({ fail, warnings }) => {
+      const { deadlineMs } = resolveGatewayStartupTiming();
+      const context = await resolveGatewayLifecycleContext(service);
+      const port = expectedPort ?? context.port;
+      const deadlineAt = performance.now() + deadlineMs;
+      const attempts = Math.ceil(deadlineMs / DEFAULT_RESTART_HEALTH_DELAY_MS);
+      const healthDeadline = createGatewayRestartDeadline({
+        timeoutMs: deadlineMs,
+        signal: getAsyncWorkSignal(),
+      });
+      const [health, readiness] = await Promise.all([
+        withCommandProcessScope(
+          () =>
+            waitForGatewayHealthyRestart({
+              service,
+              port,
+              attempts,
+              delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
+              timeoutMs: deadlineMs,
+              deadline: healthDeadline,
+              deadlineOutcome: "snapshot",
+              env: context.env,
+              supervisorKeepsAlive: process.platform === "darwin",
+              signal: getAsyncWorkSignal(),
+            }),
+          healthDeadline.signal,
+        ).finally(() => healthDeadline.dispose()),
+        waitForGatewayHttpReadiness({
+          config: context.config,
+          port,
+          attempts,
+          deadlineAt,
+          delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
+          signal: getAsyncWorkSignal(),
+        }),
+      ]);
+      if (health.healthy && readiness.healthz === 200 && readiness.readyz === 200) {
+        return;
+      }
+      warnings.push(...renderRestartDiagnostics(health));
+      warnings.push(
+        `Gateway HTTP readiness: /healthz=${readiness.healthz ?? "unreachable"}; ` +
+          `/readyz=${readiness.readyz ?? "unreachable"}.`,
+      );
+      const failure = formatGatewayRestartFailure({
+        health,
+        port,
+        defaultTimeoutSeconds: Math.round(deadlineMs / 1000),
+        action: "start",
+      });
+      fail(
+        failure.failMessage,
+        [formatCliCommand("openclaw gateway status --deep"), formatCliCommand("openclaw doctor")],
+        health.waitOutcome === "still-starting" ? "still-starting" : undefined,
+      );
+    },
     expectedPort,
     opts,
   });
@@ -352,12 +417,7 @@ export async function runDaemonStop(opts: DaemonLifecycleOptions = {}) {
     stopWhenNotLoaded: process.platform === "darwin" && Boolean(opts.disable),
     onNotLoaded: async ({ stdout }) => {
       if (process.platform === "linux") {
-        const runtime = await service.readRuntime(process.env).catch((error: unknown) => {
-          if (hasCommandProcessCleanupError(error)) {
-            throw error;
-          }
-          return null;
-        });
+        const runtime = await service.readRuntime(process.env).catch(ignoreNonCleanupCommandError);
         if (runtime?.status === "running") {
           // systemd can run a disabled unit with Restart=always. Stop it through
           // systemctl so a process-level SIGTERM cannot trigger a respawn.
@@ -376,12 +436,7 @@ export async function runDaemonStop(opts: DaemonLifecycleOptions = {}) {
       const lock = await readActiveGatewayLockIdentity().catch(() => undefined);
       const ctx = lock
         ? null
-        : await resolveGatewayLifecycleContext(service).catch((error: unknown) => {
-            if (hasCommandProcessCleanupError(error)) {
-              throw error;
-            }
-            return null;
-          });
+        : await resolveGatewayLifecycleContext(service).catch(ignoreNonCleanupCommandError);
       const port = lock?.port ?? ctx?.port ?? (await resolveGatewayConfigPorts()).fallback;
       return await stopGatewayWithoutServiceManager(port, lock?.pid, ctx ?? undefined);
     },
@@ -439,7 +494,7 @@ export async function runDaemonRestart(opts: DaemonLifecycleOptions = {}): Promi
   const restartWaitSeconds = Math.round(restartWaitMs / 1000);
   let unmanagedRestartWait: ReturnType<typeof resolveRestartListenerHealthWait> | undefined;
 
-  return await runServiceRestart({
+  return runServiceRestart({
     serviceNoun: "Gateway",
     service,
     renderStartHints: renderGatewayServiceStartHints,
@@ -469,6 +524,7 @@ export async function runDaemonRestart(opts: DaemonLifecycleOptions = {}): Promi
             env: process.env,
             attempts: restartHealthAttempts,
             delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
+            signal: getAsyncWorkSignal(),
           });
           if (!ready.healthy) {
             throw new Error(
@@ -575,6 +631,7 @@ export async function runDaemonRestart(opts: DaemonLifecycleOptions = {}): Promi
           env: process.env,
           attempts: unmanagedRestartWait?.attempts ?? restartHealthAttempts,
           delayMs: DEFAULT_RESTART_HEALTH_DELAY_MS,
+          signal: getAsyncWorkSignal(),
           ...(unmanagedPreviousLockIdentity
             ? {
                 previousLockIdentity: unmanagedPreviousLockIdentity,
@@ -612,6 +669,7 @@ export async function runDaemonRestart(opts: DaemonLifecycleOptions = {}): Promi
             ? { requirePluginHealth: false }
             : {}),
           supervisorKeepsAlive: process.platform === "darwin",
+          signal: getAsyncWorkSignal(),
         });
       let health = await waitForHealthy();
 

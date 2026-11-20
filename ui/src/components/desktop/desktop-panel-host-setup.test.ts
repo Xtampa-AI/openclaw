@@ -70,15 +70,14 @@ async function mount(
     desktopClientFactory: () => ({ connect }),
     runtimeConfig,
   });
-  mountPanel(panel);
-  const element = panel.element;
+  await mountPanel(panel);
   const button = (name: string) =>
-    Array.from(element.querySelectorAll("button")).find(
+    Array.from(panel.querySelectorAll("button")).find(
       (entry) => (entry.getAttribute("aria-label") ?? entry.textContent)?.trim() === name,
     );
   return {
     runtimeConfig,
-    panel: element,
+    panel,
     request,
     connect,
     button,

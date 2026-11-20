@@ -18,7 +18,6 @@ import * as handoffArtifacts from "./update-managed-service-handoff-artifacts.te
 import type { ManagedServiceBoundaryOptions } from "./update-managed-service-handoff-boundary-contract.test-support.js";
 import {
   awaitEmulatedRecoveryHandoffExit,
-  isManagedServiceInspectionCommand,
   createManagedServiceCommandFixture,
   LAUNCHD_GATEWAY_IDENTITY_ENV,
   waitForHandoffResponse,
@@ -28,10 +27,11 @@ import {
   createManagedServiceLaunchdClockPreload,
   createManagedServiceUpdaterFixtureScript,
   createManagedServiceManagerFixtureScript,
+  isManagedServiceInspectionCommand,
   type ManagedServiceCommandTiming,
   type ManagedServiceManagerBoundaryResult,
 } from "./update-managed-service-handoff-lifecycle.test-support.js";
-import { prepareManagedServiceHelperPreloads } from "./update-managed-service-handoff-parent.test-support.js";
+import { prepareManagedServiceParentPreloads } from "./update-managed-service-handoff-parent.test-support.js";
 import {
   createManagedServiceBoundaryCleanup,
   createManagedServiceBoundaryParent,
@@ -142,19 +142,17 @@ export function createManagedServiceManagerBoundary({
           { env },
         )
       : undefined;
-    const { sourceRuntimeImport, ledgerRuntimeImport, interrupted } =
-      await prepareManagedServiceRuntimeFixture({
-        root,
-        runId: run?.runId,
-        recoveryModulePath,
-        statePath,
-        configPath: env.OPENCLAW_CONFIG_PATH,
-        validationReleasePath,
-        activationGatePath,
-        activationReleasePath,
-        ledger: Boolean(run),
-        options,
-      });
+    const { sourceRuntimeImport, ledgerRuntimeImport } = await prepareManagedServiceRuntimeFixture({
+      recoveryModulePath,
+      statePath,
+      configPath: env.OPENCLAW_CONFIG_PATH,
+      validationReleasePath,
+      activationGatePath,
+      activationReleasePath,
+      ledger: Boolean(run),
+      options,
+    });
+    await options?.prepareState?.({ env, recoveryModulePath, sourceRuntimeImport });
     let helper: import("node:child_process").ChildProcess | undefined;
     let helperCompletion: Promise<number | null> | undefined;
     let helperLogPath: string | undefined;
@@ -166,7 +164,7 @@ export function createManagedServiceManagerBoundary({
         runId: run?.runId,
         ...(options?.beforeParkNotice ? { beforePark: async () => {} } : {}),
         ...(options?.profileRequester ? { requesterAuthority: { assertCurrent() {} } } : {}),
-        root: interrupted?.installRoot ?? root,
+        root,
         timeoutMs: options?.recoveryTimeoutMs,
         restartDrainTimeoutMs: 300_000,
         parentPid,
@@ -202,18 +200,16 @@ export function createManagedServiceManagerBoundary({
         stateDatabasePath,
         options,
       });
-      let updaterScript =
-        interrupted?.updaterScript ??
-        createManagedServiceUpdaterFixtureScript({
-          kind,
-          root,
-          statePath,
-          updaterPath,
-          logPath: String(generated.logPath),
-          stateDatabasePath,
-          consumeNotification,
-          options,
-        });
+      let updaterScript = createManagedServiceUpdaterFixtureScript({
+        kind,
+        root,
+        statePath,
+        updaterPath,
+        logPath: String(generated.logPath),
+        stateDatabasePath,
+        consumeNotification,
+        options,
+      });
       if (run && options?.rollbackRestoration) {
         updaterScript = `void (async () => {
           ${ledgerRuntimeImport}
@@ -259,7 +255,7 @@ export function createManagedServiceManagerBoundary({
           `${fixtureReceiptClientSource(receipts.endpoint)}\nexport { sendReceipt };\n`,
         );
         const continuation =
-          options.validationResult === "child-result" || options.updaterStopped
+          options.validationResult === "child-result"
             ? updaterScript
             : options.validationResult
               ? `process.stdout.write(JSON.stringify({root:${JSON.stringify(root)},status:${JSON.stringify(options.validationResult === "failed" ? "error" : "skipped")},mode:"npm",reason:${JSON.stringify(options.validationResult === "failed" ? "candidate-validation-failed" : "already-current")}}));`
@@ -314,7 +310,6 @@ export function createManagedServiceManagerBoundary({
           ...(options?.systemScope ? { serviceRecovery: undefined } : {}),
           recovery: options?.originalRecovery ?? { serviceRestartSafe: true, version: "1.0.0" },
           recoveryModulePath,
-          ...interrupted?.helperParams,
           ...(selectedDriverPath
             ? {}
             : { commandArgv: [resolveTestNodeExecPath(), "-e", updaterScript] }),
@@ -389,7 +384,7 @@ export function createManagedServiceManagerBoundary({
         );
         helperEnv = { ...helperEnv, NODE_OPTIONS: `--require ${preloadPath}` };
       }
-      helperEnv = await prepareManagedServiceHelperPreloads({
+      helperEnv = await prepareManagedServiceParentPreloads({
         root,
         scriptPath,
         statePath,
@@ -398,7 +393,6 @@ export function createManagedServiceManagerBoundary({
         logPath: String(generated.logPath),
         parentExitTimeoutMs: Number(generated.parentExitTimeoutMs),
         stopSettlementPath,
-        recovery: { paramsPath, updaterPath, ledgerRuntimeImport },
         env: helperEnv,
         options,
       });
@@ -428,8 +422,7 @@ export function createManagedServiceManagerBoundary({
 
       const databasePath = String(generated.updateLeaseDatabasePath);
       const owner = String(generated.updateLeaseOwner);
-      const readLease = () =>
-        readManagedServiceHandoffLease(databasePath, interrupted?.installRoot ?? root, owner);
+      const readLease = () => readManagedServiceHandoffLease(databasePath, root, owner);
       expect(readLease()).toEqual({
         version: 2,
         executor: { pid: runningHelper.pid, startIdentity: expect.any(String) },
@@ -659,7 +652,6 @@ export function createManagedServiceManagerBoundary({
         db.close();
       }
       return {
-        ...(interrupted ? { publication: await interrupted.inspect() } : {}),
         ...(run ? { run: getUpdateRun(run.runId, { env }) } : {}),
         ...(options?.expireParentWhileStopPending
           ? { stopSettlement: JSON.parse(await fs.readFile(stopSettlementPath, "utf8")) }
@@ -670,8 +662,12 @@ export function createManagedServiceManagerBoundary({
           .filter(Boolean),
         parentSignal: parent.signalCode,
         parkAdmitted: stdout.includes("park-admitted\n"),
+        stdout,
+        stderr,
         state: JSON.parse(await fs.readFile(statePath, "utf8").catch(() => "{}")),
-        sentinel: readRestartSentinelPayload({ OPENCLAW_STATE_DIR: root }),
+        sentinel: options?.readSentinel
+          ? await options.readSentinel(env)
+          : readRestartSentinelPayload({ OPENCLAW_STATE_DIR: root }),
         log: await fs.readFile(String(generated.logPath), "utf8"),
         ...(await spawnFixture.readCommandDeadlines()),
         savedFailure: await readSavedFailure(String(generated.triageContextPath)),

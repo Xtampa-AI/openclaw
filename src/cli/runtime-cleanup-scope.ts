@@ -7,7 +7,11 @@ import type { PluginRegistry } from "../plugins/registry-types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { CliPluginInvocationResources } from "./plugin-invocation-resources.js";
-import { installCliSignalExitHandlers, registerSignalExitGate } from "./signal-exit-barrier.js";
+import {
+  installCliSignalExitHandlers,
+  registerSignalExitGate,
+  withGatewayStartupSignalOwner,
+} from "./signal-exit-barrier.js";
 
 export type CliHarnessCleanup = {
   scheduler: GatewayScheduler;
@@ -57,7 +61,9 @@ export async function withCliCommandCleanup<T>(
 ): Promise<T> {
   if (gatewayRun) {
     // Gateway owns its process lifetime; borrowed calls must not inherit CLI ownership.
-    return scope.run(undefined, () => run());
+    // The executable still needs a stop owner until its run loop installs one.
+    const executable = scope.getStore() === "process";
+    return scope.run(undefined, () => (executable ? withGatewayStartupSignalOwner(run) : run()));
   }
   if (scope.getStore() !== "process") {
     return run();
@@ -69,6 +75,7 @@ export async function withCliCommandCleanup<T>(
   const { closeOpenClawStateDatabaseAsync } = await import("../state/openclaw-state-db-cache.js");
   const { closeDefaultRetainedNativeWorkerSource } =
     await import("../infra/worker-native-lifecycle.js");
+  const { closePostgresPool } = await import("../infra/postgres-sync/pool.js");
   const { closeSkillsWatchers } = await import("../skills/runtime/refresh.js");
   const pluginResources = new CliPluginInvocationResources();
   const releaseSignals = installCliSignalExitHandlers();
@@ -86,9 +93,10 @@ export async function withCliCommandCleanup<T>(
     pluginResources,
   };
   const finished = createDeferredCore();
-  const releaseExitGate = registerSignalExitGate(finished.promise, (signal) => {
+  const releaseExitGate = registerSignalExitGate(finished.promise, (signal, reason) => {
+    const cause = signal ?? reason;
     pluginResources.beginClose(
-      new DOMException(`CLI stopping${signal ? ` (${signal})` : ""}`, "AbortError"),
+      new DOMException(`CLI stopping${cause ? ` (${cause})` : ""}`, "AbortError"),
     );
     void scheduler.stop();
   });
@@ -102,6 +110,7 @@ export async function withCliCommandCleanup<T>(
           await runCliDisposerAfterPending("shared-state", async () => {
             await closeOpenClawStateDatabaseAsync();
             await closeDefaultRetainedNativeWorkerSource();
+            await closePostgresPool();
           });
         }
       }),

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import { createMcpRequestLifecycle } from "./mcp-client-lifecycle.js";
+import { createMcpRequestLifecycle } from "./mcp-request-lifecycle.js";
 
 afterEach(() => {
   vi.useRealTimers();

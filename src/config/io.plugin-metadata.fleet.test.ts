@@ -1,11 +1,16 @@
 import { afterEach, expect, it, vi } from "vitest";
+import * as workspaceDirs from "../agents/workspace-dirs.js";
 import { createDoctorPluginMetadataSnapshotScope } from "../commands/doctor/shared/plugin-metadata-snapshot-scope.js";
 import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
 import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
 import { createPluginCache, getPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
 import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
-import { resolveConfigWidePluginMetadataSnapshot } from "./io.plugin-metadata.js";
+import { withTempDir } from "../test-utils/temp-dir.js";
+import {
+  resolveConfigWidePluginMetadataSnapshot,
+  resolveConfigWidePluginMetadataSnapshotAsync,
+} from "./io.plugin-metadata.js";
 
 const { loadRegistry } = vi.hoisted(() => ({ loadRegistry: vi.fn() }));
 
@@ -45,7 +50,7 @@ it("bounds Doctor workspace snapshots without repeatedly rebuilding the fleet re
       ),
     },
   };
-  const scope = createDoctorPluginMetadataSnapshotScope({ env: {} });
+  await using scope = createDoctorPluginMetadataSnapshotScope({ env: {} });
   const read = (workspaceDir: string) =>
     scope.run({ config, workspaceDir }, () => {
       expect(getPluginCache().metadata.snapshots.size).toBeLessThanOrEqual(64);
@@ -62,41 +67,51 @@ it("bounds Doctor workspace snapshots without repeatedly rebuilding the fleet re
   expect(loadRegistry).toHaveBeenCalledTimes(workspaces.length * 2);
 });
 
-it("materializes shared plugin metadata once across the fleet and retains its immutable facts", () => {
-  const configSchema = { type: "object", properties: { label: { type: "string" } } };
-  const source = createPluginMetadataSnapshotFixture({
-    plugins: [{ id: "shared", providers: ["shared"], configSchema }],
-  });
-  loadRegistry.mockImplementation(({ workspaceDir }: { workspaceDir: string }) => ({
-    snapshot: { ...source.index, workspaceDir },
-    source: "derived",
-    diagnostics: [],
-    manifestRegistry: source.manifestRegistry,
-  }));
-  const config = {
-    agents: {
-      ownership: "explicit" as const,
-      entries: Object.fromEntries(
-        ["first", "second", "third"].map((id) => [id, { workspace: `/fleet/${id}` }]),
-      ),
-    },
-  };
-  const freeze = vi.spyOn(Object, "freeze");
-  withPluginCache(createPluginCache(), () => {
-    const params = { config, env: {}, installRecords: {}, allowCurrent: false };
-    const snapshot = resolveConfigWidePluginMetadataSnapshot(params);
-    expect(snapshot.plugins.map((plugin) => plugin.id)).toEqual(["shared"]);
-    expect(snapshot.owners.providers.get("shared")).toEqual(["shared"]);
-    expect(snapshot.registryIndex.workspaceDir).toBe("/fleet/first");
-    expect(snapshot.manifestRegistry.plugins[0]?.configSchema).toBe(configSchema);
-    expect(freeze.mock.calls.filter(([value]) => value === configSchema)).toHaveLength(1);
-    expect(Object.isFrozen(configSchema.properties.label)).toBe(true);
-    expect(Object.isFrozen(source.index)).toBe(false);
-    expect(() => {
-      configSchema.properties.label.type = "number";
-    }).toThrow();
-    expect(resolveConfigWidePluginMetadataSnapshot(params)).toBe(snapshot);
-    expect(freeze.mock.calls.filter(([value]) => value === configSchema)).toHaveLength(1);
-    expect(loadRegistry).toHaveBeenCalledTimes(3);
-  });
-});
+it.each(["sync", "async"] as const)(
+  "materializes %s shared plugin metadata once across the fleet and retains its prepared facts",
+  async (mode) => {
+    const configSchema = { type: "object", properties: { label: { type: "string" } } };
+    const source = createPluginMetadataSnapshotFixture({
+      plugins: [{ id: "shared", providers: ["shared"], configSchema }],
+    });
+    loadRegistry.mockImplementation(({ workspaceDir }: { workspaceDir: string }) => ({
+      snapshot: { ...source.index, workspaceDir },
+      source: "derived",
+      diagnostics: [],
+      manifestRegistry: source.manifestRegistry,
+    }));
+    const config = {
+      agents: {
+        ownership: "explicit" as const,
+        entries: Object.fromEntries(
+          ["first", "second", "third"].map((id) => [id, { workspace: `/fleet/${id}` }]),
+        ),
+      },
+    };
+    await withTempDir("openclaw-metadata-fleet-", async (stateDir) =>
+      withPluginCache(createPluginCache(), async () => {
+        const params = {
+          config,
+          env: { OPENCLAW_STATE_DIR: stateDir },
+          installRecords: {},
+          allowCurrent: false,
+        };
+        const selectWorkspaces = vi.spyOn(workspaceDirs, "listAgentWorkspaceDirs");
+        const read =
+          mode === "async"
+            ? resolveConfigWidePluginMetadataSnapshotAsync
+            : resolveConfigWidePluginMetadataSnapshot;
+        const snapshot = await read(params);
+        expect(snapshot.plugins.map((plugin) => plugin.id)).toEqual(["shared"]);
+        expect(snapshot.owners.providers.get("shared")).toEqual(["shared"]);
+        expect(snapshot.registryIndex.workspaceDir).toBe("/fleet/first");
+        expect(snapshot.manifestRegistry.plugins[0]?.configSchema).toBe(configSchema);
+        expect(Object.isFrozen(source.index)).toBe(false);
+        expect(selectWorkspaces).toHaveBeenCalledTimes(1);
+        expect(await read(params)).toBe(snapshot);
+        expect(selectWorkspaces).toHaveBeenCalledTimes(2);
+        expect(loadRegistry).toHaveBeenCalledTimes(3);
+      }),
+    );
+  },
+);

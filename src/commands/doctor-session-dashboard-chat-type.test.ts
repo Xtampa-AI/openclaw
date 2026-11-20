@@ -1,9 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
-import {
-  listSessionEntriesCore,
-  replaceSessionEntry,
-} from "../config/sessions/session-accessor.js";
+import { scanDoctorSessionEntriesTolerant } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -22,11 +19,12 @@ vi.mock("../../packages/terminal-core/src/note.js", async (importOriginal) => ({
 }));
 
 import { repairLegacyDashboardChatTypes } from "./doctor-session-dashboard-chat-type.js";
+import { createCanonicalRepairFixture } from "./doctor-session-repair-fixture.test-support.js";
 import { noteSessionTranscriptHealth } from "./doctor-session-transcripts.js";
 
-const dashboardKey = (suffix: number) =>
-  `agent:main:dashboard:7d3c1f00-0000-4000-8000-${String(suffix).padStart(12, "0")}`;
-const ROOT_KEY = dashboardKey(1);
+const dashboardRootKey = (suffix: number, agentId = "main") =>
+  `agent:${agentId}:dashboard:7d3c1f00-0000-4000-8000-${String(suffix).padStart(12, "0")}`;
+const ROOT_KEY = dashboardRootKey(1);
 
 // The durable shape v2026.10.6 wrote for a dashboard chat created without a message.
 const legacyRoot = (overrides: Partial<SessionEntry> = {}): SessionEntry => ({
@@ -46,88 +44,21 @@ const discordDelivery: SessionEntry["delivery"] = {
   origin: { provider: "discord", accountId: "default", to: "channel:1", chatType: "channel" },
 };
 
-describe("doctor dashboard chat type eligibility", () => {
-  let state: OpenClawTestState | undefined;
+function expectNote(verb: string) {
+  expect(note).toHaveBeenCalledWith(
+    expect.stringContaining(`${verb} 1 dashboard chat(s)`),
+    "Session chat type",
+  );
+  note.mockClear();
+}
 
-  afterEach(async () => {
-    note.mockClear();
-    await state?.cleanup();
-    state = undefined;
+function readEntries(fixture: ReturnType<typeof createCanonicalRepairFixture>) {
+  const entries: Record<string, SessionEntry> = {};
+  scanDoctorSessionEntriesTolerant(fixture.scope(), ({ entry, sessionKey }) => {
+    entries[sessionKey] = entry;
   });
-
-  // Eligibility is observed at the repair boundary: only the single eligible root is stamped.
-  it.each<[string, OpenClawConfig, Record<string, SessionEntry>, string]>([
-    [
-      "default main key",
-      { agents: { entries: { main: {}, ops: {} } } },
-      {
-        [ROOT_KEY]: legacyRoot({ sessionId: "eligible" }),
-        [dashboardKey(2)]: legacyRoot({ sessionId: "existing-type", chatType: "group" }),
-        [dashboardKey(3)]: legacyRoot({ sessionId: "channel-created", createdVia: "channel" }),
-        [dashboardKey(4)]: legacyRoot({ sessionId: "spawn-created", createdVia: "spawn" }),
-        [dashboardKey(5)]: legacyRoot({ sessionId: "unstamped", createdVia: undefined }),
-        [dashboardKey(6)]: legacyRoot({ sessionId: "spawned", spawnedBy: "agent:main:main" }),
-        [dashboardKey(7)]: legacyRoot({
-          sessionId: "fork",
-          forkSource: { sessionKey: ROOT_KEY, sessionId: "source" },
-        }),
-        [dashboardKey(8)]: legacyRoot({ sessionId: "plugin-owned", pluginOwnerId: "workboard" }),
-        [dashboardKey(9)]: legacyRoot({ sessionId: "incognito-row", incognito: true }),
-        [dashboardKey(10)]: legacyRoot({ sessionId: "external", delivery: discordDelivery }),
-        [dashboardKey(11)]: legacyRoot({
-          sessionId: "explicit-child",
-          parentSessionKey: "agent:main:discord:group:1",
-        }),
-        [dashboardKey(12)]: legacyRoot({ sessionId: "unparented", parentSessionKey: undefined }),
-        "agent:main:discord:group:123": legacyRoot({ sessionId: "channel-key" }),
-        "agent:main:main": legacyRoot({ sessionId: "main-key" }),
-        "agent:main:dashboard:incognito-7d3c1f00": legacyRoot({ sessionId: "incognito-key" }),
-        "agent:ops:dashboard:7d3c1f00": legacyRoot({ sessionId: "other-agent-parent" }),
-      },
-      ROOT_KEY,
-    ],
-    [
-      "configured main key",
-      { session: { mainKey: "home" } },
-      {
-        [dashboardKey(14)]: legacyRoot({ sessionId: "default-parent-under-custom-main" }),
-        [dashboardKey(15)]: legacyRoot({
-          sessionId: "custom-main-parent",
-          parentSessionKey: "agent:main:home",
-        }),
-      },
-      dashboardKey(15),
-    ],
-  ])("stamps only the eligible root with the %s", async (_name, cfg, rows, eligibleKey) => {
-    state = await createOpenClawTestState({ prefix: "openclaw-doctor-dashboard-eligibility-" });
-    const env = state.env;
-    setRuntimeConfigSnapshot(cfg);
-    const agentOf = (sessionKey: string) => sessionKey.split(":")[1] ?? "main";
-    for (const [sessionKey, entry] of Object.entries(rows)) {
-      await replaceSessionEntry({ agentId: agentOf(sessionKey), env, sessionKey }, entry);
-    }
-    await closeOpenClawAgentDatabasesAsync();
-    closeOpenClawAgentDatabasesForTest();
-
-    repairLegacyDashboardChatTypes({ apply: true, cfg, env });
-    await closeOpenClawAgentDatabasesAsync();
-    closeOpenClawAgentDatabasesForTest();
-
-    const chatTypes = Object.fromEntries(
-      [...new Set(Object.keys(rows).map(agentOf))].flatMap((agentId) =>
-        listSessionEntriesCore({ agentId, env }).map((row) => [row.sessionKey, row.entry.chatType]),
-      ),
-    );
-    expect(chatTypes).toEqual(
-      Object.fromEntries(
-        Object.entries(rows).map(([key, entry]) => [
-          key,
-          key === eligibleKey ? "direct" : entry.chatType,
-        ]),
-      ),
-    );
-  });
-});
+  return entries;
+}
 
 describe("doctor dashboard chat type backfill", () => {
   let state: OpenClawTestState | undefined;
@@ -140,60 +71,130 @@ describe("doctor dashboard chat type backfill", () => {
 
   it("records only eligible dashboard roots as direct, and only under --fix", async () => {
     state = await createOpenClawTestState({ prefix: "openclaw-doctor-dashboard-chat-type-" });
-    const config: OpenClawConfig = { plugins: { enabled: false } };
-    setRuntimeConfigSnapshot(config);
-    const env = state.env;
+    const fixture = createCanonicalRepairFixture(state.stateDir);
+    const config = fixture.cfg;
+    const env = fixture.env;
+    const exclusions: Partial<SessionEntry>[] = [
+      { chatType: "group" },
+      { createdVia: "channel" },
+      { createdVia: "spawn" },
+      { createdVia: undefined },
+      { spawnedBy: "agent:main:main" },
+      { forkSource: { sessionKey: ROOT_KEY, sessionId: "source" } },
+      { pluginOwnerId: "workboard" },
+      { incognito: true },
+      { delivery: discordDelivery },
+      { parentSessionKey: "agent:main:discord:group:1" },
+      { parentSessionKey: undefined },
+    ];
     const rows: Record<string, SessionEntry> = {
-      [ROOT_KEY]: legacyRoot(),
-      "agent:main:discord:group:123": legacyRoot({ sessionId: "group", createdVia: "channel" }),
-      "agent:main:dashboard:7d3c1f00-0000-4000-8000-000000000002": legacyRoot({
-        sessionId: "plugin",
-        pluginOwnerId: "workboard",
-      }),
+      [ROOT_KEY]: legacyRoot({ sessionId: "eligible" }),
+      ...Object.fromEntries(
+        exclusions.map((fields, index) => [
+          dashboardRootKey(index + 2),
+          legacyRoot({ sessionId: `excluded-${index}`, ...fields }),
+        ]),
+      ),
+      "agent:main:discord:group:123": legacyRoot({ sessionId: "channel-key" }),
+      "agent:main:main": legacyRoot({ sessionId: "main-key" }),
+      "agent:main:dashboard:incognito-7d3c1f00": legacyRoot({ sessionId: "incognito-key" }),
+      [dashboardRootKey(13, "ops")]: legacyRoot({ sessionId: "other-agent-parent" }),
     };
-    for (const [sessionKey, entry] of Object.entries(rows)) {
-      await replaceSessionEntry({ agentId: "main", env, sessionKey }, entry);
-    }
     const settle = async () => {
       await closeOpenClawAgentDatabasesAsync();
       closeOpenClawAgentDatabasesForTest();
     };
-    const read = () =>
-      Object.fromEntries(
-        listSessionEntriesCore({ agentId: "main", env }).map((row) => [
-          row.sessionKey,
-          row.entry.chatType,
-        ]),
-      );
+    const read = () => readEntries(fixture);
+    const write = (entries: Record<string, SessionEntry>) => {
+      for (const [sessionKey, entry] of Object.entries(entries)) {
+        fixture.insert(sessionKey, entry);
+      }
+    };
+    const runRepairCycle = async (
+      cfg: OpenClawConfig,
+      before: Record<string, SessionEntry>,
+      eligibleKey: string,
+    ) => {
+      const preview = repairLegacyDashboardChatTypes({ apply: false, cfg, env });
+      await settle();
+      expect(preview).toMatchObject({ found: 1, repaired: 0 });
+      expect(read()).toEqual(before);
+      expectNote("Would record");
 
-    await noteSessionTranscriptHealth({ cfg: config, env, shouldRepair: false });
-    await settle();
-    expect(read()[ROOT_KEY]).toBeUndefined();
-    expect(note).toHaveBeenCalledWith(
-      expect.stringContaining("Would record 1"),
-      expect.any(String),
-    );
-    note.mockClear();
+      const fixed = repairLegacyDashboardChatTypes({ apply: true, cfg, env });
+      await settle();
+      expect(fixed).toMatchObject({ found: 1, repaired: 1 });
+      const eligible = before[eligibleKey];
+      if (!eligible) {
+        throw new Error(`Missing eligible dashboard fixture: ${eligibleKey}`);
+      }
+      const after = {
+        ...before,
+        [eligibleKey]: { ...eligible, chatType: "direct" as const },
+      };
+      // The stamp is the only change: every other durable field stays current.
+      expect(read()).toEqual(after);
+      expectNote("Recorded");
+      const repeated = repairLegacyDashboardChatTypes({ apply: true, cfg, env });
+      await settle();
+      expect(repeated).toMatchObject({ found: 0, repaired: 0 });
+      expect(read()).toEqual(after);
+      expect(note).not.toHaveBeenCalledWith(expect.anything(), "Session chat type");
+    };
 
-    await noteSessionTranscriptHealth({ cfg: config, env, shouldRepair: true });
-    await settle();
-    expect(read()).toEqual({
-      [ROOT_KEY]: "direct",
-      "agent:main:discord:group:123": undefined,
-      "agent:main:dashboard:7d3c1f00-0000-4000-8000-000000000002": undefined,
+    write(rows);
+    await runRepairCycle(config, read(), ROOT_KEY);
+
+    const customConfig: OpenClawConfig = {
+      ...config,
+      session: { ...config.session, mainKey: "home" },
+    };
+    const customMainKey = dashboardRootKey(15);
+    const customRows = {
+      [dashboardRootKey(14)]: legacyRoot({ sessionId: "default-parent-under-custom-main" }),
+      [customMainKey]: legacyRoot({
+        sessionId: "custom-main-parent",
+        parentSessionKey: "agent:main:home",
+      }),
+    };
+    write(customRows);
+    await runRepairCycle(customConfig, read(), customMainKey);
+
+    await state.cleanup();
+    state = await createOpenClawTestState({
+      prefix: "openclaw-doctor-dashboard-chat-type-wiring-",
     });
-    const repaired = listSessionEntriesCore({ agentId: "main", env }).find(
-      (row) => row.sessionKey === ROOT_KEY,
-    )?.entry;
-    // The stamp is the only change: the incarnation a linked job captured stays current.
-    expect(repaired).toMatchObject({ ...legacyRoot(), chatType: "direct" });
-    expect(note).toHaveBeenCalledWith(
-      expect.stringContaining(`Recorded 1 dashboard chat(s)`),
-      "Session chat type",
-    );
+    const doctorFixture = createCanonicalRepairFixture(state.stateDir);
+    const doctorConfig: OpenClawConfig = {
+      ...doctorFixture.cfg,
+      plugins: { enabled: false },
+    };
+    const doctorKey = dashboardRootKey(16);
+    const doctorEntry = legacyRoot({ sessionId: "doctor-wiring" });
+    doctorFixture.insert(doctorKey, doctorEntry);
+    const readDoctorEntry = () => readEntries(doctorFixture)[doctorKey];
+    const runDoctor = async (shouldRepair: boolean) => {
+      await noteSessionTranscriptHealth({
+        cfg: doctorConfig,
+        env: doctorFixture.env,
+        shouldRepair,
+      });
+      await settle();
+    };
+    setRuntimeConfigSnapshot(doctorConfig);
 
-    note.mockClear();
-    await noteSessionTranscriptHealth({ cfg: config, env, shouldRepair: true });
+    await runDoctor(false);
+    expect(readDoctorEntry()).toEqual(doctorEntry);
+    expectNote("Would record");
+
+    await runDoctor(true);
+    expect(readDoctorEntry()).toMatchObject({
+      ...doctorEntry,
+      chatType: "direct",
+    });
+    expectNote("Recorded");
+
+    await runDoctor(true);
     expect(note).not.toHaveBeenCalledWith(expect.anything(), "Session chat type");
   });
 });

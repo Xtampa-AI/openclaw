@@ -2,7 +2,9 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { describe, expect, it } from "vitest";
+import templates from "../../skills/meme-maker/references/templates.json" with { type: "json" };
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import { createSolidPngBuffer } from "../helpers/image-fixtures.js";
 import { createScriptTestHarness } from "./test-helpers.js";
@@ -12,14 +14,10 @@ const { createTempDir } = createScriptTestHarness();
 const testNodeExecPath = resolveTestNodeExecPath();
 const skillRoot = path.resolve("skills/meme-maker");
 const scriptPath = path.join(skillRoot, "scripts/meme.mjs");
-const template = JSON.parse(
-  fs.readFileSync(path.join(skillRoot, "references/templates.json"), "utf8"),
-).find((entry: { id: string }) => entry.id === "always-has-been") as {
-  id: string;
-  imgflipId: string;
-  width: number;
-  height: number;
-};
+const template = expectDefined(
+  templates.find((entry) => entry.id === "always-has-been"),
+  "Expected the always-has-been template",
+);
 
 function renderFixture(format: "svg" | "png", isolated = false) {
   const root = createTempDir("openclaw-meme-maker-");
@@ -54,6 +52,32 @@ globalThis.fetch = () => { throw new Error("Unexpected network access"); };
 }
 
 describe("meme-maker local rendering", () => {
+  it("rejects missing option values before writing and preserves inline dash values", async () => {
+    const root = createTempDir("openclaw-meme-args-");
+    const cache = path.join(root, "cache");
+    const imageDir = path.join(cache, "openclaw/meme-maker");
+    fs.mkdirSync(imageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(imageDir, `${template.id}-${template.imgflipId}.png`),
+      createSolidPngBuffer(2, 2, { r: 0, g: 0, b: 0 }),
+    );
+    const sentinel = path.join(root, "--service");
+    const keep = path.join(root, "keep.txt");
+    fs.writeFileSync(sentinel, "existing output");
+    fs.writeFileSync(keep, "keep me");
+    const options = { cwd: root, env: { ...process.env, XDG_CACHE_HOME: cache }, timeout: 30_000 };
+    const base = [scriptPath, "render", template.id, "--text", "test"];
+    for (const option of ["--out", "--text"]) {
+      await expect(
+        execFileAsync(testNodeExecPath, [...base, option, "--service", "local"], options),
+      ).rejects.toMatchObject({ stderr: `error: Missing value for ${option}\n` });
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("existing output");
+      expect(fs.readFileSync(keep, "utf8")).toBe("keep me");
+    }
+    await execFileAsync(testNodeExecPath, [...base, "--out=--x", "--text=--literal"], options);
+    expect(fs.readFileSync(path.join(root, "--x"), "utf8")).toContain("--literal");
+  });
+
   it("writes a self-contained SVG with escaped text without optional rendering dependencies", async () => {
     const { image, out, result } = renderFixture("svg", true);
     const { stdout } = await result;

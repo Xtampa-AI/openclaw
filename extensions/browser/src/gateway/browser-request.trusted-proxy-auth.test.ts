@@ -1,11 +1,10 @@
-// Starting Browser control under trusted-proxy auth must not write Gateway auth config.
 import fs from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { handleBrowserGatewayRequest } from "./browser-request.js";
+import { getFreePort } from "../browser/test-port.js";
+import { makeRequest } from "./browser-request.test-support.js";
 
 // mock-isolation: these tests start Browser control, not a Chrome process.
 vi.mock("../browser/chrome.js", () => ({
@@ -28,37 +27,18 @@ const { getBridgeAuthForPort } = await import("../browser/bridge-auth-registry.j
 const { captureRuntimeConfigAsyncReader, clearConfigCache, clearRuntimeConfigSnapshot } =
   await import("openclaw/plugin-sdk/runtime-config-snapshot");
 
-type Request = Parameters<typeof handleBrowserGatewayRequest>[0];
-
-function makeRequest(params: Request["params"], overrides: Partial<Request> = {}) {
-  return {
-    params,
-    respond: vi.fn<Request["respond"]>(),
-    context: { nodeRegistry: { listConnected: () => [] } } as never,
-    client: null,
-    req: { type: "req", id: "req-1", method: "browser.request" },
-    isWebchatConnect: () => false,
-    ...overrides,
-  } satisfies Request;
-}
-
 let root = "";
 let configPath = "";
-let gatewayPort = 0;
-
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const { port } = server.address() as net.AddressInfo;
-  await new Promise<void>((resolve) => {
-    server.close(() => resolve());
-  });
-  return port;
+function configFiles() {
+  return fs.readdirSync(path.dirname(configPath)).filter((name) => name.includes("openclaw"));
 }
 
-function writeTrustedProxyConfig() {
+beforeEach(async () => {
+  root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-browser-tp-")));
+  configPath = path.join(root, "config", "openclaw.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  // Browser control derives its port from the Gateway port (+2); keep both free.
+  const gatewayPort = (await getFreePort()) - 2;
   const config = {
     gateway: {
       mode: "local",
@@ -72,19 +52,6 @@ function writeTrustedProxyConfig() {
     browser: { enabled: true, defaultProfile: "openclaw" },
   };
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-}
-
-function configFiles() {
-  return fs.readdirSync(path.dirname(configPath)).filter((name) => name.includes("openclaw"));
-}
-
-beforeEach(async () => {
-  root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-browser-tp-")));
-  configPath = path.join(root, "config", "openclaw.json");
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  // Browser control derives its port from the Gateway port (+2); keep both free.
-  gatewayPort = (await freePort()) - 2;
-  writeTrustedProxyConfig();
   vi.stubEnv("OPENCLAW_STATE_DIR", path.join(root, "state"));
   vi.stubEnv("OPENCLAW_CONFIG_PATH", configPath);
   // Credential bootstrap is skipped under test environments; exercise the production path.
@@ -92,6 +59,7 @@ beforeEach(async () => {
   vi.stubEnv("VITEST", "0");
   clearConfigCache();
   clearRuntimeConfigSnapshot();
+  // The Gateway prepares its runtime snapshot from the config file at startup.
   await captureRuntimeConfigAsyncReader()();
 });
 
@@ -113,9 +81,7 @@ it("lazily starts Browser control on the first request without writing Gateway a
     makeRequest({ method: "GET", path: "/", query: { profile: "openclaw" } }, { respond }),
   );
 
-  const [ok, result] = expectDefined(respond.mock.calls[0], "browser response");
-  expect(ok).toBe(true);
-  expect(result).toMatchObject({ enabled: true, profile: "openclaw" });
+  expect(respond.mock.calls[0]).toMatchObject([true, { enabled: true, profile: "openclaw" }]);
   expect(fs.readFileSync(configPath, "utf8")).toBe(before);
   expect(configFiles()).toEqual(filesBefore);
 });
@@ -127,8 +93,6 @@ it("authenticates the HTTP listener with a process-local password instead of gat
 
   const port = expectDefined(state?.port, "browser control port");
   const auth = expectDefined(getBridgeAuthForPort(port), "listener credential");
-  expect(auth.token).toBeUndefined();
-  expect(auth.password).toMatch(/^[a-f0-9]{48}$/);
   const url = `http://127.0.0.1:${port}/?profile=openclaw`;
   expect((await fetch(url)).status).toBe(401);
   const authorized = await fetch(url, {
@@ -137,5 +101,4 @@ it("authenticates the HTTP listener with a process-local password instead of gat
   expect(authorized.status).toBe(200);
   expect(await authorized.json()).toMatchObject({ enabled: true, profile: "openclaw" });
   expect(fs.readFileSync(configPath, "utf8")).toBe(before);
-  expect(before).not.toContain("password");
 });

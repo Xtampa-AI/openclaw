@@ -2,14 +2,16 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createTestReplyOperation } from "../../auto-reply/reply/reply-run-registry.test-helpers.js";
 import * as events from "../../auto-reply/reply/session-event-handoff.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
-import { createGatewayMethodRegistry } from "../../gateway/methods/registry.js";
 import type { GatewayRequestHandler } from "../../gateway/server-methods/types.js";
 import { withOperatorToolGatewayAuthority } from "../../gateway/server-plugin-in-process-dispatch.js";
 import { createContext } from "../../gateway/server-plugin-in-process-dispatch.test-support.js";
 import * as exec from "../../infra/exec-request-context.js";
 import { withPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { resetGatewayWorkAdmission } from "../../process/gateway-work-admission.js";
+import { withSessionControllerOwner } from "../../sessions/session-controller.context.js";
+import { captureSessionTarget } from "../../sessions/session-controller.target.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
@@ -17,6 +19,16 @@ import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 import { createPluginsTool } from "./plugins-tool.js";
 
 const request = { action: "reloadAndResume", pluginId: "reload-fixture" };
+
+function runningOperation(sessionKey: string, sessionId: string, storeScope: string) {
+  const operation = createTestReplyOperation({
+    sessionKey,
+    sessionId,
+    target: captureSessionTarget({ storeScope, sessionKey, incarnation: sessionId }),
+  });
+  operation.setPhase("running");
+  return operation;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -96,8 +108,12 @@ it.each([
             : { channel: "webchat", to: sessionKey },
       }),
     });
-    const operation = createTestReplyOperation({ sessionKey, sessionId });
-    operation.setPhase("running");
+    const operation = runningOperation(
+      sessionKey,
+      sessionId,
+      resolveSessionStorePathCore(undefined, { agentId: "main" }),
+    );
+    operation.attachBackend({ kind: "embedded", runId, cancel: () => {} });
     const cleanup = createDeferredCore();
     const observed = createDeferredCore<Parameters<typeof events.enqueueSessionEventForHost>[1]>();
     vi.spyOn(events, "enqueueSessionEventForHost").mockImplementation((_text, options) => {
@@ -116,26 +132,20 @@ it.each([
     const endpoint = vi.fn<GatewayRequestHandler>(async ({ respond }) => {
       respond(true, { ok: true, runtime: { generation: 2, pluginIds: ["reload-fixture"] } });
     });
-    const context = createContext();
-    context.getRuntimeConfig = () => config;
-    const methods = createGatewayMethodRegistry([
-      {
-        name: "plugins.reload",
-        scope: "operator.admin",
-        owner: { kind: "core", area: "plugins" },
-        handler: endpoint,
-      },
-    ]);
-    context.getGatewayMethodRegistry = () => methods;
+    const context = createContext(
+      [["plugins.reload", "operator.admin", "plugins", endpoint]],
+      () => config,
+    );
     context.resolveGatewayContext = () => context;
-    const invoke = async () => {
-      const result = await createPluginsTool({
-        sessionId,
-        runId,
-        onYield: () => operation.completeWithAfterClearBarrier(cleanup.promise),
-      }).execute("reload-route", request);
-      expect(result.details).toMatchObject({ status: "started" });
-    };
+    const invoke = () =>
+      withSessionControllerOwner(operation, async () => {
+        const result = await createPluginsTool({
+          sessionId,
+          runId,
+          onYield: () => operation.completeWithAfterClearBarrier(cleanup.promise),
+        }).execute("reload-route", request);
+        expect(result.details).toMatchObject({ status: "started" });
+      });
     try {
       await withPluginRuntimeGatewayRequestScope(
         { context, resolveGatewayContext: () => context, isWebchatConnect: () => false },

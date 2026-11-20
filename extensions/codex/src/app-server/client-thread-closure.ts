@@ -12,11 +12,7 @@ function recordCodexAppServerThreadClosed(client: CodexAppServerClient, threadId
   receipts.delete(threadId);
   receipts.add(threadId);
   while (receipts.size > MAX_CLOSED_THREAD_RECEIPTS) {
-    const oldest = receipts.values().next();
-    if (oldest.done) {
-      break;
-    }
-    receipts.delete(oldest.value);
+    receipts.delete(receipts.values().next().value!);
   }
   closureState.closedThreadsByClient.set(client, receipts);
 }

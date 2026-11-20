@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import { createOpenClawCodingTools } from "openclaw/plugin-sdk/agent-harness";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { withinTest } from "openclaw/plugin-sdk/test-fixtures";
 import { defineDiscordVoiceTests } from "./voice-test-harness.test-support.js";
 
@@ -28,6 +29,7 @@ defineDiscordVoiceTests(
     realtimeSessionMock,
     decodeOpusStreamChunksMock,
     managerModule,
+    listenersModule,
     realtimeModule,
     configureVoiceStateGateway,
     createClient,
@@ -98,7 +100,7 @@ defineDiscordVoiceTests(
             client,
           ),
         expectedOwner: false,
-        toolNames: { include: ["exec"], gated: ["gateway", "nodes", "openclaw"] },
+        toolNames: { include: ["exec"], ownerGated: ["gateway", "nodes", "openclaw"] },
       },
       ...["*", " * "].map((allowFrom, index) => ({
         name:
@@ -130,7 +132,7 @@ defineDiscordVoiceTests(
             },
           ),
         expectedOwner: true,
-        toolNames: { include: ["gateway", "nodes", "openclaw"], gated: [] },
+        toolNames: { include: ["gateway", "nodes", "openclaw"], ownerGated: [] },
       },
       {
         name: "admits the Discord command-owner wildcard without owner voice authority",
@@ -145,7 +147,7 @@ defineDiscordVoiceTests(
             },
           ),
         expectedOwner: false,
-        toolNames: { include: ["exec"], gated: ["gateway", "nodes", "openclaw"] },
+        toolNames: { include: ["exec"], ownerGated: ["gateway", "nodes", "openclaw"] },
       },
       {
         name: "does not use another provider's command owners for Discord voice",
@@ -203,21 +205,16 @@ defineDiscordVoiceTests(
         }
         if ("toolNames" in scenario && scenario.toolNames) {
           const tools = lastAgentCommandTools();
-          scenario.toolNames.include.forEach((name) =>
-            expect(tools.map((tool) => tool.name)).toContain(name),
-          );
-          // Definitions stay stable across speakers; nonowners cannot execute them.
-          for (const name of scenario.toolNames.gated) {
-            const tool = tools.find((candidate) => candidate.name === name);
-            expect(tool).toBeDefined();
-            const result = await tool!.execute("nonowner-voice", {});
+          const toolNames = tools.map((tool) => tool.name);
+          scenario.toolNames.include.forEach((name) => expect(toolNames).toContain(name));
+          for (const name of scenario.toolNames.ownerGated) {
+            const tool = expectDefined(
+              tools.find((candidate) => candidate.name === name),
+              "offered owner-only tool " + name,
+            );
+            const result = await tool.execute("voice-non-owner-" + name, {});
             expect(result.details).toMatchObject({ gated: true });
-            expect(result.content).toEqual([
-              {
-                type: "text",
-                text: `${name} needs the owner's authority, and this turn was not started by the owner. Do not retry ${name}.`,
-              },
-            ]);
+            expect(JSON.stringify(result.content)).toContain(name + " needs the owner's authority");
           }
         }
       },
@@ -332,27 +329,6 @@ defineDiscordVoiceTests(
       );
       expect(lastTtsArgs().channel).toBe("discord");
       expect(lastTtsArgs().text).toBe("hello back");
-    });
-
-    it("logs a bounded inbound transcript preview for voice debugging", async () => {
-      transcribeAudioFileMock.mockResolvedValueOnce({
-        text: `hello from voice\n\n${"x".repeat(700)}`,
-      });
-      const client = createClientWithMember("u-debug", "Debug", "0001", "Debug Speaker");
-      const manager = createManager(
-        makeVoiceConfig({}, { groupPolicy: "open", allowFrom: ["discord:u-debug"] }),
-        client,
-        {},
-      );
-
-      await receiveVoiceUtterance(manager, "u-debug");
-
-      const transcriptLog = logVerboseMock.mock.calls
-        .map((call) => String(call[0]))
-        .find((message) => message.includes("transcript from Debug Speaker (u-debug)"));
-      expect(transcriptLog).toContain("hello from voice ");
-      expect(transcriptLog).not.toContain("\n");
-      expect(transcriptLog?.length).toBeLessThan(650);
     });
 
     it("logs a failed streaming provider once per session when using file fallback", async () => {
@@ -804,7 +780,7 @@ defineDiscordVoiceTests(
         .spyOn(manager, "autoJoin")
         .mockRejectedValue(new Error("autoJoin rejected"));
 
-      const { DiscordVoiceReadyListener } = managerModule;
+      const { DiscordVoiceReadyListener } = listenersModule;
       const listener = new DiscordVoiceReadyListener(manager);
 
       await expect(listener.handle(undefined, undefined as never)).resolves.toBeUndefined();
@@ -815,7 +791,7 @@ defineDiscordVoiceTests(
       const manager = createManager();
       const autoJoinSpy = vi.spyOn(manager, "autoJoin").mockResolvedValue(undefined);
 
-      const { DiscordVoiceResumedListener } = managerModule;
+      const { DiscordVoiceResumedListener } = listenersModule;
       const listener = new DiscordVoiceResumedListener(manager);
 
       await expect(listener.handle(undefined, undefined as never)).resolves.toBeUndefined();

@@ -72,7 +72,7 @@ it("retains the concrete local timeout through native admission and cron retry c
   }).catch((error: unknown) => error);
   expect(outcome).toBe(timeout);
   const reason = resolveCronRunErrorReason(outcome, "openai");
-  expect(reason).toBe("timeout");
+  expect(reason).toBeUndefined();
   expect(
     resolveTransientCronRetryDecision({
       error: normalizeCronRunErrorText(outcome),

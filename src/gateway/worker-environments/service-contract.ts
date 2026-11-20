@@ -181,7 +181,12 @@ export type WorkerEnvironmentServiceContract = {
     runSetupScript?: boolean,
   ): Promise<WorkerEnvironmentServiceRecord>;
   destroy(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
-  destroyUnattached(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
+  /** Stop session work and return after provider acceptance; physical cleanup remains owned. */
+  reclaim(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
+  destroyUnattached(
+    environmentId: string,
+    authorize?: () => void,
+  ): Promise<WorkerEnvironmentServiceRecord>;
   observeDesktop(request: {
     environmentId: string;
     control: boolean;
@@ -289,6 +294,7 @@ export type WorkerPlacementDispatchContract = {
   forceDestroyEnvironment?(
     environmentId: string,
     onCleanupError?: (error: unknown) => void,
+    authorize?: () => void,
   ): Promise<WorkerEnvironmentServiceRecord>;
   reconcileActive?(environmentId?: string): Promise<void>;
 };

@@ -183,6 +183,41 @@ afterEach(async () => {
 });
 
 describe("secret egress Worker boundary", () => {
+  it("exports trust that rejects a disclosed eMudhra chain while retaining its local CA", async () => {
+    const grant = await register();
+    const fixture = new URL("./fixtures/emudhra/", import.meta.url);
+    // -trusted disables implicit CA files/directories/stores. Fixed verification
+    // time keeps certificate expiry separate from this trust-export regression.
+    const rejected = spawnSync(
+      "openssl",
+      [
+        "verify",
+        "-trusted",
+        grant.env.SSL_CERT_FILE!,
+        "-purpose",
+        "sslserver",
+        "-verify_hostname",
+        "dv-g3b-emudhra.we-have-a-problem.com",
+        "-attime",
+        String(Date.UTC(2026, 9, 21) / 1000),
+        "-untrusted",
+        fileURLToPath(new URL("untrusted.pem", fixture)),
+        fileURLToPath(new URL("leaf.pem", fixture)),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(rejected.error).toBeUndefined();
+    expect(rejected.status).not.toBe(0);
+    expect(rejected.stderr).toContain("unable to get local issuer certificate");
+    expect(() =>
+      execFileSync("openssl", ["verify", "-trusted", grant.env.SSL_CERT_FILE!, proxy.caCertPath], {
+        stdio: "pipe",
+      }),
+    ).not.toThrow();
+    expect(await readResponse(await openRequest(grant))).toEqual({ status: 200, body: "ok" });
+    expect(observed).toEqual([{ authorization: `Bearer ${secret}`, body: "" }]);
+  });
+
   it("keeps a multi-secret job's Basic credentials scoped to its registered grant", async () => {
     const password = sealSecretSentinel("synthetic-worker-password", { label: "WORKER_PASSWORD" });
     const unrelated = sealSecretSentinel("synthetic-unrelated-worker-secret", {

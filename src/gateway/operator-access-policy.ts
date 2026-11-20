@@ -9,6 +9,7 @@ import { getPluginRegistryState } from "../plugins/runtime-state.js";
 import { onUserProfilesChanged, readUserProfileVersion } from "../state/user-profile-events.js";
 import { captureResidentUserProfileAccess } from "../state/user-profile-list.js";
 import type { UserProfileAccessFacts } from "../state/user-profiles.types.js";
+import { GatewayOperatorAccessUnavailableError } from "./operator-access-errors.js";
 import type { GatewayOperatorAccessAuthority } from "./operator-access-policy.types.js";
 import { resolveOperatorRolePolicyForAssignment } from "./operator-role-policy.js";
 
@@ -22,12 +23,7 @@ export class GatewayOperatorAccessDeniedError extends Error {
   }
 }
 
-export class GatewayOperatorAccessUnavailableError extends Error {
-  constructor() {
-    super("Gateway access policy is unavailable; retry after its plugin is ready.");
-    this.name = "GatewayOperatorAccessUnavailableError";
-  }
-}
+export { GatewayOperatorAccessUnavailableError } from "./operator-access-errors.js";
 
 // A retained signal keeps its identity check alive without pinning abandoned HTTP captures.
 // An abort listener on AbortSignal.any would itself keep the composite signal alive in Node.
@@ -262,6 +258,7 @@ export function resolvePreparedGatewayOperatorAccessAuthority(
     return {
       assertCurrent,
       signal,
+      requiredPolicyPlugin: requiredPlugin,
       gatewayAccessGrant: original?.authority.grantId
         ? Object.freeze({ pluginId: original.pluginId, grantId: original.authority.grantId })
         : authorities.length === 0
@@ -293,10 +290,7 @@ export function resumeGatewayOperatorAccessGrant(
     // A newly required policy cannot replace the original request's recorded basis.
     throw new GatewayOperatorAccessDeniedError();
   }
-  const context = {
-    config,
-    profile: pluginProfile(profile, profile.assignedRole),
-  };
+  let policyProfile: ReturnType<typeof pluginProfile> | undefined;
   let resumed: PluginGatewayAccessAuthority | undefined;
   if (grant) {
     const policy = policies.find(({ pluginId }) => pluginId === grant.pluginId)?.policy;
@@ -309,7 +303,8 @@ export function resumeGatewayOperatorAccessGrant(
       authority =
         retained ??
         policy.resume({
-          ...context,
+          config,
+          profile: (policyProfile ??= pluginProfile(profile, profile.assignedRole)),
           grantId: grant.grantId,
           requiredByRole: requiredPlugin === grant.pluginId,
         });
@@ -328,7 +323,11 @@ export function resumeGatewayOperatorAccessGrant(
     }
     let authority: PluginGatewayAccessAuthority | undefined;
     try {
-      authority = policy.authorize({ ...context, requiredByRole: requiredPlugin === pluginId });
+      authority = policy.authorize({
+        config,
+        profile: (policyProfile ??= pluginProfile(profile, profile.assignedRole)),
+        requiredByRole: requiredPlugin === pluginId,
+      });
     } catch {
       throw new GatewayOperatorAccessUnavailableError();
     }

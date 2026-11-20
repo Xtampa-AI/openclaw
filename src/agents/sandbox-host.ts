@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { containsAsciiControlCharacter } from "@openclaw/normalization-core/string-normalization";
+import { WIDGET_SIZE_CONFIRMATION_HTML } from "../canvas/wrap.js";
 import { LruCache } from "../infra/lru-cache.js";
-import {
-  COMMAND_PALETTE_SHORTCUTS,
-  createKeyboardShortcutMatcher,
-} from "../shared/keyboard-shortcuts.js";
+import { KEYBOARD_SHORTCUT_MATCHER_SOURCE } from "../shared/keyboard-shortcuts.generated.js";
+import { COMMAND_PALETTE_SHORTCUTS } from "../shared/keyboard-shortcuts.js";
 import { WIDGET_THEME_MESSAGE_TYPE } from "../shared/widget-theme.js";
 import { buildSandboxWidgetScrollBridgeHtml } from "./sandbox-widget-scroll-bridge.js";
 
@@ -48,7 +47,7 @@ function buildSandboxShortcutBridgeHtml(): string {
   const fields=["key","code","keyCode","isComposing","metaKey","ctrlKey","altKey","shiftKey"];
   const getters=fields.map(name=>descriptor(KeyboardEvent.prototype,name).get);
   const combos=${JSON.stringify(COMMAND_PALETTE_SHORTCUTS)};
-  const matcher=(${createKeyboardShortcutMatcher.toString()})();
+  const matcher=(${KEYBOARD_SHORTCUT_MATCHER_SOURCE})();
   const applePlatform=matcher.isApplePlatform();
   let nonce="";
   let returnFocus=null;
@@ -297,11 +296,17 @@ function buildSandboxHostProxyHtml(csp?: SandboxHostCsp): string {
   const serializedDocumentGuard = JSON.stringify(
     buildSandboxDocumentGuardHtml(blockDescendantFrames) +
       buildSandboxShortcutBridgeHtml() +
-      buildSandboxWidgetScrollBridgeHtml(),
+      buildSandboxWidgetScrollBridgeHtml() +
+      WIDGET_SIZE_CONFIRMATION_HTML,
   ).replaceAll("<", "\\u003c");
   return `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
+<script>
+  // Match the embedding frame before this document can paint an opaque UA canvas.
+  const initialTheme = new URLSearchParams(window.location.hash.slice(1)).get("theme");
+  if (initialTheme === "light" || initialTheme === "dark") document.documentElement.style.colorScheme = initialTheme;
+</script>
 <title>MCP App sandbox</title>
 <style>html,body{height:100%;margin:0;background:transparent}iframe{display:block;width:100%;height:100%;border:0;background:transparent}</style>
 <body>

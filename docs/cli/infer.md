@@ -110,10 +110,11 @@ shell-completion metadata.
   `image describe`, `image describe-many`, `audio transcribe`, `video generate`, `video describe`,
   `embedding create`, and `model auth login/logout/status`) also accept `--agent <id>`. They resolve
   an explicit id first, then `agents.defaults.systemAgent.agentId`, then the sole configured agent.
-- Generated image and video `--output` files are staged beside the destination and replace it only after the complete buffer is written; a failed write leaves an existing destination unchanged.
+- Generated image and video `--output` files are staged beside the destination and replace it only after the complete buffer is written; a failed write leaves an existing destination unchanged. An interrupt stops an in-progress provider-URL video download instead of letting it finish and publish a late result.
 - Local `model run` is a lean one-shot provider completion: it resolves the configured agent model and auth but does not start a chat-agent turn, load tools, or open bundled MCP servers.
 - Model runs load the catalog for case correction only when an explicit model override contains uppercase characters. Runs using the configured default or a lowercase model ref skip that catalog lookup.
 - `model run --file` attaches image files (auto-detected MIME type) to the prompt; repeat `--file` for multiple images. Non-image files are rejected — use `infer audio transcribe` or `infer video describe` instead.
+- Local `model run --file` requires an image-capable model and fails before the provider call when the model's catalog input is text-only. `model run --gateway --file` instead offloads images for text-only models and describes them through the Gateway's media understanding.
 - `model run --gateway` exercises Gateway routing, saved auth, provider selection, and the embedded runtime, but stays a raw model check: no prior session transcript, bootstrap/AGENTS context, tools, or bundled MCP servers.
 - `model run --gateway --model <provider/model>` requires a trusted-operator gateway credential, because it asks the Gateway to run a one-off provider/model override.
 
@@ -244,6 +245,7 @@ Notes:
 
 - `tts status` only supports `--gateway` (it reflects gateway-managed TTS state).
 - Local and loopback-Gateway `tts convert --output` copies stage beside the destination and replace it only after success; a failed copy leaves an existing file unchanged.
+- If interruption is accepted before the output copy begins, `tts convert` leaves the requested destination unchanged. Completed synthesis audio remains in the media store for its normal lifetime.
 - Remote-Gateway `tts convert --output` is rejected before requesting speech synthesis.
 - Use `tts convert --provider <id>` when selecting a provider without overriding its model.
 - Use `tts providers`, `tts voices`, `tts personas`, `tts set-provider`, and `tts set-persona` to inspect and configure TTS behavior.
@@ -263,6 +265,7 @@ openclaw infer video describe --file ./clip.mp4 --model openai/gpt-5.4-mini --js
 Notes:
 
 - `video generate` accepts `--size`, `--aspect-ratio`, `--resolution`, `--duration`, `--audio`, `--watermark`, and `--timeout-ms`, forwarded to the video-generation runtime.
+- `--duration` is a number of seconds that must round to 1–9007199254740991 seconds. Zero, negative, nonnumeric, and smaller values that round to zero fail before provider dispatch. Valid fractions such as `2.5` retain normal provider-supported rounding; omitting the flag keeps the provider default.
 - Provider-hosted video downloads reject empty, text, and JSON responses instead of reporting an unusable file as successful output.
 - With `--output`, URL-backed video streams to a sibling temporary file and replaces the destination only after the complete non-empty download succeeds; a failed stream leaves an existing destination unchanged.
 - `--model` must be `<provider/model>` for `video describe`.
@@ -289,6 +292,10 @@ openclaw infer embedding create --text "friendly lobster" --json
 openclaw infer embedding create --text "customer support ticket: delayed shipment" --model openai/text-embedding-3-large --json
 openclaw infer embedding providers --agent <id> --json
 ```
+
+`--model` takes `<provider/model>`. When you also pass `--provider`, it must match
+that prefix; model ids that contain a slash keep the provider prefix, for example
+`--model deepinfra/Qwen/Qwen3-Embedding-8B`.
 
 Without `--json`, `embedding create` shows the provider and model, followed by
 each input, its dimension count, and a preview of the first eight vector values.
@@ -317,11 +324,17 @@ Stable top-level fields:
 - `transport`
 - `provider`
 - `model`
+- `usage` (observed model-run usage, when available)
+- `lastCallUsage` (observed usage from the last model API call, when available)
 - `attempts`
 - `inputs` (image attachments sent with the request, when applicable)
 - `outputs`
 - `ignoredOverrides` (hint keys a provider does not support, when applicable)
 - `error`
+
+For `model.run`, both transports expose normalized token counts such as `input`, `output`, `cacheRead`, `cacheWrite`, `reasoningTokens`, and `total`, plus usage availability and recorded cost metadata when supplied. Missing observations are omitted; adapter-default zeros are not treated as measurements. Explicitly measured zero counts are preserved, and explicitly unavailable usage is represented by `usageReport.state: "unavailable"` without invented token counts or cost.
+
+With `--local`, a run is one completion, so `usage` and `lastCallUsage` contain the same snapshot. With `--gateway`, `usage` keeps the runtime's aggregate billing usage (which can span multiple calls or candidates), while `lastCallUsage` describes only the last physical API call. Cost values and their provenance come from the existing runtime accounting; the CLI does not estimate them.
 
 For generated media commands, `outputs` contains files written by OpenClaw. Use the `path`, `mimeType`, `size`, and any media-specific dimensions in that array for automation instead of parsing human-readable stdout.
 
@@ -353,6 +366,10 @@ Focus on model runs, image generation, video generation, audio transcription, TT
 ```
 
 A good infer-based skill maps common user intents to the right subcommand, includes a few standard examples per workflow, prefers `openclaw infer ...` over lower-level alternatives, and does not re-document the entire infer surface in the skill body.
+
+On POSIX systems, `--file` and `--output` paths follow directory symlinks
+before resolving `..`, matching filesystem path resolution. Final-file symlinks
+remain subject to the existing media-directory checks.
 
 ## Related
 

@@ -1,6 +1,7 @@
 /** Lifecycle-owned model catalog access. */
 import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isAbortError } from "../infra/abort-signal.js";
 import {
   listAgentIds,
   resolveAgentDir,
@@ -11,6 +12,7 @@ import {
   getPreparedSharedAuthStoreOwnership,
   prepareSharedAuthStoreOwnership,
 } from "./auth-profiles/path-resolve.js";
+import { isTimeoutError } from "./failover/error.js";
 import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
 import { findModelInCatalog } from "./model-catalog-lookup.js";
 import { PREPARED_MODEL_CATALOG_WORKER_TIMEOUT_MS } from "./model-catalog-timeouts.js";
@@ -298,9 +300,6 @@ async function resolvePreparedModelCatalogOwnerSnapshotWithPolicy(
   configPolicy: PreparedModelCatalogConfigPolicy,
   preparePublishedOwner = preparePublishedCatalogOwner,
 ): Promise<PreparedModelCatalogOwner> {
-  if (!getPreparedSharedAuthStoreOwnership(params.env ?? process.env)) {
-    await prepareSharedAuthStoreOwnership(params.env);
-  }
   const { activationExact, activationFull, exact } = resolveInputs(params);
   if (params.readOnly) {
     const prepared = await resolveReadOnlyPublishedModelCatalogOwner(
@@ -483,13 +482,16 @@ export async function loadProviderScopedThinkingCatalog(params: {
           runtime: params.agentRuntime,
         });
       } catch (error) {
+        // A timed-out native capability read keeps the retained owner catalog, and
+        // retirement during a native observation leaves only this turn's captured facts.
+        // Cancellations still propagate, even when their message reads like a timeout.
         if (
-          !(error instanceof PreparedModelRuntimePublicationSupersededError) ||
-          admitted.owner.isCurrent()
+          (isAbortError(error) || !isTimeoutError(error)) &&
+          (!(error instanceof PreparedModelRuntimePublicationSupersededError) ||
+            admitted.owner.isCurrent())
         ) {
           throw error;
         }
-        // Retirement during a native observation leaves only this turn's captured facts.
       }
     }
   } else {
@@ -503,11 +505,19 @@ export async function loadProviderScopedThinkingCatalog(params: {
       params.agentRuntime &&
       params.agentRuntime !== "openclaw"
     ) {
-      snapshot = await owner.loadNativeModelCatalog({
-        provider: params.provider,
-        modelId: params.model,
-        runtime: params.agentRuntime,
-      });
+      try {
+        snapshot = await owner.loadNativeModelCatalog({
+          provider: params.provider,
+          modelId: params.model,
+          runtime: params.agentRuntime,
+        });
+      } catch (error) {
+        if (isAbortError(error) || !isTimeoutError(error)) {
+          throw error;
+        }
+        // A timed-out native capability read keeps the owner's latest accepted catalog.
+        snapshot = owner.readFullModelCatalog?.() ?? owner.modelCatalog;
+      }
     } else {
       const catalog = owner
         ? (await materializeRequestedModelCatalog(owner, true, undefined)).modelCatalog

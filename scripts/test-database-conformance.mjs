@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { assignWeightedTestFiles } from "./lib/weighted-test-shards.mts";
+import { listDirectoryTreeStrictSync } from "../src/infra/directory-walk.ts";
+import {
+  assignPostgresConformanceShards,
+  createPostgresConformanceEstimator,
+} from "./lib/postgres-conformance-shards.mts";
 
 const usage =
   "Usage: node scripts/test-database-conformance.mjs --engine postgres [--connection <dsn> | --list] [--shard <index>/<count>] [-- <targets and test options>]";
@@ -49,36 +53,49 @@ try {
   process.exit(2);
 }
 
-// Expand every original directory target so each test belongs to exactly one shard.
-const directoryTargets = [
-  "extensions/workboard",
-  "src/infra/postgres-sync",
-  "src/infra/database-engine",
-];
-function listTestFiles(directory) {
-  const files = [];
-  for (const entry of readdirSync(new URL("../" + directory + "/", import.meta.url), {
-    withFileTypes: true,
-  })) {
-    // Match the test runner's source inventory, never installed dependencies or symlink trees.
-    if (entry.name === "node_modules" || entry.name === ".git") {
-      continue;
-    }
-    const relativePath = directory + "/" + entry.name;
-    if (entry.isDirectory()) {
-      files.push(...listTestFiles(relativePath));
-    } else if (entry.isFile() && /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(entry.name)) {
-      files.push(relativePath);
-    }
-  }
-  return files.toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0));
-}
 let targets = explicitTargets
   ? []
   : [
-      ...directoryTargets.flatMap(listTestFiles),
-      "src/state/openclaw-state-db.postgres.test.ts",
+      "extensions/workboard",
+      "extensions/logbook/src/postgres-store.test.ts",
+      "extensions/clickclack/src/discussions/revoked-channel-store.postgres.test.ts",
       "extensions/imessage/src/monitor/recovery-cursor.postgres.test.ts",
+      "extensions/matrix/src/matrix/account-state.postgres.test.ts",
+      "extensions/team-reports/src/postgres-store.test.ts",
+      "src/infra/postgres-sync",
+      ...listDirectoryTreeStrictSync(
+        fileURLToPath(new URL("../src/infra/database-engine/", import.meta.url)),
+      )
+        .map((walkEntry) => walkEntry.relativePath)
+        .filter((file) => file.endsWith(".test.ts"))
+        .map((file) => `src/infra/database-engine/${file.replaceAll("\\", "/")}`)
+        .toSorted(),
+      "src/commands/doctor-database-diagnostics.postgres.test.ts",
+      "src/commands/startup-client-credentials.postgres.test.ts",
+      "src/config/sessions/session-accessor.sqlite-lifecycle-artifacts.postgres.test.ts",
+      "src/config/sessions/session-accessor.sqlite-read-hold.postgres.test.ts",
+      "src/config/sessions/session-turn-resident.postgres.test.ts",
+      "src/infra/client-credential-migration.postgres.test.ts",
+      "src/infra/gateway-lock-recovery.postgres.test.ts",
+      "src/infra/exec-approvals-native.test.ts",
+      "src/infra/client-credential-update.test.ts",
+      "src/infra/update-candidate-state.postgres.test.ts",
+      "src/state/openclaw-state-db.postgres.test.ts",
+      "src/state/openclaw-agent-db.postgres.test.ts",
+      "src/state/openclaw-agent-doctor-media.postgres.test.ts",
+      "src/state/openclaw-agent-db-engine.postgres.test.ts",
+      "src/talk/client-voice-session-entry.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-embedding-cache.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-embedding-cache-rebuild.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-source-index-kernel.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-duplicate-chunks.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-publication.postgres.test.ts",
+      "extensions/memory-core/src/memory/manager-search.postgres.test.ts",
+      "extensions/memory-core/src/tools.postgres.test.ts",
+      "extensions/memory-core/src/standing-intents.postgres.test.ts",
+      "extensions/memory-core/src/memory-forget.postgres.test.ts",
+      "src/gateway/server-database-engine.postgres.test.ts",
+      "src/transcripts/meeting-chronology.postgres.test.ts",
     ];
 if (shardCount) {
   if (shardCount > targets.length) {
@@ -86,16 +103,21 @@ if (shardCount) {
     process.exit(2);
   }
   // All jobs read the same committed weights; missing samples never remove a target.
-  const { targetSeconds } = JSON.parse(
+  const timings = JSON.parse(
     readFileSync(new URL("../config/postgres-conformance-timings.json", import.meta.url), "utf8"),
   );
-  const shards = Array.from({ length: shardCount }, (_, index) => ({
-    checkName: String(index + 1),
-    includePatterns: [],
-    weight: 0,
-  }));
-  assignWeightedTestFiles(shards, targets, (target) => targetSeconds[target] ?? 30);
-  const selected = new Set(shards[shardIndex - 1].includePatterns);
+  const shards = assignPostgresConformanceShards(
+    targets,
+    shardCount,
+    createPostgresConformanceEstimator(timings, (file) => {
+      try {
+        return statSync(new URL(`../${file}`, import.meta.url)).size;
+      } catch {
+        return 0;
+      }
+    }),
+  );
+  const selected = new Set(shards[shardIndex - 1]);
   targets = targets.filter((target) => selected.has(target));
 }
 if (values.list) {

@@ -8,8 +8,6 @@ import {
 } from "./auth-start-options.js";
 import { assertCodexSessionRuntimeOwnership } from "./binding-connection.js";
 import { isCodexAppServerLiveThreadClaimed } from "./client-runtime.js";
-import { resolveCodexAppServerClientInstanceId } from "./client.js";
-import { getCodexInferenceThread } from "./inference-routing.js";
 import { assertCodexThreadAcceptsDirectInput } from "./protocol-validators.js";
 import { isJsonObject, type CodexThread } from "./protocol.js";
 import {
@@ -159,7 +157,7 @@ export async function resumePendingCodexThread(
   const prebuiltPluginThreadConfig = params.pluginThreadConfig?.enabled
     ? await lifecycleTiming.measure("plugin-config-build", () => params.pluginThreadConfig?.build())
     : undefined;
-  const clientId = resolveCodexAppServerClientInstanceId(params.client);
+  const clientId = params.client.getInstanceId();
   const resumed = await resumeExistingCodexThread(params, {
     ...context,
     prebuiltPluginThreadConfig,
@@ -207,9 +205,6 @@ async function preparePendingCodexThreadResume(
     binding.preserveNativeModel === true
   ) {
     throw fail("configuration adoption requires an OpenClaw-owned local Codex home");
-  }
-  if (isCodexAppServerLiveThreadClaimed(params.client, binding.threadId)) {
-    throw fail("the thread is claimed by active work; stop that run before resuming");
   }
   const assertCurrent = captureCodexThreadResumeAuthority(params, binding, "native-process");
   assertCurrent();
@@ -272,15 +267,6 @@ export async function prepareCodexThreadResume(
   } finally {
     // A failed read cannot authorize recovery after its physical or host owner closes.
     assertCurrent();
-  }
-  // Reuse the lifecycle read so a missing unused thread reaches its recovery owner.
-  if (
-    params.inferenceRoute &&
-    binding.clientId === resolveCodexAppServerClientInstanceId(params.client) &&
-    !getCodexInferenceThread(params.client, binding.threadId) &&
-    thread.status?.type !== "notLoaded"
-  ) {
-    throw new Error("Codex loaded thread has no owned inference route; reconnect before retrying");
   }
   // Known supervision keeps its native home; manual adoption's stricter home and catalog
   // checks remain in preparePendingCodexThreadResume, before this common handoff.

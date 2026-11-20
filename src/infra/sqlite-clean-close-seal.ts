@@ -6,7 +6,18 @@ import { readDatabaseIdentityBirthtime } from "./sqlite-worker-identity.js";
 
 const fullVerificationIntervalMs = 7 * 24 * 60 * 60 * 1_000;
 
-type SealProof = { verifiedAt: number; facts: unknown };
+export type SqliteCleanCloseSealRefusal =
+  | "no-proof"
+  | "malformed-proof"
+  | "expired-proof"
+  | "file-mismatch"
+  | "journal-present"
+  | "identity-mismatch"
+  | "feature-mismatch"
+  | "schema-mismatch"
+  | "policy-mismatch";
+
+type SealProof = { verifiedAt: number; facts: unknown; identity?: unknown };
 
 function fileFields(file: BigIntStats) {
   return {
@@ -39,47 +50,105 @@ function hasNoJournal(pathname: string): boolean {
 /** The caller supplies fstat from its retained descriptor; closing a new one can release SQLite locks. */
 export function readSqliteCleanCloseSeal(
   pathname: string,
-  schemaIdentity: string,
   file: BigIntStats,
-): SealProof | undefined {
+  onRefusal?: (reason: SqliteCleanCloseSealRefusal) => void,
+): (SealProof & { schemaIdentity: string }) | undefined {
+  const refuse = (reason: SqliteCleanCloseSealRefusal) => {
+    onRefusal?.(reason);
+    return undefined;
+  };
   try {
     const sealPath = `${pathname}.seal`;
     if (!fs.lstatSync(sealPath).isFile()) {
-      return undefined;
+      return refuse("malformed-proof");
     }
-    const envelope: unknown = JSON.parse(fs.readFileSync(sealPath, "utf8"));
-    if (
-      !isRecord(envelope) ||
-      typeof envelope.payload !== "string" ||
-      envelope.checksum !== checksum(envelope.payload)
-    ) {
-      return undefined;
-    }
-    const payload: unknown = JSON.parse(envelope.payload);
-    if (
-      !isRecord(payload) ||
-      payload.version !== 1 ||
-      payload.schemaIdentity !== schemaIdentity ||
-      typeof payload.verifiedAt !== "number" ||
-      !Number.isSafeInteger(payload.verifiedAt) ||
-      !("facts" in payload) ||
-      !file.isFile()
-    ) {
-      return undefined;
-    }
-    const age = Date.now() - payload.verifiedAt;
-    if (
-      age < 0 ||
-      age > fullVerificationIntervalMs ||
-      !Object.entries(fileFields(file)).every(([key, value]) => payload[key] === value) ||
-      !hasNoJournal(pathname)
-    ) {
-      return undefined;
-    }
-    return { verifiedAt: payload.verifiedAt, facts: payload.facts };
-  } catch {
+    return decodeSqliteCleanCloseSeal(
+      fs.readFileSync(sealPath, "utf8"),
+      file,
+      hasNoJournal(pathname),
+      refuse,
+    );
+  } catch (error) {
     // Torn writes and unreadable seals fall back to the ordinary full validation.
+    return refuse(hasErrnoCode(error, "ENOENT") ? "no-proof" : "malformed-proof");
+  }
+}
+
+function decodeSqliteCleanCloseSeal(
+  contents: string,
+  file: BigIntStats,
+  journalFree: boolean,
+  refuse: (reason: SqliteCleanCloseSealRefusal) => undefined,
+): (SealProof & { schemaIdentity: string }) | undefined {
+  const envelope: unknown = JSON.parse(contents);
+  if (
+    !isRecord(envelope) ||
+    typeof envelope.payload !== "string" ||
+    envelope.checksum !== checksum(envelope.payload)
+  ) {
+    return refuse("malformed-proof");
+  }
+  const payload: unknown = JSON.parse(envelope.payload);
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.schemaIdentity !== "string" ||
+    typeof payload.verifiedAt !== "number" ||
+    !Number.isSafeInteger(payload.verifiedAt) ||
+    !("facts" in payload) ||
+    !file.isFile()
+  ) {
+    return refuse("malformed-proof");
+  }
+  const age = Date.now() - payload.verifiedAt;
+  if (age < 0 || age > fullVerificationIntervalMs) {
+    return refuse("expired-proof");
+  }
+  if (!Object.entries(fileFields(file)).every(([key, value]) => payload[key] === value)) {
+    return refuse("file-mismatch");
+  }
+  if (!journalFree) {
+    return refuse("journal-present");
+  }
+  return {
+    schemaIdentity: payload.schemaIdentity,
+    verifiedAt: payload.verifiedAt,
+    facts: payload.facts,
+    ...(payload.identity === undefined ? {} : { identity: payload.identity }),
+  };
+}
+
+export async function readSqliteCleanCloseSealAsync(
+  pathname: string,
+  file: BigIntStats,
+  onRefusal?: (reason: SqliteCleanCloseSealRefusal) => void,
+): Promise<(SealProof & { schemaIdentity: string }) | undefined> {
+  const refuse = (reason: SqliteCleanCloseSealRefusal) => {
+    onRefusal?.(reason);
     return undefined;
+  };
+  try {
+    const sealPath = pathname + ".seal";
+    if (!(await fs.promises.lstat(sealPath)).isFile()) {
+      return refuse("malformed-proof");
+    }
+    const contents = await fs.promises.readFile(sealPath, "utf8");
+    const journals = await Promise.all(
+      ["-wal", "-journal"].map(async (suffix) => {
+        try {
+          const journal = await fs.promises.stat(pathname + suffix, { bigint: true });
+          return journal.isFile() && journal.size === 0n;
+        } catch (error) {
+          if (hasErrnoCode(error, "ENOENT")) {
+            return true;
+          }
+          throw error;
+        }
+      }),
+    );
+    return decodeSqliteCleanCloseSeal(contents, file, journals.every(Boolean), refuse);
+  } catch (error) {
+    return refuse(hasErrnoCode(error, "ENOENT") ? "no-proof" : "malformed-proof");
   }
 }
 
@@ -112,6 +181,7 @@ export function writeSqliteCleanCloseSeal(
       ...fileFields(file),
       verifiedAt: proof.verifiedAt,
       facts: proof.facts,
+      identity: proof.identity,
     });
     // No rename/fsync is needed: a partial write cannot pass the checksum and file-state checks.
     fs.writeFileSync(sealPath, JSON.stringify({ payload, checksum: checksum(payload) }));

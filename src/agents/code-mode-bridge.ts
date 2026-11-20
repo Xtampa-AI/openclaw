@@ -39,6 +39,9 @@ const loadSwarmHandlers = createLazyRuntimeNamedExport(
   "codeModeSwarmHandlers",
 );
 
+const CODE_MODE_INSTRUCTIONS_HINT =
+  "Call handle.describe() before invocation to load the complete server instructions.";
+
 export const CODE_MODE_NODES_TOOL_ID = "openclaw:core:nodes";
 
 function projectCodeModeNode(node: NodeListNode) {
@@ -260,18 +263,21 @@ export async function runBridgeRequest(params: {
             value = params.results.save(values[0], params.runtime.hasNetworkContent());
           }
         } else if (params.request.method === "resultLoad") {
-          const loaded = sessionStore
-            ? await sessionStore.load(values[0])
-            : params.results.load(values[0]);
+          if (!sessionStore) {
+            const loaded = params.results.load(values[0]);
+            if (loaded.networkContent) {
+              params.runtime.observeNetworkContent(params.parentToolCallId);
+            }
+            // The guest decodes its own copy; keep the stored JSON intact on the host.
+            params.reply.settleJson(true, loaded.json);
+            return;
+          }
+          const loaded = await sessionStore.load(values[0]);
           if (loaded.networkContent) {
             params.runtime.observeNetworkContent(params.parentToolCallId);
           }
           // Session values need an envelope to preserve missing/undefined across the JSON bridge.
-          value = sessionStore
-            ? loaded.value === undefined
-              ? {}
-              : { value: loaded.value }
-            : loaded.value;
+          value = loaded.value === undefined ? {} : { value: loaded.value };
         } else if (sessionStore) {
           await sessionStore.delete(values[0]);
         } else {
@@ -324,6 +330,8 @@ export async function runBridgeRequest(params: {
                 name: entry.mcp?.toolName ?? entry.name,
                 source: "mcp",
                 description: truncateUtf16Safe(entry.description, 512),
+                instructions: entry.mcp?.instructions,
+                instructionsHint: entry.instructionsHint ? CODE_MODE_INSTRUCTIONS_HINT : undefined,
               };
             });
         break;
@@ -457,7 +465,7 @@ export async function runBridgeRequest(params: {
           .slice(offset, offset + 20)
           .map(({ name, description, location }) => ({
             name,
-            description: description.slice(0, 512),
+            description: truncateUtf16Safe(description, 512),
             location,
           }));
         break;
@@ -482,18 +490,10 @@ export async function runBridgeRequest(params: {
         if (!isRecord(result) || result.isError || !isRecord(result.details)) {
           const details = isRecord(result) && isRecord(result.details) ? result.details : undefined;
           const detail = details?.error ?? details?.message;
-          const textPart =
-            isRecord(result) && Array.isArray(result.content)
-              ? result.content.find(
-                  (part) => isRecord(part) && part.type === "text" && typeof part.text === "string",
-                )
-              : undefined;
           const message =
             typeof detail === "string"
               ? detail
-              : isRecord(textPart) && typeof textPart.text === "string"
-                ? textPart.text
-                : undefined;
+              : result.content.find((part) => part.type === "text")?.text;
           throw new Error(
             `Installed skill request failed: ${truncateUtf16Safe(
               redactToolPayloadText(message || "missing structured result details"),
@@ -530,6 +530,17 @@ export async function runBridgeRequest(params: {
     }
     params.reply.settle(true, value);
   } catch (error) {
+    const classified =
+      getBeforeToolCallFailureDisposition(error) !== undefined && error instanceof Error
+        ? (error.cause ?? error)
+        : error;
+    const code =
+      sessionStoreRequest && error instanceof RangeError
+        ? "store_range"
+        : sessionStoreRequest && error instanceof TypeError
+          ? "store_type"
+          : (getToolContractFailureCode(classified) ??
+            (isTrustedToolInputError(classified) ? "invalid_input" : "tool_error"));
     logCodeModeFailure(error, {
       sessionId: params.ctx.sessionId,
       sessionKey: params.ctx.sessionKey,
@@ -538,23 +549,14 @@ export async function runBridgeRequest(params: {
       codeModeRunId: params.activeRunId,
       workerId: params.workerId,
       failurePhase: "bridge",
+      failureCode: code,
       bridgeDispatchStarted: true,
       bridgeRequestId: params.request.id,
       bridgeMethod: params.request.method,
     });
-    const classified =
-      getBeforeToolCallFailureDisposition(error) !== undefined && error instanceof Error
-        ? (error.cause ?? error)
-        : error;
     params.reply.settle(false, {
       message: redactCodeModeCatalogIds(formatErrorMessage(error), catalogProjection.bindings),
-      code:
-        sessionStoreRequest && error instanceof RangeError
-          ? "store_range"
-          : sessionStoreRequest && error instanceof TypeError
-            ? "store_type"
-            : (getToolContractFailureCode(classified) ??
-              (isTrustedToolInputError(classified) ? "invalid_input" : "tool_error")),
+      code,
       effectStatus: "unknown",
     });
   }

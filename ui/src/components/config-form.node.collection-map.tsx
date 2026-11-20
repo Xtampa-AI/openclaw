@@ -11,12 +11,14 @@ import {
 import { defaultValue, NO_SAFE_DEFAULT } from "./config-form.constraints.ts";
 import {
   configChildRenderOptions,
+  createCollectionFocus,
   getSensitiveRenderState,
   isAnySchema,
   jsonValue,
   CollectionRemoveButton,
   FieldRow,
   JsonTextareaControl,
+  type CollectionRowFocus,
   type ConfigNodeRenderer,
   type ConfigNodeRenderParams,
 } from "./config-form.node.shared.tsx";
@@ -51,14 +53,18 @@ function resolveMapContent(params: MapParams) {
 }
 
 function ConfigMapRow(
-  props: MapProps & { entry: [string, unknown]; anySchema: boolean },
+  props: MapProps & {
+    entry: [string, unknown];
+    anySchema: boolean;
+    focus: CollectionRowFocus;
+  },
 ): JSX.Element {
   const key = createMemo(() => props.entry[0]);
   const entryValue = () => props.entry[1];
   const valuePath = createMemo(() => [...props.params.path, key()]);
   const errorId = createMemo(() => configFieldId(valuePath(), "key-error"));
   const [renameError, setRenameError] = createSignal("");
-  const keyValue = liveValue(() => key());
+  const keyValue = liveValue<HTMLInputElement>(() => key());
   const sensitiveState = createMemo(() =>
     getSensitiveRenderState({
       path: valuePath(),
@@ -135,7 +141,8 @@ function ConfigMapRow(
         </div>
         <div class="settings-row__control">
           <CollectionRemoveButton
-            label={t("configForm.removeEntry")}
+            focus={props.focus}
+            label={t("configForm.removeEntryKey", { key: key() })}
             disabled={props.params.disabled}
             remove={() => {
               const nextValue = { ...props.params.value };
@@ -174,6 +181,7 @@ function ConfigMapRow(
 export function ConfigMapField(props: MapProps): JSX.Element {
   let draft!: ConfigCollectionDraftHandle;
   const content = createMemo(() => resolveMapContent(props.params));
+  const focus = createCollectionFocus(() => content().visibleEntries.map(([key]) => key));
   return (
     <Show when={content().visible}>
       <div class="cfg-block cfg-map">
@@ -185,6 +193,7 @@ export function ConfigMapField(props: MapProps): JSX.Element {
           </Show>
           <div class="settings-row__control">
             <button
+              ref={focus.addRef}
               type="button"
               class="btn btn--sm"
               aria-controls={content().draftId}
@@ -197,7 +206,7 @@ export function ConfigMapField(props: MapProps): JSX.Element {
                 const nextValue = { ...props.params.value };
                 let index = 1;
                 let key = `custom-${index}`;
-                while (key in nextValue) {
+                while (Object.hasOwn(nextValue, key) || props.params.reservedKeys.has(key)) {
                   index += 1;
                   key = `custom-${index}`;
                 }
@@ -218,8 +227,6 @@ export function ConfigMapField(props: MapProps): JSX.Element {
           onCommit={({ key, value }) =>
             Boolean(
               key &&
-              !Object.hasOwn(props.params.value, key) &&
-              !props.params.reservedKeys.has(key) &&
               props.params.onPatch(props.params.path, {
                 ...props.params.value,
                 [key]: value,
@@ -236,6 +243,7 @@ export function ConfigMapField(props: MapProps): JSX.Element {
                   renderNode={props.renderNode}
                   entry={entry()}
                   anySchema={content().anySchema}
+                  focus={focus.row(() => entry()[0])}
                 />
               )}
             </For>

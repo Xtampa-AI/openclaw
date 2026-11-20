@@ -287,11 +287,7 @@ function resolveOpenAIImageRequestSize(
   };
 }
 
-function shouldAllowPrivateImageEndpoint(req: {
-  provider: string;
-  model: string;
-  cfg: OpenClawConfig | undefined;
-}) {
+function shouldAllowPrivateImageEndpoint(req: OpenAIImageRequest) {
   if (req.provider === MOCK_OPENAI_PROVIDER_ID) {
     return true;
   }
@@ -842,7 +838,6 @@ export function buildOpenAIImageGenerationProvider(
             },
             resolveClosestSize,
           );
-      const size = sizeResolution.size;
       const url = isAzure
         ? buildAzureImageUrl(rawBaseUrl, model, isEdit ? "edits" : "generations")
         : `${baseUrl}/images/${isEdit ? "edits" : "generations"}`;
@@ -850,7 +845,7 @@ export function buildOpenAIImageGenerationProvider(
         ...(!isAzure ? { model } : {}),
         prompt: req.prompt,
         n: count,
-        size,
+        size: sizeResolution.size,
         ...resolveOpenAIImageOptions(req),
         ...(req.providerOptions?.openai?.user !== undefined
           ? { user: req.providerOptions.openai.user }
@@ -887,7 +882,7 @@ export function buildOpenAIImageGenerationProvider(
         : await postJsonRequest({ ...requestOptions, body });
       const { response, release } = requestResult;
       try {
-        const images = await readOpenAIImageGenerationResponse(response, {
+        const { images, usage } = await readOpenAIImageGenerationResponse(response, {
           operation,
           providerUrl: url,
           deadline,
@@ -896,15 +891,18 @@ export function buildOpenAIImageGenerationProvider(
           maxDownloads: OPENAI_MAX_IMAGE_RESULTS,
           maxBytes: resolveGeneratedImageDownloadMaxBytes(req.cfg),
           defaultMimeType: resolveOutputMime(req.outputFormat).mimeType,
-          allowPrivateNetwork,
+          allowPrivateNetwork:
+            isPrivateNetworkOptInEnabled(req.cfg?.browser?.ssrfPolicy) ||
+            openAIProviderConfig?.request?.allowPrivateNetwork === true,
           ssrfPolicy: req.ssrfPolicy,
           dispatcherPolicy,
         });
 
+        const metadata = usage ? { ...sizeResolution.metadata, usage } : sizeResolution.metadata;
         return {
           images,
           model,
-          ...(sizeResolution.metadata ? { metadata: sizeResolution.metadata } : {}),
+          ...(metadata ? { metadata } : {}),
         };
       } finally {
         await release();

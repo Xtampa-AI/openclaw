@@ -44,6 +44,7 @@ function currentJob(slot: SqliteWorkerSlotCustody): Job {
     observation: { started() {}, completed() {} },
     request: { type: "execute", id: 1, actor: 1, input: new Uint8Array() },
     bytes: 0,
+    result: new Promise(() => {}),
     resolve: vi.fn(),
     reject: vi.fn(),
     detach: vi.fn(),

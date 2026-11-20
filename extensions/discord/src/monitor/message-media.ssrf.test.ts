@@ -1,9 +1,7 @@
 import { readFile } from "node:fs/promises";
-import { MessageType, StickerFormatType } from "discord-api-types/v10";
+import { StickerFormatType } from "discord-api-types/v10";
 import type { LookupFn } from "openclaw/plugin-sdk/ssrf-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Message } from "../internal/structures.js";
-import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import { resolveMediaList } from "./message-media.js";
 
 const lookup = vi.hoisted(() => vi.fn<LookupFn>());
@@ -13,26 +11,7 @@ vi.mock("node:dns/promises", async (importOriginal) => ({
 }));
 afterEach(() => vi.restoreAllMocks());
 
-const message = new Message(createInternalTestClient(), {
-  id: "message-1",
-  channel_id: "channel-1",
-  author: {
-    id: "author-1",
-    username: "fixture",
-    discriminator: "0",
-    avatar: null,
-    global_name: null,
-  },
-  content: "",
-  timestamp: "2026-11-01T00:00:00.000Z",
-  edited_timestamp: null,
-  tts: false,
-  mention_everyone: false,
-  mentions: [],
-  mention_roles: [],
-  embeds: [],
-  pinned: false,
-  type: MessageType.Default,
+const message = {
   attachments: [
     {
       id: "1",
@@ -43,10 +22,31 @@ const message = new Message(createInternalTestClient(), {
     },
   ],
   sticker_items: [{ id: "2", name: "sticker", format_type: StickerFormatType.PNG }],
-});
+};
 const body = Buffer.from("discord-media");
 
 describe("Discord CDN download authority", () => {
+  it.each([false, true])(
+    "retains explicit host trust and denials (blocked: %s)",
+    async (blocked) => {
+      lookup.mockResolvedValue([{ address: "10.0.0.1", family: 4 }]);
+      const fetchSpy = vi.fn(
+        async () => new Response(body, { headers: { "content-type": "image/png" } }),
+      );
+      const hosts = ["cdn.discordapp.com", "media.discordapp.net"];
+      const media = await resolveMediaList(message, 1024, {
+        fetchImpl: async () => fetchSpy(),
+        ssrfPolicy: {
+          allowedHostnames: hosts,
+          ...(blocked ? { blockedHostnames: hosts } : {}),
+        },
+      });
+      expect(media).toHaveLength(2);
+      expect(media.every((item) => Boolean(item.path))).toBe(!blocked);
+      expect(fetchSpy).toHaveBeenCalledTimes(blocked ? 0 : 2);
+    },
+  );
+
   it.each(["allowPrivateNetwork", "dangerouslyAllowPrivateNetwork"] as const)(
     "ignores browser %s for private and link-local DNS answers",
     async (flag) => {
@@ -72,24 +72,6 @@ describe("Discord CDN download authority", () => {
         expect(blockedMedia.every((media) => !media.path)).toBe(true);
         expect(fetchSpy).not.toHaveBeenCalled();
       }
-    },
-  );
-
-  it.each([false, true])(
-    "preserves explicit host access with denial precedence (%s)",
-    async (blocked) => {
-      lookup.mockResolvedValue([{ address: "10.0.0.1", family: 4 }]);
-      const fetchSpy = vi.fn(async () => new Response(body));
-      const media = await resolveMediaList(message, 1024, {
-        fetchImpl: async () => fetchSpy(),
-        ssrfPolicy: {
-          allowedHostnames: ["cdn.discordapp.com", "media.discordapp.net"],
-          blockedHostnames: blocked ? ["cdn.discordapp.com", "media.discordapp.net"] : [],
-        },
-      });
-      expect(media).toHaveLength(2);
-      expect(media.every((item) => Boolean(item.path) === !blocked)).toBe(true);
-      expect(fetchSpy).toHaveBeenCalledTimes(blocked ? 0 : 2);
     },
   );
 

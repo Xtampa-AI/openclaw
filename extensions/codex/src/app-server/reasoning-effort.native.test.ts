@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import type http from "node:http";
 import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
@@ -12,55 +11,14 @@ import {
   createParams,
   resetThreadLifecycleTestFixtures,
 } from "./thread-lifecycle.test-fixtures.js";
-import { listenForNativeResponses, nativeAppServerOptions } from "./thread-native.test-support.js";
+import {
+  listenForNativeResponses,
+  nativeAppServerOptions,
+  nativeProviderConfig,
+  sendNativeResponse,
+} from "./thread-native.test-support.js";
 import { buildThreadStartParams } from "./thread-requests.js";
 import { buildTurnStartParams } from "./turn-params.js";
-
-function sendNativeResponse(response: http.ServerResponse, id: string, item: unknown) {
-  const events = [
-    { type: "response.created", response: { id } },
-    { type: "response.output_item.done", item },
-    {
-      type: "response.completed",
-      response: { id, usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
-    },
-  ];
-  response.writeHead(200, { "Content-Type": "text/event-stream" });
-  response.end(
-    events
-      .map(
-        (event) => `event: ${event.type}
-data: ${JSON.stringify(event)}
-
-`,
-      )
-      .join(""),
-  );
-}
-function nativeProviderConfig(name: string, port: number, options: string[], features: string[]) {
-  return [
-    'model="gpt-5.6-luna"',
-    `model_provider="${name}"`,
-    'cli_auth_credentials_store="ephemeral"',
-    'web_search="disabled"',
-    'approval_policy="never"',
-    ...options,
-    "[features]",
-    ...features,
-    "[analytics]",
-    "enabled=false",
-    "[feedback]",
-    "enabled=false",
-    `[model_providers.${name}]`,
-    `name="Synthetic ${name} provider"`,
-    `base_url="http://127.0.0.1:${port}/v1"`,
-    'wire_api="responses"',
-    "requires_openai_auth=false",
-    "supports_websockets=false",
-    "request_max_retries=0",
-    "stream_max_retries=0",
-  ].join(String.fromCharCode(10));
-}
 
 vi.unmock("node:child_process");
 afterEach(resetThreadLifecycleTestFixtures);

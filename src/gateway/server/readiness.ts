@@ -1,37 +1,26 @@
 import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import type { ChannelAccountSnapshot } from "../../channels/plugins/types.public.js";
+import {
+  prepareChildRuntimeViability,
+  readChildRuntimeViability,
+  type ChildRuntimeViability,
+} from "../../infra/child-runtime-viability.js";
 import type { AgentDatabaseAdmissionRefusal } from "../../state/agent-database-admission.js";
 import {
   DEFAULT_CHANNEL_CONNECT_GRACE_MS,
   DEFAULT_CHANNEL_STALE_EVENT_THRESHOLD_MS,
   evaluateChannelHealth,
   type ChannelHealthPolicy,
-  type ChannelHealthEvaluation,
 } from "../channel-health-policy.js";
 import type { ChannelManager } from "../server-channels.js";
-import type { GatewayPluginReloadStatus } from "../server-plugin-runtime-generation.js";
+import type { GatewayPluginReloadStatus } from "../server-plugin-reload-status.types.js";
 import type { GatewayEventLoopHealth } from "./event-loop-health.js";
-
-type ReadinessResult = {
-  ready: boolean;
-  coreReady: boolean;
-  failing: string[];
-  suppressed?: string[];
-  uptimeMs: number;
-  eventLoop?: GatewayEventLoopHealth;
-  pluginReload?: GatewayPluginReloadStatus;
-  agentDatabases?: readonly AgentDatabaseAdmissionRefusal[];
-  stateDatabase?: { reason: string };
-};
-
-export type ReadinessChecker = () => ReadinessResult;
-
-export type StartupResult =
-  | { ok: true; status: "started"; uptimeMs: number }
-  | { ok: false; status: "starting"; uptimeMs: number; pendingReason: string }
-  | { ok: false; status: "draining"; uptimeMs: number };
-
-export type StartupChecker = () => StartupResult;
+import type {
+  PreparedReadinessChecker,
+  ReadinessResult,
+  StartupChecker,
+  StartupResult,
+} from "./readiness.types.js";
 
 type GatewayStartupStateDeps = {
   startedAt: number;
@@ -73,7 +62,7 @@ export function createStartupChecker(
 
 function shouldIgnoreReadinessFailure(
   accountSnapshot: ChannelAccountSnapshot,
-  health: ChannelHealthEvaluation,
+  health: ReturnType<typeof evaluateChannelHealth>,
 ): boolean {
   if (health.reason === "unmanaged" || health.reason === "stale-socket") {
     return true;
@@ -101,20 +90,20 @@ export function createReadinessChecker(
     getStateDatabaseFailure?: () => Error | undefined;
     getAgentDatabaseAdmissionRefusals?: () => readonly AgentDatabaseAdmissionRefusal[];
     getPluginReloadStatus?: () => GatewayPluginReloadStatus | undefined;
+    isChatSendAvailable?: () => boolean;
     shouldSkipChannelReadiness?: () => boolean;
-    cacheTtlMs?: number;
   },
-): ReadinessChecker {
+): PreparedReadinessChecker {
   const { channelManager, startedAt } = deps;
   const getStartup = createStartupChecker(deps);
-  const cacheTtlMs = Math.max(0, deps.cacheTtlMs ?? DEFAULT_READINESS_CACHE_TTL_MS);
   let cachedAt = 0;
   let cachedState: Omit<ReadinessResult, "uptimeMs"> | null = null;
 
   const readReadiness = (
     agentDatabases: readonly AgentDatabaseAdmissionRefusal[] | undefined,
+    childRuntime: ChildRuntimeViability | undefined,
+    startup: StartupResult,
   ): ReadinessResult => {
-    const startup = getStartup();
     const uptimeMs = startup.uptimeMs;
     const now = startedAt + uptimeMs;
     if (startup.status === "starting") {
@@ -122,6 +111,9 @@ export function createReadinessChecker(
     }
     if (startup.status === "draining") {
       return { ready: false, coreReady: false, failing: ["gateway-draining"], uptimeMs };
+    }
+    if (!(childRuntime ?? readChildRuntimeViability()).available) {
+      return { ready: false, coreReady: false, failing: ["child-runtime"], uptimeMs };
     }
     const stateDatabaseFailure = deps.getStateDatabaseFailure?.();
     if (stateDatabaseFailure) {
@@ -148,10 +140,14 @@ export function createReadinessChecker(
       cachedState = null;
       return { ready: false, coreReady: false, failing: ["plugin-reload"], pluginReload, uptimeMs };
     }
+    if (deps.isChatSendAvailable?.() === false) {
+      cachedState = null;
+      return { ready: false, coreReady: false, failing: ["chat-startup"], uptimeMs };
+    }
     if (
       cachedState &&
       !isFutureDateTimestampMs(cachedAt, { nowMs: now }) &&
-      now - cachedAt < cacheTtlMs
+      now - cachedAt < DEFAULT_READINESS_CACHE_TTL_MS
     ) {
       return { ...cachedState, uptimeMs };
     }
@@ -203,9 +199,9 @@ export function createReadinessChecker(
     };
     return { ...cachedState, uptimeMs };
   };
-  return () => {
+  const read = (childRuntime?: ChildRuntimeViability, startup?: StartupResult) => {
     const agentDatabases = deps.getAgentDatabaseAdmissionRefusals?.();
-    const result = readReadiness(agentDatabases);
+    const result = readReadiness(agentDatabases, childRuntime, startup ?? getStartup());
     const getEventLoopHealth = deps.getEventLoopHealth;
     const eventLoop = getEventLoopHealth?.();
     return {
@@ -214,4 +210,20 @@ export function createReadinessChecker(
       ...(eventLoop ? { eventLoop } : {}),
     };
   };
+  return Object.assign(read, {
+    prepare: async () => {
+      const startup = getStartup();
+      if (startup.status !== "started") {
+        return {
+          publish: () => {
+            const current = getStartup();
+            // An unprepared refusal cannot become ready without observing the runtime.
+            return read(undefined, current.status === "started" ? startup : current);
+          },
+        };
+      }
+      const childRuntime = await prepareChildRuntimeViability();
+      return { publish: () => read(childRuntime.publish()) };
+    },
+  });
 }

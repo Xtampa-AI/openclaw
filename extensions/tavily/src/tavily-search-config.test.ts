@@ -1,6 +1,7 @@
 /* Start By Cursor Rule, csjg8ah9884ye1ru37qo6iroqwl8waao */
 import type { MockInstance } from "vitest";
 import { afterEach, assert, expect, it, vi } from "vitest";
+import { hangingFetchUntilAbort } from "../../test-support/hanging-fetch.test-support.js";
 import { createTavilyWebSearchProvider } from "./tavily-search-provider.js";
 
 afterEach(() => {
@@ -62,31 +63,16 @@ it("keeps the client default count when no search config is set", async () => {
 });
 
 it("cancels a slow Tavily search at the configured deadline", async () => {
-  vi.spyOn(globalThis, "fetch").mockImplementation(
-    (_url, init) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          const reason = init.signal?.reason;
-          reject(reason instanceof Error ? reason : new Error("aborted"));
-        });
-      }) as Promise<Response>,
-  );
+  vi.spyOn(globalThis, "fetch").mockImplementation(hangingFetchUntilAbort);
   const tool = createConfiguredSearchTool({ timeoutSeconds: 1 });
   vi.useFakeTimers();
-  let pending: Promise<unknown> | undefined;
   try {
-    let settled = false;
-    pending = expect(
-      tool.execute({ query: "deadline enforcement" }).finally(() => {
-        settled = true;
-      }),
-    ).rejects.toThrow(/timed out|TimeoutError|aborted/i);
+    const pending = expect(tool.execute({ query: "deadline enforcement" })).rejects.toThrow(
+      /timed out|TimeoutError|aborted/i,
+    );
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(settled, "request must settle at its configured deadline").toBe(true);
     await pending;
   } finally {
-    await vi.runOnlyPendingTimersAsync();
-    await pending;
     vi.useRealTimers();
   }
 });

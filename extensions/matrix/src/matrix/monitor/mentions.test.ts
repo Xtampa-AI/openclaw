@@ -233,6 +233,17 @@ describe("resolveMentions", () => {
   }
 
   describe("formatted_body matrix.to links", () => {
+    it("keeps malformed formatted mention scans within the event-loop budget", () => {
+      const started = performance.now();
+      for (const formatted of ['<a href="https://matrix.to/#/'.repeat(1200), "<".repeat(33_600)]) {
+        expect(resolveFormatted("ordinary text", formatted)).toEqual({
+          wasMentioned: false,
+          hasExplicitMention: false,
+        });
+      }
+      expect(performance.now() - started).toBeLessThan(1000);
+    });
+
     it("detects mention in formatted_body with plain user ID", () => {
       const result = resolveFormatted(
         "Bot: hello",

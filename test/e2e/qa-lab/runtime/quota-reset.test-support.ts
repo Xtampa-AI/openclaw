@@ -690,6 +690,11 @@ export async function createQuotaResetFixture(
     startTimeoutMs: 120_000,
     env: {
       ...(tls ? { NODE_EXTRA_CA_CERTS: caPath, CODEX_CA_CERTIFICATE: caPath } : {}),
+      // Dashboard bootstrap codes and auth readbacks must use the Gateway's
+      // advanced clock. NODE_OPTIONS also carries it through CLI respawns.
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${preload.href}`]
+        .filter(Boolean)
+        .join(" "),
       OPENCLAW_TEST_MINIMAL_GATEWAY: "0",
       OPENCLAW_SKIP_PROVIDERS: undefined,
       OPENCLAW_AGENT_HARNESS_FALLBACK: "none",
@@ -807,7 +812,10 @@ export async function createQuotaResetFixture(
   const alternateProfileId = "openai:quota-alternate";
   const alternateAccess = syntheticAccessToken(expires, "quota-alternate-account");
   const { saveAuthProfileStoreWithPreparedOwner } = createAuthProfileStoreRuntime(
-    createExternalAuthRuntime(() => []),
+    createExternalAuthRuntime(
+      () => [],
+      async (_params, run) => run(),
+    ),
   );
   // Quota recovery uses shared auth, including the external saved-block writer.
   // Bind the fresh fixture's owner explicitly; an agent-local seed is not equivalent.

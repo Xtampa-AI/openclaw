@@ -3,10 +3,12 @@ import { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { readRegularFile } from "@openclaw/fs-safe/advanced";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
+import type { ReadFilePage } from "../../agents/sessions/tools/read-file-page.js";
+import { throwSettledAggregate } from "../../infra/error-graph-internal.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { getProcessInstanceStartTime } from "../../shared/pid-alive.js";
-import { spawnWithInheritedOomScore } from "../linux-oom-score.js";
-import { waitForBrokerChildCompletion } from "./child-completion.js";
+import { spawnWithInheritedOomScore } from "../linux-oom-score-spawn.js";
+import { disposeFailedChild, waitForBrokerChildCompletion } from "./child-completion.js";
 import {
   drainCurrentBrokerProcessGroup,
   isBrokerChildGroupAlive,
@@ -14,7 +16,7 @@ import {
   type BrokerChildGroupIdentity,
 } from "./cleanup.js";
 import { serializeExecaError } from "./execa-protocol.js";
-import { startBrokerExeca, type BrokerExecaProcess } from "./execa-worker.js";
+import type { BrokerExecaProcess } from "./execa-worker.js";
 import { createBrokerReceiver } from "./ipc.js";
 import { holdPipeForTransfer, takePipePrefix } from "./pipe.js";
 import {
@@ -56,7 +58,7 @@ let resources: Awaited<ReturnType<typeof createBrokerNativeResourceServer>> | un
 let startup: "waiting" | "initializing" | "ready" = "waiting";
 let initialization = Promise.resolve();
 const launches = new Set<Promise<void>>();
-const fileReads = new Map<number, { canceled: boolean }>();
+const fileReads = new Map<number, { canceled: boolean; controller: AbortController }>();
 
 const sender = createWorkerSender((message, handle, callback) => {
   if (!process.send || !process.connected) {
@@ -143,6 +145,9 @@ function shutdown(): void {
     return;
   }
   stopping = true;
+  for (const read of fileReads.values()) {
+    read.controller.abort();
+  }
   for (const grant of launchGrants.values()) {
     grant.resolve(false);
   }
@@ -162,12 +167,7 @@ function shutdown(): void {
         ...[...owned.values()].map(stopChild),
         resources?.close(),
       ]);
-      const failures = outcomes.flatMap((outcome) =>
-        outcome.status === "rejected" ? [outcome.reason] : [],
-      );
-      if (failures.length) {
-        throw new AggregateError(failures, "Spawn broker native cleanup failed");
-      }
+      throwSettledAggregate(outcomes, "Spawn broker native cleanup failed");
       // Native owners have settled. Only abandoned members of our private group
       // remain; never signal the broker or tear down its isolate during cleanup.
       await drainCurrentBrokerProcessGroup();
@@ -183,45 +183,34 @@ function shutdown(): void {
   })();
 }
 
-function disposeFailedChild(child: ChildProcess | undefined): void {
-  if (!child) {
-    return;
-  }
-  // Setup can fail before Node emits its queued spawn error.
-  child.once("error", () => {});
-  if (child.pid && child.exitCode === null && child.signalCode === null) {
-    child.kill("SIGKILL");
-  }
-  if (child.connected) {
-    child.disconnect();
-  }
-  for (const stream of child.stdio ?? []) {
-    stream?.destroy();
-  }
-}
-
 async function readFile(message: Extract<BrokerRequest, { type: "read-file" }>): Promise<void> {
-  const pending = { canceled: false };
+  const pending = { canceled: false, controller: new AbortController() };
   try {
     // Resource brokers can hold SQLite locks; only the command broker is a safe reader.
     if (resources || owned.size + starting.size + fileReads.size >= 256) {
       throw new SpawnBrokerError("Spawn broker cannot admit a raw file read");
     }
     fileReads.set(message.id, pending);
-    const { buffer } = await readRegularFile({ filePath: message.filePath });
-    // Bound each IPC message, not the file size. Await sends to avoid retaining a second payload.
-    for (let offset = 0; offset < buffer.length; offset += 512 * 1024) {
-      if (stopping || pending.canceled) {
-        return;
+    let page: ReadFilePage | undefined;
+    if (message.page) {
+      const { captureReadFilePage } = await import("../../agents/sessions/tools/read-file-page.js");
+      page = await captureReadFilePage(message.filePath, message.page, pending.controller.signal);
+    } else {
+      const { buffer } = await readRegularFile({ filePath: message.filePath });
+      // Bound IPC messages while preserving the existing complete-byte read.
+      for (let offset = 0; offset < buffer.length; offset += 512 * 1024) {
+        if (stopping || pending.canceled) {
+          return;
+        }
+        await report({
+          type: "file-read-chunk",
+          id: message.id,
+          bytes: buffer.subarray(offset, offset + 512 * 1024),
+        });
       }
-      await report({
-        type: "file-read-chunk",
-        id: message.id,
-        bytes: buffer.subarray(offset, offset + 512 * 1024),
-      });
     }
     if (!stopping && !pending.canceled) {
-      await report({ type: "file-read-result", id: message.id });
+      await report({ type: "file-read-result", id: message.id, page });
     }
   } catch (error) {
     if (!stopping && !pending.canceled) {
@@ -308,10 +297,12 @@ async function launch(
           launchGrants.delete(message.id);
         }
       }
-      const execa =
-        message.type === "spawn-execa"
-          ? await startBrokerExeca(message.argv, message.options, assertActive)
-          : undefined;
+      let execa: BrokerExecaProcess | undefined;
+      if (message.type === "spawn-execa") {
+        const { startBrokerExeca } = await import("./execa-worker.js");
+        assertActive();
+        execa = await startBrokerExeca(message.argv, message.options, assertActive);
+      }
       const child =
         execa?.child ??
         (message.type !== "spawn-execa"
@@ -571,6 +562,7 @@ process.on("message", (raw: unknown, handle: SendHandle) => {
     const read = fileReads.get(message.id);
     if (read) {
       read.canceled = true;
+      read.controller.abort();
     }
     return;
   }
@@ -660,13 +652,22 @@ async function initialize(bootstrap: BrokerBootstrap): Promise<void> {
   }
   if (bootstrap.nativeResource) {
     const authority = bootstrap.nativeResource;
-    resources = await createBrokerNativeResourceServer({
-      endpoint: authority.endpoint,
-      secret: authority.secret,
-      generation: authority.generation,
-      reportParent: report,
-      canAdmit: () => !stopping && owned.size + starting.size + (resources?.size ?? 0) < 256,
-    });
+    try {
+      resources = await createBrokerNativeResourceServer({
+        endpoint: authority.endpoint,
+        directory: authority.directory,
+        secret: authority.secret,
+        generation: authority.generation,
+        reportParent: report,
+        canAdmit: () => !stopping && owned.size + starting.size + (resources?.size ?? 0) < 256,
+      });
+    } catch (error) {
+      await report({
+        type: "startup-failed",
+        error: serializeBrokerError(toErrorObject(error, "Native resource server startup failed")),
+      }).catch(() => {});
+      throw error;
+    }
     if (stopping) {
       resources.disconnect();
       return;

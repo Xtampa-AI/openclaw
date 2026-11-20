@@ -28,6 +28,7 @@ import { disposePluginRegistryInstances } from "../plugins/runtime.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore, type Deferred } from "../shared/deferred.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { captureTurnHandoverRequest } from "./plugin-turn-handover.js";
 import { PreparedModelRuntimePluginGenerationRetiredError } from "./prepared-model-runtime.errors.js";
 import {
   registerPreparedPluginRetirement,
@@ -202,7 +203,12 @@ export function ownPreparedPluginGeneration(
         );
       }
     },
-    () => retainRuntimePluginWork(selectedRegistries),
+    () =>
+      retainRuntimePluginWork(
+        selectedRegistries,
+        "prepared-generation-lease",
+        captureTurnHandoverRequest(selectedRegistries),
+      ),
   );
   try {
     for (const registry of selectedRegistries) {
@@ -273,9 +279,6 @@ export function publishPreparedPluginGeneration(
           const registry = instance.owner?.registry;
           return !instance.acceptingCalls && registry !== undefined && gatewayLenders.has(registry);
         });
-        log.debug(
-          `Prepared plugin publication retired: metadataCacheRetired=${cacheSignal.aborted}, provenance=${owner.provenance}, pending=${Boolean(owner.pending)}, gatewayLoan=${retiredGatewayLoan}`,
-        );
         releasePreparedPluginPublication(owner);
         // Independent prepared instances and metadata caches retain their terminal
         // retirement contract; only a lost Gateway loan needs process publication.

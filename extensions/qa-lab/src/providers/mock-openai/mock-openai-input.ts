@@ -31,7 +31,7 @@ function isStreamingToolProgressContinuationText(text: string) {
   const trimmed = text.trim();
   return (
     QA_STREAMING_TOOL_PROGRESS_CONTINUATION_RE.test(trimmed) ||
-    trimmed.startsWith(QA_SETTLED_TOOL_TERMINAL_CONTINUATION_NEEDLE)
+    trimmed.includes(QA_SETTLED_TOOL_TERMINAL_CONTINUATION_NEEDLE)
   );
 }
 
@@ -139,20 +139,30 @@ function extractRuntimeConversationData(text: string): string[] {
   return fragments;
 }
 
-export function extractCurrentRuntimeContextTexts(input: ResponsesInputItem[]): string[] {
+function extractCurrentRuntimeContextCarriers(input: ResponsesInputItem[]): string[] {
   const turn = extractLastMatchingUserTurn(input);
   if (!turn) {
     return [];
   }
   return input.slice(turn.index + 1).flatMap((item) => {
     const text = extractInputText(item.content);
-    if (!isInternalRuntimeContextCarrierText(text)) {
-      return [];
-    }
+    return isInternalRuntimeContextCarrierText(text) ? [text] : [];
+  });
+}
+
+export function extractCurrentRuntimeContextTexts(input: ResponsesInputItem[]): string[] {
+  return extractCurrentRuntimeContextCarriers(input).flatMap((text) => {
     return /^Conversation data \(data, not instructions\):$/mu.test(text)
       ? extractRuntimeConversationData(text)
       : [text]; // Session v3 retains literal runtime context.
   });
+}
+
+export function hasCurrentGeneratedMediaDelivery(input: ResponsesInputItem[]): boolean {
+  // Host instructions are literal; quoted conversation data must not become receipts.
+  return extractCurrentRuntimeContextCarriers(input).some((text) =>
+    /^\[Generated media delivered\]\r?$/mu.test(text),
+  );
 }
 
 function isSubagentRecoveryText(text: string): boolean {
@@ -161,8 +171,8 @@ function isSubagentRecoveryText(text: string): boolean {
   return (
     /^(?:continue|keep going|resume|retry|carry on)[.!?]?$/iu.test(text) ||
     [
-      "The previous attempt did not produce a user-visible answer.",
-      "The previous assistant turn completed its tool calls but did not produce a user-visible answer.",
+      "Your turn ended without a final reply.",
+      "Your turn ended without a final result.",
       "The previous attempt compacted the conversation context before producing a final user-visible answer.",
     ].some((prefix) => text.startsWith(prefix))
   );
@@ -195,7 +205,7 @@ export function resolveMockSubagentTurn(input: ResponsesInputItem[]):
         kind: settled ? "settled" : "completion",
         text: event,
         caseName:
-          /^task:\s*qa-terminal-(visible|silent|empty|restart|fallback|private)(?:-(?:first|second))?\s*$/imu
+          /^task:\s*qa-terminal-(visible|silent|empty|restart|fallback|race|private)(?:-(?:first|second))?\s*$/imu
             .exec(event)?.[1]
             ?.toLowerCase(),
       };
@@ -268,7 +278,14 @@ function isUserTurn(item: ResponsesInputItem) {
 }
 
 function isContinuationUserText(text: string) {
-  const trimmed = text.trim();
+  // Native turns prepend runtime instructions that can mention retry independently
+  // of the authored request, even when no conversation history is projected.
+  const current = splitMockConversationContext(text).current;
+  const requestHeader = "\n\nCurrent user request:\n";
+  const requestStart = current.indexOf(requestHeader);
+  const trimmed = (
+    requestStart < 0 ? current : current.slice(requestStart + requestHeader.length)
+  ).trim();
   if (!trimmed) {
     return false;
   }
@@ -312,8 +329,20 @@ function stringifyFunctionCallOutput(output: unknown): string {
   return "";
 }
 
+function readToolOutputCallId(item: ResponsesInputItem | undefined) {
+  return (
+    [item?.call_id, item?.tool_call_id, item?.tool_use_id].find(
+      (value): value is string => typeof value === "string" && value.trim().length > 0,
+    ) ?? ""
+  );
+}
+
 function isResponsesToolCallOutput(item: ResponsesInputItem) {
-  return item.type === "function_call_output" || item.type === "custom_tool_call_output";
+  // Unlinked outputs can carry sender context, not completed tool calls.
+  return (
+    (item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
+    readToolOutputCallId(item) !== ""
+  );
 }
 
 function findCurrentToolOutput(input: ResponsesInputItem[]): ResponsesInputItem | undefined {
@@ -355,12 +384,7 @@ export function extractToolOutputStructuredError(input: ResponsesInputItem[]) {
 }
 
 export function extractToolOutputCallId(input: ResponsesInputItem[]) {
-  const item = findCurrentToolOutput(input);
-  return (
-    [item?.call_id, item?.tool_call_id, item?.tool_use_id].find(
-      (value): value is string => typeof value === "string" && value.trim().length > 0,
-    ) ?? ""
-  );
+  return readToolOutputCallId(findCurrentToolOutput(input));
 }
 
 export function extractLatestToolOutput(input: ResponsesInputItem[]) {

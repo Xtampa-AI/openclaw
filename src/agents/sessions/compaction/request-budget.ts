@@ -1,35 +1,14 @@
 import { MAX_COMPACTION_SUMMARY_CHARS } from "../../../../packages/agent-core/src/harness/compaction/compaction.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { PromptOptions } from "../agent-session-types.js";
-import { createFreshLlmBoundaryTokenEstimator } from "../context-token-pressure.js";
-
-/** Ephemeral foreground facts; a separately routed summarizer cannot reconstruct these. */
-export type CompactionRequestBudget = Readonly<{
-  contextWindow: number;
-  reserveTokens: number;
-  fixedTokens: number;
-  pendingTokens: number;
-  /** Known queue reservation, replaced by the SDK's projected queue at submission. */
-  pendingQueuedContextTokens?: number;
-  /** Overlap credit applies only to the user body, never newly added context. */
-  pendingUserTokens?: number;
-  pendingUserIdempotencyKey?: string;
-}>;
-
-/** Input preservation exists before the foreground prompt can supply a token budget. */
-export type CompactionRequestConstraints = Readonly<{
-  requestBudget?: CompactionRequestBudget;
-  /** Source of the active run, including after its input has been processed. */
-  requestFromEntryId?: string;
-  pendingUserEntryId?: string;
-}>;
+import {
+  createFreshLlmBoundaryTokenEstimator,
+  estimateCompactionHistoryTokens,
+  estimateVariableRequestTokens,
+} from "../context-token-pressure.js";
+import type { CompactionRequestBudget } from "./request-budget.types.js";
 
 const promptRequestBudgets = new WeakMap<PromptOptions, CompactionRequestBudget>();
-
-function estimateVariableRequestTokens(messages: AgentMessage[], prompt: string): number {
-  const estimateTokens = createFreshLlmBoundaryTokenEstimator({});
-  return estimateTokens({ messages, prompt }) - estimateTokens({ messages: [], prompt: "" });
-}
 
 /** Bind prepared foreground facts to the exact owned prompt invocation, outside public options. */
 export function attachPromptCompactionRequestBudget(
@@ -100,6 +79,15 @@ export function createCompactionRequestBudget(params: {
   };
 }
 
+/** Legacy standalone compaction relies on its fixed ceiling; opt-in growth needs a window budget. */
+export function createStandaloneCompactionRequestBudget(
+  params: Parameters<typeof createCompactionRequestBudget>[0] & { maxSummaryChars?: number },
+): CompactionRequestBudget | undefined {
+  return (params.maxSummaryChars ?? MAX_COMPACTION_SUMMARY_CHARS) > MAX_COMPACTION_SUMMARY_CHARS
+    ? createCompactionRequestBudget(params)
+    : undefined;
+}
+
 /** Reconcile only queued context; prepared user, image, and transient costs stay owned upstream. */
 export function withCompactionQueuedContext(
   budget: CompactionRequestBudget,
@@ -119,30 +107,6 @@ export function withCompactionQueuedContext(
   };
 }
 
-export function estimateCompactionHistoryTokens(
-  messages: AgentMessage[],
-  budget?: CompactionRequestBudget,
-): number {
-  // A key identifies overlapping input, not proof that its content is replaced.
-  // A retained carrier can reuse a larger canonical user, so charge the larger representation.
-  const pending =
-    budget?.pendingTokens && budget.pendingUserIdempotencyKey
-      ? messages.findLast(
-          (message) =>
-            message.role === "user" &&
-            "idempotencyKey" in message &&
-            message.idempotencyKey === budget.pendingUserIdempotencyKey,
-        )
-      : undefined;
-  const overlap = pending
-    ? Math.min(
-        estimateCompactionHistoryTokens([pending]),
-        budget?.pendingUserTokens ?? budget?.pendingTokens ?? 0,
-      )
-    : 0;
-  return estimateVariableRequestTokens(messages, "") - overlap;
-}
-
 export function estimateCompactedRequestTokens(
   messages: AgentMessage[],
   budget: CompactionRequestBudget,
@@ -152,9 +116,29 @@ export function estimateCompactedRequestTokens(
   );
 }
 
+export function assertCompactionRequestCanFit(
+  messages: AgentMessage[],
+  budget: CompactionRequestBudget | undefined,
+  hasCompactableHistory: boolean,
+): void {
+  // Try useful history reduction for pending input; only fixed overhead is unreclaimable here.
+  if (budget && (!hasCompactableHistory || budget.fixedTokens > budget.contextWindow)) {
+    const requestTokens = estimateCompactedRequestTokens(messages, budget);
+    if (requestTokens > budget.contextWindow) {
+      const historyTokens = requestTokens - budget.fixedTokens - budget.pendingTokens;
+      throw new Error(
+        `The estimated foreground request budget still exceeds the ${budget.contextWindow}-token model window ` +
+          `(fixed instructions and tools: ${budget.fixedTokens}; pending input: ${budget.pendingTokens}; retained history: ${historyTokens}). ` +
+          "No further history compaction can make this request fit. Use /context detail to reduce fixed context, shorten the request, or select a larger-context model.",
+      );
+    }
+  }
+}
+
 export function resolveCompactionRetentionBudget(
   budget: CompactionRequestBudget,
   messages: AgentMessage[],
+  maxSummaryChars = MAX_COMPACTION_SUMMARY_CHARS,
 ) {
   const preferredTokens =
     budget.contextWindow - budget.reserveTokens - budget.fixedTokens - budget.pendingTokens;
@@ -165,13 +149,18 @@ export function resolveCompactionRetentionBudget(
   const summaryTokens = estimateCompactionHistoryTokens([
     {
       role: "compactionSummary",
-      summary: "x".repeat(MAX_COMPACTION_SUMMARY_CHARS),
+      summary: "x".repeat(maxSummaryChars),
       tokensBefore: 0,
       timestamp: 0,
     },
   ]);
   return {
-    maxTokens,
+    // The legacy fallback can prefer useful reduction over fitting in one pass.
+    // A raised artifact ceiling must not use that fallback to exceed the window.
+    maxTokens:
+      maxSummaryChars > MAX_COMPACTION_SUMMARY_CHARS
+        ? Math.min(maxTokens, budget.contextWindow - budget.fixedTokens - budget.pendingTokens)
+        : maxTokens,
     reserveTokens: summaryTokens,
   };
 }

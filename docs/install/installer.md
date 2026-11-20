@@ -22,6 +22,16 @@ native builds use these assembled scripts. The npm package keeps both source
 files together for installed updater compatibility. Installing from the website
 never downloads a separate policy helper.
 
+The Bash installers tighten their process umask to disallow group and other
+writes, while preserving stricter inherited masks. This
+does not change the invoking shell or repair permissions on existing files.
+
+Git installs retry transient remote-ref lookup failures up to three times. Failed
+lookups print Git's diagnostic with URLs, authorization headers, and GitHub tokens
+redacted. Missing refs and authentication failures stop without retrying.
+Release-tag fetches stay depth-limited when the existing checkout is shallow;
+full-history checkouts retain their history.
+
 | Script                             | Platform                      | What it does                                                                                                                   |
 | ---------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | [`install.sh`](#installsh)         | macOS / Linux / WSL           | Installs Node if needed, installs OpenClaw via npm (default) or git, can run onboarding.                                       |
@@ -30,11 +40,19 @@ never downloads a separate policy helper.
 
 All three accept Node **24.16.0+ on 24.x or 26.1.0+** (24.22.1+/26.12.1+ strongly recommended for security) with a WAL-reset-safe linked SQLite library. When Node is missing and nvm is not detected, `install.sh` provisions Node 26 through Homebrew on macOS and the supported Node 24 LTS line through NodeSource on Linux. When a supported RPM-owned Node links unsafe SQLite, `install.sh` preserves the distro package and provisions a user-space Node runtime through `install-cli.sh`. The rootless `install-cli.sh` downloads Node 24.22.1 on macOS and glibc Linux. FreeBSD uses an installed system runtime. Linux ARMv7 is unsupported. On Windows, winget/Chocolatey/Scoop install the supported Node LTS line, and the portable fallback downloads Node 26.
 
+For npm installs, `install.sh` and `install.ps1` query the selected package’s `engines.node` before accepting an existing runtime. A runtime that does not satisfy the target release is upgraded through the normal Node provisioning path. The lookup has a bounded timeout; if npm or package metadata is unavailable, the installers use the conservative Node 24.22.1 / 26.12.1 floor required by the published default releases. The SQLite capability checks still apply. For git installs, they read `engines.node` from the selected checkout after clone/update and before selecting Node and bootstrapping pnpm. This retains a compatible runtime for main while respecting stricter engine requirements in older refs.
+
+On a fresh host, the installers provision Node/npm first, then query the requested package's engine requirement before installing it. `install.sh --beta` preserves the beta request through that bootstrap, selects the beta once npm is available, and checks that beta's engines. If the beta tag cannot be resolved after npm is available, it falls back to `latest` with a warning.
+
+On macOS, a failed Homebrew bootstrap stops `install.sh` before Node provisioning. Quiet and verbose modes preserve the bootstrap's exit status and error output; neither reports Homebrew success after a failure.
+
 Before changing packages, every installer checks the exact npm executable it will use. npm 11.15 and earlier installs normally; npm 11.16 and later, including npm 12, receives `--allow-scripts` for only the npm-resolved OpenClaw candidate identity. An unreadable npm version stops before package mutation. A remaining `.openclaw-lifecycle-pending` marker or legacy `dist/openclaw-install-guard` makes the install fail instead of reporting a lifecycle-skipped package as successful.
 
 On npm 12, local `.tgz` and `.tar.gz` installs and updates need a comma-free archive filename and parent path. npm uses commas to separate lifecycle approvals, so move the archive to a comma-free path before retrying. Relative tarball arguments are still supported; the installer resolves their full path for approval.
 
 Install-method switches verify the replacement before retiring the current owner. Source wrappers use a same-directory atomic replacement; when an npm shim shares that path, the installer moves only an identity-matched source wrapper aside and restores it if npm installation, lifecycle checks, or candidate verification fails. On upgrades, `install.sh` and `install.ps1` run `openclaw doctor --fix`; repair or final verification failure exits nonzero, and the success banner appears only after those steps complete.
+
+Installer help includes [official OpenClaw support](https://community.openclaw.ai/) alongside the self-service FAQ. Handled installation failures also show the support link in human-readable output; `install-cli.sh --json` keeps its existing error and completion events without human support text. Review diagnostics for credentials and personal data before sharing them.
 
 ## Private Node recovery
 
@@ -163,6 +181,10 @@ checks also default to five minutes.
   </Step>
 </Steps>
 
+For zsh, PATH setup uses `${ZDOTDIR:-$HOME}/.zshrc` and
+`${ZDOTDIR:-$HOME}/.zprofile`. Export `ZDOTDIR` before running the installer if
+you use a custom startup directory. With `ZDOTDIR` unset, zsh uses `$HOME`.
+
 ### Bun runtime
 
 ```sh
@@ -249,6 +271,15 @@ If run inside an OpenClaw checkout (`package.json` + `pnpm-workspace.yaml`), the
 If no TTY is available and no install method is set, it defaults to `npm` and warns.
 
 The script exits with code `2` for invalid method selection or invalid `--install-method` values.
+
+Existing checkout roots may use a `.git` directory or a `.git` file, including
+linked Git worktrees. All three installers validate the checkout's own commit before
+updating it and refuse incomplete checkouts or nonempty non-repository paths.
+When another worktree owns a requested branch, `install.sh` and `install-cli.sh`
+check out its selected commit detached. For `main`, they begin at the local branch
+and rebase onto `origin/main` only when Git updates are enabled; other branch
+selectors use the fetched `origin` branch.
+These remain moving-branch installs even when `HEAD` is detached.
 
 With `--install-method git`, `install.sh` and `install-cli.sh` accept a full
 40-character commit SHA through `--version`. The installer uses the existing
@@ -351,6 +382,8 @@ Designed for environments where you want everything under a local prefix
 installs on macOS/Linux/WSL. FreeBSD uses the npm method. FreeBSD and Alpine use
 system Node packages.
 </Info>
+
+Quote `--prefix` and `--git-dir` values containing spaces or shell characters when invoking the installer. The generated launcher preserves those literal paths when called from another working directory.
 
 ### Flow (install-cli.sh)
 

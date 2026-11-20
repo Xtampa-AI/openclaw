@@ -133,7 +133,6 @@ describe("shared restart observation deadline", () => {
         deadline,
         requirePluginHealth: false,
         waitForMissingService: phase === "legacy-owner" ? false : undefined,
-        settle: { probes: 3 },
       }).catch((error: unknown) => error);
       await entered.promise;
       monotonicClock.nowMs = 1_000;
@@ -161,7 +160,23 @@ describe("shared restart observation deadline", () => {
     }
   });
 
-  it("spends the remaining allowance on reconciliation after managed settlement", async () => {
+  it("stops polling a healthy Gateway once its command scope is cancelled", async () => {
+    const service = makeGatewayService({ status: "unknown" });
+    await expect(
+      withCommandProcessScope((onObservation) =>
+        waitForGatewayHealthyRestart({
+          service,
+          port: 18789,
+          attempts: 99,
+          requireRunningService: true,
+          onObservation,
+        }),
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(service.readRuntime).toHaveBeenCalledOnce();
+  });
+
+  it("spends the remaining allowance on reconciliation after managed readiness", async () => {
     const deadline = createGatewayRestartDeadline({ timeoutMs: 2_000 });
     const service = makeGatewayService({ status: "running", pid: 8000 });
     try {
@@ -170,9 +185,8 @@ describe("shared restart observation deadline", () => {
         port: 18789,
         deadline,
         requirePluginHealth: false,
-        settle: { probes: 3 },
       });
-      expect(settled).toMatchObject({ healthy: true, waitOutcome: "healthy", elapsedMs: 1_000 });
+      expect(settled).toMatchObject({ healthy: true, waitOutcome: "healthy", elapsedMs: 0 });
       const entered = createDeferred();
       inspectPortUsage.mockImplementation(() => {
         entered.resolve();
@@ -247,7 +261,6 @@ describe("shared restart observation deadline", () => {
             probeTimeoutMs: 5_000,
             waitForStartup: boundary === "update-verification",
             requireRunningService: true,
-            settle: { probes: 1 },
           });
           expect(observed.readyz).toBe(true);
           health = observed.health;

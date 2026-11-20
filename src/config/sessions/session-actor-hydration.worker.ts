@@ -1,6 +1,6 @@
-import type { SessionTreeEntry } from "@openclaw/agent-core";
 import { sql } from "kysely";
 import { jsonArrayFrom, jsonObjectFrom } from "../../infra/database-engine/json-values.js";
+import { getPostgresPhysicalFacts } from "../../infra/database-engine/physical-facts.js";
 import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
@@ -33,10 +33,12 @@ import { canonicalSessionValidationQuery } from "./session-canonical-key.js";
 import { sessionColdArchiveMetadataColumns } from "./session-cold-storage-state.js";
 import { sessionEntrySnapshotColumnsForKeys } from "./session-entry-snapshots.js";
 import { sessionEntryWindowColumns } from "./session-entry-window.types.js";
+import { projectTranscriptNavigationSql } from "./session-model-context-projection.js";
 import { projectSessionTranscriptFacts } from "./session-transcript-projection-facts.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
 import { collectSessionEntryLookupKeys } from "./store-entry.js";
-import { transcriptEventModelNavigationSql } from "./transcript-payload.js";
+import { projectTranscriptNavigationFields } from "./transcript-navigation-fields.js";
+import { transcriptEventNavigationSql, transcriptPredicateSql } from "./transcript-payload.js";
 
 // SQL JSON projections retain their declared shape but cross the driver as TEXT.
 function decodeJsonProjection<T>(value: T | string): T {
@@ -68,7 +70,13 @@ export function hydrateSessionActorState(
 ): SessionActorStoredState {
   const keys = collectSessionEntryLookupKeys(target.sessionKey);
   const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
-  const tables = getAdmittedSqliteSchemaFacts(database.db)?.tables;
+  const tables =
+    getAdmittedSqliteSchemaFacts(database.db)?.tables ??
+    new Set(
+      getPostgresPhysicalFacts(database.db)
+        ?.catalog.filter((fact) => fact.kind === "table")
+        .map((fact) => fact.table),
+    );
   const rows = executeSqliteQuerySync(
     database.db,
     canonicalSessionValidationQuery(database, { metadata: true })
@@ -97,7 +105,7 @@ export function hydrateSessionActorState(
               "session_key",
             ])
             .where("session_participants.session_key", "=", eb.ref("session_nodes.session_key"))
-            .orderBy("first_prompted_at")
+            .orderBy("first_prompted_at", (order) => order.asc().nullsFirst())
             .orderBy("actor_id")
             .orderBy("identity_namespace"),
           ["first_prompted_at", "actor_id", "identity_namespace"],
@@ -286,9 +294,12 @@ export function hydrateSessionActorState(
             .selectFrom("transcript_events")
             .select([
               "seq",
-              "navigation_type",
-              "navigation_valid",
-              transcriptEventModelNavigationSql(database.db).as("navigation_json"),
+              transcriptPredicateSql(database.db, "navigation_type").as("navigation_type"),
+              transcriptPredicateSql(database.db, "navigation_valid").as("navigation_valid"),
+              projectTranscriptNavigationSql(
+                database.db,
+                transcriptEventNavigationSql(database.db),
+              ).as("navigation_json"),
               /* kysely-allow-raw: retain exact stored JSONL sizes without loading payloads. */
               sql<number>`${transcriptEventReadBytesSql()} + 1`.as("serialized_bytes"),
             ])
@@ -304,37 +315,44 @@ export function hydrateSessionActorState(
   const entryRows: SessionActorStoredState["entryRows"] = new Map(
     keys.map((key) => [key, undefined]),
   );
+  let participants: SessionActorHotState["participants"] = [];
   for (const row of rows) {
     const entry = parseReadableSessionEntryData(database, row, "full");
-    const participants = decodeJsonProjection(row.actor_participants).map(readParticipantRecord);
+    const records = decodeJsonProjection(row.actor_participants).map(readParticipantRecord);
+    if (row === selected) {
+      participants = records;
+    }
+    // Snapshot comparisons use decoded entries; only node columns need exact persisted bytes.
+    const {
+      skills_snapshot_json: _skills,
+      system_prompt_report_json: _systemPrompt,
+      session_diff_baseline_json: _diffBaseline,
+      actor_has_board: _hasBoard,
+      actor_participants: _participants,
+      actor_members: _members,
+      actor_pending: _pending,
+      actor_completions: _completions,
+      actor_window: _window,
+      actor_rewrite: _rewrite,
+      actor_cold: _cold,
+      actor_projection: _projection,
+      actor_has_unclassified: _hasUnclassified,
+      actor_identities: _identities,
+      actor_active: _active,
+      actor_navigation: _navigation,
+      ...entryRow
+    } = row;
     entryRows.set(
       row.session_key,
       entry
         ? {
-            row: {
-              current_session_id: row.current_session_id,
-              entry_json: row.entry_json,
-              session_key: row.session_key,
-              updated_at: row.updated_at,
-              owner_actor_type: row.owner_actor_type,
-              owner_actor_id: row.owner_actor_id,
-              owner_assigned_by_type: row.owner_assigned_by_type,
-              owner_assigned_by_id: row.owner_assigned_by_id,
-              owner_assigned_at: row.owner_assigned_at,
-              legacy_acp_migration_json: row.legacy_acp_migration_json,
-              session_diff_baseline_json: row.session_diff_baseline_json,
-              skills_snapshot_json: row.skills_snapshot_json,
-              system_prompt_report_json: row.system_prompt_report_json,
-            },
-            entry: withProjectedParticipants(entry, participants),
+            row: entryRow,
+            entry: withProjectedParticipants(entry, records),
           }
         : undefined,
     );
   }
   const entry = entryRows.get(target.sessionKey)?.entry;
-  const participants = selected
-    ? decodeJsonProjection(selected.actor_participants).map(readParticipantRecord)
-    : [];
   const members = selected
     ? decodeJsonProjection(selected.actor_members).map((member) => ({
         identityId: member.identity_id,
@@ -375,13 +393,10 @@ export function hydrateSessionActorState(
   const storedNavigation = selected
     ? decodeJsonProjection(selected.actor_navigation).toSorted((a, b) => a.seq - b.seq)
     : [];
-  const navigation = storedNavigation.map((row) =>
-    Object.assign(
-      // SAFETY: The canonical model codec preserves discriminants with readable empty payloads.
-      JSON.parse(row.navigation_json) as SessionTreeEntry,
-      { seq: row.seq },
-    ),
-  );
+  const navigation = storedNavigation.map((row) => ({
+    ...projectTranscriptNavigationFields(JSON.parse(row.navigation_json)),
+    seq: row.seq,
+  }));
   const contextVersion = {
     generation: rewrite?.generation ?? null,
     rawSeq: coldArchive?.last_seq ?? navigation.at(-1)?.seq ?? null,
@@ -444,15 +459,13 @@ export function hydrateSessionActorState(
 
 /** Derives disclosure only from the actor's owned postimage, without touching SQLite. */
 export function projectSessionActorHotState(state: SessionActorStoredState): SessionActorHotState {
-  // Detach retained facts without cloning the derived collections replaced below.
+  // Replace-only metadata stays actor-owned; reads and receipts detach at publication.
   const hot: SessionActorHotState = {
-    ...structuredClone({
-      target: state.hot.target,
-      version: state.hot.version,
-      entry: state.hot.entry,
-      participants: state.hot.participants,
-      members: state.hot.members,
-    }),
+    target: state.hot.target,
+    version: state.hot.version,
+    participants: state.hot.participants,
+    members: state.hot.members,
+    entry: state.hot.entry,
     writeToken: state.hot.writeToken,
     hasBoard: state.hasBoard,
     dependencySessionIds: [],

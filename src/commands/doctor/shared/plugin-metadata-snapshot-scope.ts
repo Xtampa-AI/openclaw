@@ -16,6 +16,7 @@ import {
 import {
   isPluginMetadataSnapshotCompatible,
   loadPluginMetadataSnapshot,
+  MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS,
   rebasePluginMetadataSnapshotManifestRegistry,
   type PluginMetadataSnapshot,
 } from "../../../plugins/plugin-metadata-snapshot.js";

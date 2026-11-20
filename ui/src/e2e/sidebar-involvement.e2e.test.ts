@@ -1,22 +1,12 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Page } from "playwright";
 import { expect, it } from "vitest";
 import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
-import { controlUiBundledSettingsStorageKey } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiSessionRow as sessionRow } from "../test-helpers/control-ui-session-fixtures.ts";
+import { seedChatSettings } from "./chat-layout-fixtures.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 import { installMockGateway, sessionsListResponse } from "./session-management.test-support.ts";
 import { chooseSidebarOwner } from "./sidebar-session-menu.test-support.ts";
-
-async function seedChatSettings(page: Page, baseUrl: string, settings: object) {
-  await page.addInitScript(
-    ({ key, value }) => {
-      localStorage.setItem(key, JSON.stringify(value));
-    },
-    { key: controlUiBundledSettingsStorageKey(baseUrl), value: settings },
-  );
-}
 
 const suite = createControlUiE2eSuite({ name: "Sidebar involvement" });
 
@@ -127,9 +117,7 @@ suite.define(() => {
         expect(await row(unrelatedNestedKey).count()).toBe(0);
         expect(await row(sharedKey).count()).toBe(1);
         expect(await row(nestedKey).count()).toBe(1);
-        expect(await toggle.getAttribute("aria-label")).toBe(
-          "Hide 1 child sessions for Shared PR review",
-        );
+        expect((await toggle.textContent())?.trim()).toBe("1");
         await chooseSidebarOwner(page, "all");
         await row(unrelatedKey).waitFor();
         await row(unrelatedNestedKey).waitFor();

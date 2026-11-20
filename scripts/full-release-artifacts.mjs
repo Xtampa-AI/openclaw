@@ -353,7 +353,6 @@ async function reusePublicationArtifacts(env) {
     env.EVIDENCE_REUSE !== "true" ||
     env.EVIDENCE_POLICY !== "exact-target-full-validation-v1" ||
     env.EVIDENCE_SHA !== env.TARGET_SHA ||
-    env.TARGET_SHA !== env.PARENT_WORKFLOW_SHA ||
     !source?.qualificationAdmission
   ) {
     output({ publication_artifacts_reused: "false" });
@@ -405,7 +404,7 @@ async function reusePublicationArtifacts(env) {
     evidence.schema === "openclaw.release-validation-evidence/v4" &&
       evidence.valid === true &&
       evidence.directRoot === true &&
-      evidence.conclusions?.allRequiredSucceeded === true &&
+      evidence.current?.conclusion === "success" &&
       evidence.root?.runId === env.EVIDENCE_ROOT_RUN_ID &&
       evidence.root.targetSha === env.TARGET_SHA &&
       root?.workflowSha === env.PARENT_WORKFLOW_SHA,
@@ -698,54 +697,80 @@ function artifactAttemptJobs(request, runId, attempt, run) {
         response.total_count <= 1000,
       "Artifact producer job inventory is incomplete.",
     );
+    requireValue(
+      response.jobs.every(
+        (job) =>
+          String(job.run_id) === String(runId) &&
+          String(job.run_attempt) === String(attempt) &&
+          job.head_sha === request.toolingSha,
+      ),
+      "Artifact producer job identity changed.",
+    );
     jobs.push(...response.jobs);
     if (jobs.length === response.total_count) {
       break;
+    }
+    // A live reusable workflow can expose its expanded count before all jobs
+    // appear. Leave this observation pending; never admit a partial inventory.
+    if (
+      run &&
+      run.status !== "completed" &&
+      response.jobs.length < 100 &&
+      jobs.length < response.total_count
+    ) {
+      return [];
     }
     requireValue(
       response.jobs.length === 100 && page < 10 && jobs.length < response.total_count,
       "Artifact producer job inventory is incomplete.",
     );
   }
-  requireValue(
-    jobs.every(
-      (job) =>
-        String(job.run_id) === String(runId) &&
-        String(job.run_attempt) === String(attempt) &&
-        job.head_sha === request.toolingSha,
-    ),
-    "Artifact producer job identity changed.",
-  );
   return jobs;
 }
 
 // GitHub reruns carry successful jobs forward. The prepared descriptor artifact
 // is the durable producer identity; display names are presentation only.
-function effectiveNpmPreparationAttempt(request, runId, runAttempt) {
+async function effectiveNpmPreparationAttempt(request, runId, runAttempt) {
   readArtifactRun(request, runId, runAttempt);
   requireValue(BigInt(runAttempt) <= 100n, "Artifact producer attempt history exceeds its limit.");
-  const preparedAttempts = [];
+  const successfulAttempts = [];
   for (let attempt = 1; attempt <= Number(runAttempt); attempt += 1) {
     const name = `openclaw-npm-package-descriptor-${runId}-${attempt}`;
-    if (findArtifact(request, runId, name)) {
-      preparedAttempts.push(String(attempt));
+    if (!findArtifact(request, runId, name)) {
+      continue;
+    }
+    const descriptor = (await readArtifact(request, runId, name, "prepared-npm-bundle.json"))
+      ?.value;
+    validatePreparedNpmBundleDescriptor({
+      descriptor,
+      repository: request.repository,
+      sourceSha: request.sourceSha,
+      toolingSha: request.toolingSha,
+    });
+    requireValue(
+      descriptor.producer.runId === String(runId) &&
+        descriptor.producer.runAttempt === String(attempt),
+      "Raw npm producer identity changed.",
+    );
+    const matches = artifactAttemptJobs(request, runId, attempt).filter(
+      (job) =>
+        String(job.id) === descriptor.producer.jobId && job.name === descriptor.producer.jobName,
+    );
+    requireValue(matches.length === 1, "Raw npm bundle requires its unique exact producer job.");
+    if (matches[0].status === "completed" && matches[0].conclusion === "success") {
+      successfulAttempts.push(String(attempt));
     }
   }
   requireValue(
-    preparedAttempts.length <= 1,
+    successfulAttempts.length <= 1,
     "Successful npm preparation was replaced; its frozen bytes cannot be adopted.",
   );
-  return preparedAttempts[0] ?? String(runAttempt);
+  return successfulAttempts[0] ?? String(runAttempt);
 }
 
 function assertNpmPreparationExecutionPreserved(request, runId, runAttempt, producer) {
   const sourceAttempt = Number(producer.runAttempt);
-  let sourceJobs;
-  try {
-    sourceJobs = artifactAttemptJobs(request, runId, sourceAttempt);
-  } catch {
-    throw new Error("Raw npm bundle requires its unique exact completed producer job.");
-  }
+  const sourceJobs = artifactAttemptJobs(request, runId, sourceAttempt);
   const sourceMatches = sourceJobs.filter(
     (job) => String(job.id) === producer.jobId && job.name === producer.jobName,
   );
@@ -760,11 +785,15 @@ function assertNpmPreparationExecutionPreserved(request, runId, runAttempt, prod
       (job) => job.name === producer.jobName,
     );
     requireValue(matches.length <= 1, "Artifact preparation job is ambiguous.");
-    requireValue(
-      matches.length === 0 || sameJobExecution(sourceMatches[0], matches[0]),
-      "Successful npm preparation was replaced; its frozen bytes cannot be adopted.",
-    );
+    if (matches.length === 0 || sameJobExecution(sourceMatches[0], matches[0])) {
+      continue;
+    }
+    if (matches[0].status !== "completed") {
+      return false;
+    }
+    throw new Error("Successful npm preparation was replaced; its frozen bytes cannot be adopted.");
   }
+  return true;
 }
 
 async function waitForArtifact(request, env) {
@@ -776,7 +805,7 @@ async function waitForArtifact(request, env) {
   const rawAttempt = raw
     ? String(runAttempt) === "1"
       ? "1"
-      : effectiveNpmPreparationAttempt(request, runId, runAttempt)
+      : await effectiveNpmPreparationAttempt(request, runId, runAttempt)
     : undefined;
   const name = raw
     ? `openclaw-npm-package-descriptor-${runId}-${rawAttempt}`
@@ -808,16 +837,19 @@ async function waitForArtifact(request, env) {
         );
         const job = api(request.repository, `actions/jobs/${receipt.producer.jobId}`);
         if (job.status === "completed") {
-          assertNpmPreparationExecutionPreserved(request, runId, runAttempt, receipt.producer);
           verifyNpmBundleProducer({
             producer: receipt.producer,
             repository: request.repository,
             toolingSha: request.toolingSha,
           });
-          console.error(
-            `Artifact preparation npm identity: job ${receipt.producer.jobId} (attempt ${receipt.producer.runAttempt})`,
-          );
-          values = { prepared_bundle_json: JSON.stringify(receipt) };
+          if (
+            assertNpmPreparationExecutionPreserved(request, runId, runAttempt, receipt.producer)
+          ) {
+            console.error(
+              `Artifact preparation npm identity: job ${receipt.producer.jobId} (attempt ${receipt.producer.runAttempt})`,
+            );
+            values = { prepared_bundle_json: JSON.stringify(receipt) };
+          }
         }
       } else if (receipt) {
         values = validateArtifactReceipt(receipt, request, runId, runAttempt);

@@ -9,6 +9,10 @@ sidebarTitle: "Config"
 
 Non-interactive helpers for `openclaw.json`: get/set/patch/unset a value by path, print the schema, validate, or print the active file path. Run `openclaw config` with no subcommand to open the same guided wizard as `openclaw configure`.
 
+Validation, dry-run, and config-update reports escape terminal control characters
+in config file paths. JSON path fields and the raw path from `openclaw config file`
+retain their original values.
+
 When a local Gateway owns the state directory, `config set`, `config patch`, and
 `config unset` route the write through that Gateway instead of writing the file
 themselves. The CLI prepares the same change and validation as an offline write,
@@ -101,7 +105,7 @@ openclaw config schema --json
 openclaw config get browser.executablePath
 openclaw config set browser.executablePath "/usr/bin/google-chrome"
 openclaw config set browser.profiles.work '{"cdpPort":18801,"executablePath":"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}' --strict-json --merge
-openclaw config set agents.defaults.heartbeat.every "2h"
+openclaw config set agents.defaults.userTimezone "Europe/Vienna"
 openclaw config set logging.audit.executionIdentity true
 openclaw config set 'agents.entries.main.tools.exec.node' "node-id-or-name"
 openclaw config set agents.defaults.models '{"openai/gpt-5.4":{}}' --strict-json --merge
@@ -134,7 +138,9 @@ syntax and whole-list inputs still work with `set`, `patch`, and `unset`; writes
 persist the current keyed roster. Indexed edits use the current roster order.
 Within a batch, a submitted list keeps its order across subsequent keyed edits,
 including when agent IDs are numeric strings. Existing roster-deletion and
-`$include` ownership protections still apply.
+`$include` ownership protections still apply. `config unset agents.entries.<id>`,
+or a patch that sets it to `null`, removes only that config entry; use
+`openclaw agents delete` to also clean up the agent's state.
 
 When a legacy roster expands a single-agent installation in the root config file,
 writes retire its `default` marker and preserve the existing agent's responsibilities
@@ -221,6 +227,8 @@ machine-output spelling and keeps stdout reserved for the schema document.
 
 Schema refusals from `config set`, `config patch`, and `config unset` explain the affected setting and confirm that no settings were saved. Correct the reported value or use `openclaw config schema` to inspect supported settings, then retry. These refusals still exit with status 1. Explicit validation reports settings that need correction without changing the file; `config validate --json` retains its `valid: false`, `error`, and `issues` fields for scripts.
 
+Known retired core settings are reported before loading plugin migration diagnostics. Both `config get` and `config validate` include the `openclaw doctor --fix` repair hint. JSON errors keep their existing `error.message` and add the guidance in `repairHint`. Doctor still inspects all applicable core and plugin migrations when applying repairs.
+
 Config read failures name the file being read and preserve the underlying error. Resolve the reported file-access or runtime problem, then retry; a read failure alone does not mean the settings need repair.
 
 Human validation diagnostics quote literal record keys, such as `agents.defaults.models["provider/model.v1"].alias`, instead of displaying the dot inside a key as nested traversal. Numeric array positions use brackets, such as `agents.entries.main.skills[0]`. The `issues[].path` field in `config validate --json` keeps its existing dot-joined representation.
@@ -259,7 +267,7 @@ the provider docs and verify behavior on the selected runtime and provider.
 Values parse as JSON5 when possible; otherwise they are treated as raw strings. Use `--strict-json` to require standard JSON with no string fallback (JSON5-only syntax such as comments, trailing commas, or unquoted keys is then rejected). `--json` is a legacy alias for `--strict-json` on `config set`.
 
 ```bash
-openclaw config set agents.defaults.heartbeat.every "0m"
+openclaw config set agents.defaults.typingMode "never"
 openclaw config set gateway.port 19001 --strict-json
 openclaw config set channels.whatsapp.groups '{"*":{"requireMention":true}}' --strict-json
 ```
@@ -271,6 +279,10 @@ For structured values that are awkward to quote in your shell, put a config-shap
 When a model uses string shorthand, setting its `fallbacks` or a supported tool-model `timeoutMs` preserves that string as `primary`. This also applies to chat `/config set`. Setting `primary` explicitly replaces the primary, and setting the whole model still replaces the whole value.
 
 When a write changes `agents.defaults.model` or a per-agent `agents.entries.*.model`, OpenClaw resolves each changed primary or fallback through the configured catalogs and the selected provider's model resolver before writing. Provider-supported exact `provider/model` pins are accepted even when absent from the curated picker; validation does not replace the selected model. Unknown model references are rejected without changing the active config. Refusals for newly authored per-agent references include the entered value and resolver reason; inherited values and environment-expanded details remain redacted. Run `openclaw models list` to browse the picker, or check the provider's documentation for an exact model ID. Successful validation does not prove that your account can call the model. [`openclaw models set`](/cli/models#common-commands) is deliberately more permissive for the same setting: it saves a model the local catalog cannot confirm and prints a warning instead of rejecting the write.
+
+Provider registration during model validation sees the full candidate config,
+including other values in the same patch. A provider-specific option and its
+supported model choice can therefore change atomically.
 
 <Note>
 Object assignment replaces the target path by default. Protected paths that commonly hold user-added entries refuse replacements that would remove existing entries unless you pass `--replace`: `agents.defaults.models`, `agents.entries`, `models.providers`, `models.providers.<id>`, `models.providers.<id>.models`, `plugins.entries`, and `auth.profiles`.
@@ -445,6 +457,10 @@ openclaw config patch --file ./openclaw.patch.json5
 ```
 
 Patch files are limited to 8 MiB. Piped `--stdin` patches are limited to 1 MiB.
+
+While `--stdin` is waiting for input, Ctrl-C or SIGTERM stops the read and exits
+with status 130 or 143 without applying the pending patch. A write already
+admitted after input preparation keeps its existing completion and cleanup path.
 
 Pipe a patch over stdin for remote setup scripts:
 
@@ -642,6 +658,8 @@ instance automatically. A plugin's narrower restart policy or
 describes expected application; it is not a receipt from a running Gateway.
 See [Config hot reload](/gateway/configuration/hot-reload).
 
+When a running Gateway commits the write and it moves a configured model consumer to another billing route (metered API key, subscription/OAuth or token profile, or a CLI runtime's own credentials), the CLI prints the Gateway's warning on stderr. Each warning names the consumer path, the model, and the old and new route. The `config.set`, `config.patch`, and `config.apply` Gateway methods return the same lines as `billingRouteWarnings` on success and write them to the Gateway log. Offline writes (no running Gateway) do not compare billing routes.
+
 Successful `config set` or `config unset` operations that produce no effective config diff print `No change` and leave the JSON5 file byte-for-byte untouched. A `config unset` target that is absent from the authored config exits with status 1 and also leaves the file untouched. Setting an absent key to a value equal to its runtime default is still an authored change and persists the explicit value.
 
 Model references are normalized before a mutation is saved. Core agent model references do not require plugin discovery; provider catalog model IDs reuse compatible prepared plugin metadata or load their manifest normalization policies on demand.
@@ -650,6 +668,9 @@ Unrelated edits leave provider catalogs unchanged. Catalog writes and changes to
 ## Write safety
 
 `openclaw config set` and other OpenClaw-owned config writers validate the full post-change config before committing it to disk. If the new payload fails schema validation or looks like a destructive clobber, the active config is left alone and the rejected payload is saved beside it as `openclaw.json.rejected.*`.
+
+Normal writes refuse malformed UTF-8 in the root config or an included source
+before staging backups, preserving the original source and recovery bytes.
 
 If staging a config save fails, the existing root or include backup ring is left
 untouched. OpenClaw prepares backup contents without blocking unrelated Gateway

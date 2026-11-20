@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchClawHubPromotion, fetchClawHubPromotions } from "./clawhub-promotions.js";
+import { captureClawHubJson } from "./clawhub.test-support.js";
 
 const CLAWHUB_URL = "https://clawhub.ai";
-afterEach(() => vi.restoreAllMocks());
-function captureJson(value: unknown) {
-  return vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(value));
-}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const validPromotion = {
   slug: "spring-models",
@@ -26,9 +27,9 @@ describe("promotion payload validation", () => {
     overrides: Record<string, unknown>,
     expected: RegExp,
   ): Promise<void> {
-    const request = captureJson({ ...validPromotion, ...overrides });
+    const request = captureClawHubJson({ ...validPromotion, ...overrides });
     await expect(fetchClawHubPromotion({ slug: "spring-models" })).rejects.toThrow(expected);
-    expect(request.mock.calls[0]?.[0]).toBe(CLAWHUB_URL + "/api/v1/promotions/spring-models");
+    expect(request.url().toString()).toBe(`${CLAWHUB_URL}/api/v1/promotions/spring-models`);
   }
 
   it("rejects payloads without models", async () => {
@@ -68,14 +69,14 @@ describe("promotion payload validation", () => {
 
 describe("promotion fetches", () => {
   it("fetches and validates the active promotions list", async () => {
-    const request = captureJson({ promotions: [validPromotion] });
+    const request = captureClawHubJson({ promotions: [validPromotion] });
     const promotions = await fetchClawHubPromotions();
     expect(promotions).toHaveLength(1);
-    expect(request.mock.calls[0]?.[0]).toBe(CLAWHUB_URL + "/api/v1/promotions");
+    expect(request.url().toString()).toBe(`${CLAWHUB_URL}/api/v1/promotions`);
   });
 
   it("rejects a list response without a promotions array", async () => {
-    captureJson({ nope: true });
+    captureClawHubJson({ nope: true });
     await expect(fetchClawHubPromotions()).rejects.toThrow(/promotions array/);
   });
 });

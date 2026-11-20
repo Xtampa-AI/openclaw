@@ -67,6 +67,7 @@ activate_claude_oauth_access_token() {
 activate_claude_oauth_access_token
 
 for env_key in \
+  ABLITERATION_API_KEY \
   AZURE_SPEECH_KEY \
   AZURE_SPEECH_REGION \
   BASETEN_API_KEY \

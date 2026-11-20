@@ -42,7 +42,7 @@ export function resolveCodexAppServerLocalHomeDir(
 }
 
 /** Forces OpenClaw-owned Codex auth to remain process-local. */
-function withEphemeralCodexAuthStore(params: {
+export function withEphemeralCodexAuthStore(params: {
   startOptions: CodexAppServerStartOptions;
   preparedAuth?: unknown;
   authProfileId?: string | null;
@@ -64,7 +64,7 @@ export function usesManagedCodexThreadUnloading(start: CodexAppServerStartOption
 }
 
 // OpenClaw retains warm/child subscriptions; native post-release caching is redundant.
-function withManagedCodexThreadUnloading(
+export function withManagedCodexThreadUnloading(
   startOptions: CodexAppServerStartOptions,
 ): CodexAppServerStartOptions {
   if (!usesManagedCodexThreadUnloading(startOptions)) {
@@ -72,14 +72,6 @@ function withManagedCodexThreadUnloading(
   }
   const args = normalizeCodexAppServerArgs(startOptions.args, "thread_unload_delay_secs=0");
   return args === startOptions.args ? startOptions : { ...startOptions, args };
-}
-
-export function withManagedCodexAuthStore(params: {
-  startOptions: CodexAppServerStartOptions;
-  preparedAuth?: unknown;
-  authProfileId?: string | null;
-}): CodexAppServerStartOptions {
-  return withManagedCodexThreadUnloading(withEphemeralCodexAuthStore(params));
 }
 
 export function withClearedEnvironmentVariables(

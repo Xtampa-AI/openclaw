@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-const SOURCE_SHA = "a".repeat(40);
+export const SOURCE_SHA = "a".repeat(40);
 export const VERSION = "2026.8.1-beta.1";
 const MANIFEST = "prepublish-plugin-registry.json";
 export const writeJson = (file: string, value: unknown) =>

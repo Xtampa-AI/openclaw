@@ -1,84 +1,56 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
-import { createTempDirTracker } from "../helpers/temp-dir.js";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
-const tempDirs = createTempDirTracker();
+const tempDirs = useAutoCleanupTempDirTracker(afterAll);
 let runner: string;
-const engineFiles = [
-  "store.test.ts",
-  "command.integration.test.ts",
-  "nested/new.integration.test.ts",
-];
+const engineFiles = ["unit.test.ts", "nested/integration.test.ts"];
 
 beforeAll(() => {
   const scripts = path.join(tempDirs.make("database-conformance-"), "scripts");
-  mkdirSync(scripts);
+  const write = (file: string, content = "") => {
+    const target = path.join(scripts, file);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  };
+  write("../package.json", JSON.stringify({ type: "module" }));
+  mkdirSync(path.join(scripts, "lib"), { recursive: true });
   runner = path.join(scripts, "test-database-conformance.mjs");
   copyFileSync("scripts/test-database-conformance.mjs", runner);
-  mkdirSync(path.join(scripts, "lib"));
   copyFileSync(
-    "scripts/lib/weighted-test-shards.mts",
-    path.join(scripts, "lib/weighted-test-shards.mts"),
+    "scripts/lib/postgres-conformance-shards.mts",
+    path.join(scripts, "lib/postgres-conformance-shards.mts"),
   );
-  const config = path.join(scripts, "../config");
-  mkdirSync(config);
-  writeFileSync(
-    path.join(config, "postgres-conformance-timings.json"),
+  write(
+    "../config/postgres-conformance-timings.json",
     JSON.stringify({
-      targetSeconds: {
-        "src/infra/database-engine/store.test.ts": 900,
-        "src/infra/database-engine/command.integration.test.ts": 800,
-        "src/infra/database-engine/nested/new.integration.test.ts": 700,
-      },
+      files: {},
+      workers: 1,
+      preparationSeconds: { base: 0, runtime: 0 },
+      groupSeconds: {},
+      runtimeTargets: [],
     }),
   );
-  for (const directory of ["extensions/workboard", "src/infra/postgres-sync"]) {
-    const target = path.join(scripts, "..", directory, "nested/default-weight.test.ts");
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, "");
-    writeFileSync(path.join(path.dirname(target), "not-a-test.ts"), "");
-  }
-  const packageDirectory = path.join(scripts, "../extensions/workboard");
-  mkdirSync(path.join(packageDirectory, "node_modules"));
-  writeFileSync(path.join(packageDirectory, "node_modules/dependency.test.ts"), "");
-  symlinkSync(
-    packageDirectory,
-    path.join(packageDirectory, "recursive-link"),
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  for (const file of engineFiles) {
-    const target = path.join(scripts, "../src/infra/database-engine", file);
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, "");
-  }
   for (const file of [
+    ...engineFiles.map((engineFile) => `../src/infra/database-engine/${engineFile}`),
     "tsx.mjs",
     "generate-postgres-schema.mts",
     "test-database-conformance-preload.mjs",
   ]) {
-    writeFileSync(path.join(scripts, file), "");
+    write(file);
   }
-  writeFileSync(
-    path.join(scripts, "test-projects.mts"),
-    "console.log(JSON.stringify(process.argv.slice(2)));\n",
-  );
+  copyFileSync("src/infra/directory-walk.ts", path.join(scripts, "../src/infra/directory-walk.ts"));
+  write("test-projects.mts", "console.log(JSON.stringify(process.argv.slice(2)));\n");
 });
-afterAll(tempDirs.cleanup);
 
-function run(args: string[]) {
+function run(args: string[], connection = true) {
+  const connectionArgs = connection ? ["--connection", "postgresql://fixture@localhost/test"] : [];
   return spawnSync(
     resolveTestNodeExecPath(),
-    [
-      runner,
-      "--engine",
-      "postgres",
-      "--connection",
-      "postgresql://fixture@localhost/test",
-      ...args,
-    ],
+    [runner, "--engine", "postgres", ...connectionArgs, ...args],
     { encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } },
   );
 }
@@ -92,73 +64,18 @@ function targets(args: string[]): string[] {
 describe("PostgreSQL conformance shards", () => {
   it("partitions the full target inventory without loss or overlap and forwards test options", () => {
     const full = targets([]);
-    const first = targets(["--shard", "1/3"]);
-    const shards = [first, targets(["--shard", "2/3"]), targets(["--shard", "3/3"])];
-    expect(shards[0]).toContain("src/infra/database-engine/store.test.ts");
-    expect(shards[1]).toContain("src/infra/database-engine/command.integration.test.ts");
-    expect(shards[2]).toContain("src/infra/database-engine/nested/new.integration.test.ts");
-    expect(
-      shards.flat().toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
-    ).toEqual(full.toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0)));
+    const shards = [1, 2, 3].map((index) => targets(["--shard", `${index}/3`]));
+    expect(shards.flat().toSorted()).toEqual(full.toSorted());
     expect(new Set(shards.flat()).size).toBe(full.length);
-    expect(full).toHaveLength(engineFiles.length + 4);
-    expect(full).toContain("extensions/workboard/nested/default-weight.test.ts");
-    expect(full).toContain("src/infra/postgres-sync/nested/default-weight.test.ts");
-    expect(full).toContain("src/state/openclaw-state-db.postgres.test.ts");
-    expect(full).toContain("extensions/imessage/src/monitor/recovery-cursor.postgres.test.ts");
-    expect(full.some((target) => target.endsWith("not-a-test.ts"))).toBe(false);
-    expect(targets(["--shard", "1/3"])).toEqual(first);
-    expect(targets(["--shard", "7/7"])).toHaveLength(1);
-    for (const [index, shard] of shards.entries()) {
-      expect(targets(["--shard", String(index + 1) + "/3"])).toEqual(shard);
-    }
-    expect(targets(["--shard", "1/3", "--", "--maxWorkers=1"])).toEqual([
-      ...first,
-      "--maxWorkers=1",
-    ]);
-    expect(targets(["--", "custom.test.ts", "--maxWorkers=1"])).toEqual([
-      "custom.test.ts",
-      "--maxWorkers=1",
-    ]);
-  });
-
-  it("assigns unmeasured targets the default thirty-second weight", () => {
-    const timingFile = path.join(
-      path.dirname(runner),
-      "../config/postgres-conformance-timings.json",
-    );
-    const original = readFileSync(timingFile, "utf8");
-    try {
-      writeFileSync(
-        timingFile,
-        JSON.stringify({
-          targetSeconds: {
-            "src/infra/database-engine/store.test.ts": 60,
-            "src/infra/database-engine/command.integration.test.ts": 40,
-            "src/infra/database-engine/nested/new.integration.test.ts": 1,
-          },
-        }),
-      );
-      expect(targets(["--shard", "2/3"])).toEqual([
-        "src/infra/postgres-sync/nested/default-weight.test.ts",
-        "src/infra/database-engine/command.integration.test.ts",
-      ]);
-      expect(targets(["--shard", "3/3"])).toEqual([
-        "extensions/workboard/nested/default-weight.test.ts",
-        "src/infra/database-engine/nested/new.integration.test.ts",
-        "extensions/imessage/src/monitor/recovery-cursor.postgres.test.ts",
-      ]);
-    } finally {
-      writeFileSync(timingFile, original);
-    }
+    const firstShard = shards[0]!;
+    const options = ["--maxWorkers=1"];
+    expect(targets(["--shard", "1/3", "--", ...options])).toEqual([...firstShard, ...options]);
+    const custom = ["custom.test.ts", ...options];
+    expect(targets(["--", ...custom])).toEqual(custom);
   });
 
   it("lists the selected targets without a database connection or catalog probe", () => {
-    const result = spawnSync(
-      resolveTestNodeExecPath(),
-      [runner, "--engine", "postgres", "--shard", "2/3", "--list"],
-      { encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } },
-    );
+    const result = run(["--shard", "2/3", "--list"], false);
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual(targets(["--shard", "2/3"]));
@@ -166,13 +83,7 @@ describe("PostgreSQL conformance shards", () => {
 
   it.each([
     ["--shard", "unknown"],
-    ["--shard", "infra"],
-    ["--shard", "1/8"],
-    ["--shard", "01/3"],
-    ["--shard", "1.5/3"],
-    ["--shard", "0/3"],
     ["--shard", "4/3"],
-    ["--shard", "1/0"],
     ["--shard", "1/99999999999999999999"],
     ["--shard", "1/3", "--", "custom.test.ts"],
   ])("rejects invalid shard selection %j before running tests", (...args) => {

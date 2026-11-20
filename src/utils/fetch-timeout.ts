@@ -12,6 +12,8 @@ type TimeoutAbortSignalParams = {
   signal?: AbortSignal;
   operation?: string;
   url?: string;
+  /** Read-only callers report the returned timeout without creating file logs. */
+  logTimeout?: boolean;
 };
 
 /**
@@ -69,6 +71,7 @@ function abortDueToTimeout(
   operation?: string,
   url?: string,
   combinedSignal?: AbortSignal,
+  logTimeout = true,
 ) {
   if (combinedSignal?.aborted ?? controller.signal.aborted) {
     return;
@@ -91,14 +94,16 @@ function abortDueToTimeout(
   ]
     .filter((part): part is string => Boolean(part))
     .join(" ");
-  log.warn("fetch timeout reached; aborting operation", {
-    timeoutMs,
-    elapsedMs,
-    ...(eventLoopDelayHint ? { timerDelayMs: delayMs, eventLoopDelayHint } : {}),
-    consoleMessage,
-    ...(operation ? { operation } : {}),
-    ...(sanitizedUrl ? { url: sanitizedUrl } : {}),
-  });
+  if (logTimeout) {
+    log.warn("fetch timeout reached; aborting operation", {
+      timeoutMs,
+      elapsedMs,
+      ...(eventLoopDelayHint ? { timerDelayMs: delayMs, eventLoopDelayHint } : {}),
+      consoleMessage,
+      ...(operation ? { operation } : {}),
+      ...(sanitizedUrl ? { url: sanitizedUrl } : {}),
+    });
+  }
   const error = new Error("request timed out");
   error.name = "TimeoutError";
   controller.abort(error);
@@ -135,6 +140,7 @@ export function buildTimeoutAbortSignal(params: TimeoutAbortSignalParams): {
       params.operation,
       params.url,
       signal,
+      params.logTimeout,
     );
   };
   scheduleTimeout();
@@ -145,16 +151,12 @@ export function buildTimeoutAbortSignal(params: TimeoutAbortSignalParams): {
       if (!active || signal.aborted) {
         return;
       }
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      clearTimeout(timeoutId);
       scheduleTimeout();
     },
     cleanup: () => {
       active = false;
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      clearTimeout(timeoutId);
     },
   };
 }
@@ -165,18 +167,13 @@ export async function fetchWithTimeout(
   timeoutMs: number,
   fetchFn: typeof fetch = fetch,
 ): Promise<Response> {
-  const { signal: timeoutSignal, cleanup } = buildTimeoutAbortSignal({
+  // The wrapper timeout ends at headers; caller cancellation still follows the response body.
+  const { signal, cleanup } = buildTimeoutAbortSignal({
     timeoutMs: Math.max(1, timeoutMs),
+    signal: init.signal ?? undefined,
     operation: "fetchWithTimeout",
     url,
   });
-  const callerSignal = init.signal ?? undefined;
-  // The wrapper timeout ends once fetch returns headers, but the response body
-  // must keep following caller cancellation (and its reason) after that point.
-  const signal =
-    callerSignal && timeoutSignal
-      ? AbortSignal.any([callerSignal, timeoutSignal])
-      : (callerSignal ?? timeoutSignal);
   try {
     return await fetchFn(url, { ...init, signal });
   } finally {

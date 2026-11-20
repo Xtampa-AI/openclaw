@@ -1,4 +1,3 @@
-// Managed gateway service lifecycle before and after an update.
 import { confirm, isCancel } from "@clack/prompts";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { stylePromptMessage } from "../../../packages/terminal-core/src/prompt-style.js";
@@ -189,9 +188,9 @@ export async function maybeRestartService(params: {
   );
   const recordPhase = (phase: "restarting" | "verifying") => {
     assertCurrent();
-    if (params.opts.run) {
-      recordUpdateRunPhase(params.opts.run.runId, phase, undefined, { env: params.opts.run.env });
-      recordMutableUpdateSignalPhase(params.opts.run, phase);
+    if (run) {
+      recordUpdateRunPhase(run.runId, phase, undefined, run);
+      recordMutableUpdateSignalPhase(run, phase);
     }
   };
   let verificationObserved = false;
@@ -515,7 +514,6 @@ export async function maybeRestartService(params: {
             requirePluginHealth: false,
             serviceEnv: activation.serviceEnv,
             requireRunningService: true,
-            settle: { probes: 12 },
             assertCurrent,
           });
           assertCurrent();
@@ -536,7 +534,7 @@ export async function maybeRestartService(params: {
           }
         }
         const warning =
-          `Failed to reconcile gateway service with ${activation.result.root ?? "the updated install"}: ${String(err)}. ` +
+          `Failed to reconcile gateway service with ${activation.result.root ?? "the updated install"}: ${run?.interrupted ? "the update was interrupted before the service restart finished" : String(err)}. ` +
           `Run \`${formatCliCommand("openclaw gateway install --force", activation.serviceEnv)}\`, then \`${formatCliCommand("openclaw gateway restart", activation.serviceEnv)}\`.`;
         recordServiceReconciliationWarning(activation.result, activation.serviceEnv, warning);
         if (activation.serviceRuntimeRefreshRequired) {

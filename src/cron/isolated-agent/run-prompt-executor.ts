@@ -24,14 +24,10 @@ import {
   modelSupportsInput,
   prepareModelRunCapabilities,
 } from "../../agents/model-catalog-lookup.js";
-import { recordModelFallbackStop } from "../../agents/model-fallback-stop.js";
 import { resolveConfiguredThinkingDefault } from "../../agents/model-thinking-default.js";
-import {
-  resolveScheduledToolCallerContext,
-  resolveScheduledToolPolicyContext,
-} from "../../agents/scheduled-tool-policy.js";
+import { resolveScheduledToolCallerContext } from "../../agents/scheduled-tool-policy.js";
+import { createUnrecordedScheduledAccountRefusal } from "../../agents/scheduled-unrecorded-account.js";
 import { withLocalSessionPlacementTurnSettlement } from "../../agents/session-placement-admission.js";
-import { resolveSessionRuntimeOverrideForProvider } from "../../agents/session-runtime-compat.js";
 import { resolveAgentLifecycleTerminalMetadata } from "../../auto-reply/reply/agent-lifecycle-terminal.js";
 import type { VerboseLevel } from "../../auto-reply/thinking.js";
 import type { CliSessionBinding } from "../../config/sessions.js";
@@ -43,15 +39,23 @@ import {
 } from "../../sessions/user-turn-transcript.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveCronJobConfigRevision } from "../config-revision.js";
+import { resolveCronJobToolPolicyContext } from "../execution-context-admission.js";
 import { prepareCronRunAdmission } from "../run-admission.js";
 import { prepareCronRunInference } from "../run-inference.js";
-import { resolveCronScheduledToolPolicy } from "../scheduled-tool-policy.js";
 import { resolveCronAuthenticatedChannelRequester } from "../tools-allow-provenance.js";
 import type { CronAgentExecutionPhaseUpdate } from "../types.js";
 import { isCommandStyleCronMessage } from "./command-style-prompt.js";
 import { resolveIsolatedCronPromptCacheKey } from "./prompt-cache-key.js";
-import { assertCronRuntimeAuthorityCandidate } from "./run-admission.js";
-import { createCronCandidateExecutionResolver } from "./run-candidate-runtime.js";
+import {
+  assertCronCandidateSandboxPlacement,
+  assertCronRuntimeAuthorityCandidate,
+  resolveCronSandboxPlacement,
+  type CronSandboxPlacement,
+} from "./run-admission.js";
+import {
+  createCronCandidateExecutionResolver,
+  createCronRuntimeOverrideResolver,
+} from "./run-candidate-runtime.js";
 import { finalizeCronPromptForResolvedTools } from "./run-delivery-trace.js";
 import {
   getCliSessionBinding,
@@ -75,6 +79,18 @@ const cronEmbeddedRuntimeLoader = createLazyImportLoader<CronEmbeddedRuntime>(
   () => import("./run-embedded.runtime.js"),
 );
 
+// A CLI child in its parent's workspace runs native tools no tool check sees, so
+// its process also ends when the parent resets.
+function resolveCliChildAbortSignal(
+  runSignal: AbortSignal | undefined,
+  parentSignal: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!parentSignal) {
+    return runSignal;
+  }
+  return runSignal ? AbortSignal.any([runSignal, parentSignal]) : parentSignal;
+}
+
 function hasCliSessionReuseMetadata(binding: CliSessionBinding): boolean {
   return Object.entries(binding).some(([key, value]) => key !== "sessionId" && value !== undefined);
 }
@@ -92,13 +108,7 @@ export function createCronPromptExecutor(
   const trigger = params.trigger === "event" ? "event" : "cron";
   const cronFallbacksOverride =
     params.modelFallbacksOverride ??
-    resolveCronFallbacksOverride({
-      cfg: params.cfg,
-      job: params.job,
-      agentId: params.agentId,
-      useSubagentFallbacks: params.useSubagentFallbacks,
-      inheritDefaultFallbacksForAgentStringModel: params.inheritDefaultFallbacksForAgentStringModel,
-    });
+    resolveCronFallbacksOverride({ ...params, selectedModel: params.liveSelection });
   const fastModeStartedAtMs = Date.now();
   const fastModeAutoProgressState: FastModeAutoProgressState = {
     offAnnounced: false,
@@ -112,16 +122,10 @@ export function createCronPromptExecutor(
     isCommandStyleCronMessage(params.agentPayload?.message ?? ""))
       ? "lightweight"
       : undefined;
-  const scheduledToolPolicy = resolveScheduledToolPolicyContext({
-    toolsAllow: params.agentPayload?.toolsAllow,
-    scheduledToolPolicy: resolveCronScheduledToolPolicy({
-      toolsAllow: params.agentPayload?.toolsAllow,
-      scheduledToolPolicy: params.job.scheduledToolPolicy,
-      owner: params.job.owner,
-    }),
-    callerOrigin: params.job.toolsAllowProvenance?.callerOrigin,
-    execTarget: params.job.toolsAllowExecTarget,
-  });
+  const scheduledToolPolicy = resolveCronJobToolPolicyContext(
+    params.job,
+    params.agentPayload?.toolsAllow,
+  );
   const { sourceDelivery, runId } = params;
   const messageChannel = sourceDelivery.target.channel ?? params.resolvedDelivery.channel;
   if (scheduledToolPolicy?.mode === "account") {
@@ -164,6 +168,9 @@ export function createCronPromptExecutor(
     hasNewGeneratedMediaTaskForSessionKey(params.runSessionKey, attemptMediaTaskIds);
 
   const resolveCandidateExecution = createCronCandidateExecutionResolver(params);
+  // Resolved once per isolated run from the prepared session entry; every
+  // candidate (initial, fallback, override) reuses the same placement facts.
+  let sandboxPlacement: CronSandboxPlacement | undefined;
 
   return async (promptText: string, runStartedAt: number): Promise<CronCompletedPromptRun> => {
     using inferenceLease = new DisposableStack();
@@ -173,9 +180,8 @@ export function createCronPromptExecutor(
       cfg: params.cfgWithAgentDefaults,
       agentDir: params.agentDir,
     });
-    const inferenceAuthorization = inference?.runParams.authProfileBinding;
     if (inference) {
-      inferenceLease.defer(() => inference.dispose());
+      inferenceLease.defer(inference.dispose);
     }
     let canReusePreparedSession = preparedSessionAvailable;
     preparedSessionAvailable = false;
@@ -202,9 +208,22 @@ export function createCronPromptExecutor(
             errorContext: "cron user turn transcript",
           });
     pendingUserTurn = { promptText, recorder: userTurnTranscriptRecorder };
+    const scheduledExecution = params.occurrence.mint({
+      cfg: params.cfgWithAgentDefaults,
+      agentId: params.agentId,
+      runId,
+      runSessionKey: params.runSessionKey,
+      toolsAllow: params.agentPayload?.toolsAllow,
+      operatorAuthority: params.operatorAuthority,
+    });
     const cronAdmission = prepareCronRunAdmission({
+      scheduledExecution,
       operatorAuthority: params.operatorAuthority,
       admissionSource: params.admissionSource,
+      // A child running in its parent's workspace loses every effect once that parent resets.
+      ...(params.occurrence.childParent?.binding
+        ? { assertSourceCurrent: params.occurrence.childParent.assertCurrent }
+        : {}),
       deliveryAttemptFence: params.deliveryAttemptFence,
       cfg: params.cfgWithAgentDefaults,
       agentId: params.agentId,
@@ -270,12 +289,7 @@ export function createCronPromptExecutor(
         workspaceDir: params.workspaceDir,
         sessionKey: params.runSessionKey,
         preparation: { kind: "direct" },
-        resolveRuntimeOverride: (provider) =>
-          resolveSessionRuntimeOverrideForProvider({
-            provider,
-            entry: params.cronSession.sessionEntry,
-            cfg: params.cfgWithAgentDefaults,
-          }),
+        resolveRuntimeOverride: createCronRuntimeOverrideResolver(params),
         resolveContextEngineHost: (provider, model, runtimeOverride) => {
           const { executionProvider, cliExecution } = resolveCandidateExecution(
             provider,
@@ -367,11 +381,28 @@ export function createCronPromptExecutor(
           catalog: thinkingCatalog,
           agentRuntime: candidateRuntime,
         });
-        inference?.assertCandidate(providerOverride, cliExecution);
+        inference?.assertCandidate(providerOverride, cliExecution, candidateRuntime);
         assertCronRuntimeAuthorityCandidate({
           authority: params.job.runtimeAuthority,
           candidateRuntime,
           cliExecution,
+        });
+        // CLI backends execute on the gateway host; a session whose configured
+        // sandbox claims containment must fail closed instead of dispatching
+        // there. Covers every candidate: initial selection, fallbacks, and
+        // harness/runtime overrides. Unowned preflight errors are terminal for
+        // the whole fallback chain, so this cannot silently switch models.
+        sandboxPlacement ??= resolveCronSandboxPlacement({
+          cfg: params.cfgWithAgentDefaults,
+          agentId: params.agentId,
+          sessionKey: params.runSessionKey,
+          preparedSessionEntry: params.cronSession.sessionEntry,
+          inheritedSandbox: params.occurrence.childParent?.sandbox,
+        });
+        assertCronCandidateSandboxPlacement({
+          ...sandboxPlacement,
+          cliExecution,
+          executionProvider,
         });
         // The validated candidate that admits detached work owns its continuation
         // even if the provider throws before returning result metadata.
@@ -419,6 +450,9 @@ export function createCronPromptExecutor(
             agentId: params.agentId,
             trigger,
             jobId: params.job.id,
+            // Embedded, Codex and CLI candidates share this one sender bit for the run;
+            // the CLI loopback reads the same decision from the run's context.
+            ...cronAdmission.scheduledSender,
             messageActionTurnCapability: cronAdmission.messageActionTurnCapability,
             config: params.cfgWithAgentDefaults,
             prompt: promptText,
@@ -426,6 +460,7 @@ export function createCronPromptExecutor(
             model: modelOverride,
             thinkLevel: candidateThinkLevel,
             thinkingExplicit: candidateConfiguredThinkLevel !== undefined,
+            reasoningLevel: params.agentPayload?.includeReasoning ? "on" : undefined,
             timeoutMs: params.timeoutMs,
             runId,
             lane: resolveCronAgentLane(params.lane),
@@ -473,7 +508,10 @@ export function createCronPromptExecutor(
             sessionId: params.cronSession.sessionEntry.sessionId,
             sessionKey: params.runSessionKey,
             sessionFile: params.runSessionKey,
-            abortSignal: params.abortSignal,
+            abortSignal: resolveCliChildAbortSignal(
+              params.abortSignal,
+              params.occurrence.childParent?.signal,
+            ),
           });
           try {
             const cliAbortSignal = deferredLifecycle.signal;
@@ -515,12 +553,11 @@ export function createCronPromptExecutor(
                         : undefined,
                     );
                 if (trigger === "cron" && !binding && authProfileId) {
-                  const refusal = new Error(
-                    "Automation has no recorded inference account. Explicitly select its account with a model@profile update before running it.",
-                  );
-                  // Another model would only bypass the operator's account choice.
-                  recordModelFallbackStop(refusal);
-                  throw refusal;
+                  throw createUnrecordedScheduledAccountRefusal({
+                    runtime: executionProvider,
+                    modelRef: `${providerOverride}/${modelOverride}`,
+                    profileId: authProfileId,
+                  });
                 }
                 const guardedCliSessionBinding =
                   cliSessionBinding && hasCliSessionReuseMetadata(cliSessionBinding)
@@ -528,6 +565,8 @@ export function createCronPromptExecutor(
                     : undefined;
                 const candidateResult = await runCliAgent({
                   ...buildCommonRunParams(),
+                  // The CLI backend marks internal provenance as non-user input.
+                  inputProvenance: params.inputProvenance,
                   diagnosticOwner,
                   sessionEntry: params.cronSession.sessionEntry,
                   contextWindow: params.cronSession.sessionEntry.contextWindow,
@@ -632,28 +671,13 @@ export function createCronPromptExecutor(
           requestedRouteResolution: "resolved",
           modelFallbacksOverride: runOptions.modelFallbacksOverride,
           resolvedModelSelection: runOptions.resolvedModelSelection,
-          authProfileId: binding?.profileId ?? params.liveSelection.authProfileId,
-          ...(binding && inferenceAuthorization
-            ? {
-                authProfileBinding: {
-                  profileId: binding.profileId,
-                  authRequirement: binding.authRequirement,
-                  assertCurrent: () => inferenceAuthorization.assertCurrent(),
-                  revalidate: () => inferenceAuthorization.revalidate(),
-                },
-                allowAuthProfileFallback: false,
-                onSuccessfulAuthProfile: (profileId: string | undefined) => {
-                  if (profileId !== binding.profileId) {
-                    throw new Error("Automation inference account changed during execution.");
-                  }
-                },
-              }
-            : {}),
-          authProfileIdSource:
-            binding?.source ??
-            (params.liveSelection.authProfileId
-              ? params.liveSelection.authProfileIdSource
-              : undefined),
+          cyberAccessProgram:
+            runOptions.cyberAccessProgram ?? params.cronSession.sessionEntry.cyberAccessProgram,
+          authProfileId: runOptions.authProfileId ?? params.liveSelection.authProfileId,
+          authProfileIdSource: runOptions.authProfileId
+            ? "user"
+            : params.liveSelection.authProfileIdSource,
+          ...inference?.runParams,
           // Cron keeps overload failures local while sharing real credential failures.
           authProfileFailurePolicy: runOptions.authProfileFailurePolicy ?? "local_transient",
           verboseLevel: params.resolvedVerboseLevel,

@@ -9,6 +9,10 @@ import {
   runWithPluginExecutionFrame,
 } from "./plugin-instance-invocation.js";
 import type { PluginSourceCaptureStorage } from "./plugin-instance-invocation.types.js";
+import type {
+  PluginRecoveryCaptureInput,
+  PluginSourceCaptureDirectory,
+} from "./plugin-recovery-source-copy.types.js";
 
 export function getPluginSourceCaptureStorage(): PluginSourceCaptureStorage | undefined {
   return getPluginExecutionFrame()?.sourceCaptureStorage;
@@ -46,14 +50,6 @@ export function withPluginSourceCaptureStorage<T>(
   );
 }
 
-// CLI bootstrap imports this lightweight owner before creating command scopes;
-// Gateway metadata imports it before admitting requests. Lazy capture loading must
-// not bind a shared maintenance timer to the first command's resources.
-export const runInPluginSourceCaptureContext = resolveGlobalSingleton(
-  Symbol.for("openclaw.pluginSourceCaptureContext"),
-  () => AsyncLocalStorage.snapshot(),
-);
-
 /** Executable CLI ownership follows profile selection to each acquired capture root. */
 export const pluginSourceCaptureMaintenance = resolveGlobalSingleton(
   Symbol.for("openclaw.pluginSourceCaptureMaintenance"),
@@ -63,3 +59,14 @@ export const pluginSourceCaptureMaintenance = resolveGlobalSingleton(
       run: (operation: () => Promise<void>) => Promise<void>;
     }>(),
 );
+
+export const pluginSourceCaptureDirectory = new AsyncLocalStorage<PluginSourceCaptureDirectory>();
+
+/** Preparation borrows its existing capture domain; host-local recovery owns its own domain. */
+export const pluginRecoveryCapture = new AsyncLocalStorage<
+  (input: PluginRecoveryCaptureInput) => Promise<{
+    directory: string;
+    managedRoot?: string;
+    release(): Promise<void>;
+  }>
+>();

@@ -49,7 +49,6 @@ export async function runPublicMessageActionsScenario(context: MatrixQaScenarioC
           accessToken: context.observerAccessToken,
           baseUrl: context.baseUrl,
           endpoint: `${roomPath}/${suffix}`,
-          fetchImpl: fetch,
           method: "GET",
         })
       ).body,
@@ -97,9 +96,30 @@ export async function runPublicMessageActionsScenario(context: MatrixQaScenarioC
   try {
     // The topology gives SUT room ownership; inspect actual permissions rather than granting more.
     const power = await read("state/m.room.power_levels");
-    const users = record(power.users, "Matrix power-level users");
+    const state = (
+      await requestMatrixJson<unknown>({
+        accessToken: context.observerAccessToken,
+        baseUrl: context.baseUrl,
+        endpoint: `${roomPath}/state`,
+        method: "GET",
+        timeoutMs: remaining(),
+      })
+    ).body;
+    assert(Array.isArray(state), "Matrix room state must be an array");
+    const creation = record(
+      state.find(
+        (event) => isRecord(event) && event.type === "m.room.create" && event.state_key === "",
+      ),
+      "Matrix room creation event",
+    );
+    const creationContent = record(creation.content, "Matrix room creation content");
+    const users = isRecord(power.users) ? power.users : {};
     const events = isRecord(power.events) ? power.events : {};
-    const sutPower = users[context.sutUserId] ?? power.users_default ?? 0;
+    // Version 12 creators have infinite power and are omitted from the users map.
+    const sutPower =
+      creationContent.room_version === "12" && creation.sender === context.sutUserId
+        ? Number.POSITIVE_INFINITY
+        : (users[context.sutUserId] ?? power.users_default ?? 0);
     const pinPower = events["m.room.pinned_events"] ?? power.state_default ?? 50;
     assert(
       typeof sutPower === "number" && typeof pinPower === "number" && sutPower >= pinPower,
@@ -174,18 +194,6 @@ export async function runPublicMessageActionsScenario(context: MatrixQaScenarioC
     completed.push(`pin=${pinId}->${messageId}`);
 
     return {
-      artifacts: {
-        accountId: context.sutAccountId,
-        roomKey: room.key,
-        roomId: room.roomId,
-        rootEventId: messageId,
-        editEventId: editId,
-        reactionEventId: reactionId,
-        reactionTargetEventId: messageId,
-        reactionEmoji: emoji,
-        token: marker,
-        editedToken: editedMarker,
-      },
       details: [
         "Five public Gateway message.action operations independently observed on Matrix.",
         `SUT room power=${sutPower}; pin requirement=${pinPower}`,

@@ -11,36 +11,12 @@ import {
 import { truncateUtf8Prefix } from "openclaw/plugin-sdk/text-utility-runtime";
 import YAML from "yaml";
 import { extractWikiLinks, maskMarkdownCode } from "./markdown-links.js";
+import { WIKI_PAGE_GROUPS, type WikiPageKind } from "./wiki-page-kinds.js";
 
 export { WIKI_RELATED_END_MARKER, WIKI_RELATED_START_MARKER } from "./markdown-links.js";
 
-export const WIKI_PAGE_GROUPS = [
-  { kind: "source", dir: "sources", heading: "Sources" },
-  { kind: "entity", dir: "entities", heading: "Entities" },
-  { kind: "concept", dir: "concepts", heading: "Concepts" },
-  { kind: "synthesis", dir: "syntheses", heading: "Syntheses" },
-  { kind: "report", dir: "reports", heading: "Reports" },
-] as const;
 export const WIKI_RAW_SOURCE_MARKER = "<!-- openclaw:wiki:raw-source -->";
 
-class WikiPageNotUtf8Error extends Error {
-  constructor(displayPath: string) {
-    super(
-      `Wiki page is not valid UTF-8 and cannot be rewritten safely: ${displayPath}. ` +
-        "The file was left unchanged. Keep a byte-for-byte backup, convert a copy to UTF-8 with its original encoding, then retry.",
-    );
-    this.name = "WikiPageNotUtf8Error";
-  }
-}
-
-export function decodeWikiPageUtf8(bytes: Buffer, displayPath: string): string {
-  if (!isUtf8(bytes)) {
-    throw new WikiPageNotUtf8Error(displayPath);
-  }
-  return bytes.toString("utf8");
-}
-
-export type WikiPageKind = (typeof WIKI_PAGE_GROUPS)[number]["kind"];
 type GeneratedSourceBody = "bridge" | "unsafe-local" | "local-file" | "chatgpt-export";
 
 export type ParsedWikiMarkdown = {
@@ -49,7 +25,6 @@ export type ParsedWikiMarkdown = {
   body: string;
 };
 
-export type WikiClaimEvidence = NonNullable<ReturnType<typeof normalizeWikiClaimEvidence>>;
 export type WikiClaim = ReturnType<typeof normalizeWikiClaims>[number];
 type WikiPersonCard = ReturnType<typeof normalizeWikiPersonCard>;
 export type WikiRelationship = ReturnType<typeof normalizeWikiRelationships>[number];
@@ -129,7 +104,6 @@ function capWikiValueWithHash(raw: string, maxBytes: number, fallback: string): 
 export function slugifyWikiSegment(raw: string): string {
   const slug = normalizeLowercaseStringOrEmpty(raw)
     .replace(/[^\p{L}\p{N}\p{M}]+/gu, "-")
-    .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "");
   if (!slug) {
     return "page";
@@ -470,14 +444,17 @@ export function formatWikiLink(params: {
   sourceRelativeTo?: string;
   title: string;
 }): string {
-  const withoutExtension = params.relativePath.replace(/\.md$/i, "");
   if (params.renderMode === "obsidian") {
-    return `[[${withoutExtension}|${params.title}]]`;
+    return `[[${params.relativePath.replace(/\.md$/i, "")}|${params.title}]]`;
   }
   const linkTarget = params.sourceRelativeTo
     ? path.posix.relative(path.posix.dirname(params.sourceRelativeTo), params.relativePath)
     : params.relativePath;
-  return `[${params.title}](${linkTarget})`;
+  // Angle brackets keep spaces and parentheses inside the link destination.
+  const destination = /[\s()<>]/.test(linkTarget)
+    ? `<${linkTarget.replace(/[<>]/g, "\\$&")}>`
+    : linkTarget;
+  return `[${params.title}](${destination})`;
 }
 
 export function renderMarkdownFence(content: string, infoString = "text"): string {
@@ -587,4 +564,27 @@ export function toWikiPageSummary(params: {
 }): WikiPageSummary | null {
   const result = scanWikiPageSummary(params);
   return result.status === "valid" ? result.page : null;
+}
+
+class WikiPageNotUtf8Error extends Error {
+  constructor(displayPath: string) {
+    super(
+      `Wiki page is not valid UTF-8 and cannot be rewritten safely: ${displayPath}. ` +
+        "The file was left unchanged. Keep a byte-for-byte backup, convert a copy to UTF-8 with its original encoding, then retry.",
+    );
+    this.name = "WikiPageNotUtf8Error";
+  }
+}
+
+/**
+ * Decode vault page bytes for a whole-file rewrite. Compile and lint re-emit
+ * the full page from decoded text, so replacement-decodable bytes would be
+ * persisted back as U+FFFD over human content the update never touched (same
+ * rule as the edit/apply_patch tools, see src/agents/utf8-file.ts).
+ */
+export function decodeWikiPageUtf8(bytes: Buffer, displayPath: string): string {
+  if (!isUtf8(bytes)) {
+    throw new WikiPageNotUtf8Error(displayPath);
+  }
+  return bytes.toString("utf8");
 }

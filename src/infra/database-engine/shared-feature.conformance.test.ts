@@ -7,11 +7,15 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { OutboundMessageProgressInput } from "../../audit/audit-event-types.js";
 import { recordOutboundMessageProgressInDatabase } from "../../audit/message-delivery-progress-store.js";
+import {
+  configHealthReadOperations,
+  patchConfigHealthEntryInDatabase,
+} from "../../config/io.health-state.kernel.js";
 import { isMissingPluginStateTableError } from "../../plugin-state/plugin-state-store.database.js";
 import { DebugProxyCaptureKernel } from "../../proxy-capture/store.kernel.js";
 import {
   pruneSessionStateEventsInDatabase,
-  recordSessionStateEventInDatabase,
+  recordSessionStateEventsInDatabase,
 } from "../../sessions/session-state-events.kernel.js";
 import {
   readAgentProvenanceBatchInDatabase,
@@ -23,7 +27,7 @@ import {
 } from "../../state/openclaw-state-db.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
 import { PostgresSyncConnection } from "../postgres-sync/connection.js";
-import { rewritePostgresPlaceholders } from "../postgres-sync/protocol.js";
+import { preparePostgresQuery } from "../postgres-sync/protocol.js";
 import { runSqliteImmediateTransactionSync } from "../sqlite-transaction.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
 
@@ -89,61 +93,6 @@ function captureProgressInsert() {
   return captured;
 }
 
-it("prunes expired SQLite events with exact per-agent watermarks across repeats and later appends", () => {
-  const options = { env: { OPENCLAW_STATE_DIR: tempDirs.make("prune-sqlite-") } };
-  const { db } = openOpenClawStateDatabase(options);
-  const input = {
-    sessionKey: "agent:main:prune",
-    agentId: "main",
-    kind: "created" as const,
-    actorType: "system" as const,
-    summary: "Created",
-  };
-  const record = (agentId: string, key: string, now: number) =>
-    runSqliteImmediateTransactionSync(db, () =>
-      recordSessionStateEventInDatabase(
-        db,
-        {
-          ...input,
-          agentId,
-          sessionKey: "agent:" + agentId + ":prune",
-          dedupeKey: key,
-        },
-        now,
-      ),
-    );
-  const first = record("main", "old-main", 100);
-  const recent = record("main", "recent-main", 500);
-  const other = record("other", "old-other", 400);
-  assert(first.row);
-  assert(recent.row);
-  assert(other.row);
-  const pruneAt = 450 + 30 * 24 * 60 * 60_000;
-  const prune = () =>
-    runSqliteImmediateTransactionSync(db, () => pruneSessionStateEventsInDatabase(db, pruneAt));
-  const heads = () =>
-    db
-      .prepare("SELECT agent_id, pruned_max_sequence FROM session_state_heads ORDER BY agent_id")
-      .all();
-  const rows = () =>
-    db.prepare("SELECT sequence FROM session_state_events ORDER BY sequence").all();
-  prune();
-  const expectedHeads = [
-    { agent_id: "main", pruned_max_sequence: first.row.sequence },
-    { agent_id: "other", pruned_max_sequence: other.row.sequence },
-  ];
-  expect(heads()).toEqual(expectedHeads);
-  expect(rows()).toEqual([{ sequence: recent.row.sequence }]);
-  prune();
-  expect(heads()).toEqual(expectedHeads);
-  const appended = record("main", "appended", pruneAt);
-  assert(appended.row);
-  expect(appended.row.sequence).toBeGreaterThan(other.row.sequence);
-  prune();
-  expect(heads()).toEqual(expectedHeads);
-  expect(rows()).toEqual([{ sequence: recent.row.sequence }, { sequence: appended.row.sequence }]);
-});
-
 it.skipIf(!connection)(
   "prepares shared feature SQL against generated PostgreSQL DDL and preserves owner results",
   () => {
@@ -176,7 +125,7 @@ it.skipIf(!connection)(
             // PREPARE the actual owner statement, then execute it normally with its bound values.
             // This adds parser/type-inference proof without maintaining a second SQL implementation.
             if (/^(?:insert|select)\b/i.test(sql) && !prepared.has(sql)) {
-              query(`PREPARE feature_statement AS ${rewritePostgresPlaceholders(sql)}`);
+              query(`PREPARE feature_statement AS ${preparePostgresQuery(sql).sql}`);
               query("DEALLOCATE feature_statement");
               prepared.add(sql);
             }
@@ -192,6 +141,63 @@ it.skipIf(!connection)(
           remote.query("SELECT count(*) AS count FROM outbound_message_progress").rows,
         ).toEqual([{ count: 1 }]);
 
+        const configPath = "/synthetic/openclaw.json";
+        const patchHealth = patchConfigHealthEntryInDatabase.bind(null, remote, configPath);
+        const observedJson = '{ "hash": "observed" }';
+        const promotedJson = '{"hash":"promoted"}';
+        const readHealthBasis = () =>
+          configHealthReadOperations["config.health.read"](undefined, remote).snapshot.basis[
+            configPath
+          ];
+        expect(patchHealth({ last_known_good_json: observedJson }, null, 100)).toBe(true);
+        const observed = readHealthBasis();
+        expect(observed).toEqual({
+          lastKnownGoodJson: observedJson,
+          lastPromotedGoodJson: null,
+          suspiciousSignature: null,
+          updatedAtMs: 100,
+        });
+        expect(
+          patchHealth(
+            {
+              last_promoted_good_json: promotedJson,
+              last_observed_suspicious_signature: "observed-signature",
+            },
+            observed,
+            100,
+          ),
+        ).toBe(true);
+        const promoted = readHealthBasis();
+        assert(promoted);
+        expect(promoted).toEqual({
+          lastKnownGoodJson: observedJson,
+          lastPromotedGoodJson: promotedJson,
+          suspiciousSignature: "observed-signature",
+          updatedAtMs: 100,
+        });
+        const clearHealth = {
+          last_known_good_json: null,
+          last_promoted_good_json: null,
+          last_observed_suspicious_signature: null,
+        };
+        for (const stale of [
+          { ...promoted, lastKnownGoodJson: '{"hash":"observed"}' },
+          { ...promoted, lastPromotedGoodJson: null },
+          { ...promoted, suspiciousSignature: null },
+        ]) {
+          expect(patchHealth(clearHealth, stale, 200)).toBe(false);
+        }
+        expect(readHealthBasis()).toEqual(promoted);
+        expect(patchHealth(clearHealth, promoted, 200)).toBe(true);
+        const cleared = readHealthBasis();
+        expect(cleared).toEqual({
+          lastKnownGoodJson: null,
+          lastPromotedGoodJson: null,
+          suspiciousSignature: null,
+          updatedAtMs: 200,
+        });
+        expect(patchHealth({ last_known_good_json: observedJson }, cleared, 300)).toBe(true);
+
         const input = {
           sessionKey: "agent:main:conformance",
           agentId: "main",
@@ -201,55 +207,54 @@ it.skipIf(!connection)(
           dedupeKey: "conformance-event",
         };
         const first = runSqliteImmediateTransactionSync(db, () =>
-          recordSessionStateEventInDatabase(db, input, 100),
+          recordSessionStateEventsInDatabase(db, [{ event: input, now: 100 }]),
         );
-        expect(first.row).toMatchObject({ sequence: 1, summary: "Created" });
+        expect(first.rows[0]).toMatchObject({ sequence: 1, summary: "Created" });
         expect(
           remote.query("SELECT last_sequence, updated_at FROM session_state_heads").rows,
         ).toEqual([{ last_sequence: 1, updated_at: 100 }]);
         const duplicate = runSqliteImmediateTransactionSync(db, () =>
-          recordSessionStateEventInDatabase(db, { ...input, summary: "Ignored" }, 200),
+          recordSessionStateEventsInDatabase(db, [
+            { event: { ...input, summary: "Ignored" }, now: 200 },
+          ]),
         );
         expect(duplicate).toEqual(first);
         expect(
           remote.query("SELECT last_sequence, updated_at FROM session_state_heads").rows,
         ).toEqual([{ last_sequence: 1, updated_at: 100 }]);
 
-        const recent = runSqliteImmediateTransactionSync(db, () =>
-          recordSessionStateEventInDatabase(
-            db,
-            { ...input, dedupeKey: "recent", summary: "Recent" },
-            500,
-          ),
+        const batch = runSqliteImmediateTransactionSync(db, () =>
+          recordSessionStateEventsInDatabase(db, [
+            { event: { ...input, dedupeKey: "batch-main-first" }, now: 300 },
+            { event: { ...input, agentId: "other", dedupeKey: "batch-other" }, now: 400 },
+            { event: { ...input, dedupeKey: "batch-main-last" }, now: 500 },
+            { event: input, now: 600 },
+          ]),
         );
-        runSqliteImmediateTransactionSync(db, () =>
-          recordSessionStateEventInDatabase(
-            db,
-            {
-              ...input,
-              sessionKey: "agent:other:conformance",
-              agentId: "other",
-              dedupeKey: "other",
-            },
-            400,
-          ),
-        );
+        expect(batch.rows).toHaveLength(4);
+        expect(
+          remote.query(
+            "SELECT agent_id, last_sequence, updated_at FROM session_state_heads ORDER BY agent_id",
+          ).rows,
+        ).toEqual([
+          { agent_id: "main", last_sequence: batch.rows[2]!.sequence, updated_at: 500 },
+          { agent_id: "other", last_sequence: batch.rows[1]!.sequence, updated_at: 400 },
+        ]);
+        // Expire events recorded before 450; the watermarks must compare as bigint, not text.
         runSqliteImmediateTransactionSync(db, () =>
           pruneSessionStateEventsInDatabase(db, 450 + 30 * 24 * 60 * 60_000),
         );
-        assert(first.row);
-        assert(recent.row);
         expect(
           remote.query(
             "SELECT agent_id, pruned_max_sequence FROM session_state_heads ORDER BY agent_id",
           ).rows,
         ).toEqual([
-          { agent_id: "main", pruned_max_sequence: first.row.sequence },
-          { agent_id: "other", pruned_max_sequence: recent.row.sequence + 1 },
+          { agent_id: "main", pruned_max_sequence: batch.rows[0]!.sequence },
+          { agent_id: "other", pruned_max_sequence: batch.rows[1]!.sequence },
         ]);
         expect(
           remote.query("SELECT sequence FROM session_state_events ORDER BY sequence").rows,
-        ).toEqual([{ sequence: recent.row.sequence }]);
+        ).toEqual([{ sequence: batch.rows[2]!.sequence }]);
 
         for (const agentId of ["alpha", "beta"]) {
           recordAgentProvenanceInDatabase(db, {

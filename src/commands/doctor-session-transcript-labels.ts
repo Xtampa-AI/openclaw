@@ -1,4 +1,5 @@
 import { note } from "../../packages/terminal-core/src/note.js";
+import { INBOUND_CONTEXT_MARKER } from "../auto-reply/reply/inbound-context-marker.js";
 import {
   mayContainLegacyInboundContextLabels,
   normalizeLegacyInboundContextLabels,
@@ -8,6 +9,7 @@ import { updateSqliteTranscriptEventJsonInTransaction } from "../config/sessions
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { backupDoctorSqliteRepair } from "../infra/sqlite-index-recovery.js";
 import { runOpenClawAgentWriteTransaction } from "../state/openclaw-agent-db.js";
+import { VERSION, resolveRuntimeServiceBuildId, resolveRuntimeServiceCommit } from "../version.js";
 import {
   scanDoctorSessionTranscripts,
   transcriptSnapshotsMatch,
@@ -20,6 +22,7 @@ export async function noteSessionTranscriptLabelHealth(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   shouldRepair: boolean;
+  integrityCheck?: "quick" | "full";
 }): Promise<void> {
   const env = params.env ?? process.env;
   let foundSessions = 0;
@@ -34,10 +37,24 @@ export async function noteSessionTranscriptLabelHealth(params: {
       env,
       title: NOTE_TITLE,
       failureLabel: "Failed to inspect or rewrite labels",
+      // Frozen migration identity plus loaded build/codec and the exact target/profile.
+      cleanScanIdentity: (target) => [
+        "session-transcript-labels:v1",
+        VERSION,
+        resolveRuntimeServiceBuildId(),
+        resolveRuntimeServiceCommit(),
+        process.versions.node,
+        INBOUND_CONTEXT_MARKER,
+        env.OPENCLAW_PROFILE ?? null,
+        target.agentId,
+        target.storePath,
+        params.shouldRepair,
+        params.integrityCheck ?? "quick",
+      ],
     },
     ({ reader, target, databaseOptions, reportError, sessionId }) => {
       const { agentId } = target;
-      const readResult = reader.repairSnapshot(
+      const readResult = reader.labelRepairSnapshot(
         sessionId,
         normalizeLegacyInboundContextLabels,
         mayContainLegacyInboundContextLabels,
@@ -47,7 +64,7 @@ export async function noteSessionTranscriptLabelHealth(params: {
           `- Failed to read transcript for session ${sessionId} (${agentId})`,
           readResult.error,
         );
-        return;
+        return false;
       }
 
       const updates: Array<{ seq: number; eventJson: string }> = [];
@@ -67,7 +84,7 @@ export async function noteSessionTranscriptLabelHealth(params: {
       }
 
       if (updates.length === 0) {
-        return;
+        return true;
       }
 
       foundSessions += 1;
@@ -93,7 +110,21 @@ export async function noteSessionTranscriptLabelHealth(params: {
               updateSqliteTranscriptEventJsonInTransaction(writeDatabase, sessionId, updates);
             },
             databaseOptions,
-            { operationLabel: "doctor.session-transcript-labels" },
+            {
+              operationLabel: "doctor.session-transcript-labels",
+              repairAdmission: {
+                integrityCheck: params.integrityCheck ?? "quick",
+                integrityTables: [
+                  "transcript_events",
+                  "transcript_rewrite_watermarks",
+                  "session_windows",
+                  "session_transcript_index_state",
+                  "session_transcript_active_events",
+                  "session_transcript_fts_rows",
+                  "session_transcript_fts",
+                ],
+              },
+            },
           );
           repairedSessions += 1;
           repairedEvents += updates.length;
@@ -104,6 +135,8 @@ export async function noteSessionTranscriptLabelHealth(params: {
           );
         }
       }
+      // Findings and repairs are not a clean scan, even when the repair succeeded.
+      return false;
     },
   );
 

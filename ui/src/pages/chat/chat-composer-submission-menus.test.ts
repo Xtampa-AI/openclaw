@@ -5,7 +5,7 @@ import { createDeferred } from "../../../../test/helpers/promise.js";
 import { buildFallbackSlashCommands, replaceSlashCommands } from "../../lib/chat/commands.ts";
 import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { createComposerContainer } from "./chat-composer.test-support.ts";
-import { resetChatViewState } from "./chat-view-state.ts";
+import { resetChatViewState } from "./chat-view-state.test-support.ts";
 import {
   getComposerTextarea,
   inputDraftAtEnd,
@@ -42,7 +42,6 @@ function createSubmissionHarness(
       draft,
       getDraft: () => draft,
       onDraftChange,
-      onRequestUpdate: render,
       onSend: () => submit(setDraft),
     });
   const setDraft = (next: string) => {

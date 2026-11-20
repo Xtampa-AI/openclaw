@@ -107,12 +107,28 @@ export const cronListHandler = createPreparedReadHandler((options) => {
           ) {
             throw new Error("Cron list visibility changed; refresh the page");
           }
-          for (const id of selectedJobIds) {
-            const current = context.cron.getJob(id);
-            if (!current || !matchesCurrentJob(current)) {
+          if (selectedJobIds.size <= 1) {
+            for (const id of selectedJobIds) {
+              const current = context.cron.getJob(id);
+              if (!current || !matchesCurrentJob(current)) {
+                throw new Error("Cron list visibility changed; refresh the page");
+              }
+            }
+            return;
+          }
+          // This is the final publication check; consume this request's matched IDs.
+          for (const current of context.cron.getLoadedJobs() ?? []) {
+            if (!selectedJobIds.delete(current.id)) {
+              continue;
+            }
+            if (!matchesCurrentJob(current)) {
               throw new Error("Cron list visibility changed; refresh the page");
             }
+            if (selectedJobIds.size === 0) {
+              return;
+            }
           }
+          throw new Error("Cron list visibility changed; refresh the page");
         };
         let matchesJob: ((job: CronJob) => boolean) | undefined;
         if (callerScope || cronVisibility || p.sessionKey) {
@@ -131,11 +147,6 @@ export const cronListHandler = createPreparedReadHandler((options) => {
           page = await context.cron.listPage(listOptions, matchesJob);
         } finally {
           finishPage?.();
-        }
-        if (matchesJob) {
-          for (const job of page.jobs) {
-            selectedJobIds.add(job.id);
-          }
         }
         diagnostics?.setReturnedCount(page.jobs.length);
         diagnostics?.mark("projection");

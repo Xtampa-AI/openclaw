@@ -52,6 +52,7 @@ it("delivers configured-store child approvals to the parent session without rout
       },
       configPath: await createGatewayConfigPath(home.tempHome),
       token,
+      sidecarStartup: "defer",
       clientDisplayName: "audience setup",
     });
     await gateway.server.startupSettled;

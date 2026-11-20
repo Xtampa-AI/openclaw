@@ -1,2 +1,2 @@
-# Native signal publication and rollback fixtures exercise deferred ledger writes.
-3
+# Native deferred-ledger signal fixtures and proxy-compatible stopped-service probe.
+8

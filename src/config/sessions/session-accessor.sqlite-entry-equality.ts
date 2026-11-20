@@ -1,10 +1,10 @@
 import type { ResolvedSessionEntryRow } from "./session-entry-storage.types.js";
 import type { SessionEntryWindowFacts } from "./session-entry-window.types.js";
 import { SqliteSessionMutationConflictError } from "./session-mutation-conflict-error.js";
-import type { SessionEntry } from "./types.js";
+import type { InternalSessionEntry, SessionEntry } from "./types.js";
 
 export type SqliteLifecycleTargetSnapshot = Array<{
-  entry: SessionEntry;
+  entry: InternalSessionEntry;
   sessionKey: string;
   window?: SessionEntryWindowFacts;
   sideTables?: { memberIdsJson: string; hasBoard: boolean };
@@ -25,7 +25,9 @@ export function sqliteSessionEntriesEqual(
     if (key === "participants" || key === "participantCount") {
       continue;
     }
-    if (JSON.stringify(Reflect.get(left, key)) !== JSON.stringify(Reflect.get(right, key))) {
+    const leftValue = Reflect.get(left, key);
+    const rightValue = Reflect.get(right, key);
+    if (leftValue !== rightValue && JSON.stringify(leftValue) !== JSON.stringify(rightValue)) {
       return false;
     }
   }

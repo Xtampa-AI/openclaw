@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -17,25 +18,22 @@ import {
   type RpcRequest,
   type RpcResponse,
   type CodexServerNotification,
+  type CodexConfigReadResponse,
+  type JsonObject,
 } from "./protocol.js";
 import {
   registerCodexTestSessionIdentity,
   testCodexAppServerBindingStore,
 } from "./session-binding.test-helpers.js";
-import type { CodexAppServerClientOptions } from "./shared-client-options.js";
 import {
   getLeasedSharedCodexAppServerClient,
   releaseLeasedSharedCodexAppServerClient,
+  type CodexAppServerClientOptions,
 } from "./shared-client.js";
 import { createClientHarness, createCodexTestModel } from "./test-support.js";
 import { startOrResumeThread as startOrResumeThreadImpl } from "./thread-lifecycle-run.js";
 
-type NativeFixtureThread = {
-  response: Record<string, unknown>;
-  thread: Record<string, unknown>;
-  loaded: boolean;
-  subscribed: boolean;
-};
+export { createCodexRuntimePlanFixture } from "./test-support.js";
 
 export function createLifecycleRequest(
   respond: (method: string, requestParams?: unknown) => Promise<unknown>,
@@ -51,21 +49,59 @@ export function createLifecycleRequest(
   });
 }
 
-export function createFixedThreadRequest(threadId: string, methods: string[]) {
-  return createLifecycleRequest(async (method) => {
-    if (methods.includes(method)) {
-      return nativeThreadStartResult(threadId);
-    }
-    throw new Error(`unexpected method: ${method}`);
-  });
+export const DEFAULT_CODEX_RUNTIME_THREAD_CONFIG = {
+  "features.reasoning_effort_override": true,
+  project_doc_max_bytes: 131_072,
+  "features.tool_suggest": false,
+  "features.recommended_plugins": false,
+  "features.goals": false,
+  "tools.update_plan.enabled": false,
+  "features.code_mode": true,
+  "features.code_mode_only": false,
+  "features.shell_tool": true,
+  "features.apply_patch_streaming_events": true,
+  suppress_unstable_features_warning: true,
+  "features.standalone_web_search": false,
+  web_search: "cached",
+} as const;
+
+export function nativeQuestionConfigFixture(enabled: boolean | undefined): CodexConfigReadResponse {
+  const metadata = {
+    name: { type: "user" as const, file: "/synthetic/codex/config.toml", profile: null },
+    version: "question-config",
+  };
+  const config: JsonObject =
+    enabled === undefined ? {} : { tools: { experimental_request_user_input: { enabled } } };
+  return {
+    // The typed tools projection omits this key; the winning raw layer retains it.
+    config: { tools: { web_search: null } },
+    origins:
+      enabled === undefined ? {} : { "tools.experimental_request_user_input.enabled": metadata },
+    layers: [
+      { ...metadata, config },
+      {
+        name: { type: "project", dotCodexFolder: "/synthetic/untrusted/.codex" },
+        version: "disabled-question-config",
+        config: { tools: { experimental_request_user_input: { enabled: true } } },
+        disabledReason: "Project is not trusted",
+      },
+    ],
+  };
 }
+
+type NativeFixtureThread = {
+  response: Record<string, unknown>;
+  thread: Record<string, unknown>;
+  loaded: boolean;
+  subscribed: boolean;
+};
 
 /** A synthetic native server, not a client mock: requests still cross the real wire and guards. */
 export function createCodexLifecycleHarness(options: {
   respond: (method: string, params?: unknown) => unknown;
+  codexHome?: string;
   persistedThreads?: Array<string | ReturnType<typeof nativeThreadStartResult>>;
   unsubscribe?: (threadId: string) => unknown;
-  unloadImmediatelyOnUnsubscribe?: boolean;
 }) {
   const threads = new Map<string, NativeFixtureThread>();
   const writtenRequests = createCodexRequestRecorder();
@@ -97,7 +133,10 @@ export function createCodexLifecycleHarness(options: {
     const threadId = typeof params.threadId === "string" ? params.threadId : "";
     const current = threads.get(threadId);
     if (request.method === "initialize") {
-      return { userAgent: "codex-cli/0.151.0" };
+      return {
+        userAgent: "codex-cli/0.151.0",
+        ...(options.codexHome ? { codexHome: options.codexHome } : {}),
+      };
     }
     if (request.method === "thread/start") {
       const response = await options.respond(request.method, request.params);
@@ -106,10 +145,7 @@ export function createCodexLifecycleHarness(options: {
     }
     if (request.method === "thread/read") {
       if (!current) {
-        throw new CodexAppServerRpcError(
-          { code: -32_600, message: `thread not loaded: ${threadId}` },
-          request.method,
-        );
+        throw new Error(`Unknown synthetic native thread: ${threadId}`);
       }
       return {
         thread: {
@@ -137,14 +173,12 @@ export function createCodexLifecycleHarness(options: {
         (response.status === "unsubscribed" || response.status === "notSubscribed")
       ) {
         current.subscribed = false;
-        if (options.unloadImmediatelyOnUnsubscribe !== false) {
-          current.loaded = false;
-          harness.send({
-            method: "thread/status/changed",
-            params: { threadId, status: { type: "notLoaded" } },
-          });
-          harness.send({ method: "thread/closed", params: { threadId } });
-        }
+        current.loaded = false;
+        harness.send({
+          method: "thread/status/changed",
+          params: { threadId, status: { type: "notLoaded" } },
+        });
+        harness.send({ method: "thread/closed", params: { threadId } });
       }
       return response;
     }
@@ -449,6 +483,10 @@ function stubEmptyCodexSkillCatalog(client: CodexAppServerClient): void {
   if (typeof client.addNotificationHandler !== "function") {
     client.addNotificationHandler = () => () => undefined;
   }
+  if (typeof client.getInstanceId !== "function") {
+    const instanceId = randomUUID();
+    client.getInstanceId = () => instanceId;
+  }
   clientsWithEmptySkillCatalog.add(client);
 }
 
@@ -513,17 +551,6 @@ export async function writeNativeCatalogFixture(
     rolloutPath,
     `${JSON.stringify({ type: "session_meta", payload: { id: threadId, dynamic_tools: dynamicTools } })}\n`,
   );
-}
-
-export function disabledMcpServerStatus(name: string) {
-  return {
-    name,
-    serverInfo: null,
-    tools: {},
-    resources: [],
-    resourceTemplates: [],
-    authStatus: "unsupported",
-  };
 }
 
 export function createAppServerOptions(): CodexAppServerRuntimeOptions {
@@ -596,27 +623,6 @@ export function setCodexTestModelSupportsTools(
     ...params.model,
     compat: { ...params.model.compat, supportsTools },
   } as EmbeddedRunAttemptParams["model"] & { compat: { supportsTools: boolean } };
-}
-
-export function createCodexRuntimePlanFixture(): NonNullable<
-  EmbeddedRunAttemptParams["runtimePlan"]
-> {
-  return {
-    auth: {},
-    observability: {
-      resolvedRef: "codex/gpt-5.4-codex",
-      provider: "codex",
-      modelId: "gpt-5.4-codex",
-      harnessId: "codex",
-    },
-    prompt: {
-      resolveSystemPromptContribution: () => undefined,
-    },
-    tools: {
-      normalize: (tools: unknown[]) => tools,
-      logDiagnostics: () => undefined,
-    },
-  } as unknown as NonNullable<EmbeddedRunAttemptParams["runtimePlan"]>;
 }
 
 export function createThreadRequestAttemptParams(params: {

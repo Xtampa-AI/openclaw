@@ -1,57 +1,22 @@
 /** @vitest-environment node */
-import { assert, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createStorageMock } from "../test-helpers/storage.ts";
+import { assert, beforeEach, describe, expect, it, vi } from "vitest";
+import { startConnect, useHandshakeHarness } from "./gateway-handshake.test-support.ts";
 import {
   getLatestWebSocket,
-  MockWebSocket,
-  stubWindowGlobals,
-  useNodeFakeTimers,
+  type MockWebSocket,
   wsInstances,
 } from "./gateway-socket.test-support.ts";
-import { GatewayBrowserClient } from "./gateway.ts";
-const clients: GatewayBrowserClient[] = [];
-function createClient(
-  options: Partial<ConstructorParameters<typeof GatewayBrowserClient>[0]> = {
-    url: "ws://127.0.0.1:18789",
-  },
-) {
-  const client = new GatewayBrowserClient({ url: "ws://127.0.0.1:18789", ...options });
-  clients.push(client);
-  return client;
-}
+import type { GatewayBrowserClient } from "./gateway.ts";
+
+const createClient = useHandshakeHarness();
 beforeEach(() => {
-  const storage = createStorageMock();
-  vi.stubGlobal("localStorage", storage);
-  stubWindowGlobals(storage);
-  vi.stubGlobal("WebSocket", MockWebSocket);
-  // The heartbeat contract does not require device signing.
-  vi.stubGlobal("crypto", { randomUUID: () => "heartbeat-request" });
-  wsInstances.length = 0;
-  useNodeFakeTimers();
   vi.stubGlobal("document", {
     documentElement: { getAttribute: () => null },
     visibilityState: "visible",
   });
 });
-afterEach(() => {
-  for (const client of clients.splice(0)) {
-    client.stop();
-  }
-  vi.restoreAllMocks();
-  vi.useRealTimers();
-  vi.unstubAllGlobals();
-});
 async function connect(client: GatewayBrowserClient, tickIntervalMs = 30_000) {
-  client.start();
-  const ws = getLatestWebSocket();
-  ws.emitOpen();
-  ws.emitMessage({
-    type: "event",
-    event: "connect.challenge",
-    payload: { nonce: "heartbeat-challenge", ts: 1_800_000_000_000 },
-  });
-  await vi.advanceTimersByTimeAsync(0);
-  const connectFrame = JSON.parse(ws.sent.at(-1) ?? "{}") as { id?: string };
+  const { ws, connectFrame } = await startConnect(client, "heartbeat-challenge");
   ws.emitMessage({
     type: "res",
     id: connectFrame.id,
@@ -64,6 +29,7 @@ async function connect(client: GatewayBrowserClient, tickIntervalMs = 30_000) {
       policy: { tickIntervalMs },
     },
   });
+  await vi.advanceTimersByTimeAsync(0);
   return ws;
 }
 
@@ -140,27 +106,19 @@ describe("GatewayBrowserClient heartbeat recovery", () => {
     expect(probes(ws)).toHaveLength(2);
   });
 
-  it("probes fifteen seconds after a sent request even if it timed out after ten seconds", async () => {
+  it("probes five seconds after an unanswered send and reconnects within sixteen seconds", async () => {
     const client = createClient();
     const ws = await connect(client);
-    await vi.advanceTimersByTimeAsync(5_000);
-    const onSent = vi.fn();
+    await vi.advanceTimersByTimeAsync(5_001);
     const request = client
-      .request("sessions.list", {}, { timeoutMs: 10_000, onSent })
+      .request("sessions.list", {}, { timeoutMs: 10_000 })
       .catch((error: unknown) => error);
-    expect(onSent).toHaveBeenCalledOnce();
-    expect(JSON.parse(ws.sent.at(-1)!).method).toBe("sessions.list");
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(await request).toMatchObject({
-      code: "CLIENT_TIMEOUT",
-      timeoutMs: 10_000,
-      requestSent: true,
-    });
     await vi.advanceTimersByTimeAsync(4_999);
     expect(probes(ws)).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(probes(ws)).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(10_000);
+    expect(await request).toMatchObject({ code: "CLIENT_TIMEOUT", requestSent: true });
     expect(ws.lastClose).toEqual({ code: 4000, reason: "inbound silence probe timeout" });
   });
 

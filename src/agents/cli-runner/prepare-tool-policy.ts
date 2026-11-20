@@ -1,15 +1,20 @@
 import type { ResolvedCliBackend } from "../cli-backends.js";
+import { hashCliSessionText } from "../cli-session.js";
 import { prepareConversationCapabilityProfile } from "../conversation-capability-profile.js";
 import { applyEmbeddedAttemptToolsAllow } from "../embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import { resolveExecConfigState } from "../exec-defaults.js";
 import { resolveEffectiveToolFsWorkspaceOnly } from "../tool-fs-policy.js";
 import { expandToolGroups, normalizeToolPolicyName } from "../tool-policy.js";
+import { resolveToolSearchConfig } from "../tool-search-config.js";
 import type { RunCliAgentParams } from "./types.js";
 
 /**
  * Translate the caller's runtime tool cap into the CLI run's exact tool availability.
- * Native CLI tools cannot enforce channel or inherited completion caps, so those
- * runs expose their whole surface through the mediated MCP policy projection.
+ * Native CLI tools cannot enforce workspace, channel, or inherited completion caps, so those
+ * runs expose their whole surface through the mediated MCP policy projection. Bundled
+ * local Claude agent turns use that same mediated surface even without a cap, so a
+ * completion does not replace the native tool prefix of a running session. Operator-selected
+ * backend tools stay on both turn kinds for the same reason.
  */
 export async function resolveCliRuntimeToolPolicy(input: {
   params: RunCliAgentParams;
@@ -168,6 +173,7 @@ export async function resolveCliRuntimeToolPolicy(input: {
   }
   return { params, runtimeToolsAllowPolicy, managedNativeTools };
 }
+
 /**
  * Bootstrap routing needs the run's final file access: a native file-capable
  * selection, or Claude's mediated OpenClaw read plus write tools. Managed native
@@ -216,4 +222,42 @@ export function keptManagedNativeTools(
   params: Pick<RunCliAgentParams, "cliToolAvailability">,
 ): string[] {
   return managedNativeTools.filter((name) => params.cliToolAvailability?.native.includes(name));
+}
+
+/** Discovery sees only the final MCP catalog and does not restore native execution tools. */
+export function withCliToolSearch(
+  params: RunCliAgentParams,
+  nativeToolSearch: string | undefined,
+): RunCliAgentParams {
+  const availability = params.cliToolAvailability;
+  if (
+    !nativeToolSearch ||
+    !availability ||
+    params.disableTools ||
+    availability.openClaw.length === 0 ||
+    !resolveToolSearchConfig(params.config).enabled
+  ) {
+    return params;
+  }
+  return {
+    ...params,
+    cliToolAvailability: { ...availability, discovery: [nativeToolSearch] },
+  };
+}
+
+/** Bind CLI session reuse to its stable native, discovery, and mediated tool catalog. */
+export function resolveCliToolAvailabilityHash(
+  baseHash: string | undefined,
+  availability: RunCliAgentParams["cliToolAvailability"],
+): string | undefined {
+  return availability
+    ? hashCliSessionText(
+        JSON.stringify([
+          baseHash ?? null,
+          availability.native.toSorted(),
+          availability.openClaw.toSorted(),
+          ...(availability.discovery ? [availability.discovery] : []),
+        ]),
+      )
+    : baseHash;
 }

@@ -92,8 +92,16 @@ it.each([
               .prepare("DELETE FROM transcript_event_identities WHERE session_id = ? AND seq = 0")
               .run(scope.sessionId);
           }
-          // This release's predicate migration eagerly fills navigation fields.
-          // Unlike schema 39, clearing them would manufacture an invalid fixture.
+          if (analyzed) {
+            // The same type-index seek must cover transcripts admitted without a backfill.
+            database.db
+              .prepare(`UPDATE transcript_events
+              SET navigation_type = NULL, navigation_custom_type = NULL,
+                  navigation_display = 0, message_role = NULL, navigation_last_type = NULL,
+                  navigation_last_custom_type = NULL, navigation_valid = 1
+              WHERE session_id = ?`)
+              .run(scope.sessionId);
+          }
         },
         { agentId: database.agentId, path: database.path },
       );
@@ -139,15 +147,16 @@ it.each([
         const drivingSearch = plan.find(
           ({ detail }) => typeof detail === "string" && detail.startsWith("SEARCH "),
         )?.detail;
-        expect(drivingSearch).toBeDefined();
-        expect(
-          plan.some(
-            ({ detail }) =>
-              typeof detail === "string" &&
-              detail.includes("idx_agent_transcript_event_identity_sequence") &&
-              detail.includes("LEFT-JOIN"),
-          ),
-        ).toBe(true);
+        if (legacy) {
+          expect(
+            plan.some(
+              ({ detail }) =>
+                typeof detail === "string" && detail.includes("(session_id=? AND seq=?) LEFT-JOIN"),
+            ),
+          ).toBe(true);
+        } else {
+          expect(drivingSearch).toMatch(/\(session_id=\? AND event_type=\?/u);
+        }
       } finally {
         spy.mockRestore();
       }
@@ -184,11 +193,7 @@ it("decodes only the live cache-TTL prefix after sorting obsolete checkpoints", 
       anchor,
     ]);
     expectCompressed({ database, scope }, obsolete.length + 1);
-    const codec = resolveZstdCodec();
-    if (!codec) {
-      throw new Error("Expected zstd codec");
-    }
-    const decompress = vi.spyOn(codec, "decompress");
+    const decompress = vi.spyOn(resolveZstdCodec(), "decompress");
     try {
       expect(prefixAt(scope, anchor)).toEqual({ anchorIds: [anchor.id], entries: [marker, delta] });
       expect(decompress).toHaveBeenCalledTimes(1);

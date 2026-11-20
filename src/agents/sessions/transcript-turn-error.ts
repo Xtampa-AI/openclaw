@@ -6,6 +6,8 @@ export function isSessionTranscriptTurnMismatchErrorMessage(
   return (
     /^Transcript idempotency key ".+" conflicts with the admitted message\.$/.test(text) ||
     /^Session transcript keyed user is outside the current turn: \S/.test(text) ||
+    /^Transcript idempotency key ".+" conflicts with the admitted message\.$/.test(text) ||
+    text === "Model prompt projection lost its canonical user turn" ||
     text === "Pending input is no longer active in its admitted transcript" ||
     text === "Pending input session changed before transcript promotion" ||
     text === "Pending input custody ended before transcript promotion" ||

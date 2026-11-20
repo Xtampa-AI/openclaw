@@ -3,7 +3,9 @@ import type { SessionTranscriptContextVersion } from "../../config/sessions/sess
 import type { readSessionTranscriptModelContext } from "../../config/sessions/session-accessor.sqlite-model-context.js";
 import type { SessionTranscriptRuntimeTarget } from "../../config/sessions/session-accessor.types.js";
 import type {
+  SessionContextSeedRequest,
   SessionModelContextLimits,
+  SessionTranscriptContextSelection,
   SessionTranscriptContextSnapshot,
 } from "../../config/sessions/session-history-read.types.js";
 import { readSessionTranscriptModelContextAsync } from "../../config/sessions/session-transcript-context-read.js";
@@ -67,7 +69,7 @@ export function readSessionManagerActorTranscript(
 export function prepareSessionManagerHydration(
   source: SessionTranscriptRuntimeTarget,
   options: {
-    limits?: { maxBytes: number; maxEvents: number };
+    limits?: SessionTranscriptContextSelection;
     signal?: AbortSignal;
     manager?: object;
     retarget?: boolean;
@@ -134,9 +136,18 @@ export async function readSessionManagerModelContextAsync<T>(
 
 export async function readSessionManagerContextAsync<T>(
   target: SessionTranscriptRuntimeTarget,
-  read: (messages: Iterable<AgentMessage>, header: unknown) => T | Promise<T>,
-  options: { admission?: UserTurnTranscriptAdmissionReceipt; signal?: AbortSignal },
+  read: (
+    messages: Iterable<AgentMessage>,
+    header: unknown,
+    seed?: SessionTranscriptContextSnapshot["seed"],
+  ) => T | Promise<T>,
+  options: {
+    admission?: UserTurnTranscriptAdmissionReceipt;
+    signal?: AbortSignal;
+    seed?: SessionContextSeedRequest;
+  },
 ): Promise<T> {
+  const seed = options.seed ? { ...options.seed } : undefined;
   const captured = captureSessionTranscriptTargetBinding(target);
   const receipt = options.admission ?? resolveSessionTranscriptReadFence(captured);
   const admission = receipt ? { ...receipt } : undefined;
@@ -150,6 +161,7 @@ export async function readSessionManagerContextAsync<T>(
     const snapshot = await reader.read("session.history.context-messages", {
       sessionId: captured.sessionId,
       admission,
+      seed,
     });
     const messages = (function* () {
       for (const message of snapshot.messages) {
@@ -159,7 +171,7 @@ export async function readSessionManagerContextAsync<T>(
     })();
     try {
       reader.assertCurrent();
-      const value = await read(messages, snapshot.header);
+      const value = await read(messages, snapshot.header, snapshot.seed);
       reader.assertCurrent();
       return value;
     } finally {
@@ -183,7 +195,7 @@ export async function readSessionManagerContextAsync<T>(
         }
       })();
       try {
-        return await read(messages, snapshot.header);
+        return await read(messages, snapshot.header, snapshot.seed);
       } finally {
         messages.return(undefined);
       }
@@ -212,6 +224,7 @@ export async function readSessionManagerContextAsync<T>(
           admission,
           signal,
           expectedIdentity,
+          seed,
         );
         assertDurable();
         const result = await consumeSnapshot(snapshot, () => owner.assertCurrent());

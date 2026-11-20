@@ -31,7 +31,9 @@ export async function readPreflightTranscriptContextMessages(
   scope: TranscriptScope & { contextWindowTokens: number },
   signal?: AbortSignal,
 ): Promise<AgentMessage[]> {
-  const limits = resolveEmbeddedSessionContextLimits(scope.contextWindowTokens);
+  const limits = resolveEmbeddedSessionContextLimits({
+    contextTokenBudget: scope.contextWindowTokens,
+  });
   const readLegacyProjection = async () => {
     signal?.throwIfAborted();
     const messages = (await readSessionMessagesAsync(scope, {
@@ -105,6 +107,7 @@ export async function readSessionLogSnapshot(params: {
     return snapshot;
   } catch {
     params.abortSignal?.throwIfAborted();
+    // Accounting is optional; failed reads leave usage unknown and flush taint conservative.
     return params.includeTurnTaint ? { turnTainted: true } : {};
   }
 }
@@ -117,17 +120,12 @@ export type TranscriptTokenEstimate = {
     | "prompt_projection";
   outputTokens?: number;
   promptIncludesOutput?: boolean;
-  transcriptByteSize?: number;
 };
 
 function hasUsableProviderPromptUsage(
   usage: SessionTranscriptUsageSnapshot | undefined,
 ): usage is SessionTranscriptUsageSnapshot & { promptTokens: number } {
-  return (
-    typeof usage?.promptTokens === "number" &&
-    Number.isFinite(usage.promptTokens) &&
-    usage.promptTokens > 0
-  );
+  return usage?.promptTokens !== undefined && usage.promptTokens > 0;
 }
 
 // Fresh totals include the provider usage anchor and any later projected messages.
@@ -135,7 +133,7 @@ async function estimateProviderPromptTokens(
   messages: AgentMessage[],
   contextWindowTokens: number,
   priorPromptTokens = 0,
-): Promise<number | undefined> {
+): Promise<number> {
   if (messages.length === 0) {
     return Math.ceil(priorPromptTokens);
   }
@@ -150,9 +148,7 @@ async function estimateProviderPromptTokens(
     createToolResultPromptProjectionState(),
   ).messages;
   const tokens = estimateMessagesTokens(projected);
-  return Number.isFinite(tokens) && tokens >= 0
-    ? Math.ceil(priorPromptTokens) + Math.ceil(tokens)
-    : undefined;
+  return Math.ceil(priorPromptTokens) + Math.ceil(tokens);
 }
 
 export async function estimatePromptTokensFromSessionTranscript(
@@ -177,7 +173,7 @@ export async function estimatePromptTokensFromSessionTranscript(
         sessionId,
         sessionKey: params.sessionKey,
         storePath: params.storePath,
-        includeByteSize: true,
+        includeByteSize: false,
         includeUsage: true,
         abortSignal,
       }));
@@ -193,9 +189,6 @@ export async function estimatePromptTokensFromSessionTranscript(
       params.contextWindowTokens,
       providerUsage?.promptTokens,
     );
-    if (promptTokens === undefined) {
-      return undefined;
-    }
     return {
       promptTokens,
       promptTokenSource: providerUsage
@@ -207,7 +200,6 @@ export async function estimatePromptTokensFromSessionTranscript(
       // output only for projection against a separate persisted prompt fact.
       ...(!providerUsage ? { promptIncludesOutput: true } : {}),
       outputTokens: normalizedOutputTokens,
-      transcriptByteSize: snapshot.byteSize,
     };
   } catch (error) {
     abortSignal?.throwIfAborted();

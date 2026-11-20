@@ -1,12 +1,18 @@
-import { constants } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { constants, type Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolveStateDir } from "../../config/paths.js";
+import { materializeErrorStack } from "../../infra/error-graph-internal.js";
 import { isMissingPathError } from "../../infra/errors.js";
 import { isPathInside } from "../../infra/path-guards.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import type { WorktreeAllocationGuard } from "./allocation.js";
+import {
+  withWorktreeAllocationLease,
+  withWorktreeMutationLease,
+  type WorktreeAllocationGuard,
+} from "./allocation.js";
 import type { WorktreeGcProgress } from "./gc-progress.js";
 import {
   canonicalPathKey,
@@ -14,14 +20,47 @@ import {
   shouldPreserveOrphanCandidate,
 } from "./orphan-paths.js";
 import { readPendingWorktrees } from "./pending-slots.js";
-import { readRegistryWorktrees } from "./registry-read.js";
+import { captureWorktreeRegistryReadGuard, readRegistryWorktrees } from "./registry-read.js";
+import { worktreeGcRevision } from "./registry-read.kernel.js";
 import { isWorktreePermissionError } from "./removal-errors.js";
 import { captureWorktreeRunEndContext } from "./run-end-lifecycle.js";
 import { retireExpiredManagedWorktreeSnapshot } from "./snapshot-host.js";
 import { WORKTREE_TEMPLATE_DIRECTORY } from "./template-cache.js";
-import type { ManagedWorktreeRecord } from "./types.js";
+import type { ManagedWorktreeRecord, WorktreeMutationGuard } from "./types.js";
 
 const log = createSubsystemLogger("agents/worktrees");
+
+async function hasUnregisteredArtifacts(
+  root: string,
+  entries: readonly Dirent[],
+  records: readonly ManagedWorktreeRecord[],
+): Promise<boolean> {
+  const key = (target: string) => {
+    const resolved = path.resolve(target);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  const registered = new Set(records.map((record) => key(record.path)));
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === WORKTREE_TEMPLATE_DIRECTORY) {
+      continue;
+    }
+    const directory = path.join(root, entry.name);
+    if (registered.has(key(directory))) {
+      continue;
+    }
+    const children = await fs.readdir(directory, { withFileTypes: true }).catch(() => undefined);
+    if (
+      !children ||
+      children.length === 0 ||
+      children.some(
+        (child) => child.isDirectory() && !registered.has(key(path.join(directory, child.name))),
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export async function collectRetiredWorktreeArtifacts({
   env,
@@ -30,7 +69,7 @@ export async function collectRetiredWorktreeArtifacts({
   expiresBefore,
   progress,
   orphanFailures,
-  withAllocationLease,
+  guard: callerGuard,
 }: {
   env: NodeJS.ProcessEnv;
   getConfig?: () => OpenClawConfig;
@@ -38,7 +77,7 @@ export async function collectRetiredWorktreeArtifacts({
   expiresBefore: number;
   progress: WorktreeGcProgress;
   orphanFailures: Map<string, { dev: number; ino: number; error: unknown }>;
-  withAllocationLease: (run: (guard: WorktreeAllocationGuard) => Promise<void>) => Promise<void>;
+  guard: WorktreeMutationGuard;
 }): Promise<{ orphansDeleted: number; snapshotsPruned: number }> {
   const context = captureWorktreeRunEndContext(env);
   let orphansDeleted = 0;
@@ -47,8 +86,9 @@ export async function collectRetiredWorktreeArtifacts({
   const expired = records.filter(
     (record) => record.removedAt !== undefined && record.removedAt < expiresBefore,
   );
+  const worktreesRoot = path.join(resolveStateDir(context.environment), "worktrees");
   const entries = await fs
-    .readdir(path.join(resolveStateDir(context.environment), "worktrees"), {
+    .readdir(worktreesRoot, {
       withFileTypes: true,
     })
     .catch((error: unknown) => {
@@ -58,16 +98,25 @@ export async function collectRetiredWorktreeArtifacts({
       progress.error("orphans", error);
       return undefined;
     });
-  const hasOrphanCandidates =
+  let hasOrphanCandidates =
     entries?.some((entry) => entry.isDirectory() && entry.name !== WORKTREE_TEMPLATE_DIRECTORY) ??
     false;
+  if (hasOrphanCandidates && entries && expired.length === 0 && pending.length === 0) {
+    // Exact registered paths can only suppress a sweep. Unknown paths still get
+    // the fresh registry and canonical safety checks under allocation custody.
+    hasOrphanCandidates = await hasUnregisteredArtifacts(worktreesRoot, entries, records);
+  }
   if (entries && !hasOrphanCandidates) {
     orphanFailures.clear();
   }
   if (hasOrphanCandidates || expired.length > 0 || pending.length > 0) {
     try {
-      await withAllocationLease(async (guard) => {
-        const slots = await readPendingWorktrees(context.environment);
+      await withWorktreeMutationLease({ ...callerGuard, env, id: "artifacts" }, async (guard) => {
+        const slots = pending.length
+          ? await withWorktreeAllocationLease({ ...guard, env }, () =>
+              readPendingWorktrees(context.environment),
+            )
+          : [];
         for (const { record, state } of slots) {
           if (state !== "recovering") {
             continue;
@@ -181,6 +230,8 @@ async function reconcileOrphans(
   progress: WorktreeGcProgress,
   orphanFailures: Map<string, { dev: number; ino: number; error: unknown }>,
 ): Promise<number> {
+  const observed = new Map(records.map((record) => [record.id, worktreeGcRevision(record)]));
+  const configuredRoot = getConfig?.().worktreeRoot;
   const managedPaths = await resolveManagedWorktreePathKeys(records);
   if (!managedPaths) {
     return 0;
@@ -256,7 +307,7 @@ async function reconcileOrphans(
       if (!name.isDirectory()) {
         continue;
       }
-      const candidate = path.join(fingerprintPath, name.name);
+      let candidate = path.join(fingerprintPath, name.name);
       if (await shouldPreserveOrphanCandidate(candidate, managedPaths, customRoots)) {
         continue;
       }
@@ -270,7 +321,41 @@ async function reconcileOrphans(
         }
         orphanFailures.delete(candidate);
       }
+      let removalAttempted = false;
       try {
+        const original = candidate;
+        candidate = await withWorktreeAllocationLease({ ...guard, env }, async (allocation) => {
+          const context = captureWorktreeRunEndContext(env);
+          const accept = captureWorktreeRegistryReadGuard(context, "record");
+          const slots = await readPendingWorktrees(env);
+          const current = [
+            ...slots.map(({ record }) => record),
+            ...(await readRegistryWorktrees(env)),
+          ];
+          const assertRegistryCurrent = accept(undefined);
+          if (
+            getConfig?.().worktreeRoot !== configuredRoot ||
+            current.length !== observed.size ||
+            current.some((record) => observed.get(record.id) !== worktreeGcRevision(record))
+          ) {
+            throw new Error(
+              "Worktree inventory changed during orphan planning; directory preserved",
+            );
+          }
+          const stat = await fs.lstat(original);
+          if (!stat.isDirectory() || stat.dev !== source.dev || stat.ino !== source.ino) {
+            throw new Error("Orphan removal root changed during planning; directory preserved");
+          }
+          allocation.commitGuard();
+          assertRegistryCurrent();
+          // The atomic namespace change commits retirement. Recursive deletion owns only this
+          // unselectable sibling after allocation is released; a crash leaves it for the next GC.
+          const retired = path.join(fingerprintPath, `.openclaw-retired-${randomUUID()}`);
+          removalAttempted = true;
+          await fs.rename(original, retired);
+          return retired;
+        });
+        candidates.add(candidate);
         assertCurrent();
         try {
           await fs.rm(candidate, { recursive: true, force: true });
@@ -293,20 +378,21 @@ async function reconcileOrphans(
         deleted += 1;
       } catch (error) {
         assertCurrent();
+        progress.error("orphans", error, candidate);
+        if (!removalAttempted) {
+          continue;
+        }
         const stat = await fs.lstat(candidate).catch(() => undefined);
         if (stat?.dev === source.dev && stat.ino === source.ino) {
+          materializeErrorStack(error);
           orphanFailures.set(candidate, { dev: stat.dev, ino: stat.ino, error });
         }
-        progress.error("orphans", error, candidate);
         log.warn(
           `worktree orphan cleanup deferred for ${candidate}; repair access and run openclaw worktrees gc --retry-deferred: ${String(error)}`,
         );
       }
     }
-    if (!pendingPaths.some((pendingPath) => isPathInside(fingerprintPath, pendingPath))) {
-      guard.commitGuard?.();
-      await fs.rmdir(fingerprintPath).catch(() => undefined);
-    }
+    // Leave the empty namespace container: a creator may already have reserved a child.
   }
   for (const candidate of orphanFailures.keys()) {
     if (!candidates.has(candidate)) {

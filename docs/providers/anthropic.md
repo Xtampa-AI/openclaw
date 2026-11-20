@@ -212,7 +212,10 @@ OpenClaw release:
         use protected file-descriptor forwarding, including tokens saved with
         `openclaw models auth paste-token --provider anthropic`. API keys saved for
         the `anthropic` provider require an explicit account selection for CLI
-        forwarding. Existing sessions keep their account until you select another
+        forwarding. Saved subscription accounts also make configured Claude CLI
+        models available in the picker without a native `claude auth login`;
+        switching models preserves the configured Claude CLI runtime.
+        Existing sessions keep their account until you select another
         or remove its saved profile. Native-tool approvals remain under OpenClaw
         control. Schema-valid native calls pass through OpenClaw's shared
         tool policy before native approval. Isolated side-question completions
@@ -265,9 +268,12 @@ OpenClaw release:
     Direct Messages API requests using a setup token advertise a maintained
     Claude Code client version, or the installed CLI version when newer.
     Anthropic uses that identity to gate newer models. A missing, older, or
-    failed CLI check uses OpenClaw's maintained version floor. Discovery is
-    shared with the CLI backend and cached until process restart; API-key
-    requests do not run the check.
+    failed CLI check uses OpenClaw's maintained version floor. When Anthropic
+    rejects an OAuth request with a newer required version, OpenClaw adopts that
+    version and retries once before streaming. The Anthropic plugin stores the
+    requirement for later requests and restarts; storage failures do not prevent
+    the current process from using it. Discovery is shared with the CLI backend
+    and cached until process restart; API-key requests do not run the check.
 
     ### Config example
 
@@ -493,7 +499,11 @@ order, and lifetime without changing the pinned system prompt.
 Tool results and queued extension context also clear turn-scoped messages, so
 OpenClaw renews the current user turn's runtime context after those continuations.
 
-OAuth, proxies, Bedrock, Vertex, and Foundry keep their existing behavior.
+Every other Anthropic Messages route (OAuth, proxies and custom base URLs, Vertex,
+Foundry, and other Claude models) also pins the session system prompt. The prompt
+updates arrive as user-role notes, because these routes cannot send
+mid-conversation system messages. Runtime context keeps its user-role carrier.
+Bedrock keeps its existing behavior.
 Prefix-binding models such as Fable 5.1, Opus 5.5, and Sonnet 5.5 retain hidden
 user-role runtime-context carriers and inline inbound metadata, preserving
 consecutive user turns on the Messages API; Bedrock Converse still merges
@@ -588,9 +598,9 @@ Approve the node pairing upgrade when those commands first appear.
 
 The sidebar groups rows by their Gateway or paired-node host and shows each
 host's newest bounded page as soon as that computer answers. It reconciles again
-after host-connectivity changes, when the page regains focus, and at most every
-30 seconds while visible, so Claude sessions created outside OpenClaw appear
-without a reload. A changed catalog gets a faster follow-up pass. Use **Load more
+after host-connectivity changes, when the page becomes visible, and every two
+minutes while visible, so Claude sessions created outside OpenClaw appear
+without a reload. Discovery pauses while hidden. Use **Load more
 sessions** below a catalog group to append the next page for every host that has
 more history; appended rows stay visible and are re-fetched to the same depth
 across refreshes. Catalog clients use `sessions.catalog.list`; opening a row uses
@@ -871,7 +881,6 @@ OpenClaw supports Anthropic's prompt caching feature for API-key auth.
       agents: {
         ownership: "explicit",
         defaults: {
-          heartbeat: { agentId: "research" },
           systemAgent: { agentId: "research" },
           authInheritance: { agentId: "research" },
           model: { primary: "anthropic/claude-opus-4-6" },
@@ -1089,6 +1098,31 @@ OpenClaw supports Anthropic's prompt caching feature for API-key auth.
   <Accordion title="Claude Opus 5 1M context">
     `anthropic/claude-opus-5` and its `claude-cli` variant have a 1M context
     window by default; no `params.context1m: true` needed.
+  </Accordion>
+
+  <Accordion title="Claude Code native subagents on managed turns">
+    `plugins.entries.anthropic.config.managedNativeTools` keeps selected Claude
+    Code orchestration tools on `claude-cli` turns that OpenClaw manages. It is
+    off by default. `default` applies to every agent; `agents.<id>` replaces it
+    for one agent, and `[]` opts that agent out. Accepted values: `Agent`,
+    `Workflow`.
+
+    ```json5
+    {
+      plugins: {
+        entries: {
+          anthropic: {
+            config: {
+              managedNativeTools: { default: ["Agent", "Workflow"], agents: { ops: [] } },
+            },
+          },
+        },
+      },
+    }
+    ```
+
+    Scope and limitations: [CLI backends](/gateway/cli-backends#keeping-claude-code-orchestration-tools-on-managed-turns).
+
   </Accordion>
 </AccordionGroup>
 

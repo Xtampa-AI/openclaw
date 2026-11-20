@@ -1,7 +1,7 @@
-import path from "node:path";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import {
   readDatabasePathIdentitySync,
+  assertExistingDatabaseIdentity,
   type DatabasePathIdentity,
 } from "../infra/sqlite-worker-identity.js";
 import { getAgentDeletionDatabaseCleanup } from "./agent-deletion-cleanup.js";
@@ -19,13 +19,7 @@ import {
   isIncognitoOpenClawAgentSqlitePath,
   resolveOpenClawAgentSqlitePath,
 } from "./openclaw-agent-db.paths.js";
-import type { AgentDatabaseGenerationClaim } from "./openclaw-agent-execution-admission-contract.js";
-import type {
-  OpenClawAgentDatabaseExecution,
-  AgentDatabaseNativeGeneration,
-  AgentDatabaseFileExecutionOwner,
-  AgentDatabaseExecutionFileIdentity,
-} from "./openclaw-agent-execution-contract.js";
+import type { AgentDatabaseExecutionFileIdentity } from "./openclaw-agent-execution-contract.js";
 import {
   getOpenClawDatabaseMaintenanceScope,
   isOpenClawDatabaseMaintenanceWorkerAccess,
@@ -40,39 +34,30 @@ export type AgentDatabaseExecutionCaptureConstraints = {
   requestedPath?: string;
 };
 
+export function toAgentExecutionConstraints(
+  identity: DatabasePathIdentity,
+): AgentDatabaseExecutionCaptureConstraints {
+  return identity.key.startsWith("file:")
+    ? {
+        expectedIdentity: {
+          kind: "file",
+          physicalIdentity: identity.key.slice("file:".length),
+          nativeLocation: identity.canonicalPath,
+          birthtime: identity.birthtime,
+        },
+      }
+    : { expectedCreationIdentity: identity };
+}
+
 export type AgentDatabaseExecutionPreparedTarget = {
   agentId: string;
   pathname: string;
   identity: DatabasePathIdentity;
   initialIdentity?: AgentDatabaseExecutionFileIdentity;
+  observedIdentity?: DatabasePathIdentity;
   expectedCreationIdentity?: DatabasePathIdentity;
   requestedPath?: string;
 };
-
-/** A read can borrow an already-selected file owner only within its current storage scope. */
-export function borrowExistingAgentDatabaseExecution(
-  owners: ReadonlyMap<string, AgentDatabaseFileExecutionOwner>,
-  options: { path: string; env?: NodeJS.ProcessEnv },
-  capture?: (target: OpenClawAgentDatabaseOptions) => OpenClawAgentDatabaseExecution,
-): OpenClawAgentDatabaseExecution | undefined {
-  const pathname = path.resolve(options.path);
-  const owner =
-    owners.get(pathname) ?? owners.get(readDatabasePathIdentitySync(pathname).canonicalPath);
-  if (!owner) {
-    return undefined;
-  }
-  const target = { ...options, agentId: owner.agentId, path: pathname };
-  if (!supportsAgentDatabaseExecutionScope(target)) {
-    return undefined;
-  }
-  try {
-    assertAgentDatabaseExecutionSharedState(target, owner.sharedDatabaseKey);
-    return capture ? capture(target) : owner.borrow(pathname);
-  } catch {
-    // Initial read selection does not inherit failures of an unrelated writable lifecycle.
-    return undefined;
-  }
-}
 
 export function assertAgentDatabaseExecutionSharedState(
   options: OpenClawAgentDatabaseOptions,
@@ -173,6 +158,7 @@ export function assertBorrowedAgentDatabaseFileIdentity({
   fileIdentity,
   expectedIdentity,
   nativeIdentity,
+  observedIdentity,
 }: {
   borrowedPath: string;
   identity: DatabasePathIdentity;
@@ -180,10 +166,11 @@ export function assertBorrowedAgentDatabaseFileIdentity({
   fileIdentity: AgentDatabaseExecutionFileIdentity | undefined;
   expectedIdentity: AgentDatabaseExecutionFileIdentity | undefined;
   nativeIdentity: AgentDatabaseExecutionFileIdentity | undefined;
+  observedIdentity?: DatabasePathIdentity;
 }): void {
   // After admission the borrower follows its canonical owner, not a retargeted alias.
   if (!fileIdentity) {
-    const current = readDatabasePathIdentitySync(borrowedPath);
+    const current = observedIdentity ?? readDatabasePathIdentitySync(borrowedPath);
     if (
       current.canonicalPath !== identity.canonicalPath ||
       (creatingTarget?.key.startsWith("file:") &&
@@ -215,26 +202,21 @@ export function assertBorrowedAgentDatabaseFileIdentity({
   }
 }
 
-/** Bind a native claim to the same borrower and logical generation that captured it. */
-export function captureBorrowedAgentDatabaseGenerationClaim(
-  assertBorrowed: () => void,
-  readGeneration: () => AgentDatabaseNativeGeneration | undefined,
-): AgentDatabaseGenerationClaim {
-  assertBorrowed();
-  const captured = readGeneration();
-  if (!captured) {
-    throw new Error("Agent database execution has no admitted generation");
+/** Compare a prepared observation with custody; sync callers retain their immediate path check. */
+export function assertAgentDatabaseBorrowTarget(
+  pathname: string,
+  file: AgentDatabaseExecutionFileIdentity | undefined,
+  observed: DatabasePathIdentity | undefined,
+): void {
+  if (!file) {
+    return;
   }
-  const claim = captured.captureClaim();
-  return {
-    identity: claim.identity,
-    incarnation: claim.incarnation,
-    assertCurrent() {
-      assertBorrowed();
-      if (readGeneration() !== captured) {
-        throw new Error("Agent database execution generation was replaced");
-      }
-      claim.assertCurrent();
-    },
-  };
+  if (!observed) {
+    assertExistingDatabaseIdentity(pathname, "file:" + file.physicalIdentity, file.birthtime);
+  } else if (
+    observed.key !== "file:" + file.physicalIdentity ||
+    (file.birthtime !== undefined && observed.birthtime !== file.birthtime)
+  ) {
+    throw new Error("Agent database borrower belongs to another physical file");
+  }
 }

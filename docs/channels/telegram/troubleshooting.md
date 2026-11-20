@@ -46,12 +46,29 @@ Symptom-first checks for a Telegram bot that is not behaving.
 
   </Accordion>
 
-  <Accordion title="A final reply fails during a network interruption">
+  <Accordion title="Messages fail with runtime owner was not published">
 
-    OpenClaw retries an ordinary text or rich-text final reply once after an
-    ambiguous network failure. Recovery sends the saved reply; it does not run
-    the model or repeat completed tools. A delivery notice appears only if
-    recovery also fails.
+    OpenClaw tries to rebuild an agent's failed model runtime when the next
+    message arrives. After a failed recovery, the inbound message waits until
+    the runtime is eligible to retry. Waiting does not consume a recovery
+    attempt or keep typing active. If two actual recovery attempts fail in the same process, the
+    message remains in the failed ingress queue with the reason
+    `runtime-recovery-failed`. Ordinary network failures keep their normal
+    retry policy.
+
+    Check `openclaw logs --follow` for the underlying publication error, correct
+    the reported model or plugin problem, and resend the message. The failed
+    queue entry retains the original input for operator inspection.
+
+  </Accordion>
+
+  <Accordion title="A final reply fails during a network interruption or restart">
+
+    OpenClaw resends an ordinary text or rich-text final reply once after an
+    ambiguous network failure, or after the Gateway stopped while the send was
+    in flight. Recovery sends the saved reply; it does not run the model or
+    repeat completed tools. A delivery notice appears only if the resend also
+    fails or is interrupted.
 
     Telegram does not provide an idempotency key or chat-history lookup for
     these sends. If the original reply arrived but its acknowledgment was lost,

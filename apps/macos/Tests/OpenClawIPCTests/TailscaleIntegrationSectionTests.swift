@@ -170,11 +170,13 @@ struct TailscaleIntegrationSectionTests {
         #expect(saveCount == 0)
     }
 
-    @Test(arguments: [
-        ["mode": "token", "token": "existing-token"], // pragma: allowlist secret
-        ["mode": "password", "password": "existing-password"], // pragma: allowlist secret
-    ])
-    func `turning tailscale off keeps gateway authentication`(credentials: [String: String]) async {
+    @Test(arguments: ["token", "password", "trusted-proxy"])
+    func `turning tailscale off keeps gateway authentication`(mode: String) async {
+        let credentials: [String: Any] = switch mode {
+        case "token": ["mode": mode, "token": "existing-token"] // pragma: allowlist secret
+        case "password": ["mode": mode, "password": "existing-password"] // pragma: allowlist secret
+        default: ["mode": mode, "trustedProxy": ["userHeader": "x-forwarded-user"]]
+        }
         let saved = SavedConfigRoot()
         let outcome = await TestIsolation.withIsolatedState(defaults: [connectionModeKey: "local"]) {
             let state = AppStateStore.shared
@@ -200,7 +202,8 @@ struct TailscaleIntegrationSectionTests {
 
         #expect(outcome == .saved)
         #expect((gateway?["tailscale"] as? [String: Any])?["mode"] as? String == "off")
-        #expect(gateway?["auth"] as? [String: String] == credentials)
+        let savedCredentials = NSDictionary(dictionary: gateway?["auth"] as? [String: Any] ?? [:])
+        #expect(savedCredentials.isEqual(to: credentials))
     }
 
     @Test func `tailscale apply validates changed passwords before saving`() async {

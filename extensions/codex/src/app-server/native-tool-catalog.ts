@@ -66,8 +66,7 @@ export async function loadCodexAttemptNativeToolCatalog(
   // Restricted discovery threads may not have accepted a turn or materialized
   // metadata yet; the lifecycle owns their transition to a normal conversation.
   if (
-    binding.nativeToolPolicyRestricted === true ||
-    binding.restrictedThreadConfigFingerprint !== undefined ||
+    binding.restrictedThreadConfigFingerprint ||
     params.ephemeral ||
     (params.appServer.start.transport !== "stdio" && params.appServer.start.transport !== "unix") ||
     params.appServer.remoteWorkspaceRoot
@@ -132,7 +131,7 @@ export function parseCodexNativeToolCatalog(
       type: "function",
       name: value.name,
       description: value.description,
-      inputSchema: structuredClone(value.inputSchema),
+      inputSchema: value.inputSchema,
       ...(value.deferLoading === true ? { deferLoading: true } : {}),
     };
   };

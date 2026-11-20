@@ -1,0 +1,2 @@
+3
+# Assert removed-job replies contain no hydrated history while preserving ordinary notice lifetime.

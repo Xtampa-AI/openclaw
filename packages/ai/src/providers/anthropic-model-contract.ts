@@ -17,12 +17,14 @@ import {
   supportsClaudeNativeMaxEffort,
   supportsClaudeNativeXhighEffort,
 } from "@openclaw/llm-core";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { clampThinkingLevel } from "../model-utils.js";
 import type { AnthropicEffort } from "../provider-options.js";
 import type {
   Context,
   Model,
+  ModelRequestHeaders,
   ModelThinkingLevel,
   SimpleStreamOptions,
   StopReason,
@@ -47,14 +49,80 @@ export {
   supportsClaudeNativeXhighEffort,
 } from "@openclaw/llm-core";
 
-// Anthropic gates OAuth models with claude_code_version_too_old. Keep this floor
-// at the published Claude Code release (2.1.280); older or absent CLIs must not downgrade it.
+// Starting Claude Code identity for OAuth requests. Anthropic gates newer models
+// with claude_code_version_too_old and names the required version; the transport
+// adopts that answer (see raiseClaudeCodeVersionFloor), so new models never
+// require changing this value. A newer installed CLI also wins.
 export const ANTHROPIC_CLAUDE_CODE_VERSION = "2.1.280";
+
+// Process-wide: the requirement is per Anthropic, not per session or credential.
+// A restart forgets it and costs one rejected request to learn again.
+let learnedClaudeCodeVersion: string | undefined;
+
+function parseClaudeCodeVersion(value: string | undefined): number[] | undefined {
+  const match = value?.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  const parts = match?.slice(1).map(Number);
+  return parts?.every(Number.isSafeInteger) ? parts : undefined;
+}
+
+function isNewerClaudeCodeVersion(candidate: string | undefined, current: string): boolean {
+  const next = parseClaudeCodeVersion(candidate);
+  const base = parseClaudeCodeVersion(current);
+  if (!next || !base) {
+    return false;
+  }
+  for (const [index, part] of next.entries()) {
+    const other = base[index] ?? 0;
+    if (part !== other) {
+      return part > other;
+    }
+  }
+  return false;
+}
+
+function currentClaudeCodeVersionFloor(): string {
+  return learnedClaudeCodeVersion ?? ANTHROPIC_CLAUDE_CODE_VERSION;
+}
+
+/**
+ * Read the Claude Code version Anthropic requires from a
+ * claude_code_version_too_old rejection (SDK APIError or transport error body).
+ */
+export function readRequiredClaudeCodeVersion(error: unknown): string | undefined {
+  if (!isRecord(error) || error.status !== 400) {
+    return undefined;
+  }
+  const body = error.errorBody ?? error.error;
+  const payload = isRecord(body) && isRecord(body.error) ? body.error : body;
+  if (!isRecord(payload) || typeof payload.message !== "string") {
+    return undefined;
+  }
+  const details = payload.details;
+  if (!isRecord(details) || details.error_code !== "claude_code_version_too_old") {
+    return undefined;
+  }
+  const required = payload.message.match(/version (\d+\.\d+\.\d+) or newer is required/)?.[1];
+  return parseClaudeCodeVersion(required) ? required : undefined;
+}
+
+/** Adopt a version Anthropic required; true when it raised the floor and a retry can help. */
+export function raiseClaudeCodeVersionFloor(required: string): boolean {
+  if (!isNewerClaudeCodeVersion(required, currentClaudeCodeVersionFloor())) {
+    return false;
+  }
+  learnedClaudeCodeVersion = required;
+  return true;
+}
+
+/** Test seam: forget the learned requirement. */
+export function resetLearnedClaudeCodeVersionForTest(): void {
+  learnedClaudeCodeVersion = undefined;
+}
 
 /** Build OAuth headers and the matching billing identity from one request snapshot. */
 export function buildAnthropicClaudeCodeIdentity(
   betaHeader: string | undefined,
-  ...headerSources: (Record<string, string> | undefined)[]
+  ...headerSources: (ModelRequestHeaders | undefined)[]
 ): { headers: Record<string, string>; version: string } {
   const headers = new Headers({
     accept: "application/json",
@@ -64,26 +132,16 @@ export function buildAnthropicClaudeCodeIdentity(
   });
   for (const source of headerSources) {
     for (const [name, value] of Object.entries(source ?? {})) {
-      headers.set(name, value);
+      if (value === null) {
+        headers.delete(name);
+      } else {
+        headers.set(name, value);
+      }
     }
   }
-  let version = ANTHROPIC_CLAUDE_CODE_VERSION;
+  const floor = currentClaudeCodeVersionFloor();
   const candidate = headers.get("user-agent")?.match(/^claude-cli\/(\d+\.\d+\.\d+)$/)?.[1];
-  if (candidate) {
-    const components = candidate.split(".").map(Number);
-    const minimum = version.split(".").map(Number);
-    const differing = components.findIndex((component, index) => component !== minimum[index]);
-    const component = components[differing];
-    const minimumComponent = minimum[differing];
-    if (
-      components.every(Number.isSafeInteger) &&
-      component !== undefined &&
-      minimumComponent !== undefined &&
-      component > minimumComponent
-    ) {
-      version = candidate;
-    }
-  }
+  const version = candidate && isNewerClaudeCodeVersion(candidate, floor) ? candidate : floor;
   headers.set("user-agent", `claude-cli/${version}`);
   return { headers: headersToRecord(headers), version };
 }
@@ -261,15 +319,13 @@ export function prepareClaudeNoPrefillRequestContext(model: Model, context: Cont
     : { ...context, messages: context.messages.slice(0, end) };
 }
 
-type ClaudeSamplingRequestParams = {
-  temperature?: unknown;
-  top_p?: unknown;
-  top_k?: unknown;
-  service_tier?: unknown;
-};
-
 export function applyClaudeRequestContract(
-  params: ClaudeSamplingRequestParams,
+  params: {
+    temperature?: unknown;
+    top_p?: unknown;
+    top_k?: unknown;
+    service_tier?: unknown;
+  },
   model: {
     id?: string;
     params?: Record<string, unknown>;
@@ -354,32 +410,42 @@ function isClaudeReplaySource(ref: ReplayModelRef): boolean {
   return /(?:^|[-/])claude-/.test(normalizeModelId(modelId));
 }
 
-export function resolveModelBoundThinkingReplayMode(params: {
-  source: ReplayModelRef;
-  target: ReplayModelRef;
-}): "default" | "preserve" | "drop" {
-  const sourceApi = normalizeApi(params.source.api);
-  const targetApi = normalizeApi(params.target.api);
-  const sourceIdentity = resolveReplayModelBoundIdentity(params.source);
-  const targetIdentity = resolveReplayModelBoundIdentity(params.target);
-  const sameRoute =
-    normalizeLowercaseStringOrEmpty(params.source.provider) ===
-      normalizeLowercaseStringOrEmpty(params.target.provider) &&
-    sourceApi === targetApi &&
-    normalizeModelId(params.source.modelId) === normalizeModelId(params.target.modelId);
-  if (!sourceIdentity && !targetIdentity) {
-    return "default";
-  }
-  if (
-    sourceApi === targetApi &&
-    readsPriorClaudeThinking(targetIdentity, sourceIdentity) &&
-    isClaudeReplaySource(params.source)
-  ) {
-    return "preserve";
-  }
-  if (!sourceIdentity && !hasConcreteResponseModel(params.source) && targetIdentity && sameRoute) {
-    return "preserve";
-  }
-  const sameModel = sourceApi === targetApi && sourceIdentity === targetIdentity;
-  return sameModel ? "preserve" : "drop";
+/** The destination is fixed during one synchronous history transform. */
+export function prepareModelBoundThinkingReplay(
+  target: Pick<Model, "api" | "provider" | "id" | "params">,
+) {
+  const targetApi = normalizeApi(target.api);
+  const targetIdentity = resolveReplayModelBoundIdentity({
+    api: target.api,
+    modelId: target.id,
+    modelParams: target.params,
+  });
+  const targetProvider = normalizeLowercaseStringOrEmpty(target.provider);
+  const targetModelId = normalizeModelId(target.id);
+  return (source: ReplayModelRef): "default" | "preserve" | "drop" => {
+    const sourceApi = normalizeApi(source.api);
+    const sourceIdentity = resolveReplayModelBoundIdentity(source);
+    if (!sourceIdentity && !targetIdentity) {
+      return "default";
+    }
+    if (
+      sourceApi === targetApi &&
+      readsPriorClaudeThinking(targetIdentity, sourceIdentity) &&
+      isClaudeReplaySource(source)
+    ) {
+      return "preserve";
+    }
+    if (
+      !sourceIdentity &&
+      !hasConcreteResponseModel(source) &&
+      targetIdentity &&
+      normalizeLowercaseStringOrEmpty(source.provider) === targetProvider &&
+      sourceApi === targetApi &&
+      normalizeModelId(source.modelId) === targetModelId
+    ) {
+      return "preserve";
+    }
+    const sameModel = sourceApi === targetApi && sourceIdentity === targetIdentity;
+    return sameModel ? "preserve" : "drop";
+  };
 }

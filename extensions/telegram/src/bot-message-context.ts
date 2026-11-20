@@ -40,6 +40,7 @@ import {
   resolveTelegramConversationRoute,
 } from "./conversation-route.js";
 import { enforceTelegramDmAccess } from "./dm-access.js";
+import { isTelegramForumTopicTitleUpdate } from "./forum-service-message.js";
 import { resolveTelegramForumTopicMetadata } from "./forum-topic-metadata.js";
 import { evaluateTelegramGroupBaseAccess } from "./group-access.js";
 import { resolveTelegramNativeCommandAdmission } from "./ingress.js";
@@ -51,6 +52,7 @@ import {
   resolveTelegramReactionVariant,
   resolveTelegramStatusReactionEmojis,
 } from "./status-reaction-variants.js";
+import { resolveTelegramDirectTopicNameCacheScope } from "./topic-name-cache.js";
 
 export type {
   BuildTelegramMessageContextParams,
@@ -89,7 +91,6 @@ export type TelegramMessageContext = {
   sendTyping: () => Promise<void>;
   sendRecordVoice: () => Promise<void>;
   sendChatActionHandler: BuildTelegramMessageContextParams["sendChatActionHandler"];
-  initialTypingCueSent?: boolean;
   ackReactionPromise: Promise<boolean> | null;
   statusReactionController: TelegramStatusReactionController | null;
   accountId: string;
@@ -146,20 +147,22 @@ export const buildTelegramMessageContext = async ({
       : undefined;
   const replyThreadId = threadSpec.id;
   const dmThreadId = threadSpec.scope === "dm" ? threadSpec.id : undefined;
-  let topicName: string | undefined;
-  let isBotOwnedThread = false;
-  if (isForum && resolvedThreadId != null) {
+  const resolveTopicMetadata = async (threadId: number, direct = false) => {
     const topicRuntime = await loadTelegramMessageContextSessionRuntime(sessionRuntime);
-    const topicNameCacheScope = topicRuntime.resolveStorePath(cfg.session?.store, {
+    let scope = topicRuntime.resolveStorePath(cfg.session?.store, {
       agentId:
         ownerAgentId?.trim() ||
         resolveTelegramAccountOwnerAgentId({ cfg, accountId: account.accountId }),
     });
-    const topic = await resolveTelegramForumTopicMetadata({
-      msg,
-      threadId: resolvedThreadId,
-      scope: topicNameCacheScope,
-    });
+    if (direct) {
+      scope = resolveTelegramDirectTopicNameCacheScope(scope, account.accountId);
+    }
+    return resolveTelegramForumTopicMetadata({ msg, threadId, scope });
+  };
+  let topicName: string | undefined;
+  let isBotOwnedThread = false;
+  if (isForum && resolvedThreadId != null) {
+    const topic = await resolveTopicMetadata(resolvedThreadId);
     topicName = topic.topicName;
     isBotOwnedThread = primaryCtx.me?.id !== undefined && topic.creatorUserId === primaryCtx.me.id;
   }
@@ -297,6 +300,18 @@ export const buildTelegramMessageContext = async ({
     return null;
   }
 
+  // Private bot forums use message_thread_id/is_topic_message. They are direct
+  // conversations, not group forums or channel Direct Messages topics.
+  if (
+    !isGroup &&
+    threadSpec.scope === "dm" &&
+    dmThreadId != null &&
+    (msg.is_topic_message === true || isTelegramForumTopicTitleUpdate(msg))
+  ) {
+    const topic = await resolveTopicMetadata(dmThreadId, true);
+    topicName = topic.topicName;
+  }
+
   route = applyTelegramTargetSession({
     cfg,
     route,
@@ -305,7 +320,8 @@ export const buildTelegramMessageContext = async ({
     senderId,
     dmThreadId,
     botHasTopicsEnabled:
-      (threadSpec.scope === "dm" && msg.is_topic_message === true) ||
+      (threadSpec.scope === "dm" &&
+        (msg.is_topic_message === true || isTelegramForumTopicTitleUpdate(msg))) ||
       resolveTelegramBotHasTopicsEnabled(primaryCtx.me),
   });
   const { sessionKey } = route;
@@ -398,18 +414,6 @@ export const buildTelegramMessageContext = async ({
       });
       return null;
     }
-    logVerbose(
-      `telegram: using configured ACP binding for ${bindingMode.binding.record.conversation.conversationId} -> ${bindingMode.sessionKey}`,
-    );
-  }
-
-  // Send the first typing cue before expensive context/session construction,
-  // but only after intake has accepted the message as a non-room-event turn.
-  const initialTypingCueSent = bodyResult.inboundEventKind !== "room_event";
-  if (initialTypingCueSent) {
-    void sendTyping().catch((err: unknown) => {
-      logVerbose(`telegram early typing cue failed for chat ${chatId}: ${String(err)}`);
-    });
   }
 
   const { ctxPayload, skillFilter, turn } = await buildTelegramInboundContextPayload({
@@ -453,10 +457,7 @@ export const buildTelegramMessageContext = async ({
     statusReactionsConfig?.enabled === true &&
     shouldSendAckReaction;
   const resolvedStatusReactionEmojis = statusReactionsEnabled
-    ? resolveTelegramStatusReactionEmojis({
-        initialEmoji: ackReaction,
-        overrides: undefined,
-      })
+    ? resolveTelegramStatusReactionEmojis(ackReaction)
     : null;
   const statusReactionVariantsByEmoji = resolvedStatusReactionEmojis
     ? buildTelegramStatusReactionVariants(resolvedStatusReactionEmojis)
@@ -557,7 +558,6 @@ export const buildTelegramMessageContext = async ({
     sendTyping,
     sendRecordVoice,
     sendChatActionHandler,
-    initialTypingCueSent,
     ackReactionPromise,
     statusReactionController,
     accountId: account.accountId,
