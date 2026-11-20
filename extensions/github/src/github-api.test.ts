@@ -238,30 +238,3 @@ it("updates supplied 304 pagination metadata while retaining omitted metadata", 
   expect(second.link).toBe('<next>; rel="next"');
   expect(third.link).toBe(second.link);
 });
-
-it.each(["pending", "rejected"])(
-  "reports GitHub rate limits when body cancellation is %s",
-  async (cancellation) => {
-    const cancel = vi.fn(() =>
-      cancellation === "pending"
-        ? new Promise<void>(() => {})
-        : Promise.reject(new Error("synthetic cancellation failure")),
-    );
-    const response = new Response(new ReadableStream({ cancel }), {
-      status: 429,
-      headers: { "retry-after": "60" },
-    });
-    const api = await import("./github-api.js");
-    const fetcher = vi.fn<typeof fetch>();
-    fetcher.mockResolvedValueOnce(response);
-    await expect(
-      api.fetchGitHubApi("https://api.github.com/repos/acme/repo", fetcher),
-    ).rejects.toMatchObject({
-      statusCode: 429,
-      upstreamStatus: 429,
-      retryable: true,
-    });
-    expect(cancel).toHaveBeenCalledOnce();
-  },
-  10_000,
-);

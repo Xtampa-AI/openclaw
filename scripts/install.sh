@@ -2223,7 +2223,7 @@ install_node_with_user_prefix() {
     node_bin_dir="${prefix}/tools/node/bin"
     mktempfile cli_installer
 
-    ui_info "Using a user-space Node.js runtime because the package-managed Node.js is unsupported"
+    ui_info "Using a user-space Node.js runtime because the system Node.js links unsafe SQLite"
     run_required_step "Downloading user-space Node.js installer" \
         download_validated_script "https://openclaw.ai/install-cli.sh" "$cli_installer"
     # The child Bash expands this script's positional arguments, not this shell.
@@ -2251,9 +2251,7 @@ install_node() {
         fi
         brew link "${NODE_BREW_FORMULA}" --overwrite --force 2>/dev/null || true
         if ! ensure_macos_default_node_active; then
-            ui_warn "Homebrew has not published a Node.js build at the required security floor"
-            install_node_with_user_prefix
-            return 0
+            exit 1
         fi
         ui_success "Node.js installed"
         print_active_node_paths || true

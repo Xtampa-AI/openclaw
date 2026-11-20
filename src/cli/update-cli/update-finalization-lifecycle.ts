@@ -64,8 +64,7 @@ type Phase =
   | "doctor"
   | "plugins"
   | "targetConfigConvergence"
-  | "completionCache"
-  | "gatewayRestoration";
+  | "completionCache";
 type DoctorPhase = "doctor" | "targetConfigConvergence";
 type Outcome = "completed" | "failed" | "warning" | "skipped" | "deferred";
 

@@ -28,7 +28,6 @@ import type {
 } from "./service-types.js";
 import { systemdUnitCallArgs } from "./systemd-bus-query.js";
 import { createSystemdCommandQuery } from "./systemd-command-query.js";
-import { buildSystemdCommandSnapshot } from "./systemd-command-snapshot.js";
 import {
   buildSystemdCommandSnapshot,
   expandSystemdSpecifier,

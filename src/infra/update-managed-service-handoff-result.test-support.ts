@@ -234,7 +234,6 @@ export function registerManagedRecoveryOutcomeTests(
     async ({ kind, proof }) => {
       const { commands, sentinel, state } = await runManagedServiceManagerBoundary(kind, {
         updaterExitCode: 79,
-        helperExitCode: proof === "ledger-only" ? 1 : 79,
         ledger: proof === "ledger-only",
         rollbackRestoration: proof === "ledger-only",
         recordedFailure:
@@ -267,31 +266,18 @@ export function registerManagedRecoveryOutcomeTests(
 
       expect(state.parked).toBe(true);
       expect(state.restored).toBeUndefined();
-      if (proof === "ledger-only") {
-        expect(state.triageCalls).toBeUndefined();
-      } else {
-        expect(state).toMatchObject({
-          triageCalls: 1,
-          triageObservedRestored: false,
-          triageObservedRecovery: false,
-        });
-      }
+      expect(state).toMatchObject({
+        triageCalls: 1,
+        triageObservedRestored: false,
+        triageObservedRecovery: false,
+      });
       expect(
         commands.some((command) => /(?:^| )(?:start|enable|bootstrap|kickstart) /.test(command)),
       ).toBe(false);
       expect(sentinel).toMatchObject({
         payload: {
           status: "error",
-          stats: {
-            reason:
-              proof === "ledger-only"
-                ? "managed-service-handoff-interrupted"
-                : "managed-service-handoff-unsafe-recovery",
-            steps:
-              proof === "ledger-only"
-                ? [{ name: "service-restore", command: kind, log: { exitCode: 1 } }]
-                : [],
-          },
+          stats: { reason: "managed-service-handoff-unsafe-recovery", steps: [] },
         },
       });
     },

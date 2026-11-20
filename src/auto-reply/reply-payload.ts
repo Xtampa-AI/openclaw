@@ -160,14 +160,6 @@ export function shouldKeepPayloadDuringSilentTurn(payload: ReplyPayload): boolea
   );
 }
 
-export function shouldKeepPayloadDuringSilentTurn(payload: ReplyPayload): boolean {
-  return (
-    payload.isError === true ||
-    getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression === true ||
-    (payload.audioAsVoice === true && hasReplyPayloadMedia(payload))
-  );
-}
-
 /** Returns normalized TTS supplement metadata only when the payload has media to carry it. */
 export function getReplyPayloadTtsSupplement(
   payload: Pick<ReplyPayload, "mediaUrl" | "mediaUrls" | "ttsSupplement">,

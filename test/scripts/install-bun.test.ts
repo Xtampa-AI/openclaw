@@ -12,7 +12,6 @@ import {
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readStandaloneInstaller } from "../../scripts/lib/standalone-installers.mjs";
-import { resolveExecutablePath } from "../../src/infra/executable-path.js";
 import { requireNodeTool } from "../helpers/node-toolchain.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
@@ -37,11 +36,6 @@ function fixture() {
   for (const path of [bin, home, tmp, join(root, "bun-linux-x64")]) {
     mkdirSync(path);
   }
-  const unzipTool = resolveExecutablePath("unzip");
-  if (!unzipTool) {
-    throw new Error("install-bun fixture requires unzip on PATH");
-  }
-  symlinkSync(unzipTool, join(bin, "unzip"));
   const bun = join(root, "bun-linux-x64", "bun");
   executable(
     bun,
@@ -75,11 +69,7 @@ esac
 `,
   );
   const zip = join(root, "bun.zip");
-  const zipTool = resolveExecutablePath("zip");
-  if (!zipTool) {
-    throw new Error("install-bun fixture requires zip on PATH");
-  }
-  const zipped = spawnSync(zipTool, ["-q", zip, "bun-linux-x64/bun"], { cwd: root });
+  const zipped = spawnSync("/usr/bin/zip", ["-q", zip, "bun-linux-x64/bun"], { cwd: root });
   expect(zipped.status).toBe(0);
   const artifact = {
     asset: "bun.zip",

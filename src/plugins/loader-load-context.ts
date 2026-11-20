@@ -6,7 +6,6 @@ import { captureRuntimeConfig } from "../config/runtime-source-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveUserPath } from "../utils.js";
 import { resolvePluginActivationSourceConfig } from "./activation-source-config.js";
-import { normalizePluginsConfigWithResolverCore } from "./config-normalization-shared.js";
 import {
   applyTestPluginDefaults,
   createPluginActivationSource,
@@ -164,20 +163,11 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
         onMissing: () => undefined,
       }) as OpenClawConfig)
     : rawActivationSourceConfig;
-  // Prepared callers carry the exact alias identity used for selection. Ordinary loads
-  // keep their existing normalization owner when no metadata resolver was supplied.
-  const normalize = options.normalizePluginId
-    ? (plugins: OpenClawConfig["plugins"]) =>
-        normalizePluginsConfigWithResolverCore(plugins, options.normalizePluginId)
-    : normalizePluginsConfig;
-  const normalized = normalize(runtimeConfig.plugins);
+  const normalized = normalizePluginsConfig(runtimeConfig.plugins);
   // Identical plugin inputs may share facts; source channel policy keeps its own root config.
   const activationSource = createPluginActivationSource({
     config: activationConfig,
-    plugins:
-      runtimeConfig.plugins === activationConfig.plugins
-        ? normalized
-        : normalize(activationConfig.plugins),
+    plugins: runtimeConfig.plugins === activationConfig.plugins ? normalized : undefined,
   });
   const trustNormalized = mergeTrustPluginConfigFromActivationSource({
     normalized,
@@ -388,13 +378,10 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
       }
       const activationSourceConfig =
         activationConfig === runtimeConfig ? cfg : captureRuntimeConfig(activationConfig);
-      const capturedNormalized = normalize(cfg.plugins);
+      const capturedNormalized = normalizePluginsConfig(cfg.plugins);
       const capturedActivationSource = createPluginActivationSource({
         config: activationSourceConfig,
-        plugins:
-          cfg.plugins === activationSourceConfig.plugins
-            ? capturedNormalized
-            : normalize(activationSourceConfig.plugins),
+        plugins: cfg.plugins === activationSourceConfig.plugins ? capturedNormalized : undefined,
       });
       captured = {
         cfg,

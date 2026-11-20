@@ -724,14 +724,6 @@ extension GatewayLaunchAgentManager {
         expectedServiceAuthority: ServiceAuthority? = nil,
         checkCurrent: (@MainActor @Sendable () async throws -> Void)? = nil) async -> String?
     {
-        // An install that pins `serviceRuntime` runs its Bun from the stable service path.
-        var finishStaging: (@Sendable (Bool) -> Void)?
-        if let serviceRuntime, args.first == "install" {
-            do { finishStaging = try await serviceRuntime.stageServiceBun() } catch {
-                return "The Gateway service runtime could not be prepared (\(error.localizedDescription)). " +
-                    "Retry, or reinstall OpenClaw.app if it keeps failing."
-            }
-        }
         let result = await self.runDaemonCommandResult(
             args,
             timeout: timeout,
@@ -743,14 +735,7 @@ extension GatewayLaunchAgentManager {
             legacyAuthority: legacyAuthority,
             expectedServiceAuthority: expectedServiceAuthority,
             checkCurrent: checkCurrent)
-        if case let .failure(message) = result {
-            // The installer can publish the service and then fail, so settle on what is installed.
-            let installedRoot = self.installedServiceCLI()?.prefix.last
-                .flatMap(BundledRuntime.init(serviceEntrypoint:))?.root.resolvingSymlinksInPath()
-            finishStaging?(installedRoot != nil && installedRoot == serviceRuntime?.root.resolvingSymlinksInPath())
-            return message ?? "Gateway daemon command failed"
-        }
-        finishStaging?(true)
+        if case let .failure(message) = result { return message ?? "Gateway daemon command failed" }
         return nil
     }
 

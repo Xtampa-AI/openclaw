@@ -488,7 +488,6 @@ export async function refreshSkillsDiscovery(
     config?: OpenClawConfig;
     pluginMetadataSnapshot?: PluginMetadataSnapshot;
     reason?: "manual" | "workshop" | "config-change";
-    pluginMetadataSnapshot?: PluginMetadataSnapshot;
   } = {},
 ): Promise<void> {
   if (params.reason === "config-change") {
@@ -510,7 +509,6 @@ export async function refreshSkillsDiscovery(
             config: params.config,
             pluginMetadataSnapshot: params.pluginMetadataSnapshot,
             agentId,
-            pluginMetadataSnapshot: params.pluginMetadataSnapshot,
           }),
         ),
       );

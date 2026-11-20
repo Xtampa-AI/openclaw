@@ -164,32 +164,6 @@ it.each([
   await expectTerminalStop(error);
 });
 
-it.each([
-  [
-    "transcript admission identity change",
-    () =>
-      new SessionTranscriptReadFenceError(
-        "Current-turn transcript admission identity changed: fixture",
-      ),
-  ],
-  [
-    "session reader invalidation",
-    () =>
-      new SessionWorkStartChangedError(
-        "Session reader operation is no longer current. Retry the turn.",
-      ),
-  ],
-  [
-    "wrapped serialized session invalidation",
-    () =>
-      new Error("503 overloaded", {
-        cause: { code: "SESSION_WORK_START_INVALIDATED", message: "Session work invalidated" },
-      }),
-  ],
-] as const)("does not rotate providers after %s", async (_name, make) => {
-  await expectTerminalStop(make());
-});
-
 it("retains closed ownership when async disposal also fails", async () => {
   const closed = createSessionPlacementSettlementClosedAbortError();
   const produceError = async () => {

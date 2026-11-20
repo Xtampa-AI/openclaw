@@ -56,10 +56,6 @@ openclaw system event --text "Deploy finished" --session-key agent:ops:main --mo
 A targeted event stays with the selected session. Events assigned to another
 session or a scheduled job stay with their own execution owner.
 
-With `heartbeat.isolatedSession: true`, a targeted wake reads and consumes the
-event from the selected session while running in a fresh heartbeat session.
-Events queued for other sessions stay untouched.
-
 <Note>
 **Timing exception with `--session-key`:** when `--session-key` is supplied,
 `--mode next-heartbeat` collapses to an immediate targeted wake instead of

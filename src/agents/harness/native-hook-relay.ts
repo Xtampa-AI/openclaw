@@ -538,13 +538,9 @@ export async function invokeNativeHookRelay(
     await racePromiseWithAbortSignal(observation, signal);
   }
   const startedAt = Date.now();
-  const invocationRegistration =
-    signal === effectiveRegistration.signal
-      ? effectiveRegistration
-      : { ...effectiveRegistration, signal };
   const response = await racePromiseWithAbortSignal(
     processNativeHookRelayInvocation({
-      registration: invocationRegistration,
+      registration: effectiveRegistration,
       invocation: normalized,
       executionAdmission: readRelayLifetime(registration)?.executionAdmission,
       assertExecutionAdmissionCurrent,

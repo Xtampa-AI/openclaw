@@ -63,8 +63,6 @@ describe("maybeWakeRequesterAfterAllChildrenSettled results", () => {
           runId: `run-${index}`,
           label: `child ${index}`,
           outcome: { status },
-          // These findings have not been individually delivered to the requester.
-          delivery: { status: "pending" },
           completion:
             index === 3
               ? visibleCompletion("blocked fetch")

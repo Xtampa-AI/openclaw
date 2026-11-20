@@ -11,10 +11,6 @@ import {
   withSessionMetadataPublication,
   withSessionTranscriptWriteAssertion,
 } from "../../config/sessions/transcript-write-context.js";
-import type {
-  SessionMetadataChange,
-  SessionMetadataCommit,
-} from "../../config/sessions/transcript-write-context.types.js";
 import { bindStreamLlmRuntime } from "../../llm/model-runtime-binding.js";
 import type { Model } from "../../llm/types.js";
 import { sanitizeCompactionReplayMessages } from "../compaction-replay.js";

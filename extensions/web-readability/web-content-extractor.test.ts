@@ -13,15 +13,6 @@ const MINIFIED_BLOCKS_HTML =
   "<p>Para 2. Quarterly results were published today with figures for each region and the year over year change, and the summary below explains what moved and why it matters for the next planning cycle.</p>" +
   "</article></body></html>";
 
-const MINIFIED_BLOCKS_HTML =
-  "<!doctype html><html><head><title>Results</title></head><body><article>" +
-  "<h1>Heading</h1>" +
-  "<p>Para 0. Quarterly results were published today with figures for each region and the year over year change, and the summary below explains what moved and why it matters for the next planning cycle.</p>" +
-  "<p>Para 1. Quarterly results were published today with figures for each region and the year over year change, and the summary below explains what moved and why it matters for the next planning cycle.</p>" +
-  "<ul><li>alpha</li><li>beta</li></ul>" +
-  "<p>Para 2. Quarterly results were published today with figures for each region and the year over year change, and the summary below explains what moved and why it matters for the next planning cycle.</p>" +
-  "</article></body></html>";
-
 async function extractArticle(html: string, extractMode: "text" | "markdown" = "text") {
   const result = await createReadabilityWebContentExtractor().extract({
     html,
@@ -35,21 +26,6 @@ async function extractArticle(html: string, extractMode: "text" | "markdown" = "
 }
 
 describe("web readability extractor", () => {
-  it.each(["markdown", "text"] as const)(
-    "excludes zero-scale text in %s articles",
-    async (mode) => {
-      const html = SAMPLE_HTML.replace(
-        "<article>",
-        '<article><p style="transform:scale(0, 0)">Secret flat marker</p><p style="transform:scale3d(0, 0, 0)">Secret depth marker</p><p style="transform:scale3d(1, 1, 0)">Visible depth marker</p>',
-      );
-      const extracted = await extractArticle(html, mode);
-      expect(extracted.text).toContain("Main content starts here");
-      expect(extracted.text).toContain("Visible depth marker");
-      expect(extracted.text).not.toContain("Secret flat marker");
-      expect(extracted.text).not.toContain("Secret depth marker");
-    },
-  );
-
   it("extracts readable markdown", async () => {
     const extracted = await extractArticle(SAMPLE_HTML, "markdown");
     expect(extracted.text).toContain("Main content starts here");

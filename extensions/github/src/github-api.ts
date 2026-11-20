@@ -389,7 +389,7 @@ export async function fetchGitHubApi(
 }
 
 export async function discardResponse(response: Response): Promise<void> {
-  void response.body?.cancel().catch(() => {});
+  await response.body?.cancel().catch(() => {});
 }
 
 export async function readBoundedResponse(response: Response, maxBytes: number): Promise<Buffer> {

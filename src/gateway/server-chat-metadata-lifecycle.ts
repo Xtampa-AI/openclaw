@@ -11,7 +11,6 @@ import type { GatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 import { invalidateSharedReadResponses } from "./shared-read-responses.js";
 
 type GatewayLogger = ReturnType<typeof createSubsystemLogger>;
-const AVAILABILITY_REFRESH_INTERVAL_MS = 500;
 
 const USAGE_NOTIFICATION_INTERVAL_MS = 500;
 const AVAILABILITY_REFRESH_INTERVAL_MS = 500;
@@ -40,7 +39,6 @@ export async function createGatewayChatMetadataLifecycle(params: {
   getPluginMetadataSnapshot?: () => PluginMetadataSnapshot | undefined;
 }) {
   let context: GatewayRequestContext | undefined;
-  let availabilityTimer: ReturnType<typeof setTimeout> | undefined;
   let preparedModelRuntimeState: "unobserved" | "available" | "unavailable" = "unobserved";
   let availabilityTimer: ReturnType<typeof setTimeout> | undefined;
   const { createGatewayChatMetadataRuntime } =

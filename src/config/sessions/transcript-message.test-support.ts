@@ -58,7 +58,3 @@ export function createManualCompactRecords(sessionId: string, cwd?: string) {
     })),
   ];
 }
-
-export function messageEvent<Message, Parent>(id: string, parentId: Parent, message: Message) {
-  return { type: "message", id, parentId, message };
-}

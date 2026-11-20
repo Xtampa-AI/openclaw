@@ -47,16 +47,6 @@ const DEFAULT_LIVE_CODEX_MODEL = "gpt-5.6-luna";
 const DEFAULT_LIVE_PARENT_MODEL = "openai/gpt-5.4";
 type LiveAcpAgent = "claude" | "codex" | "droid" | "gemini" | "grok-build" | "opencode";
 
-class AgentWaitFailure extends Error {
-  constructor(readonly result: { status?: string; [key: string]: unknown }) {
-    super(`agent.wait failed: ${formatAgentWaitFailure(result)}`);
-  }
-}
-
-function isRetryableAgentWaitTimeout(error: unknown): error is AgentWaitFailure {
-  return error instanceof AgentWaitFailure && error.result.status === "timeout";
-}
-
 function snapshotAcpBindLiveEnv(): LiveEnvSnapshot {
   return snapshotLiveEnv(["CODEX_HOME"]);
 }
@@ -353,12 +343,6 @@ describe("ACP bind agent.wait diagnostics", () => {
       "ACP turn failed",
     );
   });
-
-  it("retries only terminal timeout results", () => {
-    expect(isRetryableAgentWaitTimeout(new AgentWaitFailure({ status: "timeout" }))).toBe(true);
-    expect(isRetryableAgentWaitTimeout(new AgentWaitFailure({ status: "error" }))).toBe(false);
-    expect(isRetryableAgentWaitTimeout(new Error("timeout"))).toBe(false);
-  });
 });
 
 function formatAssistantTextPreview(texts: string[], maxChars = 600): string {
@@ -463,7 +447,7 @@ async function waitForAgentRunOk(
     },
   );
   if (result?.status !== "ok") {
-    throw new AgentWaitFailure({ runId, ...result });
+    throw new Error(`agent.wait failed for ${runId}: ${formatAgentWaitFailure(result)}`);
   }
 }
 
@@ -913,37 +897,23 @@ describeLive("gateway live (ACP bind)", () => {
           const markerAssistantCount = assistantTexts.length;
           let imageHistory: Awaited<ReturnType<typeof waitForAssistantTurn>> | null = null;
           for (let attempt = 0; attempt < 2 && !imageHistory; attempt += 1) {
-            try {
-              await sendChatAndWait({
-                client,
-                sessionKey: originalSessionKey,
-                idempotencyKey: `idem-image-${attempt}-${randomUUID()}`,
-                message:
-                  "What animal is drawn in the attached image? Reply with only the lowercase animal name.",
-                originatingChannel: "slack",
-                originatingTo: conversationId,
-                originatingAccountId: accountId,
-                attachments: [
-                  {
-                    mimeType: "image/png",
-                    fileName: `probe-${randomUUID()}.png`,
-                    content: renderCatFacePngBase64(),
-                  },
-                ],
-              });
-            } catch (error) {
-              if (!isRetryableAgentWaitTimeout(error)) {
-                throw error;
-              }
-              // A timed-out wait leaves its run active on this session. A retry or the cron
-              // probe would queue behind it and spend the remaining test budget, so cancel it.
-              await client.request("chat.abort", {
-                sessionKey: originalSessionKey,
-                runId: String(error.result.runId),
-              });
-              logLiveStep("image turn timed out; aborted it and continuing to cron verification");
-              break;
-            }
+            await sendChatAndWait({
+              client,
+              sessionKey: originalSessionKey,
+              idempotencyKey: `idem-image-${attempt}-${randomUUID()}`,
+              message:
+                "What animal is drawn in the attached image? Reply with only the lowercase animal name.",
+              originatingChannel: "slack",
+              originatingTo: conversationId,
+              originatingAccountId: accountId,
+              attachments: [
+                {
+                  mimeType: "image/png",
+                  fileName: `probe-${randomUUID()}.png`,
+                  content: renderCatFacePngBase64(),
+                },
+              ],
+            });
             logLiveStep(`image turn completed (attempt ${String(attempt + 1)})`);
 
             try {

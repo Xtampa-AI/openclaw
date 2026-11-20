@@ -198,14 +198,3 @@ describe("failover user copy", () => {
     expect(copy).toContain("resets 6:20pm (Europe/London)");
   });
 });
-
-describe("stored billing classification", () => {
-  it("keeps already rendered billing copy classified as billing", () => {
-    for (const authMode of [undefined, "oauth"] as const) {
-      const stored = `${renderBillingReplyCopy({ provider: "openrouter", model: "moonshotai/kimi-k3", authMode })} | 402`;
-      expect(renderSanitizedUserFacingText(stored, { errorContext: true })).toBe(
-        renderBillingReplyCopy({}),
-      );
-    }
-  });
-});

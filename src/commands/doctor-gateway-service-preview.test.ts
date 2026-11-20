@@ -35,7 +35,7 @@ it.each([false, true])(
     await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "openclaw" }));
     const entrypoint = path.join(root, "dist", "index.js");
     await fs.writeFile(entrypoint, "export {};\n");
-    const node = "/home/test/.nvm/versions/node/v24.22.1/bin/node";
+    const node = "/home/test/.nvm/versions/node/v24.16.0/bin/node";
     const command = {
       programArguments: [node, entrypoint, "gateway", "--port", "18789"],
       environment: { PATH: "/old/bin" },
@@ -147,7 +147,7 @@ it("previews a supported system runtime instead of claiming the runtime warning 
   mocks.resolveSystemNodeInfo.mockResolvedValue({
     path: "/usr/bin/node",
     status: "supported",
-    version: "24.22.1",
+    version: "24.16.0",
   });
   const prompter = makeDoctorPrompts();
   prompter.confirmRuntimeRepair.mockResolvedValue(false);

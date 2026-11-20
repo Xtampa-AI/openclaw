@@ -55,11 +55,7 @@ export function createAppleFmNative(pluginRoot: string) {
   async function helperPath(env?: NodeJS.ProcessEnv): Promise<string> {
     sourceDigest ??= fs
       .readFile(SOURCE)
-      .then((source) => createHash("sha256").update(source).digest("hex"))
-      .catch((error: unknown) => {
-        sourceDigest = undefined;
-        throw error;
-      });
+      .then((source) => createHash("sha256").update(source).digest("hex"));
     return path.join(
       resolveStateDir(env),
       "tools",

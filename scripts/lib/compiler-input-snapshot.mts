@@ -385,16 +385,11 @@ export class CompilerInputSnapshot {
     // Keep their link identities, and retain the same subtree for other consumers.
     let signature = this.namespaceDigests.get(outputRoot);
     if (signature === undefined) {
-      // Large installed namespaces can exceed V8's maximum string length.
-      // Hash the same NUL-separated bytes without materializing one giant string.
-      const hash = createHash("sha256");
-      let separator = "";
-      for (const { name } of namespaceEntries(this.topology, outputRoot)) {
-        hash.update(separator);
-        hash.update(name);
-        separator = "\0";
-      }
-      signature = hash.digest("hex");
+      signature = digest(
+        namespaceEntries(this.topology, outputRoot)
+          .map(({ name }) => name)
+          .join("\0"),
+      );
       this.namespaceDigests.set(outputRoot, signature);
     }
     return signature;

@@ -190,10 +190,8 @@ export async function runScheduledTaskOrThrow(params: {
   onMutation?: () => void;
   assertCurrent?: () => void;
   allowFallback?: boolean;
-  beforeEffect?: () => void;
 }): Promise<ScheduledTaskActivation> {
   params.assertCurrent?.();
-  params.beforeEffect?.();
   const run = await execSchtasks(["/Run", "/TN", params.taskName]);
   if (run.code !== 0) {
     throw new Error(`schtasks run failed: ${run.stderr || run.stdout}`.trim());
@@ -205,12 +203,7 @@ export async function runScheduledTaskOrThrow(params: {
     return "scheduled-task";
   }
   if (params.allowFallback !== false && !shouldManageGatewayListenerPort(params.env)) {
-    await launchFallbackTaskScript(
-      params.env,
-      undefined,
-      params.assertCurrent,
-      params.beforeEffect,
-    );
+    await launchFallbackTaskScript(params.env, undefined, params.assertCurrent);
     return "direct-fallback";
   }
   throw new Error(
@@ -493,7 +486,6 @@ export async function startScheduledTask({
   env,
   onMutation,
   assertCurrent,
-  beforeEffect,
   preserveAutoStart,
 }: GatewayServiceControlArgs): Promise<void> {
   const effectiveEnv = env ?? (process.env as GatewayServiceEnv);
@@ -509,7 +501,6 @@ export async function startScheduledTask({
       stdout,
       () => reportMutation("startup-entry-start"),
       assertCurrent,
-      beforeEffect,
     );
     return;
   }
@@ -595,7 +586,6 @@ export async function startScheduledTask({
   await runScheduledTaskOrThrow({
     taskName,
     assertCurrent,
-    beforeEffect,
     allowFallback: preserveAutoStart !== true,
     env: effectiveEnv,
     scriptPath: resolveTaskScriptPath(effectiveEnv),

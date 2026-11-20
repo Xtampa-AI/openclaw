@@ -144,10 +144,9 @@ export async function buildCodexWorkspaceBootstrapContext(params: {
       promptContextFiles,
       memoryReferenceFiles,
       memoryToolRoutedBootstrapFiles,
-      instructionSnapshot,
     } = prepared;
     const threadDeveloperInstructionFiles = includeAgentWorkspaceInstructions
-      ? instructionSnapshot.files
+      ? prepared.instructionSnapshot.files
       : [];
     const personaFiles = injectOpenClawContext ? prepared.personaFiles : [];
     return {
@@ -161,9 +160,9 @@ export async function buildCodexWorkspaceBootstrapContext(params: {
       memoryToolNames,
       memoryToolRouted,
       promptContext: renderCodexWorkspaceBootstrapPromptContext(promptContextFiles),
-      // Keep the last delivered instructions only when the current file is empty or missing.
+      // Empty is a captured snapshot too; a missing value still permits first capture.
       threadDeveloperInstructions: includeAgentWorkspaceInstructions
-        ? instructionSnapshot.instructions || params.agentWorkspaceDeveloperInstructions || ""
+        ? (params.agentWorkspaceDeveloperInstructions ?? prepared.instructionSnapshot.instructions)
         : undefined,
       personaInstructions: injectOpenClawContext ? prepared.personaInstructions : undefined,
       sharedPersonaInstructions: injectOpenClawContext

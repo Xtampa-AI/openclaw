@@ -48,7 +48,6 @@ import {
 } from "./update-run-record.js";
 import { isUpdateRecoveryPending } from "./update-run-recovery-schema.js";
 import { inspectRecoveryRows } from "./update-run-recovery-store.js";
-import { upsertStep } from "./update-run-step-upsert.js";
 import { recordUpdateRunVerificationRecord } from "./update-run-verification.js";
 import {
   applyUpdateRunPhase,
@@ -59,6 +58,7 @@ import {
   persistRun,
   UPDATE_RUN_BOOKKEEPING_TIMEOUT_MS,
   updateRunLedgerSchema as schema,
+  upsertStep,
 } from "./update-run-write.js";
 import { readWindowsUserSid } from "./windows-user-sid.js";
 

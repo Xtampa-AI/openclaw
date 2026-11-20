@@ -521,13 +521,7 @@ export function createWhatsAppMessageDeliveryCoordinator(options: WhatsAppMessag
       }
       if (result.kind === "durable" && result.queueResult.kind === "completed") {
         finishPreparation(undefined);
-        const inbound = await normalizeInboundMessage(msg).catch((error: unknown) => {
-          inboundLogger.warn(
-            { error: formatError(error) },
-            "failed preparing read receipt for completed WhatsApp inbound",
-          );
-          return null;
-        });
+        const inbound = await normalizeInboundMessage(msg);
         if (inbound) {
           await maybeMarkNonSelfChatReadReceipt(inbound, buildReadReceiptTarget(inbound));
         }

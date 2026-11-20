@@ -32,16 +32,6 @@ export async function runNodeScript(
   const commandSignal = signal ? AbortSignal.any([signal, overflow.signal]) : overflow.signal;
   let status: number | null = null;
   let error: unknown;
-  let signalCode: NodeJS.Signals | null = null;
-  let launchDiagnostics:
-    | {
-        argvBytes: number;
-        environmentBytes: number;
-        largestArgumentBytes: number;
-        largestEnvironmentEntryBytes: number;
-        environmentEntries: number;
-      }
-    | undefined;
   try {
     const execPath = executable ?? resolveTestNodeExecPath();
     const args =
@@ -50,18 +40,6 @@ export async function runNodeScript(
         : typeof scriptPathOrArgs === "string"
           ? [scriptPathOrArgs]
           : scriptPathOrArgs;
-    // Lengths only: never retain environment values or command arguments in diagnostics.
-    const argvLengths = [execPath, ...args].map((value) => Buffer.byteLength(value) + 1);
-    const environmentLengths = Object.entries(env)
-      .filter((entry): entry is [string, string] => entry[1] !== undefined)
-      .map(([key, value]) => Buffer.byteLength(key) + 1 + Buffer.byteLength(value) + 1);
-    launchDiagnostics = {
-      argvBytes: argvLengths.reduce((sum, length) => sum + length, 0),
-      environmentBytes: environmentLengths.reduce((sum, length) => sum + length, 0),
-      largestArgumentBytes: Math.max(0, ...argvLengths),
-      largestEnvironmentEntryBytes: Math.max(0, ...environmentLengths),
-      environmentEntries: environmentLengths.length,
-    };
     status = await runManagedCommand({
       bin: execPath,
       args,
@@ -73,9 +51,6 @@ export async function runNodeScript(
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       onReady(child) {
-        child.once("exit", (_code, childSignal) => {
-          signalCode = childSignal;
-        });
         for (const [name, pipe, output] of [
           ["stdout", child.stdout!, stdout],
           ["stderr", child.stderr!, stderr],
@@ -104,11 +79,5 @@ export async function runNodeScript(
       error = new AggregateError([error, cause], "Node script failed", { cause });
     }
   }
-  return {
-    error,
-    status,
-    stderr: stderr.text(),
-    stdout: stdout.text(),
-    ...(error ? { signal: signalCode, launchDiagnostics } : {}),
-  };
+  return { error, status, stderr: stderr.text(), stdout: stdout.text() };
 }

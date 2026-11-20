@@ -568,5 +568,3 @@ Human-mode diagnostics remain on stderr. Refusals still return a nonzero exit co
 
 - [CLI reference](/cli)
 - [OC Path plugin](/plugins/oc-path)
-
-Blank numeric leaf replacements are rejected; use `0` to write zero.

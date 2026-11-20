@@ -43,12 +43,7 @@ vi.mock("../commands/sessions.js", () => ({ sessionsCommand: runRouteMock }));
 vi.mock("../commands/channels/list.js", () => ({ channelsListCommand: runRouteMock }));
 vi.mock("./daemon-cli/status.js", () => ({ runDaemonStatus: runRouteMock }));
 vi.mock("./gateway-cli/health-route.js", () => ({ runGatewayHealthJsonRoute: runRouteMock }));
-// mock-isolation: Routed config commands must not reach a live Gateway or operator config.
-vi.mock("./config-cli.js", () => ({
-  runConfigGet: runRouteMock,
-  runConfigUnset: runRouteMock,
-  routeConfigMutationToOwner: () => async () => {},
-}));
+vi.mock("./config-cli.js", () => ({ runConfigGet: runRouteMock, runConfigUnset: runRouteMock }));
 vi.mock("../commands/models/list.status-command.js", () => ({ modelsStatusCommand: runRouteMock }));
 vi.mock("../commands/models/list.list-command.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../commands/models/list.list-command.js")>()),

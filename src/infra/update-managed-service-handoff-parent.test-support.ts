@@ -1,9 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ManagedServiceBoundaryOptions } from "./update-managed-service-handoff-boundary-contract.test-support.js";
-import { createRecoveryInterruptionPreload } from "./update-managed-service-handoff-recovery-authority.test-support.js";
 
-export async function prepareManagedServiceHelperPreloads(params: {
+export async function prepareManagedServiceParentPreloads(params: {
   root: string;
   scriptPath: string;
   statePath: string;
@@ -13,10 +12,9 @@ export async function prepareManagedServiceHelperPreloads(params: {
   parentExitTimeoutMs: number;
   stopSettlementPath: string;
   env: NodeJS.ProcessEnv;
-  recovery: { paramsPath: string; updaterPath: string; ledgerRuntimeImport: string };
   options?: Pick<
     ManagedServiceBoundaryOptions,
-    "terminalParentExitProbe" | "expireParentWhileStopPending" | "recoveryInterruption"
+    "terminalParentExitProbe" | "expireParentWhileStopPending"
   >;
 }): Promise<NodeJS.ProcessEnv> {
   let helperEnv = params.env;
@@ -109,22 +107,6 @@ ${source}
           return append(pathname, data, ...args);
         };`,
     );
-  }
-  if (options?.recoveryInterruption) {
-    const preloadPath = path.join(root, "recovery-interruption.cjs");
-    await fs.writeFile(
-      preloadPath,
-      createRecoveryInterruptionPreload({
-        scriptPath,
-        statePath,
-        ...params.recovery,
-        ...options.recoveryInterruption,
-      }),
-    );
-    helperEnv = {
-      ...helperEnv,
-      NODE_OPTIONS: `${helperEnv.NODE_OPTIONS ?? ""} --require ${preloadPath}`.trim(),
-    };
   }
   return helperEnv;
 }

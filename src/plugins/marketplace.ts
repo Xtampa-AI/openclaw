@@ -708,7 +708,7 @@ async function downloadUrlToTempFile(
         },
       };
     } finally {
-      void response.body?.cancel().catch(() => undefined);
+      await response.body?.cancel().catch(() => undefined);
       await release().catch(() => undefined);
     }
   } catch (error) {

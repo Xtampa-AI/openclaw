@@ -267,10 +267,10 @@ jobs:
           }
           NODE
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: Dockerfile
 
       # Keep release smoke builds bounded and log-producing. The Blacksmith
       # build action can leave jobs in-progress without step logs when a remote
@@ -445,10 +445,10 @@ jobs:
         shell: bash
         run: *trusted_workflow_restore_run
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: Dockerfile
 
       - name: Build local root Dockerfile smoke image
         env:
@@ -804,10 +804,10 @@ jobs:
             "https://codeload.github.com/${TARGET_REPOSITORY}/tar.gz/${TARGET_SHA}"
           test -s "${RUNNER_TEMP}/candidate.tar.gz"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: scripts/docker/install-sh-smoke/Dockerfile
 
       - name: Build pinned candidate packaging harness
         run: |
@@ -821,7 +821,6 @@ jobs:
       - name: Package candidate only inside pinned harness
         env:
           ALLOW_UNRELEASED_CHANGELOG: ${{ inputs.allow_unreleased_changelog }}
-          OPENCLAW_DOCKER_PACKAGE_BUILD_TIMEOUT_MS: "3300000"
         run: |
           set -euo pipefail
           package_dir="${RUNNER_TEMP}/candidate-package"
@@ -831,7 +830,7 @@ jobs:
           limit_summary="$(mktemp "${RUNNER_TEMP}/candidate-limits.XXXXXX")"
           chmod 0666 "$limit_summary"
           trap 'pack_exit=$?; cat "$limit_summary" >> "$GITHUB_STEP_SUMMARY"; rm -f "$limit_summary"; exit "$pack_exit"' EXIT
-          timeout --kill-after=30s 60m docker run --rm \
+          timeout --kill-after=30s 50m docker run --rm \
             --cap-drop ALL \
             --security-opt no-new-privileges \
             --pids-limit 1024 \
@@ -841,7 +840,6 @@ jobs:
             -e CI=1 \
             -e GITHUB_ACTIONS \
             -e GITHUB_STEP_SUMMARY=/tmp/openclaw-limit-summary.md \
-            -e OPENCLAW_DOCKER_PACKAGE_BUILD_TIMEOUT_MS \
             -v "${limit_summary}:/tmp/openclaw-limit-summary.md" \
             -v "${RUNNER_TEMP}/candidate.tar.gz:/input/candidate.tar.gz:ro" \
             -v "${package_dir}:/output" \
@@ -942,9 +940,7 @@ jobs:
           retention-days: 7
 
   installer_smoke_update_image:
-    # A failed-job rerun starts this producer and its consumers with the
-    # candidate payload producer, so one attempt never mixes artifact tuples.
-    needs: [preflight, installer_smoke_candidate_payload]
+    needs: [preflight]
     if: needs.preflight.outputs.run_full_install_smoke == 'true'
     runs-on: *linux_runner_ubuntu
     timeout-minutes: 45
@@ -973,10 +969,10 @@ jobs:
 
       - *trusted_workflow_subdir_restore_step
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: scripts/docker/install-sh-smoke/Dockerfile
 
       - name: Build installer smoke image
         env:
@@ -1026,7 +1022,7 @@ jobs:
           retention-days: 7
 
   installer_smoke_nonroot_image:
-    needs: [preflight, installer_smoke_candidate_payload]
+    needs: [preflight]
     if: needs.preflight.outputs.run_full_install_smoke == 'true'
     runs-on: *linux_runner_ubuntu
     timeout-minutes: 45
@@ -1055,10 +1051,10 @@ jobs:
 
       - *trusted_workflow_subdir_restore_step
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: scripts/docker/install-sh-nonroot/Dockerfile
 
       - name: Build installer non-root image
         env:
@@ -1684,10 +1680,10 @@ jobs:
           ref: ${{ needs.preflight.outputs.target_sha }}
           persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0
         with:
-          version: v0.23.0
+          cache-key: scripts/e2e/Dockerfile
 
       - name: Setup Node environment for package smoke
         uses: ./.github/actions/setup-node-env

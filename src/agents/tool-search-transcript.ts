@@ -18,9 +18,6 @@ function freezeJsonSnapshot(value: unknown): unknown {
 export function snapshotToolSearchTargetTranscriptResult(
   result: AgentToolResult<unknown>,
 ): AgentToolResult<unknown> {
-  if (!isRecord(result)) {
-    throw new Error("Tool Search target result could not be captured for transcript projection.");
-  }
   const hasDetails = "details" in result;
   const snapshot = toToolSearchJsonSafe(result);
   if (!isRecord(snapshot)) {

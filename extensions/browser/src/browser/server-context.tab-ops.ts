@@ -26,7 +26,6 @@ import type { ResolvedBrowserProfile } from "./config.js";
 import { resolveBrowserEngine } from "./engines/registry.js";
 import {
   assertBrowserNavigationAllowed,
-  assertChromeMcpNavigationAllowed,
   assertBrowserNavigationResultAllowed,
   assertChromeMcpNavigationAllowed,
   InvalidBrowserNavigationUrlError,

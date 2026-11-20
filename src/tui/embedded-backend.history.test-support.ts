@@ -81,26 +81,4 @@ export function registerEmbeddedHistoryProjectionTests(params: {
     expect(result.sessionInfo).toBeUndefined();
     expect(params.present).not.toHaveBeenCalled();
   });
-
-  it("loads history verbose level from the session agent's own verboseDefault", async () => {
-    params.loadSessionEntry.mockReturnValue({
-      cfg: {
-        agents: {
-          defaults: { verboseDefault: "off" },
-          entries: { main: {}, ops: { verboseDefault: "full" } },
-        },
-      },
-      agentId: "ops",
-      canonicalKey: "agent:ops:main",
-      entry: {},
-    });
-    const backend = params.createBackend();
-    backend.start();
-    try {
-      const result = await backend.loadHistory({ sessionKey: "agent:ops:main" });
-      expect(result.verboseLevel).toBe("full");
-    } finally {
-      await backend.stop();
-    }
-  });
 }

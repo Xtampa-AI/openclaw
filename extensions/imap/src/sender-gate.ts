@@ -125,20 +125,21 @@ function mapImapAuthStrength(
   if (trusted && account.senderAuth.acceptTrustedAuthservId) {
     return { strength: "asserted", reason: "trusted-authserv-dmarc-pass", transient: false };
   }
-  // DMARC can fail when an aligned DKIM key lookup has a temporary DNS error.
-  const transient =
-    dmarc === "temperror" ||
-    Boolean(result?.dkim.results.some((entry) => entry.status.result === "temperror"));
+  const spfPass = result?.spf && result.spf.status.result === "pass";
+  const untrustedEvidence = headers.some(
+    (header) => header.dmarc === "pass" || header.spf === "pass",
+  );
+  if (spfPass || untrustedEvidence) {
+    return {
+      strength: "unverified",
+      reason: "unverified-authentication",
+      transient: dmarc === "temperror",
+    };
+  }
   return {
     strength: "unverified",
-    reason:
-      (result?.spf && result.spf.status.result === "pass") ||
-      headers.some((header) => header.dmarc === "pass" || header.spf === "pass")
-        ? "unverified-authentication"
-        : transient
-          ? "authentication-temperror"
-          : `dmarc-${dmarc || "none"}`,
-    transient,
+    reason: dmarc === "temperror" ? "authentication-temperror" : `dmarc-${dmarc || "none"}`,
+    transient: dmarc === "temperror",
   };
 }
 

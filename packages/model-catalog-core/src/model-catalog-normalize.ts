@@ -306,7 +306,7 @@ function normalizeModelCatalogCompat(value: unknown): ModelCatalogCompatConfig |
   }
 
   normalizeCatalogFields(
-    ["toolSchemaProfile", "toolCallArgumentsEncoding", "defaultThinkingLevel"],
+    ["toolSchemaProfile", "toolCallArgumentsEncoding"],
     (field) => normalizeOptionalString(value[field]),
     compat,
   );

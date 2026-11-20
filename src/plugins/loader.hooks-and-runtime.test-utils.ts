@@ -3,7 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentToolResultMiddlewareRunner } from "../agents/harness/tool-result-middleware.js";
-import { createDeferredCore } from "../shared/deferred.js";
 import { withEnv } from "../test-utils/env.js";
 import { createHookRunner } from "./hooks.js";
 import { loadInstalledPluginIndex } from "./installed-plugin-index.js";
@@ -1392,7 +1391,7 @@ ${channelPluginSource({
     const plugin = writePlugin({
       id: "tool-result-middleware-no-timeout",
       filename: "tool-result-middleware-no-timeout.cjs",
-      registration: `api.registerAgentToolResultMiddleware(({ args }) => args.pending, {
+      registration: `api.registerAgentToolResultMiddleware(() => new Promise(() => {}), {
         runtimes: ["openclaw"],
       });`,
     });
@@ -1408,22 +1407,15 @@ ${channelPluginSource({
       throw new Error("expected tool-result middleware registration");
     }
 
-    const record = registry.plugins.find((entry) => entry.id === plugin.id);
-    const instance = record && getPluginInstance(record);
-    if (!instance) {
-      throw new Error("expected a loaded plugin instance");
-    }
-    const pending = createDeferredCore();
-    let run: Promise<unknown> | undefined;
     vi.useFakeTimers();
     try {
       let settled = false;
-      run = Promise.resolve(
+      void Promise.resolve(
         middleware.handler(
           {
             toolCallId: "call-1",
             toolName: "exec",
-            args: { pending: pending.promise },
+            args: {},
             result: { content: [{ type: "text", text: "raw" }], details: {} },
           },
           { runtime: "openclaw" },
@@ -1437,12 +1429,6 @@ ${channelPluginSource({
       expect(settled).toBe(false);
     } finally {
       vi.useRealTimers();
-      pending.resolve();
-      try {
-        await run;
-      } finally {
-        await instance.waitForIdle(new AbortController().signal);
-      }
     }
   });
 
@@ -1451,7 +1437,7 @@ ${channelPluginSource({
     const plugin = writePlugin({
       id: "after-tool-call-option-timeout",
       filename: "after-tool-call-option-timeout.cjs",
-      registration: `api.on("after_tool_call", ({ params }) => params.pending, { timeoutMs: 30 });`,
+      registration: `api.on("after_tool_call", () => new Promise(() => {}), { timeoutMs: 30 });`,
     });
     const registry = loadRegistryFromSinglePlugin({
       plugin,
@@ -1460,19 +1446,9 @@ ${channelPluginSource({
     const logger = { debug: vi.fn(), error: vi.fn(), warn: vi.fn() };
     const runner = createHookRunner(registry, { logger });
 
-    const record = registry.plugins.find((entry) => entry.id === plugin.id);
-    const instance = record && getPluginInstance(record);
-    if (!instance) {
-      throw new Error("expected a loaded plugin instance");
-    }
-    const pending = createDeferredCore();
-    let run: Promise<unknown> | undefined;
     vi.useFakeTimers();
     try {
-      run = runner.runAfterToolCall(
-        { toolName: "exec", params: { pending: pending.promise } },
-        { toolName: "exec" },
-      );
+      const run = runner.runAfterToolCall({ toolName: "exec", params: {} }, { toolName: "exec" });
       await vi.advanceTimersByTimeAsync(30);
 
       await expect(run).resolves.toBeUndefined();
@@ -1481,12 +1457,6 @@ ${channelPluginSource({
       );
     } finally {
       vi.useRealTimers();
-      pending.resolve();
-      try {
-        await run;
-      } finally {
-        await instance.waitForIdle(new AbortController().signal);
-      }
     }
   });
 

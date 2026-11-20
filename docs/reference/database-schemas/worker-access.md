@@ -4183,9 +4183,7 @@ migration owner, and missing required tables at the current schema remain an
 admission error.
 
 Durable entry deletion can carry prepared Agents API and Codex binding participants
-through the same executing worker. Empty-entry deletion prepares the native binding
-codec in that worker before transaction entry, just like archive reclamation.
-Binding deletion still commits in shared state
+through the same executing worker. Binding deletion still commits in shared state
 before the agent transaction commits, and can veto that transaction. Confirmed agent
 rollback conditionally restores the actual removed binding without replacing a
 successor. Binding renewal continues during queue waits, drains before transaction
@@ -7415,5 +7413,3 @@ watermark from that same projection snapshot. It does not issue a separate retai
 watermark query. Standalone watermark reads and the early context-authority check
 keep their existing database readers. Schema, stored bytes, retention, permissions,
 and update behavior are unchanged.
-
-Logical session-entry comparison ignores top-level property insertion order from replica deltas while preserving JSON field values and rejecting intervening owner or content changes.

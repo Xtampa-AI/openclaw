@@ -101,23 +101,6 @@ function resolveNativeCopySource(boundary: string, source: string) {
   return { rootPath, absolutePath: path.join(rootPath, relative) };
 }
 
-/**
- * fs-safe copy admission compares an ordinary and a native realpath of its root, so a
- * Windows 8.3 alias such as `C:\Users\RUNNER~1` always reads as a moved root.
- * Rebase the admitted source onto the root's native spelling before handing it over.
- */
-function resolveNativeCopySource(boundary: string, source: string) {
-  if (process.platform !== "win32") {
-    return { rootPath: boundary, absolutePath: source };
-  }
-  const rootPath = fs.realpathSync.native(boundary);
-  const relative = path.relative(boundary, source);
-  if (rootPath === boundary || relative.startsWith("..") || path.isAbsolute(relative)) {
-    return { rootPath: boundary, absolutePath: source };
-  }
-  return { rootPath, absolutePath: path.join(rootPath, relative) };
-}
-
 export function copyPluginSourceFile(
   source: string,
   boundary: string,

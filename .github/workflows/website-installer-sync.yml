@@ -417,8 +417,6 @@ jobs:
           OPENCLAW_NO_PROMPT: "1"
         run: |
           bash dist/installers/install.sh --no-onboard --no-prompt --version latest
-          source "$HOME/.bashrc"
-          hash -r
           openclaw --version
 
   windows-installer:
@@ -478,9 +476,6 @@ jobs:
             } finally {
               Remove-Item Env:OPENCLAW_INSTALL_METHOD -ErrorAction SilentlyContinue
             }
-
-            & $hostCommand -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/scripts/install-ps1-entrypoint.ps1 -InstallerPath $scriptPath
-            if ($LASTEXITCODE -ne 0) { throw "$hostCommand failed the piped installer regression." }
 
             $help = Invoke-InstallerProbe -HostCommand $hostCommand -InstallerArgs @("-?")
             if ($help.ExitCode -ne 0 -or $help.Output -match '\[OK\] Windows detected') {

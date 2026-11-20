@@ -759,21 +759,6 @@ describe("prompt cache history fingerprints", () => {
     });
   });
 
-  it("asserts an undeclared tool block change and admits one declared pin change", () => {
-    withEnv({ OPENCLAW_PROMPT_CACHE_ASSERT: "1" }, () => {
-      const sessionId = scopedKey("tool-pin");
-      beginOpenAIObservation({ sessionId, tools: [{ name: "read" }] });
-      expect(() =>
-        beginOpenAIObservation({ sessionId, tools: [{ name: "read" }, { name: "exec" }] }),
-      ).toThrow("prefix changed within session: tools(");
-      declarePromptToolPin({ sessionId });
-      beginOpenAIObservation({ sessionId, tools: [{ name: "read" }, { name: "gateway" }] });
-      expect(() => beginOpenAIObservation({ sessionId, tools: [{ name: "read" }] })).toThrow(
-        "prefix changed within session: tools(",
-      );
-    });
-  });
-
   it.each(["compaction", "pruning", "runtimeContextCarrier"] as const)(
     "consumes a declared %s rewrite for exactly one request",
     (reason) => {

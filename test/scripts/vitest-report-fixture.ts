@@ -76,17 +76,6 @@ export function createVitestReportFixture(
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, contents);
   };
-  const writeConfig = (file: string, name: string, source: string, fsModuleCache = false) => {
-    // Vitest initializes root caches even when every leaf disables caching, and
-    // --clearCache deletes configured paths regardless of the enable flag.
-    write(
-      file,
-      `${source}
-config.cacheDir = ${JSON.stringify(path.join(root, "vite-" + name))};
-Object.assign(config.test, {cache:false, fsModuleCache:${fsModuleCache}, fsModuleCachePath:${JSON.stringify(path.join(root, "fs-cache-" + name))}});
-export default config;`,
-    );
-  };
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     HOME: path.join(root, "home"),
@@ -135,11 +124,8 @@ export default config;`,
     } = {},
   ) => {
     const deadline = performance.now() + 45000;
-    if (
-      ["config-load-once", "serial", "grouped", "grouped-conflict"].includes(mode) ||
-      mode.startsWith("nested-shared-leaf")
-    ) {
-      // Cache regressions must never use the checkout as their deletion target.
+    if (mode === "config-load-once") {
+      // Give the cache regression a private default root, never shared dependencies.
       const modules = path.join(root, "node_modules");
       fs.mkdirSync(modules);
       fs.symlinkSync(
@@ -149,7 +135,6 @@ export default config;`,
       );
       write(path.join(root, "package.json"), '{"private":true,"type":"module"}');
       write(path.join(modules, ".vitest-cache/canary"), "another cache owner");
-      write(path.join(modules, ".vite/canary"), "another result-cache owner");
       write(
         path.join(modules, ".vitest-cache/_metadata.json"),
         '{"lockfileHash":"unrelated-owner"}',
@@ -239,12 +224,10 @@ ${mode === "child-write" && index === 0 ? `if(!merging&&output)fs.mkdirSync(outp
 ${mode === "watchdog" && index === 0 ? "if(!merging&&output&&path.basename(path.dirname(output))==='1'){await new Promise(()=>setInterval(()=>{},1000));}" : ""}
 ${["missing", "corrupt"].includes(mode) && index === 0 ? `if(!merging)process.once('exit',()=>{const file=${mode === "missing" ? "output" : "process.argv.find(arg=>arg.startsWith('--outputFile.blob='))?.slice('--outputFile.blob='.length)"};if(file&&fs.existsSync(file)){fs.copyFileSync(file,file+'.native-original');${mode === "missing" ? "fs.unlinkSync(file)" : "fs.writeFileSync(file,'owned corruption')"};}});` : ""}
 `;
-      writeConfig(
+      write(
         path.join(root, configs[index]!),
-        name,
         prelude +
-          `const config = {root:${JSON.stringify(root)},${mode === "config-load-once" ? `plugins:[{name:'derive-project-name',config(){return {test:{name:${JSON.stringify(name)}}}}}],` : ""}test:{name:${mode === "config-load-once" ? "undefined" : mode === "identity" ? `merging?'changed-${name}':'${name}'` : JSON.stringify(name)},include:[${mode === "empty" ? "'absent.test.ts'" : JSON.stringify(testFiles[index])}],${mode === "empty" ? "passWithNoTests:true," : ""}${mode === "ignored-unhandled" ? "dangerouslyIgnoreUnhandledErrors:true," : ""}pool:${mode === "pool-identity" ? "merging?'threads':'forks'" : "'forks'"},maxWorkers:1,fileParallelism:false,teardownTimeout:1000,${["metadata", "coverage-missing"].includes(mode) ? "coverage:{provider:'v8',include:['covered.ts'],reporter:['json','lcov']}," : ""}${options.configOutput ? `coverage:{enabled:true,provider:'v8',reportsDirectory:${JSON.stringify(path.join(root, "config-coverage"))}},reporters:[['json',{outputFile:${JSON.stringify(path.join(evidence, "config-output.json"))}}]],` : ""}${mode === "tuple" ? `reporters:[['json',{outputFile:${JSON.stringify(path.join(evidence, "tuple.json"))}}]],` : ""}}};`,
-        mode === "config-load-once",
+          `export default {root:${JSON.stringify(root)},cacheDir:${JSON.stringify(path.join(root, "vite-" + name))},${mode === "config-load-once" ? `plugins:[{name:'derive-project-name',config(){return {test:{name:${JSON.stringify(name)}}}}}],` : ""}test:{name:${mode === "config-load-once" ? "undefined" : mode === "identity" ? `merging?'changed-${name}':'${name}'` : JSON.stringify(name)},include:[${mode === "empty" ? "'absent.test.ts'" : JSON.stringify(testFiles[index])}],${mode === "empty" ? "passWithNoTests:true," : ""}${mode === "ignored-unhandled" ? "dangerouslyIgnoreUnhandledErrors:true," : ""}pool:${mode === "pool-identity" ? "merging?'threads':'forks'" : "'forks'"},maxWorkers:1,fileParallelism:false,cache:false,${mode === "config-load-once" ? `fsModuleCache:true,fsModuleCachePath:${JSON.stringify(path.join(root, "fs-cache-" + name))},` : "fsModuleCache:false,"}teardownTimeout:1000,${["metadata", "coverage-missing"].includes(mode) ? "coverage:{provider:'v8',include:['covered.ts'],reporter:['json','lcov']}," : ""}${options.configOutput ? `coverage:{enabled:true,provider:'v8',reportsDirectory:${JSON.stringify(path.join(root, "config-coverage"))}},reporters:[['json',{outputFile:${JSON.stringify(path.join(evidence, "config-output.json"))}}]],` : ""}${mode === "tuple" ? `reporters:[['json',{outputFile:${JSON.stringify(path.join(evidence, "tuple.json"))}}]],` : ""}}};`,
       );
       const failure =
         (["failure", "batch-failure"].includes(mode) && index === 1) ||
@@ -281,20 +264,17 @@ ${index === 0 ? "test('alpha/two',()=>expect(2).toBe(2));" : "test.skip('beta/sk
       mode === "automatic" ? testFiles : mode === "single" ? [configs[0]!] : [...configs];
     if (mode === "grouped" || mode === "grouped-conflict") {
       const leaf = "test/vitest/vitest.alpha.config.ts";
-      writeConfig(
+      write(
         path.join(root, leaf),
-        "grouped-alpha",
-        `const config = {test:{name:'alpha',include:[${JSON.stringify(path.join(root, "alpha.test.ts"))}],pool:'threads',maxWorkers:1}};`,
+        `export default {test:{name:'alpha',include:[${JSON.stringify(path.join(root, "alpha.test.ts"))}],pool:'threads',maxWorkers:1,cache:false,fsModuleCache:false}};`,
       );
-      writeConfig(
+      write(
         path.join(root, configs[1]!),
-        "beta",
-        `const config = {test:{name:'beta',include:[${JSON.stringify(mode === "grouped-conflict" ? path.join(root, "beta.test.ts") : "beta.test.ts")}],pool:'forks',maxWorkers:1}};`,
+        `export default {test:{name:'beta',include:[${JSON.stringify(mode === "grouped-conflict" ? path.join(root, "beta.test.ts") : "beta.test.ts")}],pool:'forks',maxWorkers:1,cache:false,fsModuleCache:false}};`,
       );
-      writeConfig(
+      write(
         path.join(root, configs[0]!),
-        "alpha",
-        `const config = {root:${JSON.stringify(root)},test:{projects:${JSON.stringify([leaf, configs[1]])}}};`,
+        `export default {root:${JSON.stringify(root)},test:{projects:${JSON.stringify([leaf, configs[1]])}}};`,
       );
     }
     if (mode.startsWith("nested-shared-leaf")) {
@@ -305,40 +285,33 @@ ${index === 0 ? "test('alpha/two',()=>expect(2).toBe(2));" : "test.skip('beta/sk
       const other = path.join(root, "test/vitest/vitest.other.config.ts");
       const changedRoot = path.join(root, "changed-root");
       fs.mkdirSync(changedRoot);
-      writeConfig(
+      write(
         alpha,
-        "nested-alpha",
-        `import fs from 'node:fs';const merging=process.argv.includes('--mergeReports');if(merging)fs.appendFileSync(${JSON.stringify(configLoads)},'alpha\\n');const config = {root:${JSON.stringify(root)},plugins:[{name:'derive-alpha-identity',enforce:'post',config(){const root=merging&&${JSON.stringify(mode === "nested-shared-leaf-root-drift")}?${JSON.stringify(changedRoot)}:${JSON.stringify(root)};return {root,test:{root,name:merging&&${JSON.stringify(mode === "nested-shared-leaf-name-drift")}?'changed-alpha':'alpha',pool:'threads'}}}}],test:{include:[${JSON.stringify(path.join(root, "alpha.test.ts"))}],maxWorkers:1,fileParallelism:false}};`,
+        `import fs from 'node:fs';const merging=process.argv.includes('--mergeReports');if(merging)fs.appendFileSync(${JSON.stringify(configLoads)},'alpha\\n');export default {root:${JSON.stringify(root)},plugins:[{name:'derive-alpha-identity',enforce:'post',config(){const root=merging&&${JSON.stringify(mode === "nested-shared-leaf-root-drift")}?${JSON.stringify(changedRoot)}:${JSON.stringify(root)};return {root,test:{root,name:merging&&${JSON.stringify(mode === "nested-shared-leaf-name-drift")}?'changed-alpha':'alpha',pool:'threads'}}}}],test:{include:[${JSON.stringify(path.join(root, "alpha.test.ts"))}],maxWorkers:1,fileParallelism:false,cache:false,fsModuleCache:false}};`,
       );
-      writeConfig(
+      write(
         beta,
-        "nested-beta",
-        `import fs from 'node:fs';const merging=process.argv.includes('--mergeReports');if(merging)fs.appendFileSync(${JSON.stringify(configLoads)},'beta\\n');const config = {root:${JSON.stringify(root)},test:{name:'beta',include:[${JSON.stringify(path.join(root, "beta.test.ts"))}],projects:[${JSON.stringify(beta)}],pool:'forks',maxWorkers:1,fileParallelism:false}};`,
+        `import fs from 'node:fs';const merging=process.argv.includes('--mergeReports');if(merging)fs.appendFileSync(${JSON.stringify(configLoads)},'beta\\n');export default {root:${JSON.stringify(root)},test:{name:'beta',include:[${JSON.stringify(path.join(root, "beta.test.ts"))}],projects:[${JSON.stringify(beta)}],pool:'forks',maxWorkers:1,fileParallelism:false,cache:false,fsModuleCache:false}};`,
       );
-      writeConfig(
+      write(
         inner,
-        "nested-inner",
-        `const config = {root:${JSON.stringify(root)},test:{name:'inner',projects:[${JSON.stringify(alpha)}]}};`,
+        `export default {root:${JSON.stringify(root)},test:{name:'inner',projects:[${JSON.stringify(alpha)}]}};`,
       );
-      writeConfig(
+      write(
         outer,
-        "nested-outer",
-        `const config = {root:${JSON.stringify(root)},test:{name:'outer',projects:[${JSON.stringify(inner)}]}};`,
+        `export default {root:${JSON.stringify(root)},test:{name:'outer',projects:[${JSON.stringify(inner)}]}};`,
       );
-      writeConfig(
+      write(
         other,
-        "nested-other",
-        `const config = {root:${JSON.stringify(root)},test:{name:'other',projects:[${JSON.stringify(alpha)}]}};`,
+        `export default {root:${JSON.stringify(root)},test:{name:'other',projects:[${JSON.stringify(alpha)}]}};`,
       );
-      writeConfig(
+      write(
         path.join(root, configs[0]!),
-        "alpha",
-        `const config = {root:${JSON.stringify(root)},test:{projects:[${JSON.stringify(outer)}]}};`,
+        `export default {root:${JSON.stringify(root)},test:{projects:[${JSON.stringify(outer)}]}};`,
       );
-      writeConfig(
+      write(
         path.join(root, configs[1]!),
-        "beta",
-        `const config = {root:${JSON.stringify(root)},test:{projects:[${JSON.stringify(other)},${JSON.stringify(beta)}]}};`,
+        `export default {root:${JSON.stringify(root)},test:{projects:[${JSON.stringify(other)},${JSON.stringify(beta)}]}};`,
       );
     }
     if (mode === "chunks") {
@@ -349,10 +322,9 @@ ${index === 0 ? "test('alpha/two',()=>expect(2).toBe(2));" : "test.skip('beta/sk
           `import {test,expect} from 'vitest';test('chunk/${String(i).padStart(2, "0")}',()=>expect(1).toBe(1));`,
         );
       }
-      writeConfig(
+      write(
         path.join(root, "test/vitest/vitest.extension-telegram.config.ts"),
-        "chunks",
-        `import fs from 'node:fs';const file=process.env.OPENCLAW_VITEST_INCLUDE_FILE;const config = {root:${JSON.stringify(root)},test:{name:'chunks',include:file?JSON.parse(fs.readFileSync(file,'utf8')):${JSON.stringify(files)},pool:'forks',maxWorkers:1}};`,
+        `import fs from 'node:fs';const file=process.env.OPENCLAW_VITEST_INCLUDE_FILE;export default {root:${JSON.stringify(root)},cacheDir:${JSON.stringify(path.join(root, "vite-chunks"))},test:{name:'chunks',include:file?JSON.parse(fs.readFileSync(file,'utf8')):${JSON.stringify(files)},pool:'forks',maxWorkers:1,cache:false,fsModuleCache:false}};`,
       );
       env.OPENCLAW_VITEST_INCLUDE_FILE = path.join(root, "includes.json");
       write(env.OPENCLAW_VITEST_INCLUDE_FILE, JSON.stringify(files));

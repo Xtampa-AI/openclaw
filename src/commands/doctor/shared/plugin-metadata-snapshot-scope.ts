@@ -9,7 +9,6 @@ import { withDeferredPluginDoctorMigrations } from "../../../plugins/doctor-cont
 import {
   createPluginCache,
   getPluginMetadataSnapshotCache,
-  MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS,
   withPluginCache,
   type PluginCache,
 } from "../../../plugins/plugin-cache.js";

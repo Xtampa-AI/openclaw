@@ -249,7 +249,6 @@ describe("resolveEmbeddedAgentStream", () => {
         expectedChars: prompt.length,
         observedChars: prompt.length,
         matchesAssembledPrompt: true,
-        model: "gpt-5.5",
       });
       expect(JSON.stringify(recordEvent.mock.calls)).not.toContain(prompt);
 

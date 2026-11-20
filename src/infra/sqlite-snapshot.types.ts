@@ -8,7 +8,6 @@ import type { SqliteFileContent } from "./sqlite-snapshot-file.js";
 export type SqliteSnapshotValidator = (database: DatabaseSync, databaseLabel: string) => void;
 
 export type CreateVerifiedSqliteSnapshotOptions = {
-  integrity?: import("./sqlite-integrity.js").SqliteIntegrityCheckOptions;
   sourcePath: string;
   targetPath: string;
   /** Only in an isolated child: acquire or take custody of the same operation's private image. */

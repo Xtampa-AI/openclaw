@@ -79,7 +79,7 @@ export class NodeInvokeStreamController {
         seq: number,
         payloadJSON: string,
       ) => boolean;
-      onSettledResult: (pending: PendingInvoke, delivered: boolean) => void;
+      onFailedResult: (pending: PendingInvoke) => void;
       // Settles a pending invoke on transport loss. The registry's callback
       // preserves MCP's structured-failure contract (resolve, not reject) so
       // MCP callers can degrade instead of seeing an opaque invoke error.
@@ -138,7 +138,9 @@ export class NodeInvokeStreamController {
     if (!pending || !this.takePending(params.id, pending)) {
       return false;
     }
-    this.options.onSettledResult(pending, params.ok);
+    if (!params.ok) {
+      this.options.onFailedResult(pending);
+    }
     // Even an out-of-order frame proves execution. A contradictory readiness
     // rejection must not authorize another attempt of a non-idempotent command.
     const error =
@@ -389,7 +391,7 @@ export class NodeInvokeStreamController {
   ): void {
     if (this.takePending(requestId, pending)) {
       this.options.sendCancel(requestId, pending);
-      this.options.onSettledResult(pending, false);
+      this.options.onFailedResult(pending);
       pending.resolve({ ok: false, error });
     }
   }

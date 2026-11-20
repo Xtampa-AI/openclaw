@@ -175,7 +175,6 @@ export const mockedAcquireAgentRunPreparedModelRuntime = vi.fn(
     const snapshot = {
       agentId: input.agentId,
       agentDir: input.agentDir,
-      inheritedAuthDir: input.inheritedAuthDir,
       config: input.config,
       workspaceDir: input.workspaceDir,
       pluginRegistry: pluginRegistry

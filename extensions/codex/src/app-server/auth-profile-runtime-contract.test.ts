@@ -22,7 +22,7 @@ import {
   readCodexAppServerBinding,
   writeCodexAppServerBinding as writeRawCodexAppServerBinding,
 } from "./session-binding.test-helpers.js";
-import type { CodexAppServerClientOptions } from "./shared-client-options.js";
+import type { CodexAppServerClientOptions } from "./shared-client.js";
 import { createCodexTestOAuthProfile } from "./test-support.js";
 
 function runAttempt(

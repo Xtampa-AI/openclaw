@@ -1,4 +1,3 @@
-export { recoverSessionTranscriptProjection } from "./session-transcript-projection-recovery.js";
 /**
  * Stable storage-neutral session and transcript access API.
  *

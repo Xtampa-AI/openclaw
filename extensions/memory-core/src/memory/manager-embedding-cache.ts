@@ -265,7 +265,6 @@ export function clearMemoryEmbeddingCacheIdentities(
   return removed;
 }
 
-/** Evicts within the caller budget; full rebuilds supply bounded temporary headroom. */
 export function upsertMemoryEmbeddingCache(params: {
   db: EngineConnection;
   cacheSize: MemoryEmbeddingCacheSize;

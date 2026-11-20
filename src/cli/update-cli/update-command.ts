@@ -300,7 +300,6 @@ async function updateCommandInternal(
       const failure = createUpdateConfigFailure(configSnapshot, target.configReadFailure);
       return await refuseUpdate(failure.reason, failure.message, failure.failureFacts);
     }
-    await target.assertPackageRuntimeCurrent?.();
     const schemaPreflight = await preflightUpdateCommandSchemas({
       ...target,
       callerLegacyConfigPlan: initialization?.callerLegacyConfigPlan,

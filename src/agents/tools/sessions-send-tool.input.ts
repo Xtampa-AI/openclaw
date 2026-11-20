@@ -61,15 +61,3 @@ export function readSessionsSendMode(params: Record<string, unknown>) {
   }
   return mode;
 }
-
-/** Keep label validation shared with the send tool without changing its error contract. */
-export function readSessionsSendLabelAgent(params: Record<string, unknown>) {
-  const input = readToolStringParam(params, "agentId");
-  const normalized = input === undefined ? null : normalizeAgentIdStrict(input);
-  return normalized && !normalized.ok
-    ? {
-        input,
-        error: `Agent "${input}" not found. Run openclaw agents list to see configured agents.`,
-      }
-    : { input, agentId: normalized?.value };
-}

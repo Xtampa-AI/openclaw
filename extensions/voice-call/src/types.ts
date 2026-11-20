@@ -187,8 +187,6 @@ export type PlayTtsInput = CallControlInput & {
   locale?: string;
   /** Keep collecting speech after playback when the provider owns the listening XML. */
   listenAfterPlayback?: boolean;
-  /** Correlate speech gathered after playback with an explicit conversation turn. */
-  turnToken?: string;
 };
 
 export type SendDtmfInput = CallControlInput & {

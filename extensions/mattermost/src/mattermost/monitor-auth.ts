@@ -1,5 +1,4 @@
 import type {
-  ChannelIngressContextBinding,
   ChannelIngressDecision,
   ChannelIngressEventInput,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
@@ -83,7 +82,6 @@ export async function resolveMattermostMonitorInboundAccess(params: {
   senderId: string;
   senderName: string;
   channelId: string;
-  threadId?: string;
   kind: "direct" | "group" | "channel";
   groupPolicy: "allowlist" | "open" | "disabled";
   storeAllowFrom?: Array<string | number> | null;
@@ -92,7 +90,6 @@ export async function resolveMattermostMonitorInboundAccess(params: {
   hasControlCommand: boolean;
   eventKind?: ChannelIngressEventInput["kind"];
   mayPair?: boolean;
-  contextBinding?: ChannelIngressContextBinding;
 }) {
   const {
     account,
@@ -116,7 +113,6 @@ export async function resolveMattermostMonitorInboundAccess(params: {
   return await getMattermostRuntime().channel.inbound.ingress.resolveStable({
     channelId: "mattermost",
     accountId: account.accountId,
-    contextBinding: params.contextBinding,
     identity: mattermostIngressIdentity,
     cfg,
     ...(readStoreAllowFrom ? { readStoreAllowFrom } : {}),
@@ -128,7 +124,6 @@ export async function resolveMattermostMonitorInboundAccess(params: {
     conversation: {
       kind,
       id: channelId,
-      threadId: params.threadId,
     },
     event: {
       kind: params.eventKind ?? "message",

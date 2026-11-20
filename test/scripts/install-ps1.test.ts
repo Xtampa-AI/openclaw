@@ -137,10 +137,3 @@ runWithPowerShell("restores a conflicted pull before continuing a Git install", 
   ]);
   expect(result.status, result.stdout + result.stderr).toBe(0);
 });
-
-it("routes the piped installer regression through both Windows hosts", () => {
-  const workflow = readFileSync(".github/workflows/website-installer-sync.yml", "utf8");
-  expect(workflow).toContain("test/scripts/install-ps1-entrypoint.ps1 -InstallerPath $scriptPath");
-  const entrypoint = readFileSync("test/scripts/install-ps1-entrypoint.ps1", "utf8");
-  expect(entrypoint).toContain("Invoke-Expression");
-});

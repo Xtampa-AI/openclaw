@@ -13,7 +13,6 @@ import {
   SessionTranscriptWriterClaimReboundError,
   withOwnedSessionTranscriptWrites,
 } from "../../../config/sessions/transcript-write-context.js";
-import type { OwnedSessionTranscriptWriteContext } from "../../../config/sessions/transcript-write-context.types.js";
 import { captureAgentRunTerminalPersistence } from "../../../infra/agent-run-terminal-writes.js";
 import { readDatabasePathIdentitySync } from "../../../infra/sqlite-worker-identity.js";
 /** Prepares the admitted writer context and teardown tracker for one attempt. */

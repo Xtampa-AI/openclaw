@@ -92,9 +92,6 @@ it.each(
     vi.spyOn(Date, "now").mockReturnValue(1_000);
     vi.spyOn(performance, "now").mockReturnValue(1_000);
 
-    // Isolate timeout propagation from real elapsed setup/inspection time.
-    vi.spyOn(Date, "now").mockReturnValue(1_000);
-    vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await updateGitInstall({
       root: switchToGit ? target.packageRoot : gitRoot,
       switchToGit,

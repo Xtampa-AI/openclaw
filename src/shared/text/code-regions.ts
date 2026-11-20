@@ -387,30 +387,3 @@ function trailingBlockquoteBoundary(text: string, limit: number) {
   const raw = text.slice(-limit * 8);
   return (raw.includes(">") ? stripBlockquotePrefixes(raw) : raw).slice(-limit);
 }
-
-export function isInsideSettledBlockCode(
-  pos: number,
-  text: string,
-  regions: ReturnType<typeof findCodeRegions>,
-): boolean {
-  return regions.some(
-    (region) =>
-      region.block &&
-      region.start <= pos &&
-      pos < region.end &&
-      /[\r\n]/.test(text.slice(region.start, pos)),
-  );
-}
-
-/** Bounded marker-free reuse; complex Markdown retains the canonical parser. */
-export function canReuseMarkdownOwnership(
-  previousText: string,
-  nextText: string,
-  ownership?: ReturnType<typeof findCodeOwnership>,
-): boolean {
-  if (ownership || !nextText.startsWith(previousText)) {
-    return false;
-  }
-  const boundary = previousText.slice(-4) + nextText.slice(previousText.length);
-  return !/[\x60~\t|\r[\]():-]| {4}/u.test(boundary);
-}

@@ -136,12 +136,10 @@ async function createMediaFixture(scenario: Scenario, managed = false) {
     storePath: path.join(root, "sessions.sqlite"),
   };
   params.sessionTarget = target;
-  const sessionEntry = {
-    sessionId: params.sessionId,
-    sessionFile: params.sessionFile,
-    updatedAt: Date.now(),
-  };
-  await upsertSessionEntry({ ...target, entry: sessionEntry });
+  await upsertSessionEntry({
+    ...target,
+    entry: { sessionId: params.sessionId, sessionFile: params.sessionFile, updatedAt: Date.now() },
+  });
   let persisted = false;
   const recorder = {
     message:

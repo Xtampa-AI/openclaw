@@ -11,6 +11,10 @@ import type { UpdateRunResult } from "./update-runner-types.js";
 
 const testNodeExecPath = resolveTestNodeExecPath();
 
+export function isManagedServiceInspectionCommand(command: string): boolean {
+  return /^(?:--user )?(?:show|print) /.test(command);
+}
+
 type ManagedSystemdPostExitState = {
   activeState: string;
   generation?: "cleared" | "parked" | "replacement";
@@ -25,7 +29,7 @@ export type ManagedServiceManagerBoundaryOptions = {
   rollbackRestoration?: boolean;
   cancelAfterPark?: boolean;
   parentExitTimeoutMs?: number;
-  launchdFault?: "wrong-parent" | "missing-restored-pid" | "dead-restored-pid" | "stopped-loaded";
+  launchdFault?: "wrong-parent" | "missing-restored-pid" | "dead-restored-pid";
   launchdTeardown?: {
     bootoutDelayMs?: number;
     clockEachCommandMs?: number;
@@ -71,7 +75,6 @@ export type ManagedServiceCommandTiming = {
 };
 
 export type ManagedServiceManagerBoundaryResult = {
-  publication?: { installedVersion: string; launcher: string; publicationPending: boolean };
   run?: UpdateRunRecord;
   commands: string[];
   parentSignal: NodeJS.Signals | null;
@@ -323,11 +326,6 @@ if (${JSON.stringify(kind)} === "systemd") {
         state.loadedPrintsObserved = (state.loadedPrintsObserved || 0) + 1;
       } else {
         state.unloaded = true;
-        if (${JSON.stringify(options?.launchdFault)} === "stopped-loaded" &&
-            fs.existsSync(${JSON.stringify(path.join(path.dirname(statePath), "updater-ran"))})) {
-          process.stdout.write(args[1] + " = {\\n\\tstate = waiting\\n}\\n");
-          return state;
-        }
         process.stderr.write("Could not find service\\n");
         process.exitCode = 113;
         return state;

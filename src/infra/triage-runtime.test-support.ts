@@ -21,11 +21,6 @@ export const triageMaintenanceRuntimeEntrypoints = {
 } as const;
 
 export const triageTestRuntimeEntrypoints = {
-  handoffPublication: {
-    currentModuleUrl,
-    sourceWorkerName: "update-managed-service-handoff-publication-runtime.test-support",
-    distWorkerPath: "infra/update-managed-service-handoff-publication-runtime.test-support.js",
-  },
   sealedRuntime: {
     currentModuleUrl,
     sourceWorkerName: "sealed-runtime-registry",

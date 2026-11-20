@@ -1,5 +1,3 @@
-import type { Slot } from "./worker-task-pool.types.js";
-
 export class WorkerTaskError extends Error {
   readonly capacityAvailable?: Promise<void>;
   constructor(
@@ -34,18 +32,4 @@ export function workerTaskTimeoutError(
     process.emitWarning(error.message, { code: "WORKER_HOST_CALLBACK_TIMEOUT" });
   }
   return error;
-}
-
-export function workerTaskUnavailableError<Input, Output>(
-  slot: Slot<Input, Output>,
-  message: string,
-  cause?: unknown,
-): WorkerTaskError {
-  const task = slot.task;
-  const stage = slot.ready === false ? "startup" : task?.exchange ? "exchange" : "running";
-  // Reuse owned estimates/progress without sizing or retaining input.
-  const detail = task?.diagnosticLabel
-    ? ` [task=${task.diagnosticLabel} admittedInputBytes=${task.inputBytes} exchanges=${task.exchangeSequence} stage=${stage}]`
-    : "";
-  return new WorkerTaskError(message + detail, "unavailable", { cause });
 }

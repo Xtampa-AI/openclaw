@@ -584,13 +584,6 @@ export function buildAgentRunTerminalOutcomeFromAttempt(input: {
   });
 }
 
-/** Tool execution deadlines preserve an unknown-effect checkpoint for safe continuation. */
-export function isAgentRunResumableToolTimeout(
-  outcome: AgentRunTerminalOutcome | undefined,
-): boolean {
-  return outcome?.reason === "hard_timeout" && outcome.timeoutPhase === "tool_execution";
-}
-
 /** Builds a terminal outcome from wait paths where status may still be pending/unknown. */
 export function buildAgentRunTerminalOutcomeFromWaitResult(
   wait: AgentRunTerminalWaitInput | undefined,

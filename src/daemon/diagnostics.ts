@@ -27,9 +27,7 @@ async function readTailWindow(handle: FileHandle, size: number) {
 
 /** Reads complete lines from a bounded gateway log tail. */
 export async function readGatewayLogTailLines(filePath: string): Promise<string[]> {
-  // Reach descriptor admission even when a diagnostic path is a FIFO with no writer.
-  // Preserve intentional log symlinks; the existing fstat owns file-type admission.
-  const handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const handle = await fs.open(filePath, "r");
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size <= 0) {

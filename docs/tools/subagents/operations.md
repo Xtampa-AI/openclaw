@@ -271,9 +271,3 @@ in file logs; console output includes the first six stack lines. Direct announce
 and requester-settle retry warnings
 also include the requester and delivery idempotency key so retries can be traced
 without logging message content.
-
-## Retention during shutdown
-
-When shutdown begins, an active retention sweep finishes its current cleanup
-instead of draining the entire expired backlog. Remaining run records stay saved
-for cleanup after restart, including partially cleaned collector groups.

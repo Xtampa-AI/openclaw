@@ -146,7 +146,6 @@ import {
   registerCliMcpPreparationTests,
   setRawCliBackendForPrepareTest,
 } from "./prepare-mcp.test-support.js";
-import { registerCliModelContextPreparationTests } from "./prepare-model-context.test-support.js";
 import { registerCliThinkingPreparationTests } from "./prepare-thinking.test-support.js";
 import { prepareCliRunContext } from "./prepare.js";
 import {
@@ -324,6 +323,14 @@ function createNativeArgMcpBackend(): CliBackendPlugin & { pluginId: string } {
   };
 }
 
+type CliContextBudgetTestCase = {
+  name: string;
+  provider: string;
+  expectedContextTokens: number;
+  model: string;
+  modelAliases?: Record<string, string>;
+};
+
 describe("prepareCliRunContext", () => {
   const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-cli-prepare-");
   const retainedStateDirs: string[] = [];
@@ -470,10 +477,142 @@ describe("prepareCliRunContext", () => {
     setBackend: setCliBackendForPrepareTest,
   });
 
-  registerCliModelContextPreparationTests({
-    getFixture: () => fixture,
-    createCliBackendConfig,
-    setBackend: setCliBackendForPrepareTest,
+  it.each<CliContextBudgetTestCase>([
+    {
+      name: "a Claude CLI user alias",
+      provider: "claude-cli",
+      expectedContextTokens: 100_000,
+      model: "large",
+      modelAliases: { large: "claude-opus-4-7" },
+    },
+    {
+      name: "a Claude CLI-native alias",
+      provider: "claude-cli",
+      expectedContextTokens: 100_000,
+      model: "claude-opus-4-7",
+      modelAliases: { "claude-opus-4-7": "deployment-large" },
+    },
+  ])("resolves canonical model budgets for $name", async (testCase) => {
+    const prepareExecution = vi.fn(async () => undefined);
+    const baseConfig = createCliBackendConfig();
+    setCliBackendForPrepareTest({
+      id: testCase.provider,
+      command: testCase.provider === "claude-cli" ? "claude" : testCase.provider,
+      modelProvider: "fixture-anthropic",
+      pluginId: "fixture-plugin",
+      prepareExecution,
+      modelAliases: testCase.modelAliases,
+    });
+    const context = await fixture.prepare({
+      provider: testCase.provider,
+      model: testCase.model,
+      config: {
+        ...baseConfig,
+        agents: baseConfig.agents,
+        models: {
+          providers: {
+            "fixture-anthropic": {
+              baseUrl: "https://api.anthropic.com",
+              models: [
+                {
+                  id: "claude-opus-4-7",
+                  name: "Claude Opus 4.7",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 200_000,
+                  maxTokens: 8_192,
+                  contextTokens: 100_000,
+                },
+              ],
+            },
+            "collision-provider": {
+              baseUrl: "https://collision.invalid",
+              models: [
+                {
+                  id: "large",
+                  name: "Unrelated Large",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 32_000,
+                  maxTokens: 4_096,
+                  contextTokens: 32_000,
+                },
+              ],
+            },
+            "claude-cli": {
+              baseUrl: "https://runtime.invalid",
+              models: [
+                {
+                  id: "large",
+                  name: "Configured Alias Source",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 200_000,
+                  maxTokens: 8_192,
+                  contextTokens: 200_000,
+                },
+              ],
+            },
+          },
+        },
+      } satisfies OpenClawConfig,
+    });
+
+    expect(context.backendResolved.modelProvider).toBe("fixture-anthropic");
+    expect(context.contextWindowInfo?.tokens).toBe(testCase.expectedContextTokens);
+    expect(prepareExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ contextTokenBudget: testCase.expectedContextTokens }),
+    );
+  });
+
+  it.each([
+    { name: "the session-selected 200k option", selection: "200k", expected: 200_000 },
+    {
+      name: "the declared default option when unselected",
+      selection: undefined,
+      expected: 1_000_000,
+    },
+  ])("caps the context budget with $name from catalog contextWindows", async (testCase) => {
+    const prepareExecution = vi.fn(async () => undefined);
+    setCliBackendForPrepareTest({ prepareExecution });
+    setCliRunnerPrepareTestDeps({
+      loadManifestModelCatalog: vi.fn(() => [
+        {
+          id: "claude-fable-5",
+          name: "Claude Fable 5",
+          provider: "anthropic",
+          contextWindow: 1_000_000,
+          contextWindows: [
+            { id: "200k", label: "200K", contextWindow: 200_000 },
+            { id: "1m", label: "1M", contextWindow: 1_000_000 },
+          ],
+          contextWindowDefault: "1m",
+        },
+      ]),
+    });
+
+    const context = await fixture.prepare({
+      provider: "claude-cli",
+      model: "claude-fable-5",
+      config: {},
+      // The run owner carries the selection as a prepared fact; a session entry
+      // alone must not drive it (reply-path regression: selection dropped when
+      // prepare read sessionEntry directly).
+      ...(testCase.selection ? { contextWindow: testCase.selection } : {}),
+      sessionEntry: {
+        sessionId: "cli-session",
+        updatedAt: 0,
+        ...(testCase.selection ? {} : { contextWindow: "200k" }),
+      },
+    });
+
+    expect(context.contextWindowInfo?.tokens).toBe(testCase.expected);
+    expect(prepareExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ contextTokenBudget: testCase.expected }),
+    );
   });
 
   beforeEach(() => {
@@ -496,7 +635,7 @@ describe("prepareCliRunContext", () => {
       createMcpLoopbackServerConfig: vi.fn(createTestMcpLoopbackServerConfig),
       mintMcpLoopbackClientGrant: vi.fn(createTestMcpLoopbackClientGrant),
       bindMcpLoopbackClientGrantAdmission: vi.fn(() => true),
-      revokeMintedMcpLoopbackClientGrant: vi.fn(() => true),
+      revokeMcpLoopbackClientGrant: vi.fn(() => true),
       resolveMcpLoopbackPolicyTools: vi.fn(() => ({ agentId: "main", tools: [] })),
       resolveMcpLoopbackScopedTools: vi.fn(() => ({ agentId: "main", tools: [] })),
       resolveOpenClawReferencePaths: vi.fn(async () => ({ docsPath: null, sourcePath: null })),
@@ -1136,7 +1275,7 @@ describe("prepareCliRunContext", () => {
         ?.GEMINI_CLI_SYSTEM_SETTINGS_PATH;
       throw new Error("Gemini auth profile was selected but no credential material was found");
     });
-    const revokeMintedMcpLoopbackClientGrant = vi.fn(() => true);
+    const revokeMcpLoopbackClientGrant = vi.fn(() => true);
     setRawCliBackendForPrepareTest({
       id: "google-gemini-cli",
       pluginId: "google",
@@ -1147,7 +1286,7 @@ describe("prepareCliRunContext", () => {
     });
     setCliRunnerPrepareTestDeps({
       getActiveMcpLoopbackRuntime,
-      revokeMintedMcpLoopbackClientGrant,
+      revokeMcpLoopbackClientGrant,
     });
 
     await expect(
@@ -1161,9 +1300,7 @@ describe("prepareCliRunContext", () => {
 
     expect(generatedSystemSettingsPath).toBeTruthy();
     expect(fs.existsSync(generatedSystemSettingsPath ?? "")).toBe(false);
-    expect(revokeMintedMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ token: "loopback-token" }),
-    );
+    expect(revokeMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith("loopback-token");
   });
 
   it("cleans prepared MCP and skills plugin dirs when mid-prepare reference lookup fails", async () => {
@@ -1174,7 +1311,7 @@ describe("prepareCliRunContext", () => {
     const skillsCleanup = vi.fn(async () => {
       fs.rmSync(skillsPluginDir, { recursive: true, force: true });
     });
-    const revokeMintedMcpLoopbackClientGrant = vi.fn(() => true);
+    const revokeMcpLoopbackClientGrant = vi.fn(() => true);
     fs.mkdirSync(tempRoot, { recursive: true });
     fs.mkdirSync(skillsPluginDir, { recursive: true });
     setTestEnvValue("TMPDIR", tempRoot);
@@ -1183,7 +1320,7 @@ describe("prepareCliRunContext", () => {
     const getActiveMcpLoopbackRuntime = vi.fn(createLoopbackRuntime);
     setCliRunnerPrepareTestDeps({
       getActiveMcpLoopbackRuntime,
-      revokeMintedMcpLoopbackClientGrant,
+      revokeMcpLoopbackClientGrant,
       prepareClaudeCliSkillsPlugin: vi.fn(async () => ({
         args: ["--plugin-dir", skillsPluginDir],
         cleanup: skillsCleanup,
@@ -1202,9 +1339,7 @@ describe("prepareCliRunContext", () => {
       ).rejects.toThrow("reference path lookup failed");
 
       expect(skillsCleanup).toHaveBeenCalledOnce();
-      expect(revokeMintedMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({ token: "loopback-token" }),
-      );
+      expect(revokeMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith("loopback-token");
       expect(fs.existsSync(skillsPluginDir)).toBe(false);
       expect(
         fs.readdirSync(tempRoot).filter((entry) => entry.startsWith("openclaw-cli-mcp-")),
@@ -2306,7 +2441,7 @@ describe("prepareCliRunContext", () => {
     }));
     const deactivateMcpLoopbackClientGrantCapture = vi.fn(() => true);
     const mintMcpLoopbackClientGrant = vi.fn(createTestMcpLoopbackClientGrant);
-    const revokeMintedMcpLoopbackClientGrant = vi.fn(() => true);
+    const revokeMcpLoopbackClientGrant = vi.fn(() => true);
     const resolveMcpLoopbackScopedTools = vi.fn((_scope: McpProjectionParams) => ({
       agentId: "main",
       tools: [
@@ -2328,7 +2463,7 @@ describe("prepareCliRunContext", () => {
       activateMcpLoopbackClientGrantCapture,
       deactivateMcpLoopbackClientGrantCapture,
       mintMcpLoopbackClientGrant,
-      revokeMintedMcpLoopbackClientGrant,
+      revokeMcpLoopbackClientGrant,
       resolveMcpLoopbackScopedTools,
     });
     setRawCliBackendForPrepareTest(createNativeArgMcpBackend());
@@ -4019,7 +4154,7 @@ describe("prepareCliRunContext", () => {
     const { dir } = fixture.session;
     const skill = createWeatherSkillFixture(dir, true);
     const preparedExecutionCleanup = vi.fn(async () => undefined);
-    const revokeMintedMcpLoopbackClientGrant = vi.fn(() => true);
+    const revokeMcpLoopbackClientGrant = vi.fn(() => true);
     setCliBackendForPrepareTest({
       id: "claude-cli",
       pluginId: "anthropic",
@@ -4029,7 +4164,7 @@ describe("prepareCliRunContext", () => {
     setCliRunnerPrepareTestDeps({
       prepareClaudeCliSkillsPlugin,
       getActiveMcpLoopbackRuntime: vi.fn(createLoopbackRuntime),
-      revokeMintedMcpLoopbackClientGrant,
+      revokeMcpLoopbackClientGrant,
     });
 
     const context = await fixture.prepare({
@@ -4057,9 +4192,7 @@ describe("prepareCliRunContext", () => {
       await context.preparedBackend.cleanup?.();
       expect(fs.existsSync(skillPath)).toBe(true);
       expect(preparedExecutionCleanup).toHaveBeenCalledOnce();
-      expect(revokeMintedMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({ token: "loopback-token" }),
-      );
+      expect(revokeMcpLoopbackClientGrant).toHaveBeenCalledExactlyOnceWith("loopback-token");
 
       const nextTurn = await fixture.prepare({
         provider: "claude-cli",
@@ -4077,7 +4210,7 @@ describe("prepareCliRunContext", () => {
       expect(fs.existsSync(unusedPluginDir ?? "")).toBe(false);
       expect(fs.existsSync(skillPath)).toBe(true);
       expect(preparedExecutionCleanup).toHaveBeenCalledTimes(2);
-      expect(revokeMintedMcpLoopbackClientGrant).toHaveBeenCalledTimes(2);
+      expect(revokeMcpLoopbackClientGrant).toHaveBeenCalledTimes(2);
     } finally {
       await releaseSkills?.();
     }

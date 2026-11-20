@@ -31,20 +31,6 @@ export function resolveChannelDefaultAccountIdForDelivery(params: {
   return accountId === DEFAULT_ACCOUNT_ID ? undefined : accountId;
 }
 
-/** Picks the channel's own default account for a delivery that names none and has no binding. */
-export function resolveChannelDefaultAccountIdForDelivery(params: {
-  cfg: OpenClawConfig;
-  channel: ChannelId;
-  agentId: string;
-}): string | undefined {
-  const plugin = resolveOutboundChannelPlugin({ ...params, allowBootstrap: true });
-  const accountId = plugin
-    ? resolveChannelDefaultAccountId({ plugin, cfg: params.cfg })
-    : undefined;
-  // Keep an unnamed default implicit; only a configured account changes the route.
-  return accountId === DEFAULT_ACCOUNT_ID ? undefined : accountId;
-}
-
 /** Resolves a cron delivery target through channel plugins with bootstrap allowed. */
 export async function resolveChannelTargetForDelivery(params: {
   cfg: OpenClawConfig;

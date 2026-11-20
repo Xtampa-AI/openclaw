@@ -264,7 +264,6 @@ export const preservedModuleBuildSources = [
 export const preservedModuleBuildAssets = [
   "scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt",
   "test/fixtures/acp/owner-agent.mjs",
-  "scripts/e2e/lib/kitchen-sink-plugin/npm-version.txt",
   "scripts/e2e/lib/upgrade-survivor/config-recipe/agents.json",
   "scripts/e2e/lib/upgrade-survivor/config-recipe/channels-discord.json",
   "scripts/e2e/lib/upgrade-survivor/config-recipe/channels-feishu.json",

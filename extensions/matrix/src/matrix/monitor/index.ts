@@ -210,7 +210,6 @@ export async function monitorMatrixProvider(opts: MonitorMatrixOpts = {}): Promi
     accountId: auth.accountId,
     baseUrl: auth.homeserver,
     statusSink: opts.setStatus,
-    deferReadyUntilStartupComplete: true,
   });
   let cleanedUp = false;
   let cleanupPromise: Promise<void> | null = null;

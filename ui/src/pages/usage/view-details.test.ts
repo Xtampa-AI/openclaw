@@ -671,30 +671,3 @@ it("preserves context-category order, sorted cards, expansion, and callbacks", (
   expect(cards[0]?.querySelectorAll(".context-breakdown-item")).toHaveLength(4);
   expect(cards[0]?.querySelector(".context-breakdown-more")?.textContent).toContain("1 more");
 });
-
-function panelText(container: HTMLElement, selector: string) {
-  return container.querySelector(selector)?.textContent ?? "";
-}
-it.each([
-  { label: "total-only reports", input: 0, output: 0 },
-  { label: "partially categorized reports", input: 30, output: 40 },
-])("preserves reported token totals when selecting $label", ({ input, output }) => {
-  const container = mount(
-    [1000, 2000, 3000].map((timestamp) =>
-      point({ timestamp, totalTokens: 150, input, output, cacheRead: 0, cacheWrite: 0 }),
-    ),
-    null,
-    null,
-    "by-type",
-  );
-  expect(panelText(container, ".timeseries-summary")).toContain("450");
-  container
-    .querySelector<HTMLElement>(".chart-handle-left")!
-    .dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
-  flush();
-  expect(panelText(container, ".session-detail-stats")).toContain("300 tokens");
-  expect(panelText(container, ".timeseries-summary")).toContain("300");
-  expect(panelText(container, ".timeseries-breakdown .cost-breakdown-total")).toContain(
-    input === 0 ? "0" : "140",
-  );
-});

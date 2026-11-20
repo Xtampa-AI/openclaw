@@ -200,7 +200,7 @@ function reserveWorktreeCapacityInDatabase(
             payload_json: JSON.stringify({ owner, worktreeCapacity: reservations }),
             updated_at: now,
           })
-          .where("state_leases.owner", "=", key),
+          .where("owner", "=", key),
       ),
   );
   if (admission.numAffectedRows !== 1n) {

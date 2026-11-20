@@ -26,8 +26,6 @@ const performanceSources = [
   "src/shared/non-packaged-plugin-dirs.ts",
   ...[
     "check-limits.mts",
-    "release-context.mjs",
-    "release-version.mjs",
     "control-ui-i18n-config.ts",
     "control-ui-i18n-config.json",
     "control-ui-module-attribution.mts",

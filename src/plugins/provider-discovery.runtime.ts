@@ -242,7 +242,6 @@ function resolveProviderDiscoveryEntryPlugins(
     ...params,
     registry,
     manifestRegistry,
-    normalizePluginId: metadataSnapshot.normalizePluginId,
   });
   const pluginIdSet = new Set(pluginIds);
   const pluginRecords = manifestRegistry.plugins.filter((plugin) => pluginIdSet.has(plugin.id));

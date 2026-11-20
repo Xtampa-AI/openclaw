@@ -527,6 +527,7 @@ describe("gateway WebSocket chat abort ownership", () => {
           scope: storePath,
           identities: ["main", "agent:main:main", "sess-main"],
           reason,
+          timeoutMs: 1_000,
         });
         expect(capturedAbortSignal.aborted).toBe(true);
         expect(capturedAbortSignal.reason).toBe(reason);
@@ -563,7 +564,7 @@ describe("gateway WebSocket chat abort ownership", () => {
 
         dispatchRelease.resolve();
         await withinTest(dispatchRejected.promise, signal);
-        await expect(withinTest(interruption, signal)).resolves.toBe(true);
+        await expect(interruption).resolves.toBe(true);
         await expect(abortedFrame).resolves.toMatchObject({
           payload: { runId, state: terminalState },
         });

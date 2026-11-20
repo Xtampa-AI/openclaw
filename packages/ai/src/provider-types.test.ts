@@ -48,9 +48,6 @@ describe("provider call types", () => {
       ProviderModel["input"] | undefined
     >();
     expectTypeOf<Parameters<ProviderContextHandoff>>().toEqualTypeOf<[]>();
-    expectTypeOf<ProviderStreamOptions[typeof PROVIDER_MODEL_INPUT]>().toEqualTypeOf<
-      ProviderModel["input"] | undefined
-    >();
 
     expectTypeOf<UserMessage["content"]>().toEqualTypeOf<string | (TextContent | ImageContent)[]>();
     expectTypeOf<Context["messages"][number]>().toEqualTypeOf<Message>();

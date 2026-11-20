@@ -49,7 +49,6 @@ describe("Doctor JSON runtime failures", () => {
     );
     expect(JSON.parse(result.stdout)).toEqual({
       schemaVersion: 1,
-      status: "blocked",
       ok: false,
       status: "blocked",
       checksRun: 0,

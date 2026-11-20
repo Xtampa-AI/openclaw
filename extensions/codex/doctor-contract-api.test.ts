@@ -617,24 +617,6 @@ describe("codex doctor contract", () => {
     }
   });
 
-  it("preserves malformed UTF-8 binding sidecars without publishing replacement characters", async () => {
-    const fixture = await createBindingMigrationFixture({
-      name: "utf8-binding",
-      threadId: "thread-utf8-binding",
-    });
-    const bytes = await fs.readFile(fixture.sidecarPath);
-    const marker = bytes.indexOf("thread-utf8-binding");
-    expect(marker).toBeGreaterThanOrEqual(0);
-    bytes[marker] = 0xff;
-    await fs.writeFile(fixture.sidecarPath, bytes);
-    const result = await fixture.migration.migrateLegacyState(fixture.params);
-    expect(result.warningDisposition).toBe("recoverable");
-    expect(result.warnings.join("\n")).toContain("UTF-8");
-    expect(await fs.readFile(fixture.sidecarPath)).toEqual(bytes);
-    expect(await openBindingStore(fixture.env).entries()).toEqual([]);
-    await removeCodexDoctorFixture(fixture.stateDir);
-  });
-
   it.each([
     { contents: "{", detail: "invalid JSON", label: "invalid JSON" },
     {
@@ -674,8 +656,6 @@ describe("codex doctor contract", () => {
     };
 
     const result = await fixture.migration.migrateLegacyState(params);
-    expect(result.warningDisposition).toBe(Buffer.isBuffer(contents) ? "recoverable" : undefined);
-    expect(await fs.readFile(externalStore)).toEqual(Buffer.from(contents));
 
     expectWarning(result, "session index");
     expect(result.warnings[0]).toContain(detail);

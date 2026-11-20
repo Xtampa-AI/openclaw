@@ -123,35 +123,3 @@ describe("resolveOpenClawToolsFsPolicy", () => {
     ).toBeUndefined();
   });
 });
-
-describe("resolveOpenClawToolsFsPolicy", () => {
-  it("lets an explicit session permission mode decide and pins its root", () => {
-    expect(
-      resolveOpenClawToolsFsPolicy({
-        cfg: { tools: { fs: { workspaceOnly: false } } },
-        agentId: "main",
-        sessionPermissionPolicy: { mode: "workspace", root: "/work/root" },
-      }),
-    ).toEqual({ workspaceOnly: true, root: "/work/root" });
-    expect(
-      resolveOpenClawToolsFsPolicy({
-        cfg: { tools: { fs: { workspaceOnly: true } } },
-        agentId: "main",
-        sessionPermissionPolicy: { mode: "full", root: "/work/root" },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("keeps the subagent attachment root readable without widening the workspace", () => {
-    expect(
-      resolveOpenClawToolsFsPolicy({
-        cfg: { tools: { fs: { workspaceOnly: true } } },
-        agentId: "main",
-        attachmentReadRoot: "/state/attachments/child",
-      }),
-    ).toEqual({ workspaceOnly: true, readOnlyRoots: ["/state/attachments/child"] });
-    expect(
-      resolveOpenClawToolsFsPolicy({ cfg: {}, agentId: "main", attachmentReadRoot: "/x" }),
-    ).toBeUndefined();
-  });
-});

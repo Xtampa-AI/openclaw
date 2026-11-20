@@ -16,10 +16,6 @@ import type {
 import { managedServiceStateUpdateScript } from "./update-managed-service-handoff-state.test-support.js";
 import { signalMockManagedUpdateHandoffReady } from "./update-managed-service-handoff.test-support.js";
 
-export function isManagedServiceInspectionCommand(command: string): boolean {
-  return /^(?:--user )?(?:show|print) /.test(command);
-}
-
 const testNodeExecPath = resolveTestNodeExecPath();
 const recoveryReadyMarker = "OPENCLAW_TEST_RECOVERY_DESCENDANT_READY";
 const failed = "managed-service-handoff-failed";

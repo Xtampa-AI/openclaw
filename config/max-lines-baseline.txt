@@ -259,6 +259,7 @@ src/cron/isolated-agent/run.test-harness.ts
 src/daemon/systemd.test.ts
 src/flows/channel-setup.ts
 src/flows/doctor-core-checks.ts
+src/flows/doctor-health-contributions.test.ts
 src/flows/model-picker.ts
 src/gateway/call.test.ts
 src/gateway/call.ts
@@ -295,6 +296,7 @@ src/gateway/server-methods/chat.directive-tags.test.ts
 src/gateway/server-methods/config.ts
 src/gateway/server-methods/cron.validation.test.ts
 src/gateway/server-methods/models-auth-status.test.ts
+src/gateway/server-methods/models.test.ts
 src/gateway/server-methods/nodes.invoke-wake.test.ts
 src/gateway/server-methods/send.test.ts
 src/gateway/server-methods/send.ts
@@ -327,9 +329,11 @@ src/infra/outbound/delivery-queue-recovery.ts
 src/infra/outbound/delivery-queue.recovery.test.ts
 src/infra/restart.ts
 src/infra/state-migrations.doctor.ts
+src/infra/state-migrations.session-store.ts
 src/infra/state-migrations.test.ts
 src/infra/update-global.ts
 src/infra/update-managed-service-handoff.ts
+src/infra/update-startup.test.ts
 src/interactive/payload.ts
 src/logging/diagnostic-stability-bundle.ts
 src/logging/diagnostic-stability.ts

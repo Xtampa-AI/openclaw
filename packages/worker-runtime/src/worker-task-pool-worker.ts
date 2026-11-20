@@ -5,7 +5,6 @@ import { releaseWorkerNativeSectionsOnExit } from "./worker-task-native-sections
 import type { Slot, Task, WorkerTaskPoolOptions } from "./worker-task-pool.types.js";
 
 export function sendWorkerTaskInput<Input, Output>(params: {
-  workerUrl: URL;
   slot: Slot<Input, Output>;
   task: Task<Input, Output>;
   input: Input;
@@ -20,7 +19,6 @@ export function sendWorkerTaskInput<Input, Output>(params: {
   if (task.done) {
     return;
   }
-  task.diagnosticLabel = params.host.describeTask?.(params.workerUrl, input);
   task.preparedAt = performance.now();
   const bootstrapError = params.bootstrapError();
   if (bootstrapError && !slot.worker) {

@@ -26,8 +26,6 @@ For HTML widgets, OpenClaw core validates `widget_code` by parsing every inline 
 
 Syntax-error snippets and parser messages preserve complete Unicode code points when clipped to their existing UTF-16 limits.
 
-Syntax-error snippets and parser messages preserve complete Unicode code points when clipped to their existing UTF-16 limits.
-
 Channel plugins can register a contextual presenter behind the same core tool. In a configured Discord session, core hands the composed document to the Discord presenter, which stores it and posts the Activity button in the current channel. The model still makes one `show_widget` call. There is no transport-specific widget tool or content kind.
 
 In Control UI sessions, a Canvas widget can also be pinned to the session dashboard. Set `pin: true` in the tool call, or use **Pin to dashboard** on an existing transcript widget. Pinning gives the dashboard copy its own identity and capability grants. The inline preview never inherits those grants. The browser never resolves a widget data binding inside the untrusted frame.

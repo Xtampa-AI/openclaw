@@ -142,27 +142,6 @@ export async function initializeAndRunUpdate(
                 return;
               }
               const selectedTarget = selection.target;
-              const assertSelectedRuntimeCurrent = async () => {
-                if (!selectedTarget) {
-                  return;
-                }
-                try {
-                  await selectedTarget.assertPackageRuntimeCurrent?.();
-                } catch (error) {
-                  if (
-                    hasCommandProcessCleanupError(error) ||
-                    !(error instanceof UpdatePreMutationError)
-                  ) {
-                    throw error;
-                  }
-                  await selectedTarget.refuseUpdate(
-                    error.reason,
-                    error.message,
-                    error.failureFacts,
-                    error.recoverySteps,
-                  );
-                }
-              };
               const candidateAdmissionEnabled =
                 selectedTarget?.updateInstallKind === "package" &&
                 usesCandidateUpdateAdmission(opts, prepared.installKind);
@@ -305,7 +284,6 @@ export async function initializeAndRunUpdate(
                 }
               };
               const runCapturedInitialization = async () => {
-                await assertSelectedRuntimeCurrent();
                 await captureOriginal();
                 await runInitialized(initialization);
               };
@@ -449,7 +427,6 @@ export async function initializeAndRunUpdate(
                 await captureOriginal();
                 const runtime = await preparePackageUpdateRuntime({
                   ...target,
-                  assertPackageRuntimeCurrent: assertSelectedRuntimeCurrent,
                   managedService: schemaPreflight.service,
                   shouldRestart: prepared.shouldRestart,
                   opts,
@@ -494,7 +471,6 @@ export async function initializeAndRunUpdate(
                         await checkSchemas();
                         assertCurrent();
                         if (!target.packageAlreadyCurrent && !initialization.stagedPackage) {
-                          await assertSelectedRuntimeCurrent();
                           initializationStage = await stagePackageInstallUpdate(
                             stageParams(presentation),
                           );
@@ -543,7 +519,6 @@ export async function initializeAndRunUpdate(
                 ) {
                   const presentation = createUpdateProgress(!opts.json);
                   try {
-                    await assertSelectedRuntimeCurrent();
                     return await withPrivateStagedPackageInstall(
                       stageParams(presentation),
                       async ({ stage }) => {

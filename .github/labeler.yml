@@ -39,11 +39,6 @@
       - any-glob-to-any-file:
           - "extensions/pixverse/**"
           - "docs/providers/pixverse.md"
-"plugin: particle":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "extensions/particle/**"
-          - "docs/providers/particle.md"
 "plugin: typesafe":
   - changed-files:
       - any-glob-to-any-file:

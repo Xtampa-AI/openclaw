@@ -1,7 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { materializeErrorStack } from "../infra/error-graph-internal.js";
-import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { AsyncWorkScope, runOutsideAsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
@@ -25,7 +24,6 @@ import {
   runWithPluginExecutionFrame,
 } from "./plugin-instance-invocation.js";
 import type { PluginInstanceResource } from "./plugin-instance.types.js";
-import type { PluginMetadataSnapshot } from "./plugin-metadata-snapshot.types.js";
 
 export type { PluginCache } from "./plugin-cache.types.js";
 
@@ -307,24 +305,6 @@ export function runOutsidePluginCache<T>(run: () => T): T {
   );
 }
 
-export const MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS = 64;
-
-/** Keep recently used discovery views; active scopes retain their own snapshot references. */
-export function readPluginMetadataSnapshotCache(key: string): PluginMetadataSnapshot | undefined {
-  const snapshot = getPluginCache().metadata.snapshots.get(key);
-  if (snapshot) {
-    cachePluginMetadataSnapshot(key, snapshot);
-  }
-  return snapshot;
-}
-
-export function cachePluginMetadataSnapshot(key: string, snapshot: PluginMetadataSnapshot): void {
-  const snapshots = getPluginCache().metadata.snapshots;
-  snapshots.delete(key);
-  snapshots.set(key, snapshot);
-  pruneMapToMaxSize(snapshots, MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS);
-}
-
 /** Frozen views retain their producer so deferred access fills the same generation. */
 export function bindPluginMetadataSnapshotCache(snapshot: object, cache = getPluginCache()): void {
   state.snapshotOwners.set(snapshot, cache);
@@ -396,7 +376,6 @@ export function retirePluginCache(
       await work.drain();
     }
   };
-
   retained.controller.abort();
   materializeErrorStack(retained.controller.signal.reason);
   void runOutsideAsyncWorkScope(retire).then(completion.resolve, completion.reject);

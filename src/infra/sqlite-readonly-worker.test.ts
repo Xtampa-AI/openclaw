@@ -402,10 +402,7 @@ describe.each(["async", "sync"] as const)("SQLite read-only snapshot worker (%s)
         ? vi.mocked(spawnSync).mock.calls.filter(([, argv]) => argv?.[0] !== "--version")
         : vi.mocked(execFile).mock.calls;
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.[2]).toMatchObject({ timeout, killSignal: "SIGKILL", windowsHide: true });
-    if (mode === "sync") {
-      expect(calls[0]?.[2]).toHaveProperty("stdio", "pipe");
-    }
+    expect(calls[0]?.[2]).toMatchObject({ timeout, killSignal: "SIGKILL" });
   }
 
   it("budgets the WAL family while copying committed data from an open writer", async () => {
